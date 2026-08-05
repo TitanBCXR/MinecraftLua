@@ -1,14 +1,14 @@
 --[[
   admin.lua  -  Titan admin console for a POCKET computer ("Live" tablet)
-  Titan-Version: 1.1.6
+  Titan-Version: 1.1.7
 
   A mobile master terminal you keep on you. It listens to the whole Titan
   network and lets you monitor and command it from your pocket:
 
-    * live roster of bots + builders/gatherers (position, state, fuel, type)
+    * live roster of bots + builders/gatherers/miners (position, state, fuel, type)
     * points of interest, workers awaiting deployment, and STUCK alerts
     * dispatch / recall / refuel / stop any bot
-    * DEPLOY builder/gatherer workers (same push-deploy as the Parent Center)
+    * DEPLOY builder / gatherer / miner (same push-deploy as the Parent Center)
     * order builder scans / builds
 
   ADMIN ACTIONS ARE GATED BY THE MASTER PASSWORD. Monitoring is open; anything
@@ -112,16 +112,17 @@ local function drawDash()
     term.write(tostring(txt):sub(1, w))
   end
 
-  local total, gath, build = 0, 0, 0
+  local total, gath, build, mine = 0, 0, 0, 0
   for _, b in pairs(bots) do
     if ago(b.seen) < 20 then
       total = total + 1
       if b.botType == "gatherer" then gath = gath + 1
-      elseif b.botType == "builder" then build = build + 1 end
+      elseif b.botType == "builder" then build = build + 1
+      elseif b.botType == "miner" then mine = mine + 1 end
     end
   end
 
-  line(1, ("TITAN b:%d g:%d B:%d"):format(total, gath, build), colors.yellow)
+  line(1, ("TITAN t:%d b:%d g:%d m:%d"):format(total, build, gath, mine), colors.yellow)
   local y = 2
   for id, b in pairs(bots) do
     if y >= h then break end
@@ -188,7 +189,7 @@ local function consoleLoop()
       print("VIEW : live | bots | pois | pending | stuck | ping")
       print("BOT  : send <bot> <poi> | goto <bot> <x y z>")
       print("       return <bot> | refuel <bot> | stop <bot>")
-      print("DEPLOY: deploy <bot> <builder|gatherer> <name> [x y z]")
+      print("DEPLOY: deploy <bot> <builder|gatherer|miner> <name> [x y z]")
       print("BUILD: scan <bot> <name> <W H L> | build <bot> <name> [x y z]")
       print("ssh <id|label> [cmd...]  remote shell; jumps via modems (reboot ok)")
       print("hostname [name]  get or set this tablet's hostname")
@@ -264,13 +265,25 @@ local function consoleLoop()
       if id and requireAuth() then titan.send(id, MSG.COMMAND, { cmd = "stop" }); print("Stopped " .. a[2]) end
 
     elseif cmd == "deploy" then
-      -- resolve silently: a running worker (label/id) or a pending worker (id)
+      -- resolve: running bot, pending id, or pending name
       local id = findBot(a[2]) or tonumber(a[2])
+      if not id then
+        local want = tostring(a[2] or ""):lower()
+        for pid, w in pairs(pending) do
+          if w.name and w.name:lower() == want then id = pid; break end
+        end
+      end
       if id and not bots[id] and not pending[id] then id = nil end
       local btype, name = (a[3] or ""):lower(), a[4]
-      if not id then print("Unknown worker: " .. tostring(a[2]) .. " (try 'pending')")
-      elseif btype ~= "builder" and btype ~= "gatherer" or not name then
-        print("Usage: deploy <bot> <builder|gatherer> <name> [x y z]")
+      if btype == "mine" then btype = "miner" end
+      if btype == "build" then btype = "builder" end
+      if btype == "gather" then btype = "gatherer" end
+      local okType = (btype == "builder" or btype == "gatherer" or btype == "miner")
+      if not id then
+        print("Unknown worker: " .. tostring(a[2]) .. " (try 'pending')")
+      elseif not okType or not name then
+        print("Usage: deploy <bot> <builder|gatherer|miner> <name> [x y z]")
+        print("Example: deploy 20 miner Jimmy")
       elseif requireAuth() then
         local deposit
         if a[5] and a[6] and a[7] then
@@ -278,6 +291,9 @@ local function consoleLoop()
         end
         titan.send(id, MSG.WORKER_DEPLOY, { botType = btype, name = name, deposit = deposit })
         print(("Deploy sent to #%d: %s '%s'"):format(id, btype, name))
+        if btype == "miner" then
+          print("(Miner turtles need miner.lua — worker.lua will hand off if it is installed.)")
+        end
       end
 
     elseif cmd == "scan" then
