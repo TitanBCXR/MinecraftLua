@@ -1,6 +1,6 @@
 --[[
   console.lua  -  Basic terminal commands for a CC: Tweaked device
-  Titan-Version: 1.1.6
+  Titan-Version: 1.1.7
 
   A tiny, self-contained command console you can run on any computer or turtle.
   It gives you a handful of everyday commands (files, labels, GPS, fuel, movement)
@@ -340,9 +340,9 @@ def("ssh", "remote shell (jumps via modems): ssh <id|label> [command...]", funct
   openModems()
   if not a[1] then
     print("Usage: ssh <computer id or label> [command]")
-    print("  ssh 3              interactive (jumps through modem shells)")
-    print("  ssh Admin reboot   remote reboot via mesh jumps")
-    print("  ssh Miner-12 ls    run one command remotely")
+    print("  ssh 3              interactive (full remote command set)")
+    print("  ssh Admin status   run a remote device command")
+    print("  ssh Miner-12 ls    CraftOS / turtle builtins also work")
     print("Auth: Parent Center master password.")
     return
   end
@@ -443,6 +443,20 @@ end
 -- Mesh announce + hop relay + inbound SSH shell while the console is open.
 local tasks = { promptLoop }
 if titanLib then
+  titanLib.setSshHandler(function(line)
+    if not line or line == "" then return true end
+    local low = tostring(line):lower():match("^%s*(.-)%s*$") or ""
+    if low == "exit" or low == "quit" then
+      print("Over SSH: type `exit` to disconnect (console keeps running).")
+      return true
+    end
+    if low == "ssh" or low:match("^ssh%s") then
+      print("Nested ssh from an SSH session is not supported.")
+      return true
+    end
+    dispatch(line)
+    return true
+  end)
   tasks[#tasks + 1] = function() titanLib.networkLoop("console") end
 else
   tasks[#tasks + 1] = relayLoop

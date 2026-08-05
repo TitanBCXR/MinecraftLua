@@ -1,6 +1,6 @@
 --[[
   storage_manager.lua  -  Titan Storage Manager (Create + inventories)
-  Titan-Version: 1.0.2
+  Titan-Version: 1.0.3
 
   Watches Create mod storage (Stock Ticker) and/or any attached inventory
   peripherals (Create vaults, chests, barrels, drawers, …).
@@ -453,6 +453,159 @@ local function printStock(filter, limit)
   end
 end
 
+-- Returns "exit" to quit local console, false to fall through to CraftOS shell.
+local function handleCommand(a)
+  local cmd = (a[1] or ""):lower()
+
+  if cmd == "" then
+    return true
+  elseif cmd == "help" then
+    print("status              link mode + counts")
+    print("stock [filter]      list Create/inventory stock")
+    print("find <item>         search by name / display name")
+    print("request <item> [count] [address]")
+    print("                    ask Create network to pack items")
+    print("ticker [side]       set Stock Ticker direction")
+    print("                    sides: front back left right up down")
+    print("sides               show what is on each face")
+    print("address [name]      default Create package address")
+    print("invs                list tickers + inventories")
+    print("refresh             rescan peripherals")
+    print("net                 Titan mesh / Parent Center link")
+    print("hostname [name]     get/set label")
+    print("exit")
+  elseif cmd == "status" then
+    refresh()
+    print(("mode: %s"):format(cache.mode))
+    print(("ticker side: %s"):format(tostring(cache.tickerSide or cfg.tickerSide or "auto")))
+    print(("ticker: %s"):format(tostring(cache.tickerName or "(none)")))
+    print(("inventories: %d"):format(cache.invCount))
+    print(("item types: %d"):format(#cache.items))
+    print(("request address: %s"):format(tostring(cfg.requestAddress)))
+    print(("titan net: %s"):format(
+      cache.netOk and ("linked to MAIN #" .. tostring(cache.netMain)) or "not linked (need router)"))
+    drawMonitor()
+  elseif cmd == "net" or cmd == "network" or cmd == "link" then
+    print("Linking to Titan network...")
+    local ok = pcall(titan.reauth, "storage")
+    cache.netMain = titan.getMainRouterId()
+    cache.netOk = cache.netMain ~= nil
+    announceStorage()
+    if cache.netOk then
+      print(("Linked. MAIN router #%d. Hostname: %s"):format(
+        cache.netMain, os.getComputerLabel() or "?"))
+    else
+      print("No MAIN router found. Place/start a router with `main`, then `net` again.")
+    end
+    drawMonitor()
+  elseif cmd == "ticker" or cmd == "side" or cmd == "stockticker" then
+    local dir = a[2]
+    if not dir then
+      print(("Configured ticker side: %s"):format(tostring(cfg.tickerSide or "(auto)")))
+      print(("Active ticker: %s @ %s"):format(
+        tostring(cache.tickerName or "(none)"),
+        tostring(cache.tickerSide or "?")))
+      print("Usage: ticker <front|back|left|right|up|down>")
+      print("Example: ticker back")
+    elseif dir:lower() == "auto" or dir:lower() == "clear" then
+      cfg.tickerSide = nil
+      saveCfg()
+      refresh()
+      print("Ticker side cleared (auto-detect).")
+      drawMonitor()
+    else
+      local ok, sideOrErr, found = setTickerSide(dir)
+      if not ok then
+        print(tostring(sideOrErr))
+      else
+        refresh()
+        if found then
+          print(("Ticker side = %s  (found %s)"):format(sideOrErr, found))
+        else
+          print(("Ticker side = %s  (nothing there yet — place Stock Ticker on that face)"):format(sideOrErr))
+        end
+        drawMonitor()
+      end
+    end
+  elseif cmd == "sides" or cmd == "faces" then
+    print("Computer faces:")
+    for _, row in ipairs(describeSides()) do
+      print(("  %-6s  %-22s%s"):format(row.side, row.typ, row.mark))
+    end
+    print("Set with: ticker <side>   e.g. ticker back")
+  elseif cmd == "stock" or cmd == "list" then
+    refresh()
+    printStock(a[2] and table.concat(a, " ", 2) or nil, 40)
+    drawMonitor()
+  elseif cmd == "find" or cmd == "search" then
+    if not a[2] then print("Usage: find <item>")
+    else
+      refresh()
+      printStock(table.concat(a, " ", 2), 50)
+    end
+  elseif cmd == "request" or cmd == "req" then
+    if not a[2] then
+      print("Usage: request <item> [count] [address]")
+      print("Example: request minecraft:iron_ingot 128 DockA")
+    else
+      local item, count, address
+      if tonumber(a[3]) then
+        item = a[2]
+        count = tonumber(a[3])
+        address = a[4]
+      elseif a[#a] and tonumber(a[#a]) and #a >= 3 then
+        count = tonumber(a[#a])
+        item = table.concat(a, " ", 2, #a - 1)
+      else
+        item = table.concat(a, " ", 2)
+        count = 64
+      end
+      refresh()
+      local ok, nOrErr, resolved, addr = requestItems(item, count, address)
+      if ok then
+        print(("Requested %s x%s -> address '%s' (matched %s)"):format(
+          tostring(resolved), tostring(count), tostring(addr), tostring(nOrErr)))
+      else
+        print("Request failed: " .. tostring(nOrErr))
+      end
+    end
+  elseif cmd == "address" then
+    if not a[2] then
+      print("request address: " .. tostring(cfg.requestAddress))
+      print("Usage: address <name>")
+    else
+      cfg.requestAddress = table.concat(a, " ", 2)
+      saveCfg()
+      print("request address set: " .. cfg.requestAddress)
+    end
+  elseif cmd == "invs" or cmd == "peripherals" then
+    local tName = select(1, findTicker())
+    print("Create Stock Ticker: " .. tostring(tName or "(none)"))
+    local invs = listInventories()
+    print(("Inventories (%d):"):format(#invs))
+    for i, n in ipairs(invs) do
+      print(("  %d) %s  [%s]"):format(i, n, tostring(peripheral.getType(n))))
+    end
+  elseif cmd == "refresh" or cmd == "scan" then
+    local ok, mode = refresh()
+    print(ok and ("Refreshed (%s), %d types."):format(mode, #cache.items)
+      or "No storage found.")
+    drawMonitor()
+  elseif cmd == "hostname" or cmd == "host" then
+    if not a[2] then
+      print("hostname: " .. (os.getComputerLabel() or "?"))
+    else
+      local name, err = titan.setHostname(table.concat(a, " ", 2), "storage")
+      if name then print("hostname set: " .. name) else print(tostring(err)) end
+    end
+  elseif cmd == "exit" or cmd == "quit" then
+    return "exit"
+  else
+    return false
+  end
+  return true
+end
+
 local function consoleLoop()
   print(("Titan StorageManager #%d. Type 'help'."):format(os.getComputerID()))
   local ok, mode = refresh()
@@ -467,158 +620,27 @@ local function consoleLoop()
     write("storage> ")
     local a = {}
     for w in tostring(read()):gmatch("%S+") do a[#a + 1] = w end
-    local cmd = (a[1] or ""):lower()
-
-    if cmd == "" then
-    elseif cmd == "help" then
-      print("status              link mode + counts")
-      print("stock [filter]      list Create/inventory stock")
-      print("find <item>         search by name / display name")
-      print("request <item> [count] [address]")
-      print("                    ask Create network to pack items")
-      print("ticker [side]       set Stock Ticker direction")
-      print("                    sides: front back left right up down")
-      print("sides               show what is on each face")
-      print("address [name]      default Create package address")
-      print("invs                list tickers + inventories")
-      print("refresh             rescan peripherals")
-      print("net                 Titan mesh / Parent Center link")
-      print("hostname [name]     get/set label")
-      print("exit")
-    elseif cmd == "status" then
-      refresh()
-      print(("mode: %s"):format(cache.mode))
-      print(("ticker side: %s"):format(tostring(cache.tickerSide or cfg.tickerSide or "auto")))
-      print(("ticker: %s"):format(tostring(cache.tickerName or "(none)")))
-      print(("inventories: %d"):format(cache.invCount))
-      print(("item types: %d"):format(#cache.items))
-      print(("request address: %s"):format(tostring(cfg.requestAddress)))
-      print(("titan net: %s"):format(
-        cache.netOk and ("linked to MAIN #" .. tostring(cache.netMain)) or "not linked (need router)"))
-      drawMonitor()
-    elseif cmd == "net" or cmd == "network" or cmd == "link" then
-      print("Linking to Titan network...")
-      local ok = pcall(titan.reauth, "storage")
-      cache.netMain = titan.getMainRouterId()
-      cache.netOk = cache.netMain ~= nil
-      announceStorage()
-      if cache.netOk then
-        print(("Linked. MAIN router #%d. Hostname: %s"):format(
-          cache.netMain, os.getComputerLabel() or "?"))
-      else
-        print("No MAIN router found. Place/start a router with `main`, then `net` again.")
-      end
-      drawMonitor()
-    elseif cmd == "ticker" or cmd == "side" or cmd == "stockticker" then
-      local dir = a[2]
-      if not dir then
-        print(("Configured ticker side: %s"):format(tostring(cfg.tickerSide or "(auto)")))
-        print(("Active ticker: %s @ %s"):format(
-          tostring(cache.tickerName or "(none)"),
-          tostring(cache.tickerSide or "?")))
-        print("Usage: ticker <front|back|left|right|up|down>")
-        print("Example: ticker back")
-      elseif dir:lower() == "auto" or dir:lower() == "clear" then
-        cfg.tickerSide = nil
-        saveCfg()
-        refresh()
-        print("Ticker side cleared (auto-detect).")
-        drawMonitor()
-      else
-        local ok, sideOrErr, found = setTickerSide(dir)
-        if not ok then
-          print(tostring(sideOrErr))
-        else
-          refresh()
-          if found then
-            print(("Ticker side = %s  (found %s)"):format(sideOrErr, found))
-          else
-            print(("Ticker side = %s  (nothing there yet — place Stock Ticker on that face)"):format(sideOrErr))
-          end
-          drawMonitor()
-        end
-      end
-    elseif cmd == "sides" or cmd == "faces" then
-      print("Computer faces:")
-      for _, row in ipairs(describeSides()) do
-        print(("  %-6s  %-22s%s"):format(row.side, row.typ, row.mark))
-      end
-      print("Set with: ticker <side>   e.g. ticker back")
-    elseif cmd == "stock" or cmd == "list" then
-      refresh()
-      printStock(a[2] and table.concat(a, " ", 2) or nil, 40)
-      drawMonitor()
-    elseif cmd == "find" or cmd == "search" then
-      if not a[2] then print("Usage: find <item>")
-      else
-        refresh()
-        printStock(table.concat(a, " ", 2), 50)
-      end
-    elseif cmd == "request" or cmd == "req" then
-      if not a[2] then
-        print("Usage: request <item> [count] [address]")
-        print("Example: request minecraft:iron_ingot 128 DockA")
-      else
-        -- Parse: request <item words...> [count] [address]
-        -- If a[3] is number, it's count; optional a[4] address.
-        -- If item has no spaces: request iron_ingot 64
-        local item, count, address
-        if tonumber(a[3]) then
-          item = a[2]
-          count = tonumber(a[3])
-          address = a[4]
-        elseif a[#a] and tonumber(a[#a]) and #a >= 3 then
-          count = tonumber(a[#a])
-          item = table.concat(a, " ", 2, #a - 1)
-        else
-          item = table.concat(a, " ", 2)
-          count = 64
-        end
-        refresh()
-        local ok, nOrErr, resolved, addr = requestItems(item, count, address)
-        if ok then
-          print(("Requested %s x%s -> address '%s' (matched %s)"):format(
-            tostring(resolved), tostring(count), tostring(addr), tostring(nOrErr)))
-        else
-          print("Request failed: " .. tostring(nOrErr))
-        end
-      end
-    elseif cmd == "address" then
-      if not a[2] then
-        print("request address: " .. tostring(cfg.requestAddress))
-        print("Usage: address <name>")
-      else
-        cfg.requestAddress = table.concat(a, " ", 2)
-        saveCfg()
-        print("request address set: " .. cfg.requestAddress)
-      end
-    elseif cmd == "invs" or cmd == "peripherals" then
-      local tName = select(1, findTicker())
-      print("Create Stock Ticker: " .. tostring(tName or "(none)"))
-      local invs = listInventories()
-      print(("Inventories (%d):"):format(#invs))
-      for i, n in ipairs(invs) do
-        print(("  %d) %s  [%s]"):format(i, n, tostring(peripheral.getType(n))))
-      end
-    elseif cmd == "refresh" or cmd == "scan" then
-      local ok, mode = refresh()
-      print(ok and ("Refreshed (%s), %d types."):format(mode, #cache.items)
-        or "No storage found.")
-      drawMonitor()
-    elseif cmd == "hostname" or cmd == "host" then
-      if not a[2] then
-        print("hostname: " .. (os.getComputerLabel() or "?"))
-      else
-        local name, err = titan.setHostname(table.concat(a, " ", 2), "storage")
-        if name then print("hostname set: " .. name) else print(tostring(err)) end
-      end
-    elseif cmd == "exit" or cmd == "quit" then
-      return
-    else
-      print("Unknown: " .. cmd .. "  (type 'help')")
+    local r = handleCommand(a)
+    if r == "exit" then return
+    elseif r == false then
+      print("Unknown: " .. tostring(a[1] or "") .. "  (type 'help')")
     end
   end
 end
+
+titan.setSshHandler(function(line)
+  local a = {}
+  for w in tostring(line):gmatch("%S+") do a[#a + 1] = w end
+  local r = handleCommand(a)
+  if r == "exit" then
+    print("Over SSH: type `exit` to disconnect (StorageManager keeps running).")
+    return true
+  end
+  if r == false then
+    print("Unknown: " .. tostring(a[1] or "") .. "  (type 'help')")
+  end
+  return true
+end)
 
 --------------------------------------------------------------------------------
 -- Titan network: announce + answer stock queries

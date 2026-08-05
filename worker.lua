@@ -1,6 +1,6 @@
 --[[
   worker.lua  -  Builder / Gatherer bot for the Titan network (CC: Tweaked)
-  Titan-Version: 1.2.2
+  Titan-Version: 1.2.3
 
   A TURTLE that is either a BUILDER or a GATHERER. It registers with the
   "Bots Computer" (botserver.lua), learns/keeps its type, and then works.
@@ -557,6 +557,10 @@ end
 --==============================================================================
 local function requireAuth()
   if unlocked then return true end
+  if titan.sshIsAuthed and titan.sshIsAuthed() then
+    unlocked = true
+    return true
+  end
   if titan.login("Master password") then unlocked = true; print("Unlocked."); return true end
   print("Denied (master password required).")
   return false
@@ -571,67 +575,84 @@ local function requestRedeploy()
   print("Deployment (type/name) is set from the Parent Center, not here.")
 end
 
+local function handleCommand(a)
+  local cmd = (a[1] or ""):lower()
+
+  if cmd == "" then
+    return true
+  elseif cmd == "help" then
+    print("Commands: status | hostname [name] | login | scan <name> <W> <H> <L> |")
+    print("          build <name> | chest | deposit <x> <y> <z> | redeploy | home | reboot")
+  elseif cmd == "status" then
+    print(("%s (%s)  state=%s task=%s fuel=%s"):format(
+      cfg.name, cfg.botType, state.status, state.task, tostring(turtle.getFuelLevel())))
+    print("home=" .. fmt(nav.home) .. "  deposit=" .. fmt(cfg.deposit) .. "  chest=" .. fmt(cfg.chest))
+  elseif cmd == "hostname" or cmd == "host" then
+    if not a[2] then
+      print("hostname: " .. (os.getComputerLabel() or cfg.name or "?"))
+    else
+      local name, err = titan.setHostname(table.concat(a, " ", 2), "worker")
+      if name then
+        cfg.name = name; saveCfg()
+        print("hostname set: " .. name)
+      else print(tostring(err)) end
+    end
+  elseif cmd == "login" then
+    requireAuth()
+  elseif cmd == "scan" then
+    if cfg.botType ~= "builder" then print("Only builders scan.")
+    elseif not (a[2] and a[3] and a[4] and a[5]) then print("Usage: scan <name> <W> <H> <L>")
+    elseif requireAuth() then
+      enqueue(function() excavateScan(a[2], tonumber(a[3]), tonumber(a[4]), tonumber(a[5])) end)
+      print("Scan queued.")
+    end
+  elseif cmd == "build" then
+    if cfg.botType ~= "builder" then print("Only builders build.")
+    elseif not a[2] then print("Usage: build <name>")
+    elseif requireAuth() then
+      enqueue(function() buildPreset(a[2]) end); print("Build queued.")
+    end
+  elseif cmd == "chest" then
+    if cfg.botType ~= "builder" then print("Only builders deploy chests.")
+    elseif requireAuth() then enqueue(deployChest) end
+  elseif cmd == "deposit" then
+    if requireAuth() then
+      cfg.deposit = { x = tonumber(a[2]) or 0, y = tonumber(a[3]) or 0, z = tonumber(a[4]) or 0 }
+      saveCfg(); print("Deposit set to " .. fmt(cfg.deposit))
+    end
+  elseif cmd == "type" or cmd == "redeploy" then
+    requestRedeploy()
+  elseif cmd == "home" then
+    enqueue(function() setStatus("moving", "-> home"); nav.goHome({ dig = cfg.botType == "builder" }); setStatus("idle", "-") end)
+  elseif cmd == "reboot" then
+    os.reboot()
+  else
+    return false
+  end
+  return true
+end
+
 local function consoleLoop()
   while true do
     write("[" .. cfg.botType .. ":" .. cfg.name .. "]$ ")
-    local input = read()
     local a = {}
-    for w in tostring(input):gmatch("%S+") do a[#a + 1] = w end
-    local cmd = (a[1] or ""):lower()
-
-    if cmd == "" then
-      -- ignore
-    elseif cmd == "help" then
-      print("Commands: status | hostname [name] | login | scan <name> <W> <H> <L> |")
-      print("          build <name> | chest | deposit <x> <y> <z> | redeploy | home | reboot")
-    elseif cmd == "status" then
-      print(("%s (%s)  state=%s task=%s fuel=%s"):format(
-        cfg.name, cfg.botType, state.status, state.task, tostring(turtle.getFuelLevel())))
-      print("home=" .. fmt(nav.home) .. "  deposit=" .. fmt(cfg.deposit) .. "  chest=" .. fmt(cfg.chest))
-    elseif cmd == "hostname" or cmd == "host" then
-      if not a[2] then
-        print("hostname: " .. (os.getComputerLabel() or cfg.name or "?"))
-      else
-        local name, err = titan.setHostname(table.concat(a, " ", 2), "worker")
-        if name then
-          cfg.name = name; saveCfg()
-          print("hostname set: " .. name)
-        else print(tostring(err)) end
-      end
-    elseif cmd == "login" then
-      requireAuth()
-    elseif cmd == "scan" then
-      if cfg.botType ~= "builder" then print("Only builders scan.")
-      elseif not (a[2] and a[3] and a[4] and a[5]) then print("Usage: scan <name> <W> <H> <L>")
-      elseif requireAuth() then
-        enqueue(function() excavateScan(a[2], tonumber(a[3]), tonumber(a[4]), tonumber(a[5])) end)
-        print("Scan queued.")
-      end
-    elseif cmd == "build" then
-      if cfg.botType ~= "builder" then print("Only builders build.")
-      elseif not a[2] then print("Usage: build <name>")
-      elseif requireAuth() then
-        enqueue(function() buildPreset(a[2]) end); print("Build queued.")
-      end
-    elseif cmd == "chest" then
-      if cfg.botType ~= "builder" then print("Only builders deploy chests.")
-      elseif requireAuth() then enqueue(deployChest) end
-    elseif cmd == "deposit" then
-      if requireAuth() then
-        cfg.deposit = { x = tonumber(a[2]) or 0, y = tonumber(a[3]) or 0, z = tonumber(a[4]) or 0 }
-        saveCfg(); print("Deposit set to " .. fmt(cfg.deposit))
-      end
-    elseif cmd == "type" or cmd == "redeploy" then
-      requestRedeploy()
-    elseif cmd == "home" then
-      enqueue(function() setStatus("moving", "-> home"); nav.goHome({ dig = cfg.botType == "builder" }); setStatus("idle", "-") end)
-    elseif cmd == "reboot" then
-      os.reboot()
-    else
-      print("Unknown: " .. cmd .. " (type 'help')")
+    for w in tostring(read()):gmatch("%S+") do a[#a + 1] = w end
+    local r = handleCommand(a)
+    if r == false then
+      print("Unknown: " .. tostring(a[1] or "") .. " (type 'help')")
     end
   end
 end
+
+titan.setSshHandler(function(line)
+  local a = {}
+  for w in tostring(line):gmatch("%S+") do a[#a + 1] = w end
+  local r = handleCommand(a)
+  if r == false then
+    print("Unknown: " .. tostring(a[1] or "") .. " (type 'help')")
+  end
+  return true
+end)
 
 --==============================================================================
 -- Startup

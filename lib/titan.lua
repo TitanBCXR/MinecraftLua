@@ -1,6 +1,6 @@
 --[[
   titan.lua  -  Shared library for the Titan bot network (CC: Tweaked)
-  Titan-Version: 1.2.7
+  Titan-Version: 1.2.8
 
   Provides:
     * Rednet protocol constants + message type enum
@@ -507,7 +507,8 @@ end
 -- jumping hosts. Auth: master password via the Parent Center.
 --
 -- Every device running titan.networkLoop (or sshHostLoop) hosts a shell.
--- Built-in remote command: `reboot` (acks, then os.reboot).
+-- Remote lines run the device's registered app commands (if any), then CraftOS
+-- shell / turtle builtins. `reboot` acks then os.reboot; `exit` disconnects.
 --------------------------------------------------------------------------------
 titan.SSH_PROTOCOL = "titan_ssh"
 titan.SSH_MAX_JUMPS = 8
@@ -516,6 +517,24 @@ local sshSessions   = {}   -- [token] = session table
 local sshClientQ    = {}   -- inbox for replies (host loop + client share one receiver)
 local sshHostPending = {}  -- host requests received while a dial/jump is in progress
 local sshKind       = "device"
+local sshAppHandler = nil  -- optional fn(line) -> false to fall through to shell
+local sshExecActive = false
+
+-- Programs with a local REPL should register so SSH can run the same commands.
+-- handler(line): print normally; return false if unhandled (try shell next).
+function titan.setSshHandler(handler)
+  sshAppHandler = type(handler) == "function" and handler or nil
+end
+
+function titan.clearSshHandler()
+  sshAppHandler = nil
+end
+
+-- True while an authenticated SSH exec is running on this host.
+-- Use in requireAuth()-style gates: the session already checked the master password.
+function titan.sshIsAuthed()
+  return sshExecActive == true
+end
 
 local function sshSend(id, msg)
   rednet.send(id, msg, titan.SSH_PROTOCOL)
@@ -556,21 +575,8 @@ local function sshClientWait(timeout, pred)
   return nil, nil
 end
 
--- Capture shell output by redirecting the terminal to a string buffer.
--- Returns out, ok [, doReboot]
-local function sshCaptureRun(cmdline)
-  local low = tostring(cmdline or ""):match("^%s*(.-)%s*$") or ""
-  local lowl = low:lower()
-  -- Never shell.run("reboot") — it won't return an ack to the SSH client.
-  if lowl == "reboot" or lowl:match("^reboot%s") then
-    return "Rebooting...", true, true
-  end
-  if lowl == "id" or lowl == "whoami" then
-    return ("#%d %s"):format(os.getComputerID(), os.getComputerLabel() or ""), true, false
-  end
-  if not shell then
-    return "(no shell on this device)", false, false
-  end
+-- Capture print/write output into a string buffer while running fn().
+local function sshWithCapture(fn)
   local out, ox, oy = {}, 1, 1
   local fake = {}
   function fake.write(s) out[#out + 1] = tostring(s) end
@@ -592,12 +598,132 @@ local function sshCaptureRun(cmdline)
   function fake.getBackgroundColour() return colors.black end
   function fake.setTextColour() end
   function fake.setBackgroundColour() end
-  local old = term.redirect(fake)
-  local ok = shell.run(low)
-  term.redirect(old)
+  -- Interactive prompts (confirmations / passwords) cannot be answered over SSH.
+  local oldRead = read
+  local function sshRead()
+    out[#out + 1] = "\n[ssh] interactive input unavailable — cancelled\n"
+    return ""
+  end
+  local oldTerm = term.redirect(fake)
+  _G.read = sshRead
+  sshExecActive = true
+  local ok, a, b, c = pcall(fn)
+  sshExecActive = false
+  _G.read = oldRead
+  term.redirect(oldTerm)
   local text = table.concat(out)
-  if text == "" then text = ok and "(ok)" or "(failed)" end
-  return text, ok and true or false, false
+  if not ok then
+    if text ~= "" then text = text .. "\n" end
+    text = text .. "error: " .. tostring(a)
+    return text, false, a, b, c
+  end
+  return text, true, a, b, c
+end
+
+local function sshTurtleBuiltin(low)
+  if not turtle then return nil end
+  local cmd, rest = low:match("^(%S+)%s*(.*)$")
+  cmd = (cmd or ""):lower()
+  rest = rest or ""
+  if cmd == "fuel" then
+    return "fuel: " .. tostring(turtle.getFuelLevel()), true
+  elseif cmd == "refuel" then
+    local fuelSlot = (titan.nav and titan.nav.FUEL_SLOT) or 16
+    pcall(function()
+      turtle.select(fuelSlot); turtle.refuel()
+      for s = 1, 16 do
+        if s ~= fuelSlot then turtle.select(s); turtle.refuel() end
+      end
+      turtle.select(1)
+    end)
+    return ("fuel: %s (fuel slot %d)"):format(tostring(turtle.getFuelLevel()), fuelSlot), true
+  elseif cmd == "move" then
+    local dir, n = rest:match("^(%S+)%s*(%d*)")
+    dir = (dir or ""):lower()
+    n = tonumber(n) or 1
+    local moves = {
+      forward = turtle.forward, back = turtle.back, up = turtle.up, down = turtle.down,
+      left = turtle.turnLeft, right = turtle.turnRight,
+    }
+    local fn = moves[dir]
+    if not fn then
+      return "usage: move <forward|back|up|down|left|right> [n]", false
+    end
+    local moved = 0
+    for i = 1, n do
+      if not fn() then
+        return ("blocked after %d"):format(moved), false
+      end
+      moved = moved + 1
+    end
+    return ("moved %s x%d"):format(dir, moved), true
+  end
+  return nil
+end
+
+-- Capture shell / builtin output. Returns out, ok [, doReboot]
+local function sshCaptureRun(cmdline)
+  local low = tostring(cmdline or ""):match("^%s*(.-)%s*$") or ""
+  local lowl = low:lower()
+  -- Never shell.run("reboot") — it won't return an ack to the SSH client.
+  if lowl == "reboot" or lowl:match("^reboot%s") then
+    return "Rebooting...", true, true
+  end
+  if lowl == "id" or lowl == "whoami" then
+    return ("#%d %s"):format(os.getComputerID(), os.getComputerLabel() or ""), true, false
+  end
+
+  local turtleOut, turtleOk = sshTurtleBuiltin(low)
+  if turtleOut ~= nil then
+    return turtleOut, turtleOk, false
+  end
+
+  if not shell then
+    return "(no shell on this device — app commands need a running Titan program)", false, false
+  end
+  local text, okCall, shellOk = sshWithCapture(function()
+    return shell.run(low)
+  end)
+  if text == "" then text = shellOk and "(ok)" or "(failed)" end
+  return text, (okCall and shellOk) and true or false, false
+end
+
+-- App handler (same commands as the local prompt), then CraftOS shell fallback.
+local function sshRunLocal(line)
+  local low = tostring(line or ""):match("^%s*(.-)%s*$") or ""
+  local lowl = low:lower()
+  if lowl == "reboot" or lowl:match("^reboot%s") then
+    return "Rebooting...", true, true
+  end
+  if lowl == "id" or lowl == "whoami" then
+    return ("#%d %s"):format(os.getComputerID(), os.getComputerLabel() or ""), true, false
+  end
+
+  if sshAppHandler then
+    local text, callOk, handled = sshWithCapture(function()
+      return sshAppHandler(low)
+    end)
+    if not callOk then
+      return text, false, false
+    end
+    -- handler may return false to fall through to shell/turtle builtins
+    if handled ~= false then
+      if text == "" then text = "(ok)" end
+      return text, true, false
+    end
+    -- keep any "unhandled" prints, then append shell output
+    local shellText, shellOk, doReboot = sshCaptureRun(low)
+    if doReboot then return shellText, shellOk, true end
+    if text ~= "" and text ~= "(ok)" then
+      if shellText and shellText ~= "" then
+        return text .. "\n" .. shellText, shellOk, false
+      end
+      return text, false, false
+    end
+    return shellText, shellOk, false
+  end
+
+  return sshCaptureRun(low)
 end
 
 local function sshVisitedHas(visited, id)
@@ -759,10 +885,6 @@ local function sshEstablishTo(targetRef, password, visited, clientId)
     end
   end
   return nil, "unreachable (tried direct + " .. tostring(#peers) .. " jumps)"
-end
-
-local function sshRunLocal(line)
-  return sshCaptureRun(line)
 end
 
 -- Host: accept SSH sessions / proxy jumps / name pings.
@@ -956,7 +1078,7 @@ function titan.sshConnect(target, cmdline)
   print(("Connected to %s (#%s) [%s]%s"):format(
     destName, tostring(destId), tostring(info.kind or "?"),
     info._viaNote or (info.jumps and info.jumps > 0 and (" jumps=" .. info.jumps) or "")))
-  print("Remote shell. Commands: reboot | exit")
+  print("Remote shell: device commands + CraftOS. Type help | exit")
 
   local function runLine(line)
     local res = titan.sshExec(hopId, token, line)

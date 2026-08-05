@@ -1,6 +1,6 @@
 --[[
   admin.lua  -  Titan admin console for a POCKET computer ("Live" tablet)
-  Titan-Version: 1.1.7
+  Titan-Version: 1.1.8
 
   A mobile master terminal you keep on you. It listens to the whole Titan
   network and lets you monitor and command it from your pocket:
@@ -94,6 +94,11 @@ end
 --------------------------------------------------------------------------------
 local function requireAuth()
   if unlocked then return true end
+  -- SSH sessions already verified the master password at connect time.
+  if titan.sshIsAuthed and titan.sshIsAuthed() then
+    unlocked = true
+    return true
+  end
   print("Admin action - master password required.")
   if titan.login("Master password") then unlocked = true; print("Unlocked."); return true end
   print("Denied (need the Parent Center master online + correct password).")
@@ -173,6 +178,167 @@ local function needBot(ref)
   return id
 end
 
+local function handleCommand(a)
+  local cmd = (a[1] or ""):lower()
+
+  if cmd == "" then
+    return true
+  elseif cmd == "help" then
+    print("VIEW : live | bots | pois | pending | stuck | ping")
+    print("BOT  : send <bot> <poi> | goto <bot> <x y z>")
+    print("       return <bot> | refuel <bot> | stop <bot>")
+    print("DEPLOY: deploy <bot> <builder|gatherer|miner> <name> [x y z]")
+    print("BUILD: scan <bot> <name> <W H L> | build <bot> <name> [x y z]")
+    print("ssh <id|label> [cmd...]  remote shell (full device commands)")
+    print("hostname [name]  get or set this tablet's hostname")
+    print("login | lock | exit")
+
+  elseif cmd == "hostname" or cmd == "host" then
+    if not a[2] then
+      print("hostname: " .. (os.getComputerLabel() or "?"))
+    else
+      local name, err = titan.setHostname(table.concat(a, " ", 2), "admin")
+      if name then print("hostname set: " .. name) else print(tostring(err)) end
+    end
+
+  elseif cmd == "live" then
+    if titan.sshIsAuthed and titan.sshIsAuthed() then
+      print("live view is local-only (needs a keyboard). Use `bots` over SSH.")
+    else
+      liveView()
+    end
+
+  elseif cmd == "bots" then
+    for id, b in pairs(bots) do
+      print(("#%d %s [%s] %s %s f:%s %ss"):format(
+        id, b.name or "?", b.botType or "-", b.state or "?", pos(b),
+        tostring(b.fuel or "?"), ago(b.seen)))
+    end
+
+  elseif cmd == "pois" then
+    for name, p in pairs(pois) do
+      print(("%s %d,%d,%d %s"):format(name, p.x or 0, p.y or 0, p.z or 0, p.desc or ""))
+    end
+
+  elseif cmd == "pending" then
+    local n = 0
+    for id, w in pairs(pending) do
+      if ago(w.seen) < 20 then
+        n = n + 1
+        print(("#%d %s @ %s,%s,%s"):format(id, w.name or "?", w.x or "?", w.y or "?", w.z or "?"))
+      end
+    end
+    if n == 0 then print("(none awaiting deployment)") end
+
+  elseif cmd == "stuck" then
+    for i, al in ipairs(stuck) do
+      print(("%d) %s @ %d,%d,%d %s"):format(i, al.name or "?", al.x or 0, al.y or 0, al.z or 0, al.reason or ""))
+    end
+
+  elseif cmd == "ping" then
+    titan.broadcast(MSG.PING, {}); print("Pinged everyone.")
+
+  elseif cmd == "send" then
+    local id, p = needBot(a[2]), pois[a[3] or ""]
+    if id and p and requireAuth() then
+      titan.send(id, MSG.COMMAND, { cmd = "goto", x = p.x, y = p.y, z = p.z, poi = a[3] })
+      print(("-> %s to POI %s"):format(a[2], a[3]))
+    elseif id and not p then print("Unknown POI: " .. tostring(a[3])) end
+
+  elseif cmd == "goto" then
+    local id = needBot(a[2])
+    local x, y, z = tonumber(a[3]), tonumber(a[4]), tonumber(a[5])
+    if id and x and y and z and requireAuth() then
+      titan.send(id, MSG.COMMAND, { cmd = "goto", x = x, y = y, z = z })
+      print(("-> %s to %d,%d,%d"):format(a[2], x, y, z))
+    elseif id and not (x and y and z) then print("Usage: goto <bot> <x> <y> <z>") end
+
+  elseif cmd == "return" then
+    local id = needBot(a[2])
+    if id and requireAuth() then titan.send(id, MSG.COMMAND, { cmd = "return" }); print("Recalled " .. a[2]) end
+
+  elseif cmd == "refuel" then
+    local id = needBot(a[2])
+    if id and requireAuth() then titan.send(id, MSG.COMMAND, { cmd = "refuel" }); print("Refuel " .. a[2]) end
+
+  elseif cmd == "stop" then
+    local id = needBot(a[2])
+    if id and requireAuth() then titan.send(id, MSG.COMMAND, { cmd = "stop" }); print("Stopped " .. a[2]) end
+
+  elseif cmd == "deploy" then
+    local id = findBot(a[2]) or tonumber(a[2])
+    if not id then
+      local want = tostring(a[2] or ""):lower()
+      for pid, w in pairs(pending) do
+        if w.name and w.name:lower() == want then id = pid; break end
+      end
+    end
+    if id and not bots[id] and not pending[id] then id = nil end
+    local btype, name = (a[3] or ""):lower(), a[4]
+    if btype == "mine" then btype = "miner" end
+    if btype == "build" then btype = "builder" end
+    if btype == "gather" then btype = "gatherer" end
+    local okType = (btype == "builder" or btype == "gatherer" or btype == "miner")
+    if not id then
+      print("Unknown worker: " .. tostring(a[2]) .. " (try 'pending')")
+    elseif not okType or not name then
+      print("Usage: deploy <bot> <builder|gatherer|miner> <name> [x y z]")
+      print("Example: deploy 20 miner Jimmy")
+    elseif requireAuth() then
+      local deposit
+      if a[5] and a[6] and a[7] then
+        deposit = { x = tonumber(a[5]), y = tonumber(a[6]), z = tonumber(a[7]) }
+      end
+      titan.send(id, MSG.WORKER_DEPLOY, { botType = btype, name = name, deposit = deposit })
+      print(("Deploy sent to #%d: %s '%s'"):format(id, btype, name))
+      if btype == "miner" then
+        print("(Miner turtles need miner.lua — worker.lua will hand off if it is installed.)")
+      end
+    end
+
+  elseif cmd == "scan" then
+    local id = needBot(a[2])
+    if id and a[3] and a[4] and a[5] and a[6] and requireAuth() then
+      titan.send(id, MSG.SCAN_ORDER, { name = a[3], W = tonumber(a[4]), H = tonumber(a[5]), L = tonumber(a[6]) })
+      print("Scan order sent.")
+    elseif id then print("Usage: scan <bot> <name> <W> <H> <L>") end
+
+  elseif cmd == "build" then
+    local id = needBot(a[2])
+    if id and a[3] and requireAuth() then
+      titan.send(id, MSG.BUILD_ORDER, { name = a[3], x = tonumber(a[4]), y = tonumber(a[5]), z = tonumber(a[6]) })
+      print("Build order sent.")
+    elseif id then print("Usage: build <bot> <name> [x y z]") end
+
+  elseif cmd == "ssh" then
+    if not a[2] then
+      print("Usage: ssh <id|label> [command...]  (jumps via modem/router shells)")
+      print("  Remote: that device's full command set + CraftOS (help | exit)")
+    elseif titan.sshIsAuthed and titan.sshIsAuthed() then
+      print("Nested ssh from an SSH session is not supported.")
+    elseif requireAuth() then
+      local target = a[2]
+      local cmdline
+      if a[3] then
+        local parts = {}
+        for i = 3, #a do parts[#parts + 1] = a[i] end
+        cmdline = table.concat(parts, " ")
+      end
+      titan.sshConnect(target, cmdline)
+    end
+
+  elseif cmd == "login" then
+    requireAuth()
+  elseif cmd == "lock" or cmd == "logout" then
+    unlocked = false; print("Locked.")
+  elseif cmd == "exit" or cmd == "quit" then
+    return "exit"
+  else
+    return false
+  end
+  return true
+end
+
 local function consoleLoop()
   term.clear(); term.setCursorPos(1, 1)
   print("== Titan Admin (" .. (os.getComputerLabel() or ("#" .. os.getComputerID())) .. ") ==")
@@ -181,162 +347,27 @@ local function consoleLoop()
     write((unlocked and "admin> ") or "titan> ")
     local a = {}
     for w in tostring(read()):gmatch("%S+") do a[#a + 1] = w end
-    local cmd = (a[1] or ""):lower()
-
-    if cmd == "" then
-      -- ignore
-    elseif cmd == "help" then
-      print("VIEW : live | bots | pois | pending | stuck | ping")
-      print("BOT  : send <bot> <poi> | goto <bot> <x y z>")
-      print("       return <bot> | refuel <bot> | stop <bot>")
-      print("DEPLOY: deploy <bot> <builder|gatherer|miner> <name> [x y z]")
-      print("BUILD: scan <bot> <name> <W H L> | build <bot> <name> [x y z]")
-      print("ssh <id|label> [cmd...]  remote shell; jumps via modems (reboot ok)")
-      print("hostname [name]  get or set this tablet's hostname")
-      print("login | lock | exit")
-
-    elseif cmd == "hostname" or cmd == "host" then
-      if not a[2] then
-        print("hostname: " .. (os.getComputerLabel() or "?"))
-      else
-        local name, err = titan.setHostname(table.concat(a, " ", 2), "admin")
-        if name then print("hostname set: " .. name) else print(tostring(err)) end
-      end
-
-    elseif cmd == "live" then
-      liveView()
-
-    elseif cmd == "bots" then
-      for id, b in pairs(bots) do
-        print(("#%d %s [%s] %s %s f:%s %ss"):format(
-          id, b.name or "?", b.botType or "-", b.state or "?", pos(b),
-          tostring(b.fuel or "?"), ago(b.seen)))
-      end
-
-    elseif cmd == "pois" then
-      for name, p in pairs(pois) do
-        print(("%s %d,%d,%d %s"):format(name, p.x or 0, p.y or 0, p.z or 0, p.desc or ""))
-      end
-
-    elseif cmd == "pending" then
-      local n = 0
-      for id, w in pairs(pending) do
-        if ago(w.seen) < 20 then
-          n = n + 1
-          print(("#%d %s @ %s,%s,%s"):format(id, w.name or "?", w.x or "?", w.y or "?", w.z or "?"))
-        end
-      end
-      if n == 0 then print("(none awaiting deployment)") end
-
-    elseif cmd == "stuck" then
-      for i, al in ipairs(stuck) do
-        print(("%d) %s @ %d,%d,%d %s"):format(i, al.name or "?", al.x or 0, al.y or 0, al.z or 0, al.reason or ""))
-      end
-
-    elseif cmd == "ping" then
-      titan.broadcast(MSG.PING, {}); print("Pinged everyone.")
-
-    -- ---- admin-gated control below ----
-    elseif cmd == "send" then
-      local id, p = needBot(a[2]), pois[a[3] or ""]
-      if id and p and requireAuth() then
-        titan.send(id, MSG.COMMAND, { cmd = "goto", x = p.x, y = p.y, z = p.z, poi = a[3] })
-        print(("-> %s to POI %s"):format(a[2], a[3]))
-      elseif id and not p then print("Unknown POI: " .. tostring(a[3])) end
-
-    elseif cmd == "goto" then
-      local id = needBot(a[2])
-      local x, y, z = tonumber(a[3]), tonumber(a[4]), tonumber(a[5])
-      if id and x and y and z and requireAuth() then
-        titan.send(id, MSG.COMMAND, { cmd = "goto", x = x, y = y, z = z })
-        print(("-> %s to %d,%d,%d"):format(a[2], x, y, z))
-      elseif id and not (x and y and z) then print("Usage: goto <bot> <x> <y> <z>") end
-
-    elseif cmd == "return" then
-      local id = needBot(a[2])
-      if id and requireAuth() then titan.send(id, MSG.COMMAND, { cmd = "return" }); print("Recalled " .. a[2]) end
-
-    elseif cmd == "refuel" then
-      local id = needBot(a[2])
-      if id and requireAuth() then titan.send(id, MSG.COMMAND, { cmd = "refuel" }); print("Refuel " .. a[2]) end
-
-    elseif cmd == "stop" then
-      local id = needBot(a[2])
-      if id and requireAuth() then titan.send(id, MSG.COMMAND, { cmd = "stop" }); print("Stopped " .. a[2]) end
-
-    elseif cmd == "deploy" then
-      -- resolve: running bot, pending id, or pending name
-      local id = findBot(a[2]) or tonumber(a[2])
-      if not id then
-        local want = tostring(a[2] or ""):lower()
-        for pid, w in pairs(pending) do
-          if w.name and w.name:lower() == want then id = pid; break end
-        end
-      end
-      if id and not bots[id] and not pending[id] then id = nil end
-      local btype, name = (a[3] or ""):lower(), a[4]
-      if btype == "mine" then btype = "miner" end
-      if btype == "build" then btype = "builder" end
-      if btype == "gather" then btype = "gatherer" end
-      local okType = (btype == "builder" or btype == "gatherer" or btype == "miner")
-      if not id then
-        print("Unknown worker: " .. tostring(a[2]) .. " (try 'pending')")
-      elseif not okType or not name then
-        print("Usage: deploy <bot> <builder|gatherer|miner> <name> [x y z]")
-        print("Example: deploy 20 miner Jimmy")
-      elseif requireAuth() then
-        local deposit
-        if a[5] and a[6] and a[7] then
-          deposit = { x = tonumber(a[5]), y = tonumber(a[6]), z = tonumber(a[7]) }
-        end
-        titan.send(id, MSG.WORKER_DEPLOY, { botType = btype, name = name, deposit = deposit })
-        print(("Deploy sent to #%d: %s '%s'"):format(id, btype, name))
-        if btype == "miner" then
-          print("(Miner turtles need miner.lua — worker.lua will hand off if it is installed.)")
-        end
-      end
-
-    elseif cmd == "scan" then
-      local id = needBot(a[2])
-      if id and a[3] and a[4] and a[5] and a[6] and requireAuth() then
-        titan.send(id, MSG.SCAN_ORDER, { name = a[3], W = tonumber(a[4]), H = tonumber(a[5]), L = tonumber(a[6]) })
-        print("Scan order sent.")
-      elseif id then print("Usage: scan <bot> <name> <W> <H> <L>") end
-
-    elseif cmd == "build" then
-      local id = needBot(a[2])
-      if id and a[3] and requireAuth() then
-        titan.send(id, MSG.BUILD_ORDER, { name = a[3], x = tonumber(a[4]), y = tonumber(a[5]), z = tonumber(a[6]) })
-        print("Build order sent.")
-      elseif id then print("Usage: build <bot> <name> [x y z]") end
-
-    elseif cmd == "ssh" then
-      if not a[2] then
-        print("Usage: ssh <id|label> [command...]  (jumps via modem/router shells)")
-        print("  Remote: reboot | exit")
-      elseif requireAuth() then
-        local target = a[2]
-        local cmdline
-        if a[3] then
-          local parts = {}
-          for i = 3, #a do parts[#parts + 1] = a[i] end
-          cmdline = table.concat(parts, " ")
-        end
-        -- Already unlocked locally; still need password on the wire for the host.
-        titan.sshConnect(target, cmdline)
-      end
-
-    elseif cmd == "login" then
-      requireAuth()
-    elseif cmd == "lock" or cmd == "logout" then
-      unlocked = false; print("Locked.")
-    elseif cmd == "exit" or cmd == "quit" then
-      return
-    else
-      print("Unknown: " .. cmd .. " (type 'help')")
+    local r = handleCommand(a)
+    if r == "exit" then return
+    elseif r == false then
+      print("Unknown: " .. tostring(a[1] or "") .. " (type 'help')")
     end
   end
 end
+
+titan.setSshHandler(function(line)
+  local a = {}
+  for w in tostring(line):gmatch("%S+") do a[#a + 1] = w end
+  local r = handleCommand(a)
+  if r == "exit" then
+    print("Over SSH: type `exit` to disconnect (admin keeps running).")
+    return true
+  end
+  if r == false then
+    print("Unknown: " .. tostring(a[1] or "") .. " (type 'help')")
+  end
+  return true
+end)
 
 print("Titan admin tablet online.")
 parallel.waitForAny(listenerLoop, consoleLoop,

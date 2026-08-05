@@ -1,6 +1,6 @@
 --[[
   miner.lua  -  Area miner turtle for the Titan network (CC: Tweaked)
-  Titan-Version: 1.2.5
+  Titan-Version: 1.2.6
 
   Digs a rectangular "box":
     * set1 <x> <z> / set2 <x> <z> — opposite corners (X/Z footprint)
@@ -635,6 +635,160 @@ local function setYEnd(y)
   return cfg.yEnd
 end
 
+-- Returns "exit" to quit local console, false for unknown (shell fallthrough over SSH).
+local function handleCommand(a)
+  local cmd = (a[1] or ""):lower()
+
+  if cmd == "" then
+    return true
+  elseif cmd == "help" then
+    print("BOX (opposite corners + Y range):")
+    print("  set1 <x> <z>             corner A (X/Z)")
+    print("  set2 <x> <z>             corner B (X/Z)")
+    print("  set1 here / set2 here    use current GPS X/Z")
+    print("  sety <startY> <endY>     vertical range (e.g. sety 80 -59)")
+    print("  ystart <y> / yend <y>    set start or end Y alone")
+    print("  yhere start|end          use current GPS Y")
+    print("OTHER:")
+    print("  home / start   mark start (face the mine; chest = 1 block behind)")
+    print("  chest          show / recompute behind home")
+    print("  chest <x y z>  set chest block manually")
+    print("  deposit        legacy: stand ABOVE a chest (dropDown)")
+    print("  exclude   reload & show exclude.txt")
+    print("  mine      dig the box from startY down to endY")
+    print("  stop | status | dump | goto <x> <y> <z>")
+    print("  hostname [name] | exit")
+  elseif cmd == "hostname" or cmd == "host" then
+    if not a[2] then
+      print("hostname: " .. (os.getComputerLabel() or "?"))
+    else
+      local name, err = titan.setHostname(table.concat(a, " ", 2), "miner")
+      if name then print("hostname set: " .. name) else print(tostring(err)) end
+    end
+  elseif cmd == "set1" or cmd == "corner1" then
+    local sub = (a[2] or ""):lower()
+    if sub == "" then
+      print("Usage: set1 <x> <z>   or   set1 here")
+    elseif sub == "here" or sub == "gps" or sub == "me" then
+      markHere("loc1")
+    else
+      setCornerXZ("loc1", a[2], a[3], a[4])
+    end
+  elseif cmd == "set2" or cmd == "corner2" then
+    local sub = (a[2] or ""):lower()
+    if sub == "" then
+      print("Usage: set2 <x> <z>   or   set2 here")
+    elseif sub == "here" or sub == "gps" or sub == "me" then
+      markHere("loc2")
+    else
+      setCornerXZ("loc2", a[2], a[3], a[4])
+    end
+  elseif cmd == "sety" then
+    local ys, ye = tonumber(a[2]), tonumber(a[3])
+    if ys and ye then
+      setYStart(ys); setYEnd(ye)
+      local topY, floorY = yRange()
+      print(("Y range: start=%d  end=%d  (will mine %d -> %d)"):format(
+        ys, ye, topY, floorY))
+    elseif ys and not ye then
+      setYEnd(ys)
+      print(("yend (bottom) = %d   (also: sety <startY> <endY>)"):format(cfg.yEnd))
+    else
+      print("Usage: sety <startY> <endY>")
+      print("  startY = top of the box (begin mining here)")
+      print("  endY   = bottom of the box (stop here, inclusive)")
+    end
+  elseif cmd == "ystart" or cmd == "ytop" or cmd == "starty" then
+    local y, err = setYStart(a[2])
+    if y then print("ystart (top) = " .. y) else print("Usage: ystart <y>  (" .. tostring(err) .. ")") end
+  elseif cmd == "yend" or cmd == "ybottom" or cmd == "endy" or cmd == "floor" then
+    local y, err = setYEnd(a[2])
+    if y then print("yend (bottom) = " .. y) else print("Usage: yend <y>  (" .. tostring(err) .. ")") end
+  elseif cmd == "yhere" then
+    local which = (a[2] or ""):lower()
+    local x, y, z = nav.locatePrecise(4)
+    if not y then print("No GPS signal.")
+    elseif which == "start" or which == "top" or which == "ystart" then
+      setYStart(y)
+      local fix = nav.lastFix
+      print(("ystart = %d (GPS Y; range %.2f..%.2f)"):format(
+        cfg.yStart, fix and fix.yLo or y, fix and fix.yHi or y))
+    elseif which == "end" or which == "bottom" or which == "yend" then
+      setYEnd(y)
+      local fix = nav.lastFix
+      print(("yend = %d (GPS Y; range %.2f..%.2f)"):format(
+        cfg.yEnd, fix and fix.yLo or y, fix and fix.yHi or y))
+    else
+      print("Usage: yhere start | yhere end")
+    end
+  elseif cmd == "deposit" then
+    markHere("deposit")
+    print("(Legacy dropDown mode. Prefer `home` with chest behind.)")
+  elseif cmd == "home" or cmd == "start" then
+    setHomeHere()
+  elseif cmd == "chest" then
+    if a[2] and a[3] and a[4] then
+      local x, y, z = tonumber(a[2]), tonumber(a[3]), tonumber(a[4])
+      if not x then
+        print("Usage: chest <x> <y> <z>   or   chest   (recompute behind home)")
+      else
+        cfg.chest = { x = math.floor(x), y = math.floor(y), z = math.floor(z) }
+        saveCfg()
+        print("chest = " .. fmt(cfg.chest))
+      end
+    else
+      if not cfg.home then
+        print("Set `home` first (stand at start, face the mine).")
+      else
+        local c = chestBehindHome()
+        if c then
+          cfg.chest = c
+          saveCfg()
+          print("chest = " .. fmt(cfg.chest) .. "  (behind home)")
+        else
+          print("Need heading — run `home` again facing the mine.")
+        end
+      end
+    end
+  elseif cmd == "exclude" then
+    loadExclude()
+    print("Excluded blocks:")
+    local n = 0
+    for name in pairs(exclude) do print("  " .. name); n = n + 1 end
+    if n == 0 then print("  (none - edit exclude.txt)") end
+    print("(also respects titan.RESTRICTED / computercraft:*)")
+  elseif cmd == "status" then
+    printStatus()
+  elseif cmd == "mine" then
+    if state.status == "mining" then print("Already mining.")
+    elseif not quarryReady() then
+      print("Box incomplete. Need set1, set2, and sety <start> <end>.")
+      printStatus()
+    else
+      mineVolume()
+    end
+  elseif cmd == "stop" then
+    state.stop = true
+    print("Stop requested.")
+  elseif cmd == "dump" then
+    dumpInventory()
+  elseif cmd == "goto" then
+    local x, y, z = tonumber(a[2]), tonumber(a[3]), tonumber(a[4])
+    if not x then print("Usage: goto <x> <y> <z>"); else
+      setStatus("moving", ("goto %d,%d,%d"):format(x, y, z))
+      local ok, err = nav.travelTo(x, y, z)
+      print(ok and "Arrived." or ("Failed: " .. tostring(err)))
+      setStatus("idle", "-")
+    end
+  elseif cmd == "exit" or cmd == "quit" then
+    state.stop = true
+    return "exit"
+  else
+    return false
+  end
+  return true
+end
+
 local function consoleLoop()
   print(("Titan miner '%s'. Type 'help'."):format(cfg.name or ("#" .. os.getComputerID())))
   printStatus()
@@ -642,158 +796,27 @@ local function consoleLoop()
     write("miner> ")
     local a = {}
     for word in tostring(read()):gmatch("%S+") do a[#a + 1] = word end
-    local cmd = (a[1] or ""):lower()
-
-    if cmd == "" then
-      -- ignore
-    elseif cmd == "help" then
-      print("BOX (opposite corners + Y range):")
-      print("  set1 <x> <z>             corner A (X/Z)")
-      print("  set2 <x> <z>             corner B (X/Z)")
-      print("  set1 here / set2 here    use current GPS X/Z")
-      print("  sety <startY> <endY>     vertical range (e.g. sety 80 -59)")
-      print("  ystart <y> / yend <y>    set start or end Y alone")
-      print("  yhere start|end          use current GPS Y")
-      print("OTHER:")
-      print("  home / start   mark start (face the mine; chest = 1 block behind)")
-      print("  chest          show / recompute behind home")
-      print("  chest <x y z>  set chest block manually")
-      print("  deposit        legacy: stand ABOVE a chest (dropDown)")
-      print("  exclude   reload & show exclude.txt")
-      print("  mine      dig the box from startY down to endY")
-      print("  stop | status | dump | goto <x> <y> <z>")
-      print("  hostname [name] | exit")
-    elseif cmd == "hostname" or cmd == "host" then
-      if not a[2] then
-        print("hostname: " .. (os.getComputerLabel() or "?"))
-      else
-        local name, err = titan.setHostname(table.concat(a, " ", 2), "miner")
-        if name then print("hostname set: " .. name) else print(tostring(err)) end
-      end
-    elseif cmd == "set1" or cmd == "corner1" then
-      local sub = (a[2] or ""):lower()
-      if sub == "" then
-        print("Usage: set1 <x> <z>   or   set1 here")
-      elseif sub == "here" or sub == "gps" or sub == "me" then
-        markHere("loc1")
-      else
-        setCornerXZ("loc1", a[2], a[3], a[4])
-      end
-    elseif cmd == "set2" or cmd == "corner2" then
-      local sub = (a[2] or ""):lower()
-      if sub == "" then
-        print("Usage: set2 <x> <z>   or   set2 here")
-      elseif sub == "here" or sub == "gps" or sub == "me" then
-        markHere("loc2")
-      else
-        setCornerXZ("loc2", a[2], a[3], a[4])
-      end
-    elseif cmd == "sety" then
-      local ys, ye = tonumber(a[2]), tonumber(a[3])
-      if ys and ye then
-        setYStart(ys); setYEnd(ye)
-        local topY, floorY = yRange()
-        print(("Y range: start=%d  end=%d  (will mine %d -> %d)"):format(
-          ys, ye, topY, floorY))
-      elseif ys and not ye then
-        -- Back-compat: sety <y> alone sets the end (bottom) level.
-        setYEnd(ys)
-        print(("yend (bottom) = %d   (also: sety <startY> <endY>)"):format(cfg.yEnd))
-      else
-        print("Usage: sety <startY> <endY>")
-        print("  startY = top of the box (begin mining here)")
-        print("  endY   = bottom of the box (stop here, inclusive)")
-      end
-    elseif cmd == "ystart" or cmd == "ytop" or cmd == "starty" then
-      local y, err = setYStart(a[2])
-      if y then print("ystart (top) = " .. y) else print("Usage: ystart <y>  (" .. tostring(err) .. ")") end
-    elseif cmd == "yend" or cmd == "ybottom" or cmd == "endy" or cmd == "floor" then
-      local y, err = setYEnd(a[2])
-      if y then print("yend (bottom) = " .. y) else print("Usage: yend <y>  (" .. tostring(err) .. ")") end
-    elseif cmd == "yhere" then
-      local which = (a[2] or ""):lower()
-      local x, y, z = nav.locatePrecise(4)
-      if not y then print("No GPS signal.")
-      elseif which == "start" or which == "top" or which == "ystart" then
-        setYStart(y)
-        local fix = nav.lastFix
-        print(("ystart = %d (GPS Y; range %.2f..%.2f)"):format(
-          cfg.yStart, fix and fix.yLo or y, fix and fix.yHi or y))
-      elseif which == "end" or which == "bottom" or which == "yend" then
-        setYEnd(y)
-        local fix = nav.lastFix
-        print(("yend = %d (GPS Y; range %.2f..%.2f)"):format(
-          cfg.yEnd, fix and fix.yLo or y, fix and fix.yHi or y))
-      else
-        print("Usage: yhere start | yhere end")
-      end
-    elseif cmd == "deposit" then
-      markHere("deposit")
-      print("(Legacy dropDown mode. Prefer `home` with chest behind.)")
-    elseif cmd == "home" or cmd == "start" then
-      setHomeHere()
-    elseif cmd == "chest" then
-      if a[2] and a[3] and a[4] then
-        local x, y, z = tonumber(a[2]), tonumber(a[3]), tonumber(a[4])
-        if not x then
-          print("Usage: chest <x> <y> <z>   or   chest   (recompute behind home)")
-        else
-          cfg.chest = { x = math.floor(x), y = math.floor(y), z = math.floor(z) }
-          saveCfg()
-          print("chest = " .. fmt(cfg.chest))
-        end
-      else
-        if not cfg.home then
-          print("Set `home` first (stand at start, face the mine).")
-        else
-          local c = chestBehindHome()
-          if c then
-            cfg.chest = c
-            saveCfg()
-            print("chest = " .. fmt(cfg.chest) .. "  (behind home)")
-          else
-            print("Need heading — run `home` again facing the mine.")
-          end
-        end
-      end
-    elseif cmd == "exclude" then
-      loadExclude()
-      print("Excluded blocks:")
-      local n = 0
-      for name in pairs(exclude) do print("  " .. name); n = n + 1 end
-      if n == 0 then print("  (none - edit exclude.txt)") end
-      print("(also respects titan.RESTRICTED / computercraft:*)")
-    elseif cmd == "status" then
-      printStatus()
-    elseif cmd == "mine" then
-      if state.status == "mining" then print("Already mining.")
-      elseif not quarryReady() then
-        print("Box incomplete. Need set1, set2, and sety <start> <end>.")
-        printStatus()
-      else
-        mineVolume()
-      end
-    elseif cmd == "stop" then
-      state.stop = true
-      print("Stop requested.")
-    elseif cmd == "dump" then
-      dumpInventory()
-    elseif cmd == "goto" then
-      local x, y, z = tonumber(a[2]), tonumber(a[3]), tonumber(a[4])
-      if not x then print("Usage: goto <x> <y> <z>"); else
-        setStatus("moving", ("goto %d,%d,%d"):format(x, y, z))
-        local ok, err = nav.travelTo(x, y, z)
-        print(ok and "Arrived." or ("Failed: " .. tostring(err)))
-        setStatus("idle", "-")
-      end
-    elseif cmd == "exit" or cmd == "quit" then
-      state.stop = true
-      return
-    else
-      print("Unknown: " .. cmd .. "  (type 'help')")
+    local r = handleCommand(a)
+    if r == "exit" then return
+    elseif r == false then
+      print("Unknown: " .. tostring(a[1] or "") .. "  (type 'help')")
     end
   end
 end
+
+titan.setSshHandler(function(line)
+  local a = {}
+  for w in tostring(line):gmatch("%S+") do a[#a + 1] = w end
+  local r = handleCommand(a)
+  if r == "exit" then
+    print("Over SSH: type `exit` to disconnect (miner keeps running).")
+    return true
+  end
+  if r == false then
+    print("Unknown: " .. tostring(a[1] or "") .. "  (type 'help')")
+  end
+  return true
+end)
 
 --------------------------------------------------------------------------------
 -- Deploy (Parent Center) + status + remote orders

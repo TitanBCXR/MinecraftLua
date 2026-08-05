@@ -1,6 +1,6 @@
 --[[
   hub.lua  -  Control computer for the Titan bot network (CC: Tweaked)
-  Titan-Version: 1.1.0
+  Titan-Version: 1.1.1
 
   Runs on a normal (or advanced) computer that has:
     * a wireless modem  (to talk to bots & POIs)
@@ -195,72 +195,89 @@ local function needBot(ref)
   return id
 end
 
+local function handleCommand(args)
+  local cmd = (args[1] or ""):lower()
+  if cmd == "" then
+    return true
+  elseif cmd == "help" then
+    print("list | hostname [name] | send <bot> <poi> | goto <bot> <x> <y> <z> |")
+    print("return <bot> | refuel <bot> | stop <bot> | ping | exit")
+  elseif cmd == "hostname" or cmd == "host" then
+    if not args[2] then
+      print("hostname: " .. (os.getComputerLabel() or "?"))
+    else
+      local name, err = titan.setHostname(table.concat(args, " ", 2), "hub")
+      if name then print("hostname set: " .. name) else print(tostring(err)) end
+    end
+  elseif cmd == "list" then
+    print("Bots:")
+    for id, b in pairs(bots) do
+      print(("  %s (#%d) %s @ %d,%d,%d fuel:%s"):format(
+        b.name or "?", id, b.state or "?", b.x or 0, b.y or 0, b.z or 0,
+        tostring(b.fuel or "?")))
+    end
+    print("POIs:")
+    for name, p in pairs(pois) do
+      print(("  %s @ %d,%d,%d %s"):format(name, p.x, p.y, p.z, p.desc or ""))
+    end
+  elseif cmd == "send" then
+    local id = needBot(args[2])
+    local poi = pois[args[3] or ""]
+    if id and poi then
+      titan.send(id, titan.MSG.COMMAND,
+        { cmd = "goto", x = poi.x, y = poi.y, z = poi.z, poi = args[3] })
+      print(("[>] %s -> POI %s"):format(args[2], args[3]))
+    elseif id then print("[!] unknown POI: " .. tostring(args[3])) end
+  elseif cmd == "goto" then
+    local id = needBot(args[2])
+    local x, y, z = tonumber(args[3]), tonumber(args[4]), tonumber(args[5])
+    if id and x and y and z then
+      titan.send(id, titan.MSG.COMMAND, { cmd = "goto", x = x, y = y, z = z })
+      print(("[>] %s -> %d,%d,%d"):format(args[2], x, y, z))
+    elseif id then print("[!] usage: goto <bot> <x> <y> <z>") end
+  elseif cmd == "return" then
+    local id = needBot(args[2])
+    if id then titan.send(id, titan.MSG.COMMAND, { cmd = "return" }) end
+  elseif cmd == "refuel" then
+    local id = needBot(args[2])
+    if id then titan.send(id, titan.MSG.COMMAND, { cmd = "refuel" }) end
+  elseif cmd == "stop" then
+    local id = needBot(args[2])
+    if id then titan.send(id, titan.MSG.COMMAND, { cmd = "stop" }) end
+  elseif cmd == "ping" then
+    titan.broadcast(titan.MSG.PING, {})
+    print("[>] pinged everyone")
+  elseif cmd == "exit" then
+    return "exit"
+  else
+    return false
+  end
+  return true
+end
+
 local function consoleLoop()
   print("Titan hub online. Type 'help' for commands.")
   while true do
     write("titan> ")
-    local input = read()
     local args = {}
-    for w in tostring(input):gmatch("%S+") do args[#args + 1] = w end
-    local cmd = (args[1] or ""):lower()
-
-    if cmd == "" then
-      -- ignore
-    elseif cmd == "help" then
-      print("list | hostname [name] | send <bot> <poi> | goto <bot> <x> <y> <z> |")
-      print("return <bot> | refuel <bot> | stop <bot> | ping | exit")
-    elseif cmd == "hostname" or cmd == "host" then
-      if not args[2] then
-        print("hostname: " .. (os.getComputerLabel() or "?"))
-      else
-        local name, err = titan.setHostname(table.concat(args, " ", 2), "hub")
-        if name then print("hostname set: " .. name) else print(tostring(err)) end
-      end
-    elseif cmd == "list" then
-      print("Bots:")
-      for id, b in pairs(bots) do
-        print(("  %s (#%d) %s @ %d,%d,%d fuel:%s"):format(
-          b.name or "?", id, b.state or "?", b.x or 0, b.y or 0, b.z or 0,
-          tostring(b.fuel or "?")))
-      end
-      print("POIs:")
-      for name, p in pairs(pois) do
-        print(("  %s @ %d,%d,%d %s"):format(name, p.x, p.y, p.z, p.desc or ""))
-      end
-    elseif cmd == "send" then
-      local id = needBot(args[2])
-      local poi = pois[args[3] or ""]
-      if id and poi then
-        titan.send(id, titan.MSG.COMMAND,
-          { cmd = "goto", x = poi.x, y = poi.y, z = poi.z, poi = args[3] })
-        print(("[>] %s -> POI %s"):format(args[2], args[3]))
-      elseif id then print("[!] unknown POI: " .. tostring(args[3])) end
-    elseif cmd == "goto" then
-      local id = needBot(args[2])
-      local x, y, z = tonumber(args[3]), tonumber(args[4]), tonumber(args[5])
-      if id and x and y and z then
-        titan.send(id, titan.MSG.COMMAND, { cmd = "goto", x = x, y = y, z = z })
-        print(("[>] %s -> %d,%d,%d"):format(args[2], x, y, z))
-      elseif id then print("[!] usage: goto <bot> <x> <y> <z>") end
-    elseif cmd == "return" then
-      local id = needBot(args[2])
-      if id then titan.send(id, titan.MSG.COMMAND, { cmd = "return" }) end
-    elseif cmd == "refuel" then
-      local id = needBot(args[2])
-      if id then titan.send(id, titan.MSG.COMMAND, { cmd = "refuel" }) end
-    elseif cmd == "stop" then
-      local id = needBot(args[2])
-      if id then titan.send(id, titan.MSG.COMMAND, { cmd = "stop" }) end
-    elseif cmd == "ping" then
-      titan.broadcast(titan.MSG.PING, {})
-      print("[>] pinged everyone")
-    elseif cmd == "exit" then
-      return
-    else
-      print("[!] unknown command: " .. cmd)
-    end
+    for w in tostring(read()):gmatch("%S+") do args[#args + 1] = w end
+    local r = handleCommand(args)
+    if r == "exit" then return
+    elseif r == false then print("[!] unknown command: " .. tostring(args[1] or "")) end
   end
 end
+
+titan.setSshHandler(function(line)
+  local args = {}
+  for w in tostring(line):gmatch("%S+") do args[#args + 1] = w end
+  local r = handleCommand(args)
+  if r == "exit" then
+    print("Over SSH: type `exit` to disconnect (hub keeps running).")
+    return true
+  end
+  if r == false then print("[!] unknown command: " .. tostring(args[1] or "")) end
+  return true
+end)
 
 parallel.waitForAny(networkLoop, consoleLoop,
   function() titan.networkLoop("hub") end)

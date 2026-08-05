@@ -1,6 +1,6 @@
 --[[
   router.lua  -  Titan network router / repeater (CC: Tweaked)
-  Titan-Version: 1.2.11
+  Titan-Version: 1.2.12
 
   Place one (or several) of these to tie the whole network together over
   wireless and/or wired modems. Roles:
@@ -1800,18 +1800,13 @@ end
 --------------------------------------------------------------------------------
 -- Console
 --------------------------------------------------------------------------------
-local function consoleLoop()
-  print(("Titan router #%d [%s]. %d modem(s) (rf:%d wire:%d). Type 'help'."):format(
-    os.getComputerID(), routerRole:upper(), #modems, #wirelessModems, #wiredModems))
-  while true do
-    write(isMain() and "router> " or "modem> ")
-    local a = {}
-    for word in tostring(read()):gmatch("%S+") do a[#a + 1] = word end
-    local cmd = (a[1] or ""):lower()
+-- Shared by local console and SSH. Returns "exit" / false / true.
+local function handleRouterCommand(a)
+  local cmd = (a[1] or ""):lower()
 
-    if cmd == "" then
-      -- ignore
-    elseif cmd == "help" then
+  if cmd == "" then
+    return true
+  elseif cmd == "help" then
       print("role     - show main / modem role")
       print("main     - make THIS the main router (directory + OTA authority)")
       print("modem    - demote to modem-only repeater (reboot)")
@@ -1840,9 +1835,9 @@ local function consoleLoop()
       else
         print("  routes = keep MAIN id; hard/all = also forget MAIN + name")
       end
-      print("ssh <id|label> [cmd] - remote shell; jumps via modems (reboot ok)")
+      print("ssh <id|label> [cmd] - remote shell (full device commands)")
       print("exit")
-    elseif cmd == "role" then
+  elseif cmd == "role" then
       print(("Role: %s  (id #%d)"):format(routerRole, os.getComputerID()))
       if isMain() then
         print("This is the MAIN router — devices re-auth here after update/reboot.")
@@ -2358,8 +2353,10 @@ local function consoleLoop()
         claimMain()
         print("Re-auth broadcast sent. Devices will re-auth to this main (bots also hit data server).")
       end
-    elseif cmd == "ssh" then
+  elseif cmd == "ssh" then
       if not a[2] then print("Usage: ssh <id|label> [command...]")
+      elseif titanLib and titanLib.sshIsAuthed and titanLib.sshIsAuthed() then
+        print("Nested ssh from an SSH session is not supported.")
       elseif not titanLib then
         print("ssh needs lib/titan.lua on this router (re-install router role).")
       else
@@ -2369,10 +2366,25 @@ local function consoleLoop()
         local cmdline = #parts > 0 and table.concat(parts, " ") or nil
         titanLib.sshConnect(target, cmdline)
       end
-    elseif cmd == "exit" or cmd == "quit" then
-      return
-    else
-      print("Unknown: " .. cmd)
+  elseif cmd == "exit" or cmd == "quit" then
+    return "exit"
+  else
+    return false
+  end
+  return true
+end
+
+local function consoleLoop()
+  print(("Titan router #%d [%s]. %d modem(s) (rf:%d wire:%d). Type 'help'."):format(
+    os.getComputerID(), routerRole:upper(), #modems, #wirelessModems, #wiredModems))
+  while true do
+    write(isMain() and "router> " or "modem> ")
+    local a = {}
+    for word in tostring(read()):gmatch("%S+") do a[#a + 1] = word end
+    local r = handleRouterCommand(a)
+    if r == "exit" then return
+    elseif r == false then
+      print("Unknown: " .. tostring(a[1] or ""))
     end
   end
 end
@@ -2382,6 +2394,19 @@ end
 --------------------------------------------------------------------------------
 if fs.exists("lib/titan.lua") then
   titanLib = dofile("lib/titan.lua")
+  titanLib.setSshHandler(function(line)
+    local a = {}
+    for w in tostring(line):gmatch("%S+") do a[#a + 1] = w end
+    local r = handleRouterCommand(a)
+    if r == "exit" then
+      print("Over SSH: type `exit` to disconnect (router keeps running).")
+      return true
+    end
+    if r == false then
+      print("Unknown: " .. tostring(a[1] or ""))
+    end
+    return true
+  end)
 end
 
 --------------------------------------------------------------------------------

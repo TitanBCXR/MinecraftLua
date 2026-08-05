@@ -1,6 +1,6 @@
 --[[
   botserver.lua  -  "Bots Computer" for the Titan network (CC: Tweaked)
-  Titan-Version: 1.2.1
+  Titan-Version: 1.2.2
 
   Coordination hub for the three bot types:
     * builder  / gatherer  (worker.lua)
@@ -308,105 +308,124 @@ end
 --==============================================================================
 -- Console
 --==============================================================================
+local function handleCommand(a)
+  local cmd = (a[1] or ""):lower()
+  if cmd == "" then
+    return true
+  elseif cmd == "help" then
+    print("bots | builders | gatherers | miners")
+    print("gathers | coal | builds | alerts | ping")
+    print("scan <bot> <name> <W> <H> <L>")
+    print("build <bot> <name> [x y z]")
+    print("mine <bot> | stop <bot>")
+    print("order <bot> goto <x> <y> <z>")
+    print("assign <bot> <text> | unassign <bot>")
+    print("exit")
+  elseif cmd == "bots" then
+    local n = countByType()
+    print(("Active %d  build:%d gather:%d mine:%d busy:%d"):format(
+      n.total, n.builder, n.gatherer, n.miner, n.busy))
+    printBots(nil)
+  elseif cmd == "builders" then
+    printBots("builder")
+  elseif cmd == "gatherers" then
+    printBots("gatherer")
+  elseif cmd == "miners" then
+    printBots("miner")
+  elseif cmd == "gathers" then
+    for gid, g in pairs(gathers) do
+      print(("  #%-3d chest %s accepts=%s mode=%s"):format(
+        gid, fmt(g.pos), type(g.accepts) == "table" and table.concat(g.accepts, ",") or tostring(g.accepts),
+        tostring(g.mode or "include")))
+    end
+  elseif cmd == "coal" then
+    for cid, c in pairs(coal) do print(("  #%-3d needs coal @ %s"):format(cid, fmt(c.pos))) end
+  elseif cmd == "builds" then
+    for _, n in ipairs(listBuilds()) do print("  " .. n) end
+  elseif cmd == "alerts" then
+    for i, al in ipairs(alerts) do
+      print(("  %2d) %s @ %d,%d,%d %s"):format(i, al.name or "?", al.x or 0, al.y or 0, al.z or 0, al.reason or ""))
+    end
+  elseif cmd == "scan" then
+    local id = findBot(a[2])
+    if id and a[3] and a[4] and a[5] and a[6] then
+      titan.send(id, MSG.SCAN_ORDER, { name = a[3], W = tonumber(a[4]), H = tonumber(a[5]), L = tonumber(a[6]) })
+      assigns[id] = "scan " .. a[3]
+      print("Scan order sent to " .. a[2])
+    else print("Usage: scan <bot> <name> <W> <H> <L>") end
+  elseif cmd == "build" then
+    local id = findBot(a[2])
+    if id and a[3] then
+      local x, y, z = tonumber(a[4]), tonumber(a[5]), tonumber(a[6])
+      titan.send(id, MSG.BUILD_ORDER, { name = a[3], x = x, y = y, z = z })
+      assigns[id] = "build " .. a[3]
+      print("Build order sent to " .. a[2])
+    else print("Usage: build <bot> <name> [x y z]") end
+  elseif cmd == "mine" then
+    local id = findBot(a[2])
+    if not id then print("Usage: mine <bot>")
+    elseif bots[id].botType ~= "miner" then print("That bot is not a miner.")
+    else
+      titan.send(id, MSG.COMMAND, { cmd = "mine" })
+      assigns[id] = "mine volume"
+      print("Mine order sent to " .. a[2])
+    end
+  elseif cmd == "stop" then
+    local id = findBot(a[2])
+    if id then
+      titan.send(id, MSG.COMMAND, { cmd = "stop" })
+      print("Stop sent to " .. a[2])
+    else print("Usage: stop <bot>") end
+  elseif cmd == "order" then
+    local id = findBot(a[2])
+    if id and (a[3] or ""):lower() == "goto" and a[6] then
+      titan.send(id, MSG.COMMAND, { cmd = "goto", x = tonumber(a[4]), y = tonumber(a[5]), z = tonumber(a[6]) })
+      assigns[id] = ("goto %s,%s,%s"):format(a[4], a[5], a[6])
+    else print("Usage: order <bot> goto <x> <y> <z>") end
+  elseif cmd == "assign" then
+    local id = findBot(a[2])
+    local text = table.concat(a, " ", 3)
+    if id and text ~= "" then
+      assigns[id] = text
+      print(("Assigned #%d: %s"):format(id, text))
+    else print("Usage: assign <bot> <text>") end
+  elseif cmd == "unassign" then
+    local id = findBot(a[2])
+    if id then assigns[id] = nil; print("Cleared assignment for " .. a[2])
+    else print("Usage: unassign <bot>") end
+  elseif cmd == "ping" then
+    titan.broadcast(MSG.PING, {}); print("Pinged.")
+  elseif cmd == "exit" then
+    return "exit"
+  else
+    return false
+  end
+  return true
+end
+
 local function consoleLoop()
   print("Bots Computer online (builder / gatherer / miner). Type 'help'.")
   while true do
     write("bots> ")
     local a = {}
     for w in tostring(read()):gmatch("%S+") do a[#a + 1] = w end
-    local cmd = (a[1] or ""):lower()
-
-    if cmd == "" then
-    elseif cmd == "help" then
-      print("bots | builders | gatherers | miners")
-      print("gathers | coal | builds | alerts | ping")
-      print("scan <bot> <name> <W> <H> <L>")
-      print("build <bot> <name> [x y z]")
-      print("mine <bot> | stop <bot>")
-      print("order <bot> goto <x> <y> <z>")
-      print("assign <bot> <text> | unassign <bot>")
-      print("exit")
-    elseif cmd == "bots" then
-      local n = countByType()
-      print(("Active %d  build:%d gather:%d mine:%d busy:%d"):format(
-        n.total, n.builder, n.gatherer, n.miner, n.busy))
-      printBots(nil)
-    elseif cmd == "builders" then
-      printBots("builder")
-    elseif cmd == "gatherers" then
-      printBots("gatherer")
-    elseif cmd == "miners" then
-      printBots("miner")
-    elseif cmd == "gathers" then
-      for gid, g in pairs(gathers) do
-        print(("  #%-3d chest %s accepts=%s mode=%s"):format(
-          gid, fmt(g.pos), type(g.accepts) == "table" and table.concat(g.accepts, ",") or tostring(g.accepts),
-          tostring(g.mode or "include")))
-      end
-    elseif cmd == "coal" then
-      for cid, c in pairs(coal) do print(("  #%-3d needs coal @ %s"):format(cid, fmt(c.pos))) end
-    elseif cmd == "builds" then
-      for _, n in ipairs(listBuilds()) do print("  " .. n) end
-    elseif cmd == "alerts" then
-      for i, al in ipairs(alerts) do
-        print(("  %2d) %s @ %d,%d,%d %s"):format(i, al.name or "?", al.x or 0, al.y or 0, al.z or 0, al.reason or ""))
-      end
-    elseif cmd == "scan" then
-      local id = findBot(a[2])
-      if id and a[3] and a[4] and a[5] and a[6] then
-        titan.send(id, MSG.SCAN_ORDER, { name = a[3], W = tonumber(a[4]), H = tonumber(a[5]), L = tonumber(a[6]) })
-        assigns[id] = "scan " .. a[3]
-        print("Scan order sent to " .. a[2])
-      else print("Usage: scan <bot> <name> <W> <H> <L>") end
-    elseif cmd == "build" then
-      local id = findBot(a[2])
-      if id and a[3] then
-        local x, y, z = tonumber(a[4]), tonumber(a[5]), tonumber(a[6])
-        titan.send(id, MSG.BUILD_ORDER, { name = a[3], x = x, y = y, z = z })
-        assigns[id] = "build " .. a[3]
-        print("Build order sent to " .. a[2])
-      else print("Usage: build <bot> <name> [x y z]") end
-    elseif cmd == "mine" then
-      local id = findBot(a[2])
-      if not id then print("Usage: mine <bot>")
-      elseif bots[id].botType ~= "miner" then print("That bot is not a miner.")
-      else
-        titan.send(id, MSG.COMMAND, { cmd = "mine" })
-        assigns[id] = "mine volume"
-        print("Mine order sent to " .. a[2])
-      end
-    elseif cmd == "stop" then
-      local id = findBot(a[2])
-      if id then
-        titan.send(id, MSG.COMMAND, { cmd = "stop" })
-        print("Stop sent to " .. a[2])
-      else print("Usage: stop <bot>") end
-    elseif cmd == "order" then
-      local id = findBot(a[2])
-      if id and (a[3] or ""):lower() == "goto" and a[6] then
-        titan.send(id, MSG.COMMAND, { cmd = "goto", x = tonumber(a[4]), y = tonumber(a[5]), z = tonumber(a[6]) })
-        assigns[id] = ("goto %s,%s,%s"):format(a[4], a[5], a[6])
-      else print("Usage: order <bot> goto <x> <y> <z>") end
-    elseif cmd == "assign" then
-      local id = findBot(a[2])
-      local text = table.concat(a, " ", 3)
-      if id and text ~= "" then
-        assigns[id] = text
-        print(("Assigned #%d: %s"):format(id, text))
-      else print("Usage: assign <bot> <text>") end
-    elseif cmd == "unassign" then
-      local id = findBot(a[2])
-      if id then assigns[id] = nil; print("Cleared assignment for " .. a[2])
-      else print("Usage: unassign <bot>") end
-    elseif cmd == "ping" then
-      titan.broadcast(MSG.PING, {}); print("Pinged.")
-    elseif cmd == "exit" then
-      return
-    else
-      print("Unknown: " .. cmd)
-    end
+    local r = handleCommand(a)
+    if r == "exit" then return
+    elseif r == false then print("Unknown: " .. tostring(a[1] or "")) end
   end
 end
+
+titan.setSshHandler(function(line)
+  local a = {}
+  for w in tostring(line):gmatch("%S+") do a[#a + 1] = w end
+  local r = handleCommand(a)
+  if r == "exit" then
+    print("Over SSH: type `exit` to disconnect (botserver keeps running).")
+    return true
+  end
+  if r == false then print("Unknown: " .. tostring(a[1] or "")) end
+  return true
+end)
 
 parallel.waitForAny(networkLoop, consoleLoop,
   function() titan.networkLoop("botserver") end)
