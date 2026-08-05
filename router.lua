@@ -132,18 +132,24 @@ local function directoryLoop()
     if type(msg) == "table" and id then
       local kind = classify(msg)
       local prev = seen[id]
+      -- Prefer explicit hostname from registration; fall back to name / prior.
+      local host = msg.hostname or msg.name or (prev and prev.name)
       seen[id] = {
-        name = msg.name or (prev and prev.name),
+        name = host,
+        hostname = host,
         kind = kind or (prev and prev.kind) or "device",
         seen = now(),
       }
       if not prev then
-        print(("[+] %s #%d (%s)"):format(seen[id].name or "?", id, seen[id].kind))
+        print(("[+] %s #%d (%s)"):format(seen[id].hostname or "?", id, seen[id].kind))
+      elseif host and prev.name ~= host then
+        print(("[~] #%d hostname -> %s"):format(id, host))
       end
       -- Answer register/discovery so a device can confirm it's on the network.
       if proto == PROTO_ROUTER and msg.type == "hello" then
+        local rname = os.getComputerLabel() or ("Router-" .. os.getComputerID())
         rednet.send(id, {
-          type = "here", label = os.getComputerLabel(), devices = deviceCount(),
+          type = "here", label = rname, hostname = rname, devices = deviceCount(),
         }, PROTO_ROUTER)
       end
     end
@@ -163,12 +169,13 @@ local function draw()
   line(1, ("== TITAN ROUTER #%d ==  modems:%d"):format(os.getComputerID(), #modems), colors.yellow)
   line(2, ("relayed:%d  online:%d%s"):format(stats.relayed, deviceCount(),
     gpsCoords and ("  GPS " .. gpsCoords.x .. "," .. gpsCoords.y .. "," .. gpsCoords.z) or ""), colors.lime)
-  line(3, "ID   KIND     NAME            AGE", colors.lightGray)
+  line(3, "ID   KIND     HOSTNAME        AGE", colors.lightGray)
   local y = 4
   for id, d in pairs(seen) do
     if y >= h then break end
     if ago(d.seen) < 60 then
-      line(y, ("%-4d %-8s %-15s %ss"):format(id, (d.kind or "?"):sub(1, 8), (d.name or "?"):sub(1, 15), ago(d.seen)),
+      local host = d.hostname or d.name or "?"
+      line(y, ("%-4d %-8s %-15s %ss"):format(id, (d.kind or "?"):sub(1, 8), host:sub(1, 15), ago(d.seen)),
         ago(d.seen) > 30 and colors.gray or colors.white)
       y = y + 1
     end
@@ -228,7 +235,8 @@ local function consoleLoop()
       for id, d in pairs(seen) do
         if ago(d.seen) < 60 then
           n = n + 1
-          print(("#%-3d %-8s %-14s %ss"):format(id, d.kind or "?", d.name or "?", ago(d.seen)))
+          print(("#%-3d %-8s %-18s %ss"):format(
+            id, d.kind or "?", d.hostname or d.name or "?", ago(d.seen)))
         end
       end
       if n == 0 then print("(no devices heard yet)") end

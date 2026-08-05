@@ -181,7 +181,9 @@ end)
 
 def("net", "find/register with the Titan router", function()
   openModems()
-  rednet.broadcast({ type = "hello" }, "titan_router")
+  local host = os.getComputerLabel() or ("Console-" .. os.getComputerID())
+  if not os.getComputerLabel() then os.setComputerLabel(host) end
+  rednet.broadcast({ type = "hello", kind = "console", name = host, hostname = host }, "titan_router")
   local deadline, found = os.clock() + 2, false
   while os.clock() < deadline do
     local id, msg = rednet.receive("titan_router", deadline - os.clock())
@@ -189,7 +191,8 @@ def("net", "find/register with the Titan router", function()
     if type(msg) == "table" and msg.type == "here" then
       found = true
       print(("Connected via Router #%d '%s' (%d devices online)"):format(
-        id, msg.label or "?", msg.devices or 0))
+        id, msg.hostname or msg.label or "?", msg.devices or 0))
+      print("Registered hostname: " .. host)
     end
   end
   if not found then

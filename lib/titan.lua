@@ -136,7 +136,8 @@ function titan.send(id, msgType, data)
   local msg = data or {}
   msg.type = msgType
   msg.from = os.getComputerID()
-  msg.name = os.getComputerLabel()
+  msg.name = titan.hostname()
+  msg.hostname = msg.name
   msg.ts   = os.epoch("utc")
   rednet.send(id, msg, titan.PROTOCOL)
 end
@@ -146,7 +147,8 @@ function titan.broadcast(msgType, data)
   local msg = data or {}
   msg.type = msgType
   msg.from = os.getComputerID()
-  msg.name = os.getComputerLabel()
+  msg.name = titan.hostname()
+  msg.hostname = msg.name
   msg.ts   = os.epoch("utc")
   rednet.broadcast(msg, titan.PROTOCOL)
 end
@@ -173,8 +175,26 @@ end
 --------------------------------------------------------------------------------
 titan.ROUTER_PROTOCOL = "titan_router"
 
+-- Hostname shared on every network registration. Uses the computer label; if
+-- none is set yet, assigns "<Kind>-<id>" (e.g. Worker-12) so the roster never
+-- shows a blank name.
+function titan.hostname(kind)
+  local label = os.getComputerLabel()
+  if label and label ~= "" then return label end
+  local prefix = "Device"
+  if type(kind) == "string" and kind ~= "" then
+    prefix = kind:sub(1, 1):upper() .. kind:sub(2)
+  end
+  label = prefix .. "-" .. os.getComputerID()
+  os.setComputerLabel(label)
+  return label
+end
+
 function titan.announce(kind)
-  rednet.broadcast({ type = "hello", kind = kind, name = os.getComputerLabel() }, titan.ROUTER_PROTOCOL)
+  local host = titan.hostname(kind)
+  rednet.broadcast({
+    type = "hello", kind = kind, name = host, hostname = host,
+  }, titan.ROUTER_PROTOCOL)
 end
 
 -- Announce periodically AND listen for an OTA "update" command from a router.
@@ -346,11 +366,11 @@ function titan.sshHostLoop(kind)
       sshClientQ[#sshClientQ + 1] = { id = id, msg = msg }
 
     elseif msg.type == "ssh_ping" then
-      local name = os.getComputerLabel() or ("#" .. os.getComputerID())
+      local name = titan.hostname(kind)
       local want = tostring(msg.want or ""):lower()
       if want == "" or name:lower() == want or name:lower():find(want, 1, true)
          or tostring(os.getComputerID()) == want then
-        sshSend(id, { type = "ssh_pong", name = name, kind = kind })
+        sshSend(id, { type = "ssh_pong", name = name, hostname = name, kind = kind })
       end
 
     elseif msg.type == "ssh_open" then
@@ -358,10 +378,11 @@ function titan.sshHostLoop(kind)
         sshSend(id, { type = "ssh_deny", reason = "auth failed (need master password + Parent Center online)" })
       else
         local token = sshNewToken()
+        local host = titan.hostname(kind)
         sshSessions[token] = { clientId = id, expires = os.clock() + 600 }
         sshSend(id, {
           type = "ssh_ok", token = token,
-          name = os.getComputerLabel() or ("#" .. os.getComputerID()),
+          name = host, hostname = host,
           kind = kind, id = os.getComputerID(),
         })
       end
