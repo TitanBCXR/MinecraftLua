@@ -1,6 +1,6 @@
 --[[
   router.lua  -  Titan network router / repeater (CC: Tweaked)
-  Titan-Version: 1.2.0
+  Titan-Version: 1.2.1
 
   Place one (or several) of these to tie the whole network together over
   wireless. Roles:
@@ -59,6 +59,8 @@ local ONLINE_SECS = 45   -- heard within this window => ONLINE on the board
 -- Multi-monitor boards (main): roster / stats / gps. Names from peripheral.getName.
 local screens = { roster = nil, stats = nil, gps = nil }  -- wrapped monitors
 local screenNames = { roster = nil, stats = nil, gps = nil }
+-- When true, monitors show the fleet map instead of roster/stats/gps boards.
+local displayMap = false
 
 -- Router config (GPS host coords + role: "main" | "modem").
 local RCFG      = "router.cfg"
@@ -889,10 +891,22 @@ local function drawGps(out, y0, y1)
   put("routers with gpshost set.", colors.gray)
 end
 
-local function drawBoards()
-  local n = refreshScreens()
-  if n == 0 then return end
+local function loadDisplayMap()
+  local c = loadRouterCfg() or {}
+  displayMap = c.displayMap == true
+  return displayMap
+end
 
+local function setDisplayMap(on)
+  displayMap = on and true or false
+  patchRouterCfg({ displayMap = displayMap })
+  return displayMap
+end
+
+-- Forward-declared; body set after drawFleetMapOn is defined.
+local drawMapOnMonitors
+
+local function drawStatsBoards()
   local roster, statsM, gpsM = screens.roster, screens.stats, screens.gps
   local same = (roster == statsM) and (statsM == gpsM)
 
@@ -943,8 +957,19 @@ local function drawBoards()
   end
 end
 
+local function drawBoards()
+  local n = refreshScreens()
+  if n == 0 then return end
+  if displayMap then
+    if drawMapOnMonitors then drawMapOnMonitors() end
+  else
+    drawStatsBoards()
+  end
+end
+
 local function drawLoop()
   loadScreenAssignments()
+  loadDisplayMap()
   while true do
     drawBoards()
     if rosterDirty then saveRoster() end
@@ -1264,47 +1289,55 @@ local function mapGridChar(relX, relZ)
   return " "
 end
 
-local function drawFleetMap(scale)
-  local tw, th = term.getSize()
-  term.setBackgroundColor(colors.black)
-  term.clear()
+-- Draw fleet map onto any term/monitor (`out`). opts.interactive adds key hints.
+local function drawFleetMapOn(out, scale, opts)
+  opts = opts or {}
+  local tw, th = out.getSize()
+  out.setBackgroundColor(colors.black)
+  out.clear()
+  local colorOk = out.isColor and out.isColor()
   local function put(x, y, ch, fg)
     if x < 1 or y < 1 or x > tw or y > th then return end
-    term.setCursorPos(x, y)
-    if term.isColor and term.isColor() then
-      term.setTextColor(fg or colors.white)
-      term.setBackgroundColor(colors.black)
+    out.setCursorPos(x, y)
+    if colorOk then
+      out.setTextColor(fg or colors.white)
+      out.setBackgroundColor(colors.black)
     end
-    term.write(ch)
+    out.write(ch)
   end
 
   local nodes = fleetMapNodes()
   local ox, oz = mapOrigin(nodes)
   if not gpsCoords and #nodes == 0 then
-    put(1, 1, "No GPS on main and no modem positions yet.", colors.red)
-    put(1, 2, "Set gpshost / wait for modems to hello with coords.", colors.gray)
-    put(1, 4, "[Q] quit", colors.gray)
-    return nodes, ox, oz, scale
+    put(1, 1, "No GPS / modem positions yet.", colors.red)
+    put(1, 2, "Set gpshost; wait for modem hellos.", colors.gray)
+    if opts.interactive then put(1, 4, "[Q] quit", colors.gray) end
+    return nodes, ox, oz, scale or mapScale
   end
 
   local top, bottom = 3, th - 3
   local left, right = 1, tw
   local gw, gh = right - left + 1, bottom - top + 1
+  if gh < 4 then top, bottom = 2, th - 1 end
+  gw, gh = right - left + 1, bottom - top + 1
   if not scale then
-    scale = mapAutoScale(nodes, ox, oz, gw, gh)
+    scale = mapAutoScale(nodes, ox, oz, gw, math.max(4, gh))
   end
   mapScale = scale
 
-  put(1, 1, ("FLEET MAP  origin %d,%d  %dm/cell  (zoomed out)"):format(ox, oz, scale), colors.yellow)
-  put(1, 2, "r=main router  m=modem  N=up  +/- zoom  F fit  Q quit", colors.lightGray)
+  put(1, 1, ("FLEET MAP  origin %d,%d  %dm/cell"):format(ox, oz, scale), colors.yellow)
+  if opts.interactive then
+    put(1, 2, "r=main  m=modem  N=up  +/- zoom  F fit  Q quit", colors.lightGray)
+  else
+    put(1, 2, "r=main  m=modem  N=up   (map true — monitors)", colors.lightGray)
+  end
 
   local cx = left + math.floor(gw / 2)
   local cy = top + math.floor(gh / 2)
 
   for gy = top, bottom do
     for gx = left, right do
-      local relX, relZ = gx - cx, gy - cy
-      put(gx, gy, mapGridChar(relX, relZ), colors.gray)
+      put(gx, gy, mapGridChar(gx - cx, gy - cy), colors.gray)
     end
   end
   put(cx, top, "N", colors.white)
@@ -1317,40 +1350,64 @@ local function drawFleetMap(scale)
            cy + math.floor((wz - oz) / scale + 0.5)
   end
 
-  -- Plot modems first, main last so `r` wins on overlap.
   table.sort(nodes, function(a, b)
     if a.main ~= b.main then return not a.main end
     return (a.id or 0) < (b.id or 0)
   end)
   for _, n in ipairs(nodes) do
     local sx, sy = cellOf(n.x, n.z)
-    if n.main or n.kind == "router" and n.id == os.getComputerID() then
+    if n.main or (n.kind == "router" and n.id == os.getComputerID()) then
       put(sx, sy, "r", colors.cyan)
     else
       put(sx, sy, "m", colors.lime)
     end
   end
 
-  -- Legend / name list along the bottom
   local y = th - 2
+  if y < 1 then y = th end
   local parts = {}
   for _, n in ipairs(nodes) do
     local tag = (n.main or n.id == os.getComputerID()) and "r" or "m"
     parts[#parts + 1] = ("%s:%s"):format(tag, tostring(n.name):sub(1, 10))
   end
   put(1, y, table.concat(parts, "  "):sub(1, tw), colors.white)
-  put(1, th, ("nodes:%d  scale:%d  [+/-]zoom [F]fit [Q]quit"):format(#nodes, scale), colors.gray)
+  if opts.interactive then
+    put(1, th, ("nodes:%d  scale:%d  [+/-] [F]fit [Q]"):format(#nodes, scale), colors.gray)
+  else
+    put(1, th, ("nodes:%d  scale:%d  `map false` for stats"):format(#nodes, scale), colors.gray)
+  end
 
-  if term.isColor and term.isColor() then
-    term.setTextColor(colors.white)
-    term.setBackgroundColor(colors.black)
+  if colorOk then
+    out.setTextColor(colors.white)
+    out.setBackgroundColor(colors.black)
   end
   return nodes, ox, oz, scale
 end
 
+drawMapOnMonitors = function()
+  local drawn = {}
+  local function drawOne(mon)
+    if not mon or drawn[mon] then return end
+    drawn[mon] = true
+    local w, h = mon.getSize()
+    local nodes = fleetMapNodes()
+    local ox, oz = mapOrigin(nodes)
+    local scale = mapAutoScale(nodes, ox, oz, w, math.max(4, h - 4))
+    drawFleetMapOn(mon, scale, { interactive = false })
+  end
+  -- Primary map on roster (or first) screen; mirror onto others.
+  drawOne(screens.roster)
+  drawOne(screens.stats)
+  drawOne(screens.gps)
+  -- Any leftover attached monitors not assigned.
+  for _, name in ipairs(listMonitorNames()) do
+    drawOne(wrapScreen(name))
+  end
+end
+
 local function fleetMapView()
   if not isMain() then
-    print("map is MAIN-only.")
+    print("map view is MAIN-only.")
     return
   end
   local nodes = fleetMapNodes()
@@ -1359,7 +1416,7 @@ local function fleetMapView()
   local scale = mapAutoScale(nodes, ox, oz, tw, math.max(5, th - 6))
   local timer = os.startTimer(2)
   while true do
-    drawFleetMap(scale)
+    drawFleetMapOn(term, scale, { interactive = true })
     local ev, p1 = os.pullEvent()
     if ev == "timer" and p1 == timer then
       timer = os.startTimer(2)
@@ -1417,7 +1474,7 @@ local function consoleLoop()
       print("stats    - relay counts (+ roster if main)")
       print("gpshost [x y z] - show / set this router's GPS host coords")
       if isMain() then
-        print("map      - zoomed-out fleet map (r=main, m=modem)")
+        print("map [true|false|view] - monitors: map vs stats boards (default false)")
         print("versions - local vs GitHub package versions")
         print("devices  - list remembered systems (ONLINE / OFFLINE)")
         print("forget <id|host> - remove a system from the remembered roster")
@@ -1500,10 +1557,39 @@ local function consoleLoop()
           end
         end
       end
-    elseif cmd == "map" or cmd == "fmap" or cmd == "fleetmap" then
+    elseif cmd == "map" or cmd == "fmap" or cmd == "fleetmap" or cmd == "display" then
       if not isMain() then print("map is MAIN-only.")
       else
-        fleetMapView()
+        local sub = (a[2] or ""):lower()
+        -- `display map` / `display stats` aliases
+        if cmd == "display" then
+          if sub == "map" then sub = "true"
+          elseif sub == "stats" or sub == "boards" then sub = "false"
+          elseif sub == "" then sub = "" end
+        end
+        if sub == "" or sub == "status" then
+          loadDisplayMap()
+          print(("Monitor display: map=%s"):format(tostring(displayMap)))
+          print("  map false  — roster / stats / gps boards (default)")
+          print("  map true   — fleet map on monitors (r/m grid)")
+          print("  map view   — interactive map on this terminal")
+        elseif sub == "true" or sub == "on" or sub == "1" or sub == "yes" then
+          setDisplayMap(true)
+          print("Monitors: MAP mode (fleet map).")
+          drawBoards()
+        elseif sub == "false" or sub == "off" or sub == "0" or sub == "no" or sub == "stats" then
+          setDisplayMap(false)
+          print("Monitors: STATS mode (roster / stats / gps).")
+          drawBoards()
+        elseif sub == "view" or sub == "term" or sub == "live" then
+          fleetMapView()
+        elseif sub == "toggle" then
+          setDisplayMap(not displayMap)
+          print(("Monitors: map=%s"):format(tostring(displayMap)))
+          drawBoards()
+        else
+          print("Usage: map true | map false | map view | map toggle")
+        end
       end
     elseif cmd == "names" then
       if not isMain() then print("Name registry is MAIN-only."); else
@@ -1949,20 +2035,24 @@ if isMain() then
   end
   loadNameRegistry()
   loadScreenAssignments()
+  loadDisplayMap()
   local nMon = refreshScreens()
   do
     local n = 0
     for _ in pairs(nameAssign) do n = n + 1 end
     if n > 0 then print(("Modem names: %d assigned. Type `names`."):format(n)) end
   end
+  print(("Monitor mode: map=%s  (`map true` / `map false`)"):format(tostring(displayMap)))
   if nMon == 0 then
-    print("No monitors yet — attach 1–3 for roster / stats / gps boards.")
+    print("No monitors yet — attach 1–3 for boards or fleet map.")
+  elseif displayMap then
+    print(("%d monitor(s): FLEET MAP. Type `map false` for stats boards."):format(nMon))
   elseif nMon == 1 then
-    print("1 monitor: stacked roster + stats + gps. Type `screens`.")
+    print("1 monitor: stacked roster + stats + gps. Type `screens` / `map true`.")
   elseif nMon == 2 then
-    print("2 monitors: roster | stats+gps. Type `screens` / `screen`.")
+    print("2 monitors: roster | stats+gps. Type `screens` / `map true`.")
   else
-    print(("%d monitors: roster | stats | gps. Type `screens` / `screen`."):format(nMon))
+    print(("%d monitors: roster | stats | gps. Type `screens` / `map true`."):format(nMon))
   end
 else
   clearRosterIfModem()
