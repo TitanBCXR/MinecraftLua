@@ -393,3 +393,38 @@ move <forward|back|up|down|left|right> [n]
 ```
 
 Supports tab-completion of command names and up/down input history.
+
+---
+
+# Admin tablet (`admin.lua`)
+
+A mobile master terminal for a **pocket computer** — the "Live" computer you
+keep on you. It listens to the whole network and lets you monitor and command it
+from your pocket.
+
+Needs a **pocket computer with a wireless modem** upgrade and `lib/titan.lua`
+(install with the installer → **"Admin tablet"**, or `wget` both files). The
+tablet itself needs no GPS.
+
+**Monitoring is open; every command that controls a bot requires `login`** with
+the master password — verified against the Parent Center's master floppy, just
+like the disk-drive lock. No master online → denied.
+
+```
+VIEW  : live            full-screen auto-refreshing dashboard (any key exits)
+        bots            roster: id, name, type, state, pos, fuel
+        pois            points of interest
+        pending         workers awaiting deployment
+        stuck           recent STUCK alerts
+        ping            re-discover everyone
+BOT   : send <bot> <poi>            dispatch to a named POI
+        goto <bot> <x> <y> <z>      dispatch to coordinates
+        return <bot> | refuel <bot> | stop <bot>
+DEPLOY: deploy <bot> <builder|gatherer> <name> [x y z]
+BUILD : scan <bot> <name> <W> <H> <L> | build <bot> <name> [x y z]
+        login | lock | exit
+```
+
+`<bot>` is a turtle's label or its computer id. Because control is gated by the
+master password, losing the tablet doesn't hand over the network — pull the
+master floppy and every login (including the tablet's) is denied.

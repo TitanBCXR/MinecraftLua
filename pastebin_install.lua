@@ -27,6 +27,7 @@ local CODES = {
   ["botserver.lua"] = "",
   ["datacenter.lua"]= "",
   ["console.lua"]   = "",
+  ["admin.lua"]     = "",
 }
 
 --==============================================================================
@@ -47,9 +48,11 @@ local ROLES = {
     files = { "lib/titan.lua", "worker.lua" } },
   { key = "7", name = "Terminal console (basic commands)", run = "console.lua",
     files = { "console.lua" } },
-  { key = "8", name = "Everything (all files, no auto-run)", run = nil,
-    files = { "lib/titan.lua", "hub.lua", "bot.lua", "poi.lua",
-              "worker.lua", "botserver.lua", "datacenter.lua", "console.lua" } },
+  { key = "8", name = "Admin tablet (pocket console)",     run = "admin.lua",
+    files = { "lib/titan.lua", "admin.lua" } },
+  { key = "9", name = "Everything (all files, no auto-run)", run = nil,
+    files = { "lib/titan.lua", "hub.lua", "bot.lua", "poi.lua", "worker.lua",
+              "botserver.lua", "datacenter.lua", "console.lua", "admin.lua" } },
 }
 
 --==============================================================================
