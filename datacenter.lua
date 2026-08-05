@@ -395,18 +395,21 @@ local function cmdScan()
 end
 
 local function cmdRename(newName)
-  if not newName or newName == "" then print("Usage: rename <new name>"); return end
+  if not newName or newName == "" then print("Usage: rename <new name>  (or: hostname <new name)"); return end
   station.name = newName
   saveConfig({ name = newName })
   os.setComputerLabel(newName)
-  -- Re-register immediately.
+  -- Re-register immediately with Parent Center master + network router.
   if isLocalMaster() then
     registry[os.getComputerID()] = { name = newName, seen = os.epoch("utc"), master = true }
   else
     local mId = discoverMaster(1)
     if mId then rednet.send(mId, { type = MSG.REGISTER, name = newName }, PROTOCOL) end
   end
-  print("Renamed to: " .. newName)
+  rednet.broadcast({
+    type = "hello", kind = "datacenter", name = newName, hostname = newName,
+  }, "titan_router")
+  print("hostname set: " .. newName)
 end
 
 local function printStatus()
@@ -550,7 +553,7 @@ local function handleAdmin(cmd, rest)
       print(("  state: %s   task: %s   fuel: %s"):format(
         b.state or "?", b.task or "-", tostring(b.fuel or "?")))
     end
-  elseif cmd == "rename" then
+  elseif cmd == "rename" or cmd == "hostname" or cmd == "host" then
     cmdRename(rest)
   elseif cmd == "setmaster" then
     cmdSetMaster()
@@ -575,7 +578,7 @@ local function handleAdmin(cmd, rest)
     print("  locate <name>      alias of 'bot'")
     print("  pending            workers awaiting deployment")
     print("  deploy <id> <builder|gatherer> <name> [x y z]   deploy a worker")
-    print("  rename <name>      rename this station")
+    print("  rename|hostname <name>  rename this station (updates router roster)")
     print("  setmaster          change master password (master only)")
     print("  who | status       session / station info")
     print("  lock | logout      re-lock this terminal")

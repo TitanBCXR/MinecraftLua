@@ -46,6 +46,12 @@ local function openModems()
   end
 end
 
+-- Loaded once so hostname / SSH / mesh helpers share one lib instance.
+local titanLib = nil
+if fs.exists("lib/titan.lua") then
+  titanLib = dofile("lib/titan.lua")
+end
+
 -- Background mesh relay so a console device also hops rednet for neighbours.
 local function relayLoop()
   local REPEAT, relayed = rednet.CHANNEL_REPEAT, {}
@@ -149,10 +155,34 @@ end)
 --------------------------------------------------------------------------------
 -- Commands: device info
 --------------------------------------------------------------------------------
-def("label", "get or set the computer label", function(a)
+local function setHost(name)
+  name = tostring(name or ""):gsub("^%s+", ""):gsub("%s+$", "")
+  if name == "" then return nil, "empty hostname" end
+  if titanLib then
+    return titanLib.setHostname(name, "console")
+  end
+  os.setComputerLabel(name)
+  openModems()
+  rednet.broadcast({ type = "hello", kind = "console", name = name, hostname = name }, "titan_router")
+  return name
+end
+
+def("hostname", "get or set network hostname (updates router roster)", function(a)
   if a[1] then
-    local name = table.concat(a, " ")
-    os.setComputerLabel(name); print("label set: " .. name)
+    local name, err = setHost(table.concat(a, " "))
+    if name then print("hostname set: " .. name)
+    else printError(err or "failed") end
+  else
+    print(os.getComputerLabel() or "(no hostname)")
+  end
+end)
+alias("host", "hostname")
+
+def("label", "get or set the computer label (same as hostname)", function(a)
+  if a[1] then
+    local name, err = setHost(table.concat(a, " "))
+    if name then print("label set: " .. name)
+    else printError(err or "failed") end
   else
     print(os.getComputerLabel() or "(no label)")
   end
@@ -200,11 +230,86 @@ def("net", "find/register with the Titan router", function()
   end
 end)
 
--- Loaded once so the SSH host loop and client share the same reply inbox.
-local titanLib = nil
-if fs.exists("lib/titan.lua") then
-  titanLib = dofile("lib/titan.lua")
+local function needTitan(feature)
+  if titanLib then return true end
+  printError((feature or "this") .. " needs lib/titan.lua (re-install console via Titan installer).")
+  return false
 end
+
+local function showPackages()
+  if not needTitan("packages") then return end
+  local info, err = titanLib.listPackages()
+  if not info then
+    printError(err or "no packages")
+    return
+  end
+  print("== Installed packages ==")
+  print("role   : " .. tostring(info.role))
+  print("source : " .. tostring(info.source))
+  if info.base then print("base   : " .. tostring(info.base)) end
+  if info.run then print("run    : " .. tostring(info.run)) end
+  print("files:")
+  for _, f in ipairs(info.files) do
+    if f.present then
+      print(("  %-22s %6db"):format(f.path, f.size))
+    else
+      print(("  %-22s MISSING"):format(f.path))
+    end
+  end
+  print("")
+  print("Run 'update' to re-download all packages from the install source.")
+end
+
+local function runPackageUpdate(autoReboot)
+  if not needTitan("update") then return end
+  openModems()
+  local info = titanLib.listPackages()
+  if not info then
+    printError("No .titan-install manifest. Install this device with an installer first.")
+    return
+  end
+  print(("Updating %d file(s) from %s ..."):format(#info.files, info.source))
+  if info.source == "host" then
+    print("(needs host.lua running on the install computer)")
+  end
+  local ok, detail = titanLib.updateSelf({
+    onProgress = function(path, good, msg)
+      if good then print("  ok   " .. path .. " (" .. msg .. ")")
+      else printError("  FAIL " .. path .. " — " .. msg) end
+    end,
+  })
+  if not ok then
+    printError("Update failed: " .. tostring(detail))
+    return
+  end
+  print(("Updated %s package file(s)."):format(tostring(detail)))
+  if autoReboot then
+    print("Rebooting..."); sleep(1); os.reboot()
+  end
+  write("Reboot now to load new code? [Y/n] ")
+  local yn = read():lower()
+  if yn == "" or yn == "y" then os.reboot() end
+end
+
+def("packages", "list installed Titan packages (or: packages update)", function(a)
+  local sub = (a[1] or ""):lower()
+  if sub == "update" or sub == "upgrade" then
+    runPackageUpdate(a[2] == "-y" or a[2] == "--yes")
+  elseif sub == "help" then
+    print("packages          list installed files + source")
+    print("packages update   re-download all packages")
+    print("update [-y]       same as packages update")
+  else
+    showPackages()
+  end
+end)
+alias("pkgs", "packages")
+
+def("update", "re-download installed packages from their install source", function(a)
+  local flag = (a[1] or ""):lower()
+  runPackageUpdate(flag == "-y" or flag == "--yes" or flag == "yes")
+end)
+alias("upgrade", "update")
 
 def("ssh", "remote shell: ssh <id|label> [command...]", function(a)
   openModems()

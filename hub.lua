@@ -206,8 +206,15 @@ local function consoleLoop()
     if cmd == "" then
       -- ignore
     elseif cmd == "help" then
-      print("list | send <bot> <poi> | goto <bot> <x> <y> <z> |")
+      print("list | hostname [name] | send <bot> <poi> | goto <bot> <x> <y> <z> |")
       print("return <bot> | refuel <bot> | stop <bot> | ping | exit")
+    elseif cmd == "hostname" or cmd == "host" then
+      if not args[2] then
+        print("hostname: " .. (os.getComputerLabel() or "?"))
+      else
+        local name, err = titan.setHostname(table.concat(args, " ", 2), "hub")
+        if name then print("hostname set: " .. name) else print(tostring(err)) end
+      end
     elseif cmd == "list" then
       print("Bots:")
       for id, b in pairs(bots) do

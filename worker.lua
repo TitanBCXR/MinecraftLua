@@ -515,12 +515,22 @@ local function consoleLoop()
     if cmd == "" then
       -- ignore
     elseif cmd == "help" then
-      print("Commands: status | login | scan <name> <W> <H> <L> | build <name> |")
-      print("          chest | deposit <x> <y> <z> | redeploy | home | reboot")
+      print("Commands: status | hostname [name] | login | scan <name> <W> <H> <L> |")
+      print("          build <name> | chest | deposit <x> <y> <z> | redeploy | home | reboot")
     elseif cmd == "status" then
       print(("%s (%s)  state=%s task=%s fuel=%s"):format(
         cfg.name, cfg.botType, state.status, state.task, tostring(turtle.getFuelLevel())))
       print("home=" .. fmt(nav.home) .. "  deposit=" .. fmt(cfg.deposit) .. "  chest=" .. fmt(cfg.chest))
+    elseif cmd == "hostname" or cmd == "host" then
+      if not a[2] then
+        print("hostname: " .. (os.getComputerLabel() or cfg.name or "?"))
+      else
+        local name, err = titan.setHostname(table.concat(a, " ", 2), "worker")
+        if name then
+          cfg.name = name; saveCfg()
+          print("hostname set: " .. name)
+        else print(tostring(err)) end
+      end
     elseif cmd == "login" then
       requireAuth()
     elseif cmd == "scan" then

@@ -425,7 +425,15 @@ local function consoleLoop()
       print("status          show config / progress")
       print("goto <x> <y> <z>")
       print("dump            travel to deposit and drop inventory")
+      print("hostname [name] get or set network hostname")
       print("exit")
+    elseif cmd == "hostname" or cmd == "host" then
+      if not a[2] then
+        print("hostname: " .. (os.getComputerLabel() or "?"))
+      else
+        local name, err = titan.setHostname(table.concat(a, " ", 2), "miner")
+        if name then print("hostname set: " .. name) else print(tostring(err)) end
+      end
     elseif cmd == "set1" then
       markHere("loc1")
     elseif cmd == "set2" then

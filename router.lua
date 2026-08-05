@@ -338,6 +338,7 @@ local function consoleLoop()
     elseif cmd == "help" then
       print("devices  - list remembered systems (ONLINE / OFFLINE)")
       print("forget <id|host> - remove a system from the remembered roster")
+      print("hostname [name] - get or set this router's hostname")
       print("ping     - re-discover the network")
       print("stats    - relay + online/offline counts")
       print("gpshost [x y z] - show / set this router's GPS host coords")
@@ -375,6 +376,20 @@ local function consoleLoop()
           saveRoster()
         else
           print("Unknown system: " .. tostring(ref))
+        end
+      end
+    elseif cmd == "hostname" or cmd == "host" then
+      if not a[2] then
+        print("hostname: " .. (os.getComputerLabel() or "(none)"))
+      else
+        local name = table.concat(a, " ", 2)
+        if titanLib then
+          local ok, err = titanLib.setHostname(name, "router")
+          if ok then print("hostname set: " .. ok) else print(tostring(err)) end
+        else
+          os.setComputerLabel(name)
+          rednet.broadcast({ type = "hello", kind = "router", name = name, hostname = name }, PROTO_ROUTER)
+          print("hostname set: " .. name)
         end
       end
     elseif cmd == "ping" then

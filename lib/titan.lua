@@ -178,6 +178,8 @@ titan.ROUTER_PROTOCOL = "titan_router"
 -- Hostname shared on every network registration. Uses the computer label; if
 -- none is set yet, assigns "<Kind>-<id>" (e.g. Worker-12) so the roster never
 -- shows a blank name.
+local lastAnnounceKind = "device"
+
 function titan.hostname(kind)
   local label = os.getComputerLabel()
   if label and label ~= "" then return label end
@@ -190,10 +192,22 @@ function titan.hostname(kind)
   return label
 end
 
+-- Set the network hostname (computer label) and re-announce to the router so
+-- the roster updates immediately. Returns the new hostname, or nil + err.
+function titan.setHostname(name, kind)
+  name = tostring(name or ""):gsub("^%s+", ""):gsub("%s+$", "")
+  if name == "" then return nil, "empty hostname" end
+  if #name > 32 then return nil, "hostname too long (max 32)" end
+  os.setComputerLabel(name)
+  titan.announce(kind or lastAnnounceKind)
+  return name
+end
+
 function titan.announce(kind)
-  local host = titan.hostname(kind)
+  if type(kind) == "string" and kind ~= "" then lastAnnounceKind = kind end
+  local host = titan.hostname(lastAnnounceKind)
   rednet.broadcast({
-    type = "hello", kind = kind, name = host, hostname = host,
+    type = "hello", kind = lastAnnounceKind, name = host, hostname = host,
   }, titan.ROUTER_PROTOCOL)
 end
 
@@ -511,6 +525,31 @@ function titan.writeManifest(m)
   local f = fs.open(titan.MANIFEST, "w"); f.write(textutils.serialize(m)); f.close()
 end
 
+-- Return install package info for display, or nil + error.
+-- { source, role, run, base, files = { { path, size, present }, ... } }
+function titan.listPackages()
+  local m = titan.readManifest()
+  if not m or type(m.files) ~= "table" then
+    return nil, "no install manifest (.titan-install) — re-install this device with an installer"
+  end
+  local files = {}
+  for _, path in ipairs(m.files) do
+    local present = fs.exists(path) and not fs.isDir(path)
+    files[#files + 1] = {
+      path = path,
+      present = present,
+      size = present and fs.getSize(path) or 0,
+    }
+  end
+  return {
+    source = m.source or "?",
+    role = m.role or "?",
+    run = m.run,
+    base = m.base,
+    files = files,
+  }
+end
+
 local function otaWriteFile(path, data)
   local dir = fs.getDir(path)
   if dir and dir ~= "" and not fs.exists(dir) then fs.makeDir(dir) end
@@ -552,8 +591,10 @@ local function otaFromHost(hostId, path)
   return nil, "timeout"
 end
 
--- Re-download this device's files from its install source. Returns ok, err.
-function titan.updateSelf()
+-- Re-download this device's files from its install source.
+-- opts.onProgress(path, ok, detail) is optional. Returns ok, err.
+function titan.updateSelf(opts)
+  opts = opts or {}
   local m = titan.readManifest()
   if not m or type(m.files) ~= "table" then
     return false, "no install manifest (.titan-install) on this device"
@@ -571,20 +612,26 @@ function titan.updateSelf()
     end
   elseif m.source == "host" then
     local hostId = otaFindHost(3)
-    if not hostId then return false, "no install host online" end
+    if not hostId then return false, "no install host online (run host.lua on the install computer)" end
     getter = function(path) return otaFromHost(hostId, path) end
   else
     return false, "unknown install source: " .. tostring(m.source)
   end
 
-  local failed = {}
+  local failed, okCount = {}, 0
   for _, path in ipairs(m.files) do
     local data, err = getter(path)
-    if data then otaWriteFile(path, data)
-    else failed[#failed + 1] = path .. " (" .. tostring(err) .. ")" end
+    if data then
+      otaWriteFile(path, data)
+      okCount = okCount + 1
+      if opts.onProgress then opts.onProgress(path, true, #data .. "b") end
+    else
+      failed[#failed + 1] = path .. " (" .. tostring(err) .. ")"
+      if opts.onProgress then opts.onProgress(path, false, tostring(err)) end
+    end
   end
   if #failed > 0 then return false, "failed: " .. table.concat(failed, ", ") end
-  return true
+  return true, okCount
 end
 
 --------------------------------------------------------------------------------

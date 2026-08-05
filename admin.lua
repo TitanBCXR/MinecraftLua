@@ -190,7 +190,16 @@ local function consoleLoop()
       print("DEPLOY: deploy <bot> <builder|gatherer> <name> [x y z]")
       print("BUILD: scan <bot> <name> <W H L> | build <bot> <name> [x y z]")
       print("ssh <id|label> [cmd...]  remote shell (master password)")
+      print("hostname [name]  get or set this tablet's hostname")
       print("login | lock | exit")
+
+    elseif cmd == "hostname" or cmd == "host" then
+      if not a[2] then
+        print("hostname: " .. (os.getComputerLabel() or "?"))
+      else
+        local name, err = titan.setHostname(table.concat(a, " ", 2), "admin")
+        if name then print("hostname set: " .. name) else print(tostring(err)) end
+      end
 
     elseif cmd == "live" then
       liveView()

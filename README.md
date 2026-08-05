@@ -422,10 +422,20 @@ run <prog> ...    run a program
 label [name]      get/set the label      id               show computer id
 time              in-game time and day   about            version info
 pos               locate via GPS         net              find Titan router
+hostname [name]   get or set network hostname (updates router roster)
+packages          list installed Titan packages (from `.titan-install`)
+packages update   re-download those packages from their install source
+update [-y]       same as `packages update` (`-y` reboots without asking)
 ssh <id|label> [cmd...]   remote shell (master password)
 reboot|shutdown   power control
 exit | quit       leave the console
 ```
+
+`hostname MyBase-PC` sets the computer label and immediately re-registers with
+the router so the status board shows the new name. Alias: `host`.
+
+`packages` / `update` use the install manifest written by the installer. GitHub
+and pastebin sources pull over HTTP; `host` source needs `host.lua` online.
 
 ---
 
@@ -545,7 +555,8 @@ computer with a wireless (ideally **ender**) modem. It does three things:
   the `gpshost <x> <y> <z>` console command.
 
 Install it via the installer → **"Network router"** (option **11**). Console:
-`devices`, `forget`, `ping`, `stats`, `gpshost`, `update`, `ssh`, `exit`.
+`devices`, `forget`, `hostname`, `ping`, `stats`, `gpshost`, `update`, `ssh`,
+`exit`.
 
 **OTA update:** from the main router console, run `update` (confirms first).
 Every device that was installed via an installer (and has a `.titan-install`
