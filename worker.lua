@@ -390,7 +390,7 @@ end
 -- Blocking loop for a brand-new (unconfigured) worker: beacon + wait for deploy.
 local function awaitDeployment()
   setStatus("await", "awaiting deployment")
-  os.setComputerLabel("worker-" .. os.getComputerID())
+  os.setComputerLabel(os.getComputerLabel() or ("worker-" .. os.getComputerID()))
   print("Unconfigured worker. Waiting for the Parent Center to deploy me...")
   print("(An admin must log into the Parent Center and run 'deploy'.)")
   local beacon = os.startTimer(0)

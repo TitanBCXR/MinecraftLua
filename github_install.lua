@@ -119,6 +119,20 @@ end
 
 print("")
 print("Install complete.")
+
+-- Give this device a role-based label if it doesn't have one yet.
+local LABELS = {
+  ["hub.lua"] = "Hub", ["bot.lua"] = "Bot", ["poi.lua"] = "POI",
+  ["datacenter.lua"] = "ParentCenter", ["botserver.lua"] = "BotsComputer",
+  ["worker.lua"] = "Worker", ["console.lua"] = "Console",
+  ["admin.lua"] = "Admin", ["host.lua"] = "Host",
+}
+local lbl = role.run and LABELS[role.run]
+if lbl and not os.getComputerLabel() then
+  os.setComputerLabel(lbl .. "-" .. os.getComputerID())
+  print("Label set: " .. os.getComputerLabel())
+end
+
 if role.run then
   write("Auto-run " .. role.run .. " on boot? [Y/n] ")
   local yn = read():lower()

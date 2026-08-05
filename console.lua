@@ -18,6 +18,9 @@ local commands = {}                       -- name -> { help = str, fn = function
 local history  = {}
 local cwd      = (shell and shell.dir()) or ""
 
+-- Give this device a friendly label if it doesn't have one yet.
+os.setComputerLabel(os.getComputerLabel() or ("Console-" .. os.getComputerID()))
+
 --------------------------------------------------------------------------------
 -- Helpers
 --------------------------------------------------------------------------------
