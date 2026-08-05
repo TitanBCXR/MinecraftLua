@@ -1,10 +1,9 @@
 --[[
   locator.lua  -  Pocket GPS locator for the Titan network (CC: Tweaked)
-  Titan-Version: 1.1.4
+  Titan-Version: 1.1.9
 
-  A handheld you carry: live GPS, waypoints, and a top-down RADAR GRID of
-  routers / modems relative to YOU (pocket PC at center). Modems named by
-  compass from the main router (North, East, NE-1, …) light up on the map.
+  A handheld you carry: live GPS, waypoints, and a top-down fleet map matching
+  the main router's `map` command — grid (- _ | \ /), r=main, m=modem, @=you.
 
   Requires: a POCKET computer with a WIRELESS MODEM upgrade, `lib/titan.lua`,
   and an existing GPS constellation in range (see README).
@@ -13,7 +12,7 @@
   router.lua / gpshost.lua for that. This tool only LOCATES.
 
   Run:  locator
-  Tip:  `live` opens the radar (default focus). +/- zoom, Tab cycles modems.
+  Tip:  `live` opens the map. +/- zoom, F fit, Tab focus, Q quit.
 ]]
 
 local titan = dofile("lib/titan.lua")
@@ -30,8 +29,9 @@ local bots      = {}     -- [id]   = { name, botType, x, y, z, state, seen }
 local nodes     = {}     -- [id]   = { name, kind, x, y, z, seen } routers/modems
 local last      = nil    -- last position, for movement-based heading
 local headAngle = nil    -- degrees (0=N,90=E,...) from last movement
-local mapScale  = 8      -- blocks per cell (zoom)
+local mapScale  = 16     -- blocks per cell (zoomed out, matches router map)
 local focusIdx  = 1      -- which modem/router is highlighted
+local autoFitOnce = true
 
 --------------------------------------------------------------------------------
 -- Config
@@ -100,14 +100,26 @@ end
 local function upsertNode(id, entry)
   if not id or not entry then return end
   local prev = nodes[id] or {}
+  local isMain = entry.main
+  if isMain == nil then
+    isMain = prev.main
+  end
+  if entry.kind == "router" and (entry.main == true) then isMain = true end
   nodes[id] = {
     name = entry.name or entry.hostname or prev.name or ("#" .. id),
     kind = entry.kind or prev.kind or "modem",
+    main = isMain and true or false,
     x = tonumber(entry.x) or prev.x,
     y = tonumber(entry.y) or prev.y,
     z = tonumber(entry.z) or prev.z,
     seen = os.epoch("utc"),
   }
+  -- Only one main: clear main flag on others when we learn a new main.
+  if nodes[id].main then
+    for oid, n in pairs(nodes) do
+      if oid ~= id then n.main = false end
+    end
+  end
 end
 
 --------------------------------------------------------------------------------
@@ -118,11 +130,18 @@ local function handleRouterMsg(id, msg)
   if type(msg) ~= "table" or not id then return end
   if msg.type == "fleet_map" and type(msg.nodes) == "table" then
     for _, n in ipairs(msg.nodes) do
-      if n.id and n.x then upsertNode(n.id, n) end
+      if n.id and n.x then
+        local main = (n.kind == "router" and n.main)
+          or (tonumber(n.id) == tonumber(msg.from))
+        upsertNode(n.id, {
+          name = n.name, kind = n.kind or "modem",
+          main = main, x = n.x, y = n.y, z = n.z,
+        })
+      end
     end
     if msg.x then
       upsertNode(id, {
-        name = msg.name or msg.hostname, kind = "router",
+        name = msg.name or msg.hostname, kind = "router", main = true,
         x = msg.x, y = msg.y, z = msg.z,
       })
     end
@@ -130,9 +149,12 @@ local function handleRouterMsg(id, msg)
           or msg.type == "main_here" or msg.type == "here")
          and msg.x and (msg.kind == "modem" or msg.kind == "router"
            or msg.main or msg.type == "main_claim" or msg.type == "main_here") then
+    local isMain = msg.main or msg.type == "main_claim" or msg.type == "main_here"
+      or msg.kind == "router"
     upsertNode(id, {
       name = msg.assignHostname or msg.hostname or msg.name or msg.label,
-      kind = msg.kind or (msg.main and "router") or "modem",
+      kind = isMain and "router" or (msg.kind or "modem"),
+      main = isMain,
       x = msg.x, y = msg.y, z = msg.z,
     })
   end
@@ -167,12 +189,14 @@ local function freshNodes()
   for id, n in pairs(nodes) do
     if n.x and n.z and (now - (n.seen or 0)) < 120000 then
       list[#list + 1] = {
-        id = id, name = n.name, kind = n.kind,
+        id = id, name = n.name, kind = n.kind, main = n.main,
         x = n.x, y = n.y, z = n.z,
       }
     end
   end
+  -- Modems first, main last (draw order); then by name.
   table.sort(list, function(a, b)
+    if a.main ~= b.main then return not a.main end
     local ka = (a.kind == "router" and "0" or "1") .. tostring(a.name)
     local kb = (b.kind == "router" and "0" or "1") .. tostring(b.name)
     return ka < kb
@@ -180,8 +204,32 @@ local function freshNodes()
   return list
 end
 
+-- Same background art as router.lua `map` (- _ | \ /).
+local function mapGridChar(relX, relZ)
+  if relX == 0 and relZ == 0 then return "+" end
+  if relX == 0 then return "|" end
+  if relZ == 0 then return "-" end
+  if relX == relZ then return "\\" end
+  if relX == -relZ then return "/" end
+  if relZ % 4 == 0 then return "_" end
+  if relX % 4 == 0 then return "|" end
+  if (relX + relZ) % 6 == 0 then return "/" end
+  if (relX - relZ) % 6 == 0 then return "\\" end
+  if relZ % 2 == 0 then return "-" end
+  return " "
+end
+
+local function mapAutoScale(list, ox, oz, gw, gh)
+  local maxD = 8
+  for _, n in ipairs(list) do
+    maxD = math.max(maxD, math.abs(n.x - ox), math.abs(n.z - oz))
+  end
+  local half = math.max(2, math.floor(math.min(gw, gh) / 2) - 1)
+  return math.max(2, math.ceil(maxD / half))
+end
+
 --------------------------------------------------------------------------------
--- Live radar GRID (pocket at center; highlight focused modem)
+-- Live map (matches main router `map`: grid -_|\/  r=main m=modem @=you)
 --------------------------------------------------------------------------------
 local function drawRadar()
   local tw, th = term.getSize()
@@ -201,7 +249,7 @@ local function drawRadar()
   local px, py, pz = locate()
   if not px then
     put(1, 1, "No GPS fix — need 4+ GPS hosts", colors.red)
-    put(1, 3, "[any key] exit  [R] refresh map", colors.gray)
+    put(1, 3, "[Q] quit  [R] refresh map", colors.gray)
     return
   end
 
@@ -210,18 +258,7 @@ local function drawRadar()
     rednet.broadcast({ type = "map_req" }, ROUTER)
     rednet.broadcast({ type = "where_main" }, ROUTER)
   end
-  if focusIdx > #list then focusIdx = math.max(1, #list) end
-  if focusIdx < 1 then focusIdx = 1 end
-  local focus = list[focusIdx]
 
-  -- Header
-  put(1, 1, ("@ %d,%d,%d  zoom:%dm/cell"):format(px, py, pz, mapScale), colors.yellow)
-  local head = headAngle
-    and cardinal(math.sin(math.rad(headAngle)), -math.cos(math.rad(headAngle)))
-    or "?"
-  put(1, 2, ("facing %s   N=up"):format(head), colors.lightGray)
-
-  -- Grid area (leave rows 1-2 header, last 3 footer)
   local top, bottom = 3, th - 3
   local left, right = 1, tw
   local gw, gh = right - left + 1, bottom - top + 1
@@ -229,64 +266,57 @@ local function drawRadar()
     put(1, 3, "Screen too small", colors.red)
     return
   end
+
+  if autoFitOnce then
+    mapScale = mapAutoScale(list, px, pz, gw, gh)
+    autoFitOnce = false
+  end
+
+  if focusIdx > #list then focusIdx = math.max(1, #list) end
+  if focusIdx < 1 then focusIdx = 1 end
+  local focus = list[focusIdx]
+
+  put(1, 1, ("FLEET MAP  @ %d,%d,%d  %dm/cell"):format(px, py, pz, mapScale), colors.yellow)
+  put(1, 2, "r=main  m=modem  @=you  N=up  +/- zoom  F fit  Tab focus  Q quit", colors.lightGray)
+
   local cx = left + math.floor(gw / 2)
   local cy = top + math.floor(gh / 2)
 
-  -- Background grid dots every 4 cells
   for gy = top, bottom do
     for gx = left, right do
-      local relX = gx - cx
-      local relZ = gy - cy
-      if relX == 0 or relZ == 0 then
-        put(gx, gy, (relX == 0 and relZ == 0) and " " or "·", colors.gray)
-      elseif relX % 4 == 0 and relZ % 4 == 0 then
-        put(gx, gy, "·", colors.gray)
-      else
-        put(gx, gy, " ", colors.black)
-      end
+      put(gx, gy, mapGridChar(gx - cx, gy - cy), colors.gray)
     end
   end
-  -- Axis cross
-  for gx = left, right do put(gx, cy, "─", colors.gray) end
-  for gy = top, bottom do put(cx, gy, "│", colors.gray) end
-  put(cx, cy, "+", colors.lightGray)
   put(cx, top, "N", colors.white)
   put(right, cy, "E", colors.white)
   put(cx, bottom, "S", colors.white)
   put(left, cy, "W", colors.white)
 
-  -- Plot nodes (world: +X east = right, +Z south = down on screen)
   local function cellOf(wx, wz)
-    local dx = math.floor((wx - px) / mapScale + 0.5)
-    local dz = math.floor((wz - pz) / mapScale + 0.5)
-    return cx + dx, cy + dz
+    return cx + math.floor((wx - px) / mapScale + 0.5),
+           cy + math.floor((wz - pz) / mapScale + 0.5)
   end
 
-  for i, n in ipairs(list) do
+  for _, n in ipairs(list) do
     local sx, sy = cellOf(n.x, n.z)
     local isFocus = focus and n.id == focus.id
-    local ch = (n.kind == "router") and "R" or "M"
-    local fg, bg = colors.lime, colors.black
-    if n.kind == "router" then fg = colors.cyan end
+    local isMain = n.main or n.kind == "router"
+    local ch = isMain and "r" or "m"
+    local fg = isMain and colors.cyan or colors.lime
+    local bg = colors.black
     if isFocus then
-      fg = colors.black
-      bg = colors.orange
-      ch = (n.kind == "router") and "R" or "M"
+      fg, bg = colors.black, colors.orange
     end
     put(sx, sy, ch, fg, bg)
   end
 
-  -- You are here (draw last so always on top)
+  -- You are here (always on top)
   put(cx, cy, "@", colors.yellow, colors.black)
 
-  -- Footer: focused modem highlight details
   local fy = th - 2
   if focus and focus.x then
-    local dist, card = bearingTo(px, py, pz, focus.x, focus.y or py, focus.z)
-    local label = ("%s %s"):format(
-      (focus.kind == "router") and "ROUTER" or "MODEM",
-      tostring(focus.name):sub(1, 12))
-    put(1, fy, label, colors.orange)
+    local tag = (focus.main or focus.kind == "router") and "r" or "m"
+    put(1, fy, ("%s:%s"):format(tag, tostring(focus.name):sub(1, 14)), colors.orange)
     put(1, fy + 1, ("%s  %d,%d,%d"):format(
       fmtTarget(px, py, pz, focus.x, focus.y or py, focus.z),
       focus.x, focus.y or 0, focus.z), colors.white)
@@ -294,9 +324,9 @@ local function drawRadar()
     put(1, fy, "No routers/modems on map yet", colors.gray)
     put(1, fy + 1, "Waiting for fleet_map from main…", colors.gray)
   end
-  put(1, th, "[Tab]focus +/-zoom [R]map [Q]quit", colors.gray)
+  put(1, th, ("nodes:%d  scale:%d  [+/-] [F]fit [Tab]focus [R]refresh [Q]"):format(
+    #list, mapScale), colors.gray)
 
-  -- Reset colors
   if term.isColor and term.isColor() then
     term.setBackgroundColor(colors.black)
     term.setTextColor(colors.white)
@@ -305,6 +335,8 @@ end
 
 local function liveView()
   rednet.broadcast({ type = "map_req", name = os.getComputerLabel() }, ROUTER)
+  rednet.broadcast({ type = "where_main" }, ROUTER)
+  autoFitOnce = true
   local timer = os.startTimer(0.5)
   while true do
     drawRadar()
@@ -319,11 +351,11 @@ local function liveView()
         local n = #freshNodes()
         if n > 0 then focusIdx = (focusIdx % n) + 1 end
       elseif key == keys.equals or key == keys.numPadAdd then
-        mapScale = math.max(2, math.floor(mapScale / 2))
-        saveCfg()
+        mapScale = math.max(2, math.floor(mapScale / 2)); saveCfg()
       elseif key == keys.minus or key == keys.numPadSubtract then
-        mapScale = math.min(128, mapScale * 2)
-        saveCfg()
+        mapScale = math.min(256, mapScale * 2); saveCfg()
+      elseif key == keys.f then
+        autoFitOnce = true
       elseif key == keys.r then
         rednet.broadcast({ type = "map_req" }, ROUTER)
         rednet.broadcast({ type = "where_main" }, ROUTER)
@@ -340,14 +372,17 @@ local function liveView()
       if ch == "+" or ch == "=" then
         mapScale = math.max(2, math.floor(mapScale / 2)); saveCfg()
       elseif ch == "-" then
-        mapScale = math.min(128, mapScale * 2); saveCfg()
+        mapScale = math.min(256, mapScale * 2); saveCfg()
+      elseif ch == "f" or ch == "F" then
+        autoFitOnce = true
       elseif ch == "q" or ch == "Q" then
         break
       elseif ch == "r" or ch == "R" then
         rednet.broadcast({ type = "map_req" }, ROUTER)
+        rednet.broadcast({ type = "where_main" }, ROUTER)
       end
       timer = os.startTimer(0.1)
-    elseif ev == "mouse_click" or ev == "terminate" then
+    elseif ev == "terminate" then
       break
     end
   end
@@ -375,8 +410,9 @@ local function consoleLoop()
       -- ignore
     elseif cmd == "help" then
       print("here            show current position")
-      print("live            radar grid (@=you, M=modem, R=router)")
-      print("               Tab focus modem  +/- zoom  R refresh")
+      print("live            fleet map (same as router map)")
+      print("               r=main m=modem @=you  grid -_|\\/")
+      print("               +/- zoom  F fit  Tab focus  R refresh  Q quit")
       print("modems|map      list routers/modems with bearing")
       print("mark <name>     save current spot as a waypoint")
       print("wp              list waypoints w/ distance + bearing")

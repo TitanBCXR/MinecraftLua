@@ -1,6 +1,6 @@
 --[[
   router.lua  -  Titan network router / repeater (CC: Tweaked)
-  Titan-Version: 1.1.6
+  Titan-Version: 1.1.9
 
   Place one (or several) of these to tie the whole network together over
   wireless. Roles:
@@ -9,7 +9,8 @@
             Devices re-auth to the main router after boot / fleet update.
             Attach up to 3+ monitors for ROSTER / STATS / GPS boards.
     MODEM - repeater (+ optional GPS host) only. Use for coverage; not the
-            network authority. Set with `modem` / promote with `main`.
+            network authority. Main assigns each a unique name from a pool;
+            the modem sets it and reboots once. Set with `modem` / `main`.
 
     1. REPEATER - re-transmits rednet traffic (same idea as `repeat`) so devices
        out of direct range still reach each other. Both roles do this.
@@ -79,43 +80,133 @@ local function patchRouterCfg(patch)
 end
 local function isMain() return routerRole == "main" end
 
--- Compass sector from main GPS toward (x,z). MC: N=-Z, E=+X.
--- Cardinals -> North/East/South/West; diagonals -> NE/SE/SW/NW (numbered).
-local function sectorInfo(x, z)
+--------------------------------------------------------------------------------
+-- Modem name registry (MAIN): unique names from a pool, persisted in router.cfg.
+-- Modems hello -> main assigns a free name -> modem sets label and reboots.
+--------------------------------------------------------------------------------
+local DEFAULT_NAME_POOL = {
+  "North", "East", "South", "West",
+  "NE", "SE", "SW", "NW", "Center",
+  "North-2", "East-2", "South-2", "West-2",
+  "NE-2", "SE-2", "SW-2", "NW-2",
+  "Alpha", "Bravo", "Charlie", "Delta", "Echo", "Foxtrot",
+}
+
+-- nameAssign[id] = "North"  (persisted)
+local nameAssign = {}
+
+local function loadNameRegistry()
+  local c = loadRouterCfg() or {}
+  nameAssign = {}
+  if type(c.nameAssign) == "table" then
+    for k, v in pairs(c.nameAssign) do
+      local id = tonumber(k) or k
+      if type(v) == "string" and v ~= "" then nameAssign[id] = v end
+    end
+  end
+  if type(c.namePool) == "table" and #c.namePool > 0 then
+    return c.namePool
+  end
+  return DEFAULT_NAME_POOL
+end
+
+local function saveNameRegistry(pool)
+  local assign = {}
+  for id, name in pairs(nameAssign) do
+    assign[tostring(id)] = name
+  end
+  local patch = { nameAssign = assign }
+  if pool then patch.namePool = pool end
+  patchRouterCfg(patch)
+end
+
+local function namePool()
+  local c = loadRouterCfg() or {}
+  if type(c.namePool) == "table" and #c.namePool > 0 then return c.namePool end
+  return DEFAULT_NAME_POOL
+end
+
+local function nameTaken(name, exceptId)
+  if not name then return true end
+  local want = name:lower()
+  for id, n in pairs(nameAssign) do
+    if id ~= exceptId and tostring(n):lower() == want then return true end
+  end
+  for id, d in pairs(seen) do
+    if id ~= exceptId and d.kind == "modem" then
+      local h = tostring(d.hostname or d.name or ""):lower()
+      if h == want then return true end
+    end
+  end
+  return false
+end
+
+-- Preferred pool entry from GPS bearing (still unique via registry).
+local function preferredSectorName(x, z)
   if not gpsCoords or not x or not z then return nil end
   local dx, dz = x - gpsCoords.x, z - gpsCoords.z
-  if dx == 0 and dz == 0 then
-    return { oct = -1, base = "Center", cardinal = true }
-  end
+  if dx == 0 and dz == 0 then return "Center" end
   local a = (math.deg(math.atan2(dx, -dz)) + 360) % 360
   local oct = math.floor((a + 22.5) / 45) % 8
   local bases = {
     [0] = "North", [1] = "NE", [2] = "East", [3] = "SE",
     [4] = "South", [5] = "SW", [6] = "West", [7] = "NW",
   }
-  return { oct = oct, base = bases[oct], cardinal = (oct % 2 == 0) }
+  return bases[oct]
 end
 
--- Unique hostname for a modem/router at (x,z) relative to main.
-local function allocateSectorName(x, z, id)
-  local info = sectorInfo(x, z)
-  if not info then return "Modem-" .. tostring(id) end
-  if info.base == "Center" then return "Center" end
-  local peers = { id }
-  for sid, d in pairs(seen) do
-    if sid ~= id and d.x and d.z
-       and (d.kind == "modem" or d.kind == "router") then
-      local o = sectorInfo(d.x, d.z)
-      if o and o.oct == info.oct then peers[#peers + 1] = sid end
+-- Assign or return the stable unique name for this modem id.
+-- Returns name, isNew (true if first assignment or renamed).
+local function allocateModemName(id, x, z, currentName)
+  loadNameRegistry()
+  if nameAssign[id] then
+    return nameAssign[id], (currentName ~= nameAssign[id])
+  end
+  -- Keep current label if it's already a unique registry-style name we issued.
+  if currentName and currentName ~= "" and not nameTaken(currentName, id)
+     and not tostring(currentName):lower():match("^modem%-pending")
+     and not tostring(currentName):lower():match("^modem%-" .. tostring(id) .. "$")
+     and not tostring(currentName):lower():match("^router%-") then
+    -- Only reclaim if it looks like a pool name or was previously ours.
+    local poolHit = false
+    for _, n in ipairs(namePool()) do
+      if n:lower() == currentName:lower() then poolHit = true; break end
+    end
+    if poolHit then
+      nameAssign[id] = currentName
+      saveNameRegistry()
+      return currentName, false
     end
   end
-  table.sort(peers)
-  local rank = 1
-  for i, sid in ipairs(peers) do
-    if sid == id then rank = i; break end
+
+  local candidates = {}
+  local pref = preferredSectorName(x, z)
+  if pref then
+    candidates[#candidates + 1] = pref
+    for i = 2, 9 do candidates[#candidates + 1] = pref .. "-" .. i end
   end
-  if info.cardinal and rank == 1 then return info.base end
-  return info.base .. "-" .. tostring(rank)
+  for _, n in ipairs(namePool()) do candidates[#candidates + 1] = n end
+  candidates[#candidates + 1] = "Modem-" .. tostring(id)
+
+  for _, n in ipairs(candidates) do
+    if not nameTaken(n, id) then
+      nameAssign[id] = n
+      saveNameRegistry()
+      return n, true
+    end
+  end
+  local fallback = "Modem-" .. tostring(id) .. "-" .. tostring(os.epoch("utc") % 10000)
+  nameAssign[id] = fallback
+  saveNameRegistry()
+  return fallback, true
+end
+
+local function releaseModemName(id)
+  loadNameRegistry()
+  if nameAssign[id] then
+    nameAssign[id] = nil
+    saveNameRegistry()
+  end
 end
 
 local function claimMain()
@@ -197,7 +288,9 @@ local function statusRank(d)
 end
 
 -- Persist remembered systems so the monitor still lists them when offline.
+-- Roster file is MAIN-only. Modems must not keep router_roster.cfg.
 local function saveRoster()
+  if not isMain() then return end
   local list = {}
   for id, d in pairs(seen) do
     list[tostring(id)] = {
@@ -213,6 +306,7 @@ local function saveRoster()
 end
 
 local function loadRoster()
+  if not isMain() then return 0 end
   if not fs.exists(ROSTER) then return 0 end
   local f = fs.open(ROSTER, "r"); local d = textutils.unserialize(f.readAll()); f.close()
   if type(d) ~= "table" then return 0 end
@@ -233,6 +327,16 @@ local function loadRoster()
   return n
 end
 
+local function clearRosterIfModem()
+  if isMain() then return end
+  seen = {}
+  rosterDirty = false
+  if fs.exists(ROSTER) then
+    pcall(fs.delete, ROSTER)
+    print("Removed " .. ROSTER .. " (MAIN-only).")
+  end
+end
+
 -- Sorted id list: ONLINE, UNKNOWN, OFFLINE, then hostname, then id.
 local function sortedIds()
   local ids = {}
@@ -247,11 +351,6 @@ local function sortedIds()
     return a < b
   end)
   return ids
-end
-
-local remembered = loadRoster()
-if remembered > 0 then
-  print(("Loaded %d remembered system(s) from %s."):format(remembered, ROSTER))
 end
 
 -- Guess a device's role from the message it sent.
@@ -298,67 +397,111 @@ end
 
 --------------------------------------------------------------------------------
 -- 2) Directory  (roster + register / main-router handshake) — MAIN only
+-- Roster (router_roster.cfg) lives ONLY on the main router.
 --------------------------------------------------------------------------------
+local function mainReplyBase()
+  local rname = os.getComputerLabel() or ("Router-" .. os.getComputerID())
+  local on, off = countOnlineOffline()
+  local reply = {
+    label = rname, hostname = rname,
+    main = true, mainRouterId = os.getComputerID(),
+    devices = on, online = on, offline = off,
+  }
+  if gpsCoords then
+    reply.x, reply.y, reply.z = gpsCoords.x, gpsCoords.y, gpsCoords.z
+  end
+  return reply
+end
+
+-- Register a device into the MAIN roster; optionally assign a modem name.
+-- Returns assignHostname, assignReboot for the reply.
+local function rosterTouch(id, msg, kind, doAssign)
+  local prev = seen[id]
+  local host = msg.hostname or msg.name or (prev and (prev.hostname or prev.name))
+  local wasOnline = prev and isOnline(prev)
+  local px = tonumber(msg.x) or (prev and prev.x)
+  local py = tonumber(msg.y) or (prev and prev.y)
+  local pz = tonumber(msg.z) or (prev and prev.z)
+  local assignHostname, assignReboot = nil, false
+  local isModem = (kind == "modem" or msg.kind == "modem")
+  if doAssign and isModem and msg.autoName ~= false then
+    local name, isNew = allocateModemName(id, px, pz, host)
+    assignHostname = name
+    host = name
+    local cur = tostring(msg.hostname or msg.name or "")
+    assignReboot = isNew or (cur:lower() ~= name:lower())
+  end
+  seen[id] = {
+    name = host, hostname = host,
+    kind = kind or (prev and prev.kind) or "device",
+    seen = now(), x = px, y = py, z = pz,
+  }
+  rosterDirty = true
+  if not prev then
+    print(("[+] %s #%d (%s) ONLINE"):format(seen[id].hostname or "?", id, seen[id].kind))
+  elseif host and prev.hostname ~= host and prev.name ~= host then
+    print(("[~] #%d hostname -> %s"):format(id, host))
+  elseif prev and not wasOnline then
+    print(("[*] %s #%d back ONLINE"):format(host or "?", id))
+  end
+  if assignHostname and assignReboot then
+    print(("[name] #%d <- %s (modem will reboot)"):format(id, assignHostname))
+  end
+  return assignHostname, assignReboot
+end
+
 local function directoryLoop()
-  rednet.broadcast({ type = "ping" }, "titan_net")   -- nudge everyone to announce
+  rednet.broadcast({ type = "ping" }, "titan_net")
   rednet.broadcast({ type = "ping" }, "titan_dc")
   claimMain()
   broadcastFleetMap()
   while true do
     local id, msg, proto = rednet.receive()
     if type(msg) == "table" and id then
-      local kind = classify(msg)
-      local prev = seen[id]
-      -- Prefer explicit hostname from registration; fall back to name / prior.
-      local host = msg.hostname or msg.name or (prev and (prev.hostname or prev.name))
-      local wasOnline = prev and isOnline(prev)
-      local px = tonumber(msg.x) or (prev and prev.x)
-      local py = tonumber(msg.y) or (prev and prev.y)
-      local pz = tonumber(msg.z) or (prev and prev.z)
-      -- Main assigns compass hostnames to modems (and unnamed routers) with GPS.
-      local assignHostname = nil
-      if proto == PROTO_ROUTER and msg.type == "hello"
-         and px and pz and (kind == "modem" or msg.kind == "modem"
-           or (kind == "router" and msg.autoName)) then
-        assignHostname = allocateSectorName(px, pz, id)
-        host = assignHostname
-      end
-      seen[id] = {
-        name = host,
-        hostname = host,
-        kind = kind or (prev and prev.kind) or "device",
-        seen = now(),
-        x = px, y = py, z = pz,
-      }
-      rosterDirty = true
-      if not prev then
-        print(("[+] %s #%d (%s) ONLINE"):format(seen[id].hostname or "?", id, seen[id].kind))
-      elseif host and prev.hostname ~= host and prev.name ~= host then
-        print(("[~] #%d hostname -> %s"):format(id, host))
-      elseif prev and not wasOnline then
-        print(("[*] %s #%d back ONLINE"):format(host or "?", id))
-      end
-      if proto == PROTO_ROUTER then
-        local rname = os.getComputerLabel() or ("Router-" .. os.getComputerID())
-        local on, off = countOnlineOffline()
-        local reply = {
-          label = rname, hostname = rname,
-          main = true, mainRouterId = os.getComputerID(),
-          devices = on, online = on, offline = off,
-        }
-        if gpsCoords then
-          reply.x, reply.y, reply.z = gpsCoords.x, gpsCoords.y, gpsCoords.z
+      -- Hopped modem hello: peer modem forwarded a device that can't hear main.
+      if proto == PROTO_ROUTER and msg.type == "hop_hello" and tonumber(msg.from) then
+        local src = tonumber(msg.from)
+        local hello = type(msg.hello) == "table" and msg.hello or msg
+        hello.kind = hello.kind or "modem"
+        local assignHostname, assignReboot = rosterTouch(src, hello, "modem", true)
+        local reply = mainReplyBase()
+        reply.type = "hop_reply"
+        reply.dest = src
+        reply.via = id
+        if assignHostname then
+          reply.assignHostname = assignHostname
+          reply.reboot = assignReboot and true or false
         end
-        if assignHostname then reply.assignHostname = assignHostname end
+        rednet.send(id, reply, PROTO_ROUTER)
+
+      elseif proto == PROTO_ROUTER and (msg.type == "hello" or msg.type == "where_main"
+          or msg.type == "map_req" or msg.type == "hop_find_main") then
+        local kind = classify(msg)
+        local assignHostname, assignReboot = nil, false
+        if msg.type == "hello" then
+          assignHostname, assignReboot = rosterTouch(id, msg, kind, true)
+        else
+          rosterTouch(id, msg, kind, false)
+        end
+        local reply = mainReplyBase()
+        if assignHostname then
+          reply.assignHostname = assignHostname
+          reply.reboot = assignReboot and true or false
+        end
         if msg.type == "hello" then
           reply.type = "here"
           rednet.send(id, reply, PROTO_ROUTER)
-        elseif msg.type == "where_main" then
+        elseif msg.type == "where_main" or msg.type == "hop_find_main" then
           reply.type = "main_here"
           rednet.send(id, reply, PROTO_ROUTER)
         elseif msg.type == "map_req" then
           broadcastFleetMap()
         end
+
+      else
+        -- Other protocols: remember presence only (no modem naming).
+        local kind = classify(msg)
+        if kind then rosterTouch(id, msg, kind, false) end
       end
     end
   end
@@ -707,13 +850,27 @@ local function pingLoop()
   end
 end
 
--- MODEM routers: GPS-aware naming (North/East/…) + announce + OTA.
+-- MODEM routers: mesh hop to MAIN (no local roster), accept unique name, reboot.
+-- rednet CHANNEL_REPEAT already relays; we also app-hop hello/where_main when
+-- a peer cannot hear main directly.
 local function modemLoop()
-  local mainPos = nil   -- { id, x, y, z }
   local manualName = false
+  local assignedName = nil
+  local mainId = nil
+  local mainInfo = nil   -- last main_here fields
+  local mainSeenAt = 0
+  local MAIN_STALE = 90  -- seconds without hearing main => rediscover via hops
+
   do
     local c = loadRouterCfg() or {}
     if c.manualHostname then manualName = true end
+    if type(c.assignedName) == "string" and c.assignedName ~= "" then
+      assignedName = c.assignedName
+      if os.getComputerLabel() ~= assignedName then
+        os.setComputerLabel(assignedName)
+      end
+    end
+    if tonumber(c.mainRouterId) then mainId = tonumber(c.mainRouterId) end
   end
 
   local function ownPos()
@@ -725,70 +882,149 @@ local function modemLoop()
     return nil
   end
 
-  local function localSectorName(mx, mz, x, z)
-    local dx, dz = x - mx, z - mz
-    if dx == 0 and dz == 0 then return "Center" end
-    local a = (math.deg(math.atan2(dx, -dz)) + 360) % 360
-    local oct = math.floor((a + 22.5) / 45) % 8
-    local bases = {
-      [0] = "North", [1] = "NE", [2] = "East", [3] = "SE",
-      [4] = "South", [5] = "SW", [6] = "West", [7] = "NW",
-    }
-    local base = bases[oct]
-    if oct % 2 == 0 then return base end
-    return base .. "-" .. tostring(os.getComputerID())
+  local function rememberMain(id, msg)
+    if not id or not msg then return end
+    if msg.main or msg.type == "main_claim" or msg.type == "main_here"
+       or msg.mainRouterId then
+      mainId = tonumber(msg.mainRouterId) or id
+      mainInfo = msg
+      mainSeenAt = os.clock()
+      patchRouterCfg({ mainRouterId = mainId })
+    end
   end
 
-  local function applyName(name)
-    if not name or name == "" or manualName then return end
+  local function applyAssignedName(name, shouldReboot)
+    if not name or name == "" or manualName then return false end
     local cur = os.getComputerLabel()
-    if cur ~= name then
-      os.setComputerLabel(name)
-      print("[gps] Hostname -> " .. name)
+    if cur == name and assignedName == name then
+      return false
     end
+    os.setComputerLabel(name)
+    assignedName = name
+    patchRouterCfg({ assignedName = name, manualHostname = false })
+    print("[name] Main router assigned: " .. name)
+    if shouldReboot ~= false then
+      print("[name] Rebooting with new hostname...")
+      sleep(1)
+      os.reboot()
+    end
+    return true
+  end
+
+  local function handleAssign(msg)
+    if not msg or not msg.assignHostname then return end
+    local needReboot = msg.reboot == true
+      or (os.getComputerLabel() ~= msg.assignHostname)
+      or (assignedName ~= msg.assignHostname)
+    applyAssignedName(msg.assignHostname, needReboot)
   end
 
   local function announce()
     local x, y, z = ownPos()
-    if not manualName and mainPos and mainPos.x and x then
-      applyName(localSectorName(mainPos.x, mainPos.z, x, z))
-    end
-    local name = os.getComputerLabel() or ("Modem-" .. os.getComputerID())
+    local name = assignedName or os.getComputerLabel()
+      or ("Modem-pending-" .. os.getComputerID())
     local msg = {
       type = "hello", kind = "modem", name = name, hostname = name,
       autoName = not manualName,
+      needName = (not manualName) and (assignedName == nil),
     }
     if x then msg.x, msg.y, msg.z = x, y, z end
+    -- Prefer directed hello to main when known; also broadcast for mesh/repeat.
+    if mainId then
+      rednet.send(mainId, msg, PROTO_ROUTER)
+    end
     rednet.broadcast(msg, PROTO_ROUTER)
+    -- If main is stale/unknown, ask peers to hop us a path.
+    if not mainId or (os.clock() - mainSeenAt) > MAIN_STALE then
+      rednet.broadcast({
+        type = "hop_find_main", from = os.getComputerID(),
+        name = name, hostname = name,
+      }, PROTO_ROUTER)
+    end
   end
 
-  rednet.broadcast({ type = "where_main" }, PROTO_ROUTER)
+  local function findMain()
+    rednet.broadcast({ type = "where_main", name = os.getComputerLabel() }, PROTO_ROUTER)
+    rednet.broadcast({
+      type = "hop_find_main", from = os.getComputerID(),
+      name = os.getComputerLabel(),
+    }, PROTO_ROUTER)
+  end
+
+  if not manualName and not assignedName then
+    print("[name] Waiting for main router to assign a unique name...")
+  end
+  print("[hop] Mesh relay on — will hop to MAIN when out of direct range.")
+  findMain()
   announce()
   local nextAnn = os.clock() + 20
   while true do
     if os.clock() >= nextAnn then announce(); nextAnn = os.clock() + 20 end
     local id, msg = rednet.receive(PROTO_ROUTER, math.max(0.2, nextAnn - os.clock()))
-    if type(msg) == "table" then
-      if (msg.type == "main_claim" or msg.type == "main_here" or msg.type == "here") then
-        if msg.x then mainPos = { id = id, x = msg.x, y = msg.y, z = msg.z } end
-        if msg.assignHostname then applyName(msg.assignHostname) end
-        if msg.type == "main_claim" or msg.type == "main_here" then
-          announce()
-        end
-      elseif msg.type == "update" and id ~= os.getComputerID() then
-        print("")
-        print(("[OTA] Update from main #%s — downloading, then reboot..."):format(tostring(id)))
-        if titanLib and titanLib.updateSelf then
-          local ok, err = titanLib.updateSelf()
-          if ok then
-            print("[OTA] Updated. Rebooting..."); sleep(2); os.reboot()
-          else
-            print("[OTA] Failed: " .. tostring(err) .. " — rebooting anyway...")
-            sleep(2); os.reboot()
-          end
+    if type(msg) ~= "table" or not id then
+      -- ignore
+    elseif msg.type == "main_claim" or msg.type == "main_here" then
+      rememberMain(id, msg)
+      handleAssign(msg)
+      announce()
+
+    elseif msg.type == "here" then
+      rememberMain(id, msg)
+      handleAssign(msg)
+
+    elseif msg.type == "hop_reply" then
+      -- Reply from main via another modem (or for us to forward).
+      if tonumber(msg.dest) == os.getComputerID() then
+        rememberMain(msg.mainRouterId or id, msg)
+        handleAssign(msg)
+      elseif msg.dest then
+        rednet.send(tonumber(msg.dest), msg, PROTO_ROUTER)
+      end
+
+    elseif msg.type == "where_main" or msg.type == "hop_find_main" then
+      -- Peer looking for main: if we know it, answer + forward their query.
+      if mainId and mainInfo and id ~= mainId then
+        local reply = {
+          type = "main_here",
+          main = true,
+          mainRouterId = mainId,
+          label = mainInfo.label or mainInfo.hostname,
+          hostname = mainInfo.hostname or mainInfo.label,
+          x = mainInfo.x, y = mainInfo.y, z = mainInfo.z,
+          via = os.getComputerID(),
+          hop = true,
+        }
+        rednet.send(id, reply, PROTO_ROUTER)
+        rednet.send(mainId, {
+          type = "where_main", from = id, via = os.getComputerID(),
+          name = msg.name or msg.hostname,
+        }, PROTO_ROUTER)
+      elseif mainId and id ~= mainId then
+        rednet.send(mainId, msg, PROTO_ROUTER)
+      end
+
+    elseif msg.type == "hello" and (msg.kind == "modem" or msg.autoName) then
+      -- Peer modem hello: if we can reach main and they might not, hop it.
+      if mainId and id ~= mainId and id ~= os.getComputerID() then
+        rednet.send(mainId, {
+          type = "hop_hello", from = id, via = os.getComputerID(),
+          hello = msg,
+        }, PROTO_ROUTER)
+      end
+
+    elseif msg.type == "update" and id ~= os.getComputerID() then
+      print("")
+      print(("[OTA] Update from router #%s — downloading, then reboot..."):format(tostring(id)))
+      if titanLib and titanLib.updateSelf then
+        local ok, err = titanLib.updateSelf()
+        if ok then
+          print("[OTA] Updated. Rebooting..."); sleep(2); os.reboot()
         else
-          print("[OTA] No install source — rebooting..."); sleep(1); os.reboot()
+          print("[OTA] Failed: " .. tostring(err) .. " — rebooting anyway...")
+          sleep(2); os.reboot()
         end
+      else
+        print("[OTA] No install source — rebooting..."); sleep(1); os.reboot()
       end
     end
   end
@@ -805,6 +1041,200 @@ local function gpsHostLoop()
         { gpsCoords.x, gpsCoords.y, gpsCoords.z })
     end
   end
+end
+
+--------------------------------------------------------------------------------
+-- Fleet map (MAIN): zoomed-out ASCII grid of routers/modems
+-- Grid lines use - _ | \ /   Markers: r = main, m = modem
+--------------------------------------------------------------------------------
+local mapScale = 16  -- blocks per cell (zoomed out by default)
+
+local function fleetMapNodes()
+  local list = {}
+  local myId = os.getComputerID()
+  local rname = os.getComputerLabel() or ("Router-" .. myId)
+  if gpsCoords then
+    list[#list + 1] = {
+      id = myId, name = rname, kind = "router",
+      x = gpsCoords.x, y = gpsCoords.y, z = gpsCoords.z, main = true,
+    }
+  end
+  for id, d in pairs(seen) do
+    if id ~= myId and d.x and d.z
+       and (d.kind == "modem" or d.kind == "router") then
+      list[#list + 1] = {
+        id = id,
+        name = d.hostname or d.name or ("#" .. id),
+        kind = d.kind,
+        x = d.x, y = d.y, z = d.z,
+        main = false,
+      }
+    end
+  end
+  return list
+end
+
+local function mapOrigin(nodes)
+  if gpsCoords then return gpsCoords.x, gpsCoords.z end
+  if #nodes == 0 then return 0, 0 end
+  local sx, sz = 0, 0
+  for _, n in ipairs(nodes) do sx = sx + n.x; sz = sz + n.z end
+  return math.floor(sx / #nodes + 0.5), math.floor(sz / #nodes + 0.5)
+end
+
+local function mapAutoScale(nodes, ox, oz, gw, gh)
+  local maxD = 8
+  for _, n in ipairs(nodes) do
+    maxD = math.max(maxD, math.abs(n.x - ox), math.abs(n.z - oz))
+  end
+  local half = math.max(2, math.floor(math.min(gw, gh) / 2) - 1)
+  return math.max(2, math.ceil(maxD / half))
+end
+
+-- Background cell art from (-, _, |, \, /).
+local function mapGridChar(relX, relZ)
+  if relX == 0 and relZ == 0 then return "+" end
+  if relX == 0 then return "|" end
+  if relZ == 0 then return "-" end
+  if relX == relZ then return "\\" end
+  if relX == -relZ then return "/" end
+  if relZ % 4 == 0 then return "_" end
+  if relX % 4 == 0 then return "|" end
+  if (relX + relZ) % 6 == 0 then return "/" end
+  if (relX - relZ) % 6 == 0 then return "\\" end
+  if relZ % 2 == 0 then return "-" end
+  return " "
+end
+
+local function drawFleetMap(scale)
+  local tw, th = term.getSize()
+  term.setBackgroundColor(colors.black)
+  term.clear()
+  local function put(x, y, ch, fg)
+    if x < 1 or y < 1 or x > tw or y > th then return end
+    term.setCursorPos(x, y)
+    if term.isColor and term.isColor() then
+      term.setTextColor(fg or colors.white)
+      term.setBackgroundColor(colors.black)
+    end
+    term.write(ch)
+  end
+
+  local nodes = fleetMapNodes()
+  local ox, oz = mapOrigin(nodes)
+  if not gpsCoords and #nodes == 0 then
+    put(1, 1, "No GPS on main and no modem positions yet.", colors.red)
+    put(1, 2, "Set gpshost / wait for modems to hello with coords.", colors.gray)
+    put(1, 4, "[Q] quit", colors.gray)
+    return nodes, ox, oz, scale
+  end
+
+  local top, bottom = 3, th - 3
+  local left, right = 1, tw
+  local gw, gh = right - left + 1, bottom - top + 1
+  if not scale then
+    scale = mapAutoScale(nodes, ox, oz, gw, gh)
+  end
+  mapScale = scale
+
+  put(1, 1, ("FLEET MAP  origin %d,%d  %dm/cell  (zoomed out)"):format(ox, oz, scale), colors.yellow)
+  put(1, 2, "r=main router  m=modem  N=up  +/- zoom  F fit  Q quit", colors.lightGray)
+
+  local cx = left + math.floor(gw / 2)
+  local cy = top + math.floor(gh / 2)
+
+  for gy = top, bottom do
+    for gx = left, right do
+      local relX, relZ = gx - cx, gy - cy
+      put(gx, gy, mapGridChar(relX, relZ), colors.gray)
+    end
+  end
+  put(cx, top, "N", colors.white)
+  put(right, cy, "E", colors.white)
+  put(cx, bottom, "S", colors.white)
+  put(left, cy, "W", colors.white)
+
+  local function cellOf(wx, wz)
+    return cx + math.floor((wx - ox) / scale + 0.5),
+           cy + math.floor((wz - oz) / scale + 0.5)
+  end
+
+  -- Plot modems first, main last so `r` wins on overlap.
+  table.sort(nodes, function(a, b)
+    if a.main ~= b.main then return not a.main end
+    return (a.id or 0) < (b.id or 0)
+  end)
+  for _, n in ipairs(nodes) do
+    local sx, sy = cellOf(n.x, n.z)
+    if n.main or n.kind == "router" and n.id == os.getComputerID() then
+      put(sx, sy, "r", colors.cyan)
+    else
+      put(sx, sy, "m", colors.lime)
+    end
+  end
+
+  -- Legend / name list along the bottom
+  local y = th - 2
+  local parts = {}
+  for _, n in ipairs(nodes) do
+    local tag = (n.main or n.id == os.getComputerID()) and "r" or "m"
+    parts[#parts + 1] = ("%s:%s"):format(tag, tostring(n.name):sub(1, 10))
+  end
+  put(1, y, table.concat(parts, "  "):sub(1, tw), colors.white)
+  put(1, th, ("nodes:%d  scale:%d  [+/-]zoom [F]fit [Q]quit"):format(#nodes, scale), colors.gray)
+
+  if term.isColor and term.isColor() then
+    term.setTextColor(colors.white)
+    term.setBackgroundColor(colors.black)
+  end
+  return nodes, ox, oz, scale
+end
+
+local function fleetMapView()
+  if not isMain() then
+    print("map is MAIN-only.")
+    return
+  end
+  local nodes = fleetMapNodes()
+  local ox, oz = mapOrigin(nodes)
+  local tw, th = term.getSize()
+  local scale = mapAutoScale(nodes, ox, oz, tw, math.max(5, th - 6))
+  local timer = os.startTimer(2)
+  while true do
+    drawFleetMap(scale)
+    local ev, p1 = os.pullEvent()
+    if ev == "timer" and p1 == timer then
+      timer = os.startTimer(2)
+    elseif ev == "key" then
+      if p1 == keys.q or p1 == keys.x or p1 == keys.escape then break
+      elseif p1 == keys.equals or p1 == keys.numPadAdd then
+        scale = math.max(2, math.floor(scale / 2))
+      elseif p1 == keys.minus or p1 == keys.numPadSubtract then
+        scale = math.min(256, scale * 2)
+      elseif p1 == keys.f then
+        nodes = fleetMapNodes()
+        ox, oz = mapOrigin(nodes)
+        scale = mapAutoScale(nodes, ox, oz, tw, math.max(5, th - 6))
+      end
+      timer = os.startTimer(0.1)
+    elseif ev == "char" then
+      if p1 == "q" or p1 == "Q" then break
+      elseif p1 == "+" or p1 == "=" then scale = math.max(2, math.floor(scale / 2))
+      elseif p1 == "-" then scale = math.min(256, scale * 2)
+      elseif p1 == "f" or p1 == "F" then
+        nodes = fleetMapNodes()
+        ox, oz = mapOrigin(nodes)
+        scale = mapAutoScale(nodes, ox, oz, tw, math.max(5, th - 6))
+      end
+      timer = os.startTimer(0.1)
+    elseif ev == "terminate" then
+      break
+    end
+  end
+  term.setBackgroundColor(colors.black)
+  term.clear()
+  term.setCursorPos(1, 1)
+  if term.setTextColor then term.setTextColor(colors.white) end
 end
 
 --------------------------------------------------------------------------------
@@ -825,12 +1255,16 @@ local function consoleLoop()
       print("role     - show main / modem role")
       print("main     - make THIS the main router (directory + OTA authority)")
       print("modem    - demote to modem-only repeater (reboot)")
-      print("hostname [name|auto] - set name (modems: auto = GPS North/East/…)")
+      print("hostname [name|auto] - set name (modems: auto = accept main assign)")
       print("stats    - relay counts (+ roster if main)")
       print("gpshost [x y z] - show / set this router's GPS host coords")
       if isMain() then
+        print("map      - zoomed-out fleet map (r=main, m=modem)")
         print("devices  - list remembered systems (ONLINE / OFFLINE)")
         print("forget <id|host> - remove a system from the remembered roster")
+        print("names    - modem name pool + assignments")
+        print("name <id|host> <newname>  - force-assign a modem name (reboots it)")
+        print("namepool add|remove <name>  - edit the unique-name list")
         print("screens  - list monitors + roster/stats/gps assignments")
         print("screen <roster|stats|gps> <name|side|auto>  assign a board")
         print("ping     - re-discover the network")
@@ -864,7 +1298,8 @@ local function consoleLoop()
         write("Demote this MAIN router to MODEM-only repeater? [y/N] ")
         if read():lower() ~= "y" then print("Cancelled.") else
           patchRouterCfg({ role = "modem" })
-          print("Saved role=modem. Rebooting..."); sleep(1); os.reboot()
+          if fs.exists(ROSTER) then pcall(fs.delete, ROSTER) end
+          print("Saved role=modem (roster removed). Rebooting..."); sleep(1); os.reboot()
         end
       end
     elseif cmd == "devices" or cmd == "list" then
@@ -897,6 +1332,7 @@ local function consoleLoop()
           if id and seen[id] then
             print(("Forgot %s (#%d)."):format(seen[id].hostname or "?", id))
             seen[id] = nil
+            releaseModemName(id)
             rosterDirty = true
             saveRoster()
           else
@@ -904,22 +1340,123 @@ local function consoleLoop()
           end
         end
       end
+    elseif cmd == "map" or cmd == "fmap" or cmd == "fleetmap" then
+      if not isMain() then print("map is MAIN-only.")
+      else
+        fleetMapView()
+      end
+    elseif cmd == "names" then
+      if not isMain() then print("Name registry is MAIN-only."); else
+        loadNameRegistry()
+        print("Modem name assignments:")
+        local any = false
+        local ids = {}
+        for id in pairs(nameAssign) do ids[#ids + 1] = id end
+        table.sort(ids, function(a, b) return tonumber(a) < tonumber(b) end)
+        for _, id in ipairs(ids) do
+          any = true
+          print(("  #%d -> %s"):format(id, nameAssign[id]))
+        end
+        if not any then print("  (none yet)") end
+        print("Name pool:")
+        print("  " .. table.concat(namePool(), ", "))
+      end
+    elseif cmd == "name" then
+      if not isMain() then print("Name assign is MAIN-only."); else
+        local ref, newName = a[2], a[3] and table.concat(a, " ", 3) or nil
+        if not ref or not newName then
+          print("Usage: name <id|hostname> <newname>")
+        else
+          local id = tonumber(ref)
+          if not id then
+            local want = ref:lower()
+            for sid, d in pairs(seen) do
+              local host = tostring(d.hostname or d.name or ""):lower()
+              if host == want or host:find(want, 1, true) then id = sid; break end
+            end
+            for sid, n in pairs(nameAssign) do
+              if tostring(n):lower() == want then id = sid; break end
+            end
+          end
+          if not id then
+            print("Unknown modem: " .. tostring(ref))
+          elseif nameTaken(newName, id) then
+            print("Name already in use: " .. newName)
+          else
+            loadNameRegistry()
+            nameAssign[id] = newName
+            saveNameRegistry()
+            if seen[id] then
+              seen[id].hostname = newName
+              seen[id].name = newName
+              rosterDirty = true
+            end
+            rednet.send(id, {
+              type = "here", assignHostname = newName, reboot = true,
+              main = true, mainRouterId = os.getComputerID(),
+              label = os.getComputerLabel(), hostname = os.getComputerLabel(),
+            }, PROTO_ROUTER)
+            print(("Assigned #%d -> %s (reboot sent)"):format(id, newName))
+          end
+        end
+      end
+    elseif cmd == "namepool" then
+      if not isMain() then print("Name pool is MAIN-only."); else
+        local sub = (a[2] or ""):lower()
+        local pool = {}
+        for _, n in ipairs(namePool()) do pool[#pool + 1] = n end
+        if sub == "add" and a[3] then
+          local n = table.concat(a, " ", 3)
+          local exists = false
+          for _, p in ipairs(pool) do if p:lower() == n:lower() then exists = true; break end end
+          if exists then print("Already in pool: " .. n)
+          else
+            pool[#pool + 1] = n
+            saveNameRegistry(pool)
+            print("Added to pool: " .. n)
+          end
+        elseif sub == "remove" and a[3] then
+          local n = table.concat(a, " ", 3):lower()
+          local out = {}
+          for _, p in ipairs(pool) do
+            if p:lower() ~= n then out[#out + 1] = p end
+          end
+          saveNameRegistry(out)
+          print("Removed from pool (if present): " .. table.concat(a, " ", 3))
+        else
+          print("Usage: namepool add <name> | namepool remove <name>")
+          print("Pool: " .. table.concat(pool, ", "))
+        end
+      end
     elseif cmd == "hostname" or cmd == "host" then
       if not a[2] then
         print("hostname: " .. (os.getComputerLabel() or "(none)"))
         local c = loadRouterCfg() or {}
         if not isMain() then
-          print(c.manualHostname and "Naming: manual (GPS auto-name off)"
-            or "Naming: auto from GPS vs main (North/East/…)")
+          if c.manualHostname then
+            print("Naming: manual")
+          elseif c.assignedName then
+            print("Naming: assigned by main (" .. c.assignedName .. ")")
+          else
+            print("Naming: waiting for main router unique-name assign")
+          end
         end
       else
         local name = table.concat(a, " ", 2)
         if name:lower() == "auto" and not isMain() then
-          patchRouterCfg({ manualHostname = false })
-          print("GPS auto-naming re-enabled. Reboot or wait for next announce.")
+          patchRouterCfg({ manualHostname = false, assignedName = nil })
+          print("Will accept next name from main router (announce + reboot).")
+          rednet.broadcast({
+            type = "hello", kind = "modem",
+            name = "Modem-pending-" .. os.getComputerID(),
+            hostname = "Modem-pending-" .. os.getComputerID(),
+            autoName = true, needName = true,
+          }, PROTO_ROUTER)
         else
           os.setComputerLabel(name)
-          if not isMain() then patchRouterCfg({ manualHostname = true }) end
+          if not isMain() then
+            patchRouterCfg({ manualHostname = true, assignedName = name })
+          end
           if titanLib then
             local ok, err = titanLib.setHostname(name, isMain() and "router" or "modem")
             if ok then print("hostname set: " .. ok) else print(tostring(err)) end
@@ -931,7 +1468,7 @@ local function consoleLoop()
             print("hostname set: " .. name)
           end
           if isMain() then claimMain() end
-          if not isMain() then print("(manual — use `hostname auto` to resume GPS names)") end
+          if not isMain() then print("(manual — use `hostname auto` to resume main assign)") end
         end
       end
     elseif cmd == "ping" then
@@ -1126,8 +1663,18 @@ end
 
 print(("Role: %s"):format(routerRole:upper()))
 if isMain() then
+  local remembered = loadRoster()
+  if remembered > 0 then
+    print(("Loaded %d remembered system(s) from %s."):format(remembered, ROSTER))
+  end
+  loadNameRegistry()
   loadScreenAssignments()
   local nMon = refreshScreens()
+  do
+    local n = 0
+    for _ in pairs(nameAssign) do n = n + 1 end
+    if n > 0 then print(("Modem names: %d assigned. Type `names`."):format(n)) end
+  end
   if nMon == 0 then
     print("No monitors yet — attach 1–3 for roster / stats / gps boards.")
   elseif nMon == 1 then
@@ -1138,12 +1685,13 @@ if isMain() then
     print(("%d monitors: roster | stats | gps. Type `screens` / `screen`."):format(nMon))
   end
 else
-  print("MODEM mode: repeating traffic only (no directory / OTA). Use `main` to promote.")
+  clearRosterIfModem()
+  print("MODEM mode: mesh hop + relay (no roster). Use `main` to promote.")
 end
 parallel.waitForAny(table.unpack(tasks))
 for _, role in ipairs(SCREEN_ROLES) do
   local m = screens[role]
   if m then pcall(function() m.clear() end) end
 end
-if rosterDirty then saveRoster() end
+if isMain() and rosterDirty then saveRoster() end
 print("Router stopped.")
