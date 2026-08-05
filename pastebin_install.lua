@@ -28,6 +28,8 @@ local CODES = {
   ["datacenter.lua"]= "",
   ["console.lua"]   = "",
   ["admin.lua"]     = "",
+  ["gpshost.lua"]   = "",
+  ["locator.lua"]   = "",
 }
 
 --==============================================================================
@@ -50,9 +52,13 @@ local ROLES = {
     files = { "console.lua" } },
   { key = "8", name = "Admin tablet (pocket console)",     run = "admin.lua",
     files = { "lib/titan.lua", "admin.lua" } },
-  { key = "9", name = "Everything (all files, no auto-run)", run = nil,
-    files = { "lib/titan.lua", "hub.lua", "bot.lua", "poi.lua", "worker.lua",
-              "botserver.lua", "datacenter.lua", "console.lua", "admin.lua" } },
+  { key = "9", name = "GPS host (needs 4+ for navigation)", run = "gpshost.lua",
+    files = { "gpshost.lua" } },
+  { key = "10", name = "GPS locator (pocket)",             run = "locator.lua",
+    files = { "lib/titan.lua", "locator.lua" } },
+  { key = "11", name = "Everything (all files, no auto-run)", run = nil,
+    files = { "lib/titan.lua", "hub.lua", "bot.lua", "poi.lua", "worker.lua", "botserver.lua",
+              "datacenter.lua", "console.lua", "admin.lua", "gpshost.lua", "locator.lua" } },
 }
 
 --==============================================================================
@@ -129,7 +135,8 @@ local LABELS = {
   ["hub.lua"] = "Hub", ["bot.lua"] = "Bot", ["poi.lua"] = "POI",
   ["datacenter.lua"] = "ParentCenter", ["botserver.lua"] = "BotsComputer",
   ["worker.lua"] = "Worker", ["console.lua"] = "Console",
-  ["admin.lua"] = "Admin", ["host.lua"] = "Host",
+  ["admin.lua"] = "Admin", ["host.lua"] = "Host", ["gpshost.lua"] = "GPS",
+  ["locator.lua"] = "Locator",
 }
 local lbl = role.run and LABELS[role.run]
 if lbl and not os.getComputerLabel() then

@@ -25,7 +25,7 @@ local FILES = {
   "hub.lua", "bot.lua", "poi.lua",
   "worker.lua", "botserver.lua",
   "datacenter.lua",
-  "console.lua", "admin.lua",
+  "console.lua", "admin.lua", "gpshost.lua", "locator.lua",
 }
 
 local function openModem()

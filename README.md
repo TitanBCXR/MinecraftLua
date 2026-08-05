@@ -23,7 +23,11 @@ Hub (monitor + modem)  <--rednet-->  Bots (turtles)
 
 ## 2. Set up a GPS constellation (needed for navigation)
 
-Bots locate themselves and drive to coordinates using `gps.locate`, which needs at least **4 GPS host computers** in range. Quick version:
+Bots locate themselves and drive to coordinates using `gps.locate`, which needs at least **4 GPS host computers** in range.
+
+**Easy way — `gpshost.lua`:** install it on each GPS computer (installer → **"GPS host"**, or `wget` it). It asks for that computer's coordinates (or auto-detects if a constellation already exists), saves them, offers to auto-start on boot, and hosts. Repeat on 4+ computers, spread out.
+
+**Manual way:**
 
 1. Place 4 computers high up, each with a wireless (ideally ender) modem.
 2. On each, note its real world coords (F3 in-game) and run:
@@ -35,6 +39,8 @@ Bots locate themselves and drive to coordinates using `gps.locate`, which needs 
    ```lua
    shell.run("gps", "host", "123", "72", "-45")
    ```
+
+**Placement matters:** spread the hosts out — don't put them in a straight line or all at the same height, or the fix fails (that's the "Could not determine position" you'll see on a bot). Vary X, Z **and** Y. Ender modems give unlimited range.
 
 Full guide: <https://tweaked.cc/guide/gps_setup.html>
 
@@ -428,3 +434,31 @@ BUILD : scan <bot> <name> <W> <H> <L> | build <bot> <name> [x y z]
 `<bot>` is a turtle's label or its computer id. Because control is gated by the
 master password, losing the tablet doesn't hand over the network — pull the
 master floppy and every login (including the tablet's) is denied.
+
+---
+
+# GPS locator (`locator.lua`)
+
+A pocket **handheld map**: shows your live GPS position, lets you save waypoints,
+and gives distance + compass bearing to each — plus the network's POIs and bots.
+The personal counterpart to the admin tablet (that one commands bots; this one
+helps *you* navigate).
+
+Needs a **pocket computer with a wireless modem**, `lib/titan.lua`, and an
+existing GPS constellation. (A pocket PC can't *host* GPS — hosts must be
+stationary; use `gpshost.lua` for that. This tool only *locates*.)
+
+```
+here            show current position
+live            full-screen radar: position, heading, nearest targets
+mark <name>     save your current spot as a waypoint
+wp              list waypoints with distance + bearing
+go <name>       bearing to one waypoint
+del <name>      delete a waypoint
+pois | bots     network targets with distance + bearing
+exit
+```
+
+Bearings are absolute compass directions (e.g. `84m NE up3`). Once you start
+walking, it infers your facing from movement and adds a relative cue
+(`ahead` / `left` / `right` / `behind`).
