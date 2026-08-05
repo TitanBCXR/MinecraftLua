@@ -231,6 +231,7 @@ bot location data is gated behind the master floppy.
 
 - **Storage** commands read any attached **inventory** peripherals (chests, barrels, storage drawers, and AE2/Refined Storage bridges that expose an inventory). Connect them with wired modems for a big networked store.
 - The **master password lives only on the floppy**. Pull the floppy and the whole network denies logins — that's your kill switch.
+- **Multiple passwords:** `master.pw` may contain several passwords **separated by commas** — any one of them is accepted (e.g. `alice123,bob456,ops789`). Each entry is trimmed of surrounding spaces; empty entries are ignored. Set them at once via `initmaster`/`setmaster` (type them comma-separated), or edit `master.pw` on the floppy directly.
 - Player-name reading requires **Advanced Peripherals** (the Player Detector). Plain CC: Tweaked has no vanilla way to read a player's name.
 - This runs on its own protocol (`titan_dc`) and can coexist with the bot network above on the same computers.
 

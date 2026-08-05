@@ -5,8 +5,10 @@
   its own role automatically:
 
     * MASTER  - the computer that has the "master floppy disk" inserted (a floppy
-                containing the file `master.pw`). It stores the master password and
-                the registry of every station, and it answers login checks.
+                containing the file `master.pw`). It stores the master password(s)
+                and the registry of every station, and it answers login checks.
+                `master.pw` may list SEVERAL passwords separated by commas - any
+                one of them is accepted (e.g.  alice123,bob456,ops789).
     * STATION - any other computer. It's locked in "bot" mode until a player logs
                 in with the master password, after which it becomes an "admin"
                 terminal for that session.
@@ -145,6 +147,18 @@ local function readMasterPassword(path)
   return trim(pw)
 end
 
+-- master.pw may hold SEVERAL passwords separated by commas; any one is valid.
+-- Each entry is trimmed of surrounding whitespace; empty entries are ignored,
+-- and an empty attempt never matches.
+local function passwordMatches(stored, attempt)
+  if not stored or attempt == nil or attempt == "" then return false end
+  for candidate in tostring(stored):gmatch("[^,]+") do
+    candidate = candidate:gsub("^%s+", ""):gsub("%s+$", "")
+    if candidate ~= "" and candidate == attempt then return true end
+  end
+  return false
+end
+
 local function isLocalMaster() return findMasterDrive() ~= nil end
 
 --==============================================================================
@@ -192,7 +206,7 @@ local function validatePassword(pw)
   local _, path = findMasterDrive()
   if path then
     local stored = readMasterPassword(path)
-    return stored ~= nil and stored == pw
+    return passwordMatches(stored, pw)
   end
   -- Case 2: find the master over the network and ask it to verify.
   local masterId = discoverMaster(2)
@@ -252,6 +266,7 @@ local function cmdInitMaster()
       return
     end
   end
+  print("(Tip: enter several passwords comma-separated to allow more than one.)")
   write("Set NEW master password: ")
   local a = read("*")
   write("Confirm password:      ")
@@ -271,6 +286,7 @@ local function cmdSetMaster()
     print("Only the computer holding the master floppy can change the password.")
     return
   end
+  print("(Tip: comma-separate several passwords to allow more than one.)")
   write("New master password: ")
   local a = read("*")
   write("Confirm password:    ")
@@ -558,7 +574,7 @@ local function serviceLoop()
         if isLocalMaster() then
           local _, path = findMasterDrive()
           local stored = path and readMasterPassword(path)
-          local ok = stored ~= nil and stored == msg.password
+          local ok = passwordMatches(stored, msg.password)
           rednet.send(id, { type = MSG.AUTH_RESULT, ok = ok }, PROTOCOL)
         end
       elseif t == MSG.REGISTER then
