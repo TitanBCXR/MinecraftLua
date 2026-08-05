@@ -259,5 +259,6 @@ local function consoleLoop()
 end
 
 print("Titan locator online.")
-parallel.waitForAny(listenerLoop, consoleLoop)
+parallel.waitForAny(listenerLoop, consoleLoop,
+  function() titan.registerLoop("locator") end)
 print("Locator closed.")

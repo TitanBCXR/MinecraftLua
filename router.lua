@@ -69,7 +69,7 @@ local function classify(msg)
   elseif t == "register" or t == "status" then return msg.botType and "worker" or "bot"
   elseif t == "worker_await" then return "worker?"
   elseif t == "pong" or t == "master_here" then return "computer"
-  elseif t == "hello" then return "device"
+  elseif t == "hello" then return msg.kind or "device"
   end
   return nil
 end
@@ -160,6 +160,15 @@ local function drawLoop()
   while true do draw(); sleep(1) end
 end
 
+-- Periodically nudge the network so devices that booted before us also register.
+local function pingLoop()
+  while true do
+    rednet.broadcast({ type = "ping" }, "titan_net")
+    rednet.broadcast({ type = "ping" }, "titan_dc")
+    sleep(15)
+  end
+end
+
 --------------------------------------------------------------------------------
 -- Console
 --------------------------------------------------------------------------------
@@ -204,7 +213,7 @@ local function consoleLoop()
 end
 
 --------------------------------------------------------------------------------
-local tasks = { repeaterLoop, directoryLoop, consoleLoop }
+local tasks = { repeaterLoop, directoryLoop, pingLoop, consoleLoop }
 if monitor then tasks[#tasks + 1] = drawLoop end
 parallel.waitForAny(table.unpack(tasks))
 if monitor then monitor.clear() end

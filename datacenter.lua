@@ -585,6 +585,8 @@ local function registerLoop()
       local mId = discoverMaster(1)
       if mId then rednet.send(mId, { type = MSG.REGISTER, name = station.name }, PROTOCOL) end
     end
+    -- Announce to the network router's directory as well.
+    rednet.broadcast({ type = "hello", kind = "datacenter", name = station.name }, "titan_router")
     sleep(15)
   end
 end

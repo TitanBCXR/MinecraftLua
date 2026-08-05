@@ -479,13 +479,18 @@ computer with a wireless (ideally **ender**) modem. It does two things:
   who's online (bots, workers, hubs, POIs, data center, tablets). With a monitor
   attached it shows the roster + relay stats.
 
-Install it via the installer → **"Network router"** (self-contained, no lib).
-Console: `devices`, `ping`, `stats`, `exit`.
+Install it via the installer → **"Network router"** (option **11**;
+self-contained, no lib). Console: `devices`, `ping`, `stats`, `exit`.
 
-**Register / check connectivity from any device:** the terminal console
-(`console.lua`) has a `net` command — it pings the router and reports
-`Connected via Router #<id> (<n> devices online)`, or tells you no router is in
-range.
+**Auto-registration:** every networked program (bot, worker, hub, POI, Bots
+Computer, data center, admin tablet, locator) announces itself to the router on
+startup and re-announces every ~20s, so they appear in the router's directory
+automatically — no manual step. The router also periodically pings the network,
+so devices register no matter which booted first.
+
+**Manual check from any device:** the terminal console (`console.lua`) has a
+`net` command — it pings the router and reports `Connected via Router #<id>
+(<n> devices online)`, or tells you no router is in range.
 
 Tip: with **ender modems** you already have unlimited range, so a router is
 mainly useful for **plain wireless modems** (extending range) or as a **central

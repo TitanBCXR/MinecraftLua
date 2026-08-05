@@ -134,5 +134,6 @@ local function menuLoop()
 end
 
 print("POI '" .. cfg.name .. "' online.")
-parallel.waitForAny(beaconLoop, replyLoop, menuLoop)
+parallel.waitForAny(beaconLoop, replyLoop, menuLoop,
+  function() titan.registerLoop("poi") end)
 print("POI stopped.")

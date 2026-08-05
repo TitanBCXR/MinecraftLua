@@ -140,6 +140,27 @@ function titan.recv(timeout)
 end
 
 --------------------------------------------------------------------------------
+-- Router registration (see router.lua)
+--
+-- Any device announces itself to the network router so it shows in the router's
+-- live directory. registerLoop() is meant to run as one of a program's parallel
+-- tasks: it announces immediately, then re-announces periodically so the roster
+-- stays fresh regardless of who booted first.
+--------------------------------------------------------------------------------
+titan.ROUTER_PROTOCOL = "titan_router"
+
+function titan.announce(kind)
+  rednet.broadcast({ type = "hello", kind = kind, name = os.getComputerLabel() }, titan.ROUTER_PROTOCOL)
+end
+
+function titan.registerLoop(kind, period)
+  while true do
+    titan.announce(kind)
+    os.sleep(period or 20)
+  end
+end
+
+--------------------------------------------------------------------------------
 -- Turtle navigation (GPS based)
 --
 -- These functions only work on turtles that have:

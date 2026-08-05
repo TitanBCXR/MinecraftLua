@@ -296,5 +296,6 @@ local function consoleLoop()
 end
 
 print("Titan admin tablet online.")
-parallel.waitForAny(listenerLoop, consoleLoop)
+parallel.waitForAny(listenerLoop, consoleLoop,
+  function() titan.registerLoop("admin") end)
 print("Admin console closed.")

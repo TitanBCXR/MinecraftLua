@@ -259,6 +259,7 @@ local function consoleLoop()
   end
 end
 
-parallel.waitForAny(networkLoop, consoleLoop)
+parallel.waitForAny(networkLoop, consoleLoop,
+  function() titan.registerLoop("botserver") end)
 if monitor then monitor.clear() end
 print("Bots Computer stopped.")

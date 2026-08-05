@@ -566,4 +566,5 @@ end
 
 print(("Titan %s '%s' online."):format(cfg.botType, cfg.name))
 setStatus("idle", "-")
-parallel.waitForAny(receiveLoop, statusLoop, workerLoop, roleTicker, consoleLoop)
+parallel.waitForAny(receiveLoop, statusLoop, workerLoop, roleTicker, consoleLoop,
+  function() titan.registerLoop("worker") end)
