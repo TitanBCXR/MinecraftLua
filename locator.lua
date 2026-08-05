@@ -1,6 +1,6 @@
 --[[
   locator.lua  -  Pocket GPS locator for the Titan network (CC: Tweaked)
-  Titan-Version: 1.1.9
+  Titan-Version: 1.2.0
 
   A handheld you carry: live GPS, waypoints, and a top-down fleet map matching
   the main router's `map` command — grid (- _ | \ /), r=main, m=modem, @=you.
@@ -65,13 +65,12 @@ local function cardinal(dx, dz)
 end
 
 local function locate()
-  local x, y, z = gps.locate(2)
+  local x, y, z, info = titan.gpsFix({ timeout = 2.5, samples = 5 })
   if not x then return nil end
-  x, y, z = math.floor(x + 0.5), math.floor(y + 0.5), math.floor(z + 0.5)
   if last and (x ~= last.x or z ~= last.z) then
     headAngle = angleOf(x - last.x, z - last.z)
   end
-  last = { x = x, y = y, z = z }
+  last = { x = x, y = y, z = z, yLo = info and info.yLo, yHi = info and info.yHi, n = info and info.n }
   return x, y, z
 end
 

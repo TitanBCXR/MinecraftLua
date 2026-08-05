@@ -1,6 +1,6 @@
 --[[
   router.lua  -  Titan network router / repeater (CC: Tweaked)
-  Titan-Version: 1.2.7
+  Titan-Version: 1.2.10
 
   Place one (or several) of these to tie the whole network together over
   wireless and/or wired modems. Roles:
@@ -79,22 +79,22 @@ local relayed = {}   -- [nMessageID] = timerId  (de-dup with 30s expiry)
 local relayStats = { relayed = 0 }
 local rosterDirty = false
 local ONLINE_SECS = 45   -- heard within this window => ONLINE on the board
--- Multi-monitor boards (main): roster / stats / gps / map — each on its own
--- screen when available. Toggle boards with `screen <role> on|off`.
+-- Multi-monitor boards (main):
+--   Default = TitanSystems screensaver on every monitor.
+--   `screen <role> on`   → show board for saverIdleSecs (default 120), then saver.
+--   `screen <role> perm` → show board permanently (survives idle + reboot).
+--   `screen <role> off`  → back to saver for that board.
 local SCREEN_ROLES = { "roster", "stats", "gps", "map" }
 local screens = { roster = nil, stats = nil, gps = nil, map = nil }
 local screenNames = { roster = nil, stats = nil, gps = nil, map = nil }
-local screenOn = { roster = true, stats = true, gps = true, map = true }
--- When only one physical monitor is attached, show this board (cycle with `view`).
-local screenFocus = "roster"
-
--- Monitor screensaver: "TitanSystems" DVD-style bounce after idle.
+local screenOn   = { roster = false, stats = false, gps = false, map = false }
+local screenPerm = { roster = false, stats = false, gps = false, map = false }
+local screenFocus = "roster"   -- which board wins on a single monitor
 local SAVER_TEXT = "TitanSystems"
-local saverEnabled = true
-local saverIdleSecs = 60
-local lastActivity = os.clock()
+local saverIdleSecs = 120      -- temp boards auto-off after this many seconds
+local boardWakeAt = nil        -- os.clock() when a temp board was last woken
 local saverActive = false
-local saverState = {}   -- [monitor] = { x, y, dx, dy, tw, prevX, prevY }
+local saverState = {}          -- [monitor] = bounce state
 
 -- Router config (GPS host coords + role: "main" | "modem").
 local RCFG      = "router.cfg"
@@ -880,34 +880,38 @@ local function loadScreenAssignments()
       screenNames[role] = s[role]
     end
   end
-  if type(c.screenOn) == "table" then
+  -- Only permanent boards survive reboot. Temp toggles always start as saver.
+  if type(c.screenPerm) == "table" then
     for _, role in ipairs(SCREEN_ROLES) do
-      if c.screenOn[role] ~= nil then
-        screenOn[role] = c.screenOn[role] and true or false
-      end
+      screenPerm[role] = c.screenPerm[role] and true or false
+      screenOn[role] = screenPerm[role] and true or false
     end
-  elseif c.displayMap == true then
-    -- Migrate old global map mode: keep boards on, ensure map enabled.
-    screenOn.map = true
+  else
+    -- Migrate older cfgs that kept every board ON — default to screensaver.
+    for _, role in ipairs(SCREEN_ROLES) do
+      screenPerm[role] = false
+      screenOn[role] = false
+    end
   end
   if type(c.screenFocus) == "string" and isScreenRole(c.screenFocus) then
     screenFocus = c.screenFocus
   end
-  if c.saverEnabled ~= nil then saverEnabled = c.saverEnabled and true or false end
   if tonumber(c.saverIdleSecs) and tonumber(c.saverIdleSecs) >= 5 then
     saverIdleSecs = math.floor(tonumber(c.saverIdleSecs))
   end
+  boardWakeAt = nil
 end
 
 local function saveScreenAssignments()
-  local s, on = {}, {}
+  local s, on, perm = {}, {}, {}
   for _, role in ipairs(SCREEN_ROLES) do
     if screenNames[role] then s[role] = screenNames[role] end
     on[role] = screenOn[role] and true or false
+    perm[role] = screenPerm[role] and true or false
   end
   patchRouterCfg({
-    screens = s, screenOn = on, screenFocus = screenFocus,
-    saverEnabled = saverEnabled, saverIdleSecs = saverIdleSecs,
+    screens = s, screenOn = on, screenPerm = perm,
+    screenFocus = screenFocus, saverIdleSecs = saverIdleSecs,
   })
 end
 
@@ -919,6 +923,56 @@ local function enabledRoles()
   return list
 end
 
+local function anyLiveBoard()
+  return #enabledRoles() > 0
+end
+
+local function ensureFocus()
+  local active = enabledRoles()
+  if #active == 0 then return active end
+  if screenOn[screenFocus] then return active end
+  screenFocus = active[1]
+  return active
+end
+
+local function expireTemporaryBoards()
+  if not boardWakeAt then return false end
+  if os.clock() < boardWakeAt + saverIdleSecs then return false end
+  local changed = false
+  for _, role in ipairs(SCREEN_ROLES) do
+    if screenOn[role] and not screenPerm[role] then
+      screenOn[role] = false
+      changed = true
+    end
+  end
+  boardWakeAt = nil
+  if changed then
+    ensureFocus()
+    saveScreenAssignments()
+  end
+  return changed
+end
+
+local function wakeBoard(role, permanent)
+  if not isScreenRole(role) then return false end
+  screenOn[role] = true
+  screenPerm[role] = permanent and true or false
+  if role ~= "map" then screenFocus = role end
+  if permanent then
+    local anyTemp = false
+    for _, r in ipairs(SCREEN_ROLES) do
+      if screenOn[r] and not screenPerm[r] then anyTemp = true; break end
+    end
+    if not anyTemp then boardWakeAt = nil end
+  else
+    boardWakeAt = os.clock()
+  end
+  saverActive = false
+  saverState = {}
+  saveScreenAssignments()
+  return true
+end
+
 local function refreshScreens()
   local names = listMonitorNames()
   local used = {}
@@ -926,8 +980,7 @@ local function refreshScreens()
     screens[role] = nil
   end
 
-  -- Disabled boards never claim a monitor.
-  local active = enabledRoles()
+  local active = ensureFocus()
   if #active == 0 then return #names end
 
   -- One monitor: show only the focused (or first enabled) board.
@@ -950,10 +1003,7 @@ local function refreshScreens()
       used[want] = true
     else
       screens[role] = nil
-      if want and used[want] then
-        -- Saved monitor already taken by another board; clear sticky claim.
-        screenNames[role] = nil
-      end
+      if want and used[want] then screenNames[role] = nil end
     end
   end
 
@@ -1136,10 +1186,24 @@ local function drawGps(out, y0, y1)
     put("Use: gpshost <x> <y> <z>", colors.lightGray)
   end
   put("", colors.white)
-  put("Live locate:", colors.lightGray)
-  local lx, ly, lz = gps.locate(0.2)
+  put("Live locate (hi/lo):", colors.lightGray)
+  local lx, ly, lz, info
+  if titanLib and titanLib.gpsFix then
+    lx, ly, lz, info = titanLib.gpsFix({ timeout = 1.2, samples = 5 })
+  else
+    lx, ly, lz = gps.locate(0.5)
+    if lx then
+      lx = math.floor(lx + 0.5); ly = math.floor(ly + 0.5); lz = math.floor(lz + 0.5)
+    end
+  end
   if lx then
-    put(("  %.1f, %.1f, %.1f"):format(lx, ly, lz), colors.lime)
+    put(("  %d, %d, %d"):format(lx, ly, lz), colors.lime)
+    if info then
+      put(("  Y %.2f..%.2f  n=%d"):format(info.yLo, info.yHi, info.n), colors.cyan)
+      if info.spreadY and info.spreadY > 1.0 then
+        put("  Y noisy — check host heights", colors.orange)
+      end
+    end
   else
     put("  (no fix - need 4 hosts)", colors.orange)
   end
@@ -1150,57 +1214,48 @@ end
 
 local function setScreenOn(role, on)
   if not isScreenRole(role) then return false end
-  screenOn[role] = on and true or false
-  if not screenOn[role] and screenFocus == role then
-    local en = enabledRoles()
-    screenFocus = en[1] or "roster"
+  if on then
+    return wakeBoard(role, false)
   end
+  screenOn[role] = false
+  screenPerm[role] = false
+  ensureFocus()
+  local anyTemp = false
+  for _, r in ipairs(SCREEN_ROLES) do
+    if screenOn[r] and not screenPerm[r] then anyTemp = true; break end
+  end
+  if not anyTemp then boardWakeAt = nil end
   saveScreenAssignments()
   return true
 end
 
 local function setScreenFocus(role)
   if not isScreenRole(role) then return false end
-  screenFocus = role
-  if not screenOn[role] then screenOn[role] = true end
-  saveScreenAssignments()
-  return true
+  return wakeBoard(role, false)
 end
 
--- Forward-declared; bodies assigned below / after drawFleetMapOn.
+-- Forward-declared; body set after drawFleetMapOn.
 local drawMapBoard
 local drawBoards
 
 local function activeMonitors()
-  local list, seen = {}, {}
+  local list, seenM = {}, {}
   local function add(m)
-    if m and not seen[m] then
-      seen[m] = true
+    if m and not seenM[m] then
+      seenM[m] = true
       list[#list + 1] = m
     end
   end
   for _, role in ipairs(SCREEN_ROLES) do
     if screenOn[role] then add(screens[role]) end
   end
+  -- Saver (and unused screens) cover every attached monitor.
   if #list == 0 then
     for _, name in ipairs(listMonitorNames()) do
       add(wrapScreen(name))
     end
   end
   return list
-end
-
-local function bumpActivity()
-  lastActivity = os.clock()
-  if saverActive then
-    saverActive = false
-    saverState = {}
-    if drawBoards then drawBoards() end
-  end
-end
-
-local function saverIdle()
-  return saverEnabled and (os.clock() - lastActivity) >= saverIdleSecs
 end
 
 -- Bounce "TitanSystems" without full-screen clears (erase old glyph only).
@@ -1259,23 +1314,23 @@ drawBoards = function()
   local n = refreshScreens()
   if n == 0 then return end
   local drawn = {}
-  local function paint(role, mon, drawer)
+  local function paint(mon, drawer)
     if not mon or drawn[mon] then return end
     drawn[mon] = true
     clearMon(mon)
     drawer(mon)
   end
   if screens.roster and screenOn.roster then
-    paint("roster", screens.roster, function(m) drawRoster(m) end)
+    paint(screens.roster, function(m) drawRoster(m) end)
   end
   if screens.stats and screenOn.stats then
-    paint("stats", screens.stats, function(m) drawStats(m) end)
+    paint(screens.stats, function(m) drawStats(m) end)
   end
   if screens.gps and screenOn.gps then
-    paint("gps", screens.gps, function(m) drawGps(m) end)
+    paint(screens.gps, function(m) drawGps(m) end)
   end
   if screens.map and screenOn.map and drawMapBoard then
-    paint("map", screens.map, function(m) drawMapBoard(m) end)
+    paint(screens.map, function(m) drawMapBoard(m) end)
   end
   for _, name in ipairs(listMonitorNames()) do
     local m = wrapScreen(name)
@@ -1287,12 +1342,13 @@ local function drawLoop()
   loadScreenAssignments()
   while true do
     refreshWiredFlags()
-    if saverIdle() then
+    expireTemporaryBoards()
+    if not anyLiveBoard() then
       local entering = not saverActive
       saverActive = true
       screensaverFrame(entering)
       if rosterDirty then saveRoster() end
-      sleep(0.08)   -- ~12 fps; erase/redraw only the word
+      sleep(0.08)   -- ~12 fps bounce
     else
       if saverActive then
         saverActive = false
@@ -1781,7 +1837,6 @@ local function consoleLoop()
     write(isMain() and "router> " or "modem> ")
     local a = {}
     for word in tostring(read()):gmatch("%S+") do a[#a + 1] = word end
-    bumpActivity()
     local cmd = (a[1] or ""):lower()
 
     if cmd == "" then
@@ -1796,11 +1851,12 @@ local function consoleLoop()
       print("reset [routes|names|all|hard] - wipe routing data (confirm)")
       if isMain() then
         print("  routes = roster; names = name assigns; all = both")
-        print("screens  - list monitors + board toggles (roster/stats/gps/map)")
-        print("screen <role> on|off|<monitor>|auto  toggle / assign a board")
-        print("view <roster|stats|gps|map>  single-monitor focus")
-        print("saver [on|off|now|idle <sec>]  TitanSystems screensaver")
-        print("map view - interactive fleet map on this terminal")
+        print("screens  - list monitors + board toggles")
+        print("screen <role> on|off|perm|<monitor>|auto")
+        print(("  on = show %ds then saver;  perm = stay on"):format(saverIdleSecs))
+        print("view <roster|stats|gps|map>  wake board (temp)")
+        print("idle [seconds]  temp-board timeout (default 120)")
+        print("map on|off|perm|view  map board / terminal map")
         print("versions - local vs GitHub package versions")
         print("devices  - list remembered systems (ONLINE / OFFLINE)")
         print("forget <id|host> - remove a system from the remembered roster")
@@ -1930,25 +1986,30 @@ local function consoleLoop()
       else
         local sub = (a[2] or ""):lower()
         if sub == "" or sub == "status" then
-          print(("Map board: %s  (screen map on|off)"):format(screenOn.map and "ON" or "OFF"))
-          print("  map on|off  — toggle the dedicated map monitor")
-          print("  map view    — interactive map on this terminal")
+          local mode = not screenOn.map and "saver"
+            or (screenPerm.map and "PERM" or ("temp %ds"):format(saverIdleSecs))
+          print(("Map board: %s"):format(mode))
+          print("  map on|off|perm  — temp / off / permanent")
+          print("  map view         — interactive map on this terminal")
         elseif sub == "true" or sub == "on" or sub == "1" or sub == "yes" then
-          setScreenOn("map", true)
-          print("Map board ON (own monitor when available).")
+          wakeBoard("map", false)
+          print(("Map ON for %ds, then screensaver."):format(saverIdleSecs))
+          drawBoards()
+        elseif sub == "perm" or sub == "permanent" or sub == "always" then
+          wakeBoard("map", true)
+          print("Map ON permanently.")
           drawBoards()
         elseif sub == "false" or sub == "off" or sub == "0" or sub == "no" then
           setScreenOn("map", false)
-          print("Map board OFF.")
-          drawBoards()
+          print("Map OFF (screensaver).")
         elseif sub == "view" or sub == "term" or sub == "live" then
           fleetMapView()
         elseif sub == "toggle" then
-          setScreenOn("map", not screenOn.map)
+          if screenOn.map then setScreenOn("map", false) else wakeBoard("map", false) end
           print(("Map board: %s"):format(screenOn.map and "ON" or "OFF"))
           drawBoards()
         else
-          print("Usage: map on|off|view|toggle")
+          print("Usage: map on|off|perm|view|toggle")
         end
       end
     elseif cmd == "view" or cmd == "display" then
@@ -1956,49 +2017,33 @@ local function consoleLoop()
       else
         local role = (a[2] or ""):lower()
         if role == "" then
-          print(("Focus: %s  (single-monitor board)"):format(screenFocus))
+          local left = boardWakeAt and math.max(0, math.floor(boardWakeAt + saverIdleSecs - os.clock())) or 0
+          local live = enabledRoles()
+          print(("Active: %s  focus=%s  temp-timeout=%ds (left %ds)"):format(
+            #live > 0 and table.concat(live, ",") or "(saver)",
+            screenFocus, saverIdleSecs, left))
           print("Usage: view <roster|stats|gps|map>")
         elseif not isScreenRole(role) then
           print("Usage: view <roster|stats|gps|map>")
         else
-          setScreenFocus(role)
-          print(("Showing %s on the single-monitor focus."):format(role))
+          wakeBoard(role, false)
+          print(("%s ON for %ds, then screensaver."):format(role, saverIdleSecs))
           drawBoards()
         end
       end
-    elseif cmd == "saver" or cmd == "screensaver" then
-      if not isMain() then print("saver is MAIN-only.")
+    elseif cmd == "idle" or cmd == "saver" then
+      if not isMain() then print("idle is MAIN-only.")
       else
-        local sub = (a[2] or ""):lower()
-        if sub == "" or sub == "status" then
-          print(("Screensaver: %s  idle=%ds  text=%s  active=%s"):format(
-            saverEnabled and "ON" or "OFF", saverIdleSecs, SAVER_TEXT,
-            tostring(saverActive)))
-          print("Usage: saver on|off|now|idle <seconds>")
-        elseif sub == "on" or sub == "true" or sub == "1" then
-          saverEnabled = true
-          saveScreenAssignments()
-          print(("Screensaver ON (after %ds idle)."):format(saverIdleSecs))
-        elseif sub == "off" or sub == "false" or sub == "0" then
-          saverEnabled = false
-          bumpActivity()
-          saveScreenAssignments()
-          print("Screensaver OFF.")
-        elseif sub == "now" or sub == "start" then
-          saverEnabled = true
-          lastActivity = os.clock() - saverIdleSecs - 1
-          print("Screensaver starting…")
-        elseif sub == "idle" or sub == "time" or sub == "delay" then
-          local sec = tonumber(a[3])
-          if not sec or sec < 5 then
-            print("Usage: saver idle <seconds>  (min 5)")
-          else
-            saverIdleSecs = math.floor(sec)
-            saveScreenAssignments()
-            print(("Screensaver idle delay: %ds"):format(saverIdleSecs))
-          end
+        local sec = tonumber(a[2])
+        if not a[2] or a[2]:lower() == "status" then
+          print(("Temp boards return to screensaver after %ds."):format(saverIdleSecs))
+          print("Usage: idle <seconds>   (min 5)")
+        elseif not sec or sec < 5 then
+          print("Usage: idle <seconds>   (min 5)")
         else
-          print("Usage: saver on|off|now|idle <seconds>")
+          saverIdleSecs = math.floor(sec)
+          saveScreenAssignments()
+          print(("Temp-board timeout set to %ds."):format(saverIdleSecs))
         end
       end
     elseif cmd == "names" then
@@ -2148,72 +2193,82 @@ local function consoleLoop()
       if not isMain() then print("Screens are MAIN-only."); else
         refreshScreens()
         local names = listMonitorNames()
-        print(("Attached monitors: %d   (4 boards: roster stats gps map)"):format(#names))
+        print(("Attached monitors: %d   mode=%s"):format(
+          #names, anyLiveBoard() and "boards" or "screensaver"))
         for i, n in ipairs(names) do
           local roles = {}
           for _, role in ipairs(SCREEN_ROLES) do
-            if screenNames[role] == n and screens[role] then roles[#roles + 1] = role end
+            if screenOn[role] and screenNames[role] == n and screens[role] then
+              roles[#roles + 1] = role
+            end
           end
-          print(("  %d) %-16s %s"):format(i, n, #roles > 0 and table.concat(roles, "+") or "(free)"))
+          print(("  %d) %-16s %s"):format(i, n, #roles > 0 and table.concat(roles, "+") or "(saver)"))
         end
-        print("Boards (toggle with screen <role> on|off):")
+        print(("Boards (temp timeout %ds):"):format(saverIdleSecs))
         for _, role in ipairs(SCREEN_ROLES) do
           local n = screenNames[role]
           local ok = n and peripheral.isPresent(n)
-          local shown = screens[role] ~= nil
-          print(("  %-6s %-3s -> %-16s%s%s"):format(
-            role, screenOn[role] and "ON" or "off",
-            n or "(none)",
-            ok == false and " [MISSING]" or "",
-            shown and " [LIVE]" or ""))
+          local mode = not screenOn[role] and "off"
+            or (screenPerm[role] and "PERM" or "temp")
+          print(("  %-6s %-4s -> %-16s%s"):format(
+            role, mode, n or "(auto)",
+            ok == false and " [MISSING]" or ""))
         end
-        if #names <= 1 then
-          print(("Single-monitor focus: %s  (`view <role>` to switch)"):format(screenFocus))
-        else
-          print("Each ON board uses its own monitor. Stats and GPS are separate.")
+        if boardWakeAt then
+          local left = math.max(0, math.floor(boardWakeAt + saverIdleSecs - os.clock()))
+          print(("Temp boards expire in %ds."):format(left))
         end
       end
     elseif cmd == "screen" then
       if not isMain() then print("Screens are MAIN-only."); else
         local role = (a[2] or ""):lower()
         local target = (a[3] or ""):lower()
+        local flag = (a[4] or ""):lower()
         if not isScreenRole(role) then
-          print("Usage: screen <roster|stats|gps|map> <on|off|auto|monitor>")
-          print("Example: screen gps on   |   screen stats monitor_2")
+          print("Usage: screen <roster|stats|gps|map> <on|off|perm|auto|monitor>")
+          print(("  on   = show %ds then screensaver"):format(saverIdleSecs))
+          print("  perm = stay on permanently")
+          print("Example: screen roster on   |   screen map perm")
         elseif target == "" then
-          print(("Usage: screen %s <on|off|auto|monitor>"):format(role))
+          print(("Usage: screen %s <on|off|perm|auto|monitor>"):format(role))
         elseif target == "on" or target == "true" or target == "1" or target == "yes" then
-          setScreenOn(role, true)
-          print(role .. " board ON")
+          local permanent = (flag == "perm" or flag == "permanent" or flag == "always")
+          wakeBoard(role, permanent)
+          if permanent then
+            print(role .. " board ON permanently.")
+          else
+            print(("%s board ON for %ds, then screensaver."):format(role, saverIdleSecs))
+          end
+          drawBoards()
+        elseif target == "perm" or target == "permanent" or target == "always" then
+          wakeBoard(role, true)
+          print(role .. " board ON permanently.")
           drawBoards()
         elseif target == "off" or target == "false" or target == "0" or target == "no" then
           setScreenOn(role, false)
-          print(role .. " board OFF")
-          drawBoards()
+          print(role .. " board OFF (screensaver).")
         elseif target == "auto" or target == "clear" then
           screenNames[role] = nil
           screens[role] = nil
           saveScreenAssignments()
           refreshScreens()
           print(role .. " assignment cleared (auto).")
-          drawBoards()
+          if anyLiveBoard() then drawBoards() end
         else
           local monName = a[3]
           if not peripheral.isPresent(monName) or peripheral.getType(monName) ~= "monitor" then
             print("Not a monitor: " .. tostring(monName))
             print("Available: " .. table.concat(listMonitorNames(), ", "))
           else
-            -- Free this monitor from other roles so boards stay 1:1.
             for _, r in ipairs(SCREEN_ROLES) do
               if r ~= role and screenNames[r] == monName then
                 screenNames[r] = nil
               end
             end
             screenNames[role] = monName
-            screenOn[role] = true
-            saveScreenAssignments()
-            refreshScreens()
-            print(("%s -> %s (ON)"):format(role, monName))
+            local permanent = (flag == "perm" or flag == "permanent" or flag == "always")
+            wakeBoard(role, permanent)
+            print(("%s -> %s (%s)"):format(role, monName, permanent and "PERM" or "temp"))
             drawBoards()
           end
         end
@@ -2381,6 +2436,13 @@ local function consoleLoop()
 end
 
 --------------------------------------------------------------------------------
+-- Shared lib (needed for accurate multi-sample GPS host setup).
+--------------------------------------------------------------------------------
+if fs.exists("lib/titan.lua") then
+  titanLib = dofile("lib/titan.lua")
+end
+
+--------------------------------------------------------------------------------
 -- Config: role + GPS hosting.
 --------------------------------------------------------------------------------
 local rcfg = loadRouterCfg() or {}
@@ -2404,13 +2466,26 @@ elseif rcfg.gpsHost == false then
 else
   print("")
   print("Routers double as GPS hosts (place 4+ spread out for a constellation).")
-  local x, y, z = gps.locate(2)
+  print("Host coords = MODEM block (F3 Targeted Block on the modem).")
+  local x, y, z, info
+  if titanLib and titanLib.gpsFix then
+    x, y, z, info = titanLib.gpsFix({ timeout = 4, samples = 9 })
+  else
+    x, y, z = gps.locate(2)
+    if x then
+      x = math.floor(x + 0.5); y = math.floor(y + 0.5); z = math.floor(z + 0.5)
+    end
+  end
   if x then
-    x, y, z = math.floor(x + 0.5), math.floor(y + 0.5), math.floor(z + 0.5)
-    print(("Auto-located: %d, %d, %d"):format(x, y, z))
+    if info then
+      print(("Auto-located: %d, %d, %d  (n=%d  Y %.2f..%.2f)"):format(
+        x, y, z, info.n, info.yLo, info.yHi))
+    else
+      print(("Auto-located: %d, %d, %d"):format(x, y, z))
+    end
     gpsCoords = { x = x, y = y, z = z }
   else
-    print("Enter this router's coordinates to host GPS (blank X = skip).")
+    print("Enter this MODEM's coordinates to host GPS (blank X = skip).")
     write("X: "); local sx = read()
     if sx ~= "" then
       write("Y: "); local sy = read(); write("Z: "); local sz = read()
@@ -2423,12 +2498,6 @@ else
     patchRouterCfg({ gpsHost = false })
   end
   if gpsCoords then print(("Hosting GPS at %d, %d, %d."):format(gpsCoords.x, gpsCoords.y, gpsCoords.z)) end
-end
-
---------------------------------------------------------------------------------
--- Shared lib instance (SSH host + client must share one reply inbox).
-if fs.exists("lib/titan.lua") then
-  titanLib = dofile("lib/titan.lua")
 end
 
 local tasks = { repeaterLoop, consoleLoop, wiredLinkLoop }
@@ -2473,15 +2542,15 @@ if isMain() then
   end
   local onBits = {}
   for _, role in ipairs(SCREEN_ROLES) do
-    onBits[#onBits + 1] = role .. "=" .. (screenOn[role] and "on" or "off")
+    local mode = not screenOn[role] and "off" or (screenPerm[role] and "perm" or "on")
+    onBits[#onBits + 1] = role .. "=" .. mode
   end
   print("Boards: " .. table.concat(onBits, "  "))
   if nMon == 0 then
-    print("No monitors yet — attach up to 4 (roster | stats | gps | map).")
-  elseif nMon == 1 then
-    print(("1 monitor: focus=%s  (`view` / `screen <role> on|off`)"):format(screenFocus))
+    print("No monitors yet — attach one for TitanSystems screensaver / boards.")
   else
-    print(("%d monitors: one board each. Stats & GPS are separate. Type `screens`."):format(nMon))
+    print(("%d monitor(s). Default=screensaver. Temp boards last %ds."):format(nMon, saverIdleSecs))
+    print("Type `screen roster on` / `screen map perm` / `screens`.")
   end
 else
   clearRosterIfModem()

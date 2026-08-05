@@ -1,6 +1,6 @@
 --[[
   worker.lua  -  Builder / Gatherer bot for the Titan network (CC: Tweaked)
-  Titan-Version: 1.2.0
+  Titan-Version: 1.2.1
 
   A TURTLE that is either a BUILDER or a GATHERER. It registers with the
   "Bots Computer" (botserver.lua), learns/keeps its type, and then works.
@@ -240,7 +240,7 @@ local function deployChest()
     print("Could not place chest (block in front?).")
     return false
   end
-  local x, y, z = nav.locate(2)
+  local x, y, z = nav.locatePrecise(4)
   if not x then print("No GPS - cannot register chest position."); return false end
   local d = DIR[nav.heading]
   local chestPos = { x = x + d.x, y = y, z = z + d.z }
@@ -440,9 +440,12 @@ local function statusLoop()
   titan.broadcast(MSG.BOT_REGISTER, { botType = cfg.botType, home = nav.home, chest = cfg.chest })
   while true do
     local x, y, z = nav.locate(1)
+    local fix = nav.lastFix
     titan.broadcast(MSG.STATUS, {
       name = cfg.name,
       x = x, y = y, z = z, fuel = turtle.getFuelLevel(),
+      yLo = fix and fix.yLo, yHi = fix and fix.yHi,
+      gpsN = fix and fix.n, gpsSpreadY = fix and fix.spreadY,
       state = state.status, task = state.task,
       assignment = state.task, botType = cfg.botType,
     })

@@ -1,6 +1,6 @@
 --[[
   miner.lua  -  Area miner turtle for the Titan network (CC: Tweaked)
-  Titan-Version: 1.2.1
+  Titan-Version: 1.2.2
 
   Digs a rectangular "box":
     * set1 / set2  — opposite corners (defines the X/Z footprint)
@@ -299,7 +299,7 @@ local function mineVolume()
 
   -- Remember home if not set
   if not cfg.home then
-    local x, y, z = nav.locate(2)
+    local x, y, z = nav.locatePrecise(3)
     if x then cfg.home = { x = x, y = y, z = z }; saveCfg() end
   end
 
@@ -448,11 +448,17 @@ local function printStatus()
 end
 
 local function markHere(field)
-  local x, y, z = nav.locate(2)
+  local x, y, z = nav.locatePrecise(4)
   if not x then print("No GPS signal."); return end
   cfg[field] = { x = x, y = y, z = z }
   saveCfg()
-  print(("%s set to %s"):format(field, fmt(cfg[field])))
+  local fix = nav.lastFix
+  if fix then
+    print(("%s set to %s  (Y %.2f..%.2f n=%d)"):format(
+      field, fmt(cfg[field]), fix.yLo, fix.yHi, fix.n))
+  else
+    print(("%s set to %s"):format(field, fmt(cfg[field])))
+  end
   if (field == "loc1" or field == "loc2") and cfg.loc1 and cfg.loc2 then
     print(("X/Z box: %d..%d , %d..%d"):format(
       math.min(cfg.loc1.x, cfg.loc2.x), math.max(cfg.loc1.x, cfg.loc2.x),
@@ -537,12 +543,18 @@ local function consoleLoop()
       if y then print("yend (bottom) = " .. y) else print("Usage: yend <y>  (" .. tostring(err) .. ")") end
     elseif cmd == "yhere" then
       local which = (a[2] or ""):lower()
-      local x, y, z = nav.locate(2)
+      local x, y, z = nav.locatePrecise(4)
       if not y then print("No GPS signal.")
       elseif which == "start" or which == "top" or which == "ystart" then
-        setYStart(y); print("ystart = " .. cfg.yStart .. " (current GPS Y)")
+        setYStart(y)
+        local fix = nav.lastFix
+        print(("ystart = %d (GPS Y; range %.2f..%.2f)"):format(
+          cfg.yStart, fix and fix.yLo or y, fix and fix.yHi or y))
       elseif which == "end" or which == "bottom" or which == "yend" then
-        setYEnd(y); print("yend = " .. cfg.yEnd .. " (current GPS Y)")
+        setYEnd(y)
+        local fix = nav.lastFix
+        print(("yend = %d (GPS Y; range %.2f..%.2f)"):format(
+          cfg.yEnd, fix and fix.yLo or y, fix and fix.yHi or y))
       else
         print("Usage: yhere start | yhere end")
       end
@@ -647,6 +659,7 @@ local function statusLoop()
   })
   while true do
     local x, y, z = nav.locate(1)
+    local fix = nav.lastFix
     local asg = assignmentText()
     titan.broadcast(MSG.STATUS, {
       name = cfg.name or os.getComputerLabel(),
@@ -654,6 +667,8 @@ local function statusLoop()
       task   = state.task,
       assignment = asg,
       x = x, y = y, z = z,
+      yLo = fix and fix.yLo, yHi = fix and fix.yHi,
+      gpsN = fix and fix.n, gpsSpreadY = fix and fix.spreadY,
       fuel   = turtle.getFuelLevel(),
       dug    = state.dug,
       botType = "miner",

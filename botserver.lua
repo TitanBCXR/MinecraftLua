@@ -1,6 +1,6 @@
 --[[
   botserver.lua  -  "Bots Computer" for the Titan network (CC: Tweaked)
-  Titan-Version: 1.2.0
+  Titan-Version: 1.2.1
 
   Coordination hub for the three bot types:
     * builder  / gatherer  (worker.lua)
@@ -186,6 +186,10 @@ local function touchBot(id, msg)
   b.name = msg.name or msg.hostname or b.name
   b.botType = msg.botType or b.botType
   b.x, b.y, b.z = msg.x or b.x, msg.y or b.y, msg.z or b.z
+  if msg.yLo ~= nil then b.yLo = msg.yLo end
+  if msg.yHi ~= nil then b.yHi = msg.yHi end
+  if msg.gpsSpreadY ~= nil then b.gpsSpreadY = msg.gpsSpreadY end
+  if msg.gpsN ~= nil then b.gpsN = msg.gpsN end
   if msg.fuel ~= nil then b.fuel = msg.fuel end
   b.state = msg.state or b.state
   b.task = msg.task or b.task
@@ -290,9 +294,13 @@ local function printBots(filter)
   for _, id in ipairs(sortedBotIds(filter)) do
     local b = bots[id]
     n = n + 1
-    print(("  #%-3d %-12s %-8s %-8s %s fuel:%s  %ss"):format(
+    local pos = (b.x and ("%d,%d,%d"):format(b.x, b.y or 0, b.z or 0)) or "?"
+    if b.yLo and b.yHi and b.yLo ~= b.yHi then
+      pos = pos .. (" Y%.1f..%.1f"):format(b.yLo, b.yHi)
+    end
+    print(("  #%-3d %-12s %-8s %-8s @%s  %s fuel:%s  %ss"):format(
       id, b.name or "?", b.botType or "?", b.state or "?",
-      assignmentOf(id, b):sub(1, 20), tostring(b.fuel or "?"), ago(b.seen)))
+      pos, assignmentOf(id, b):sub(1, 16), tostring(b.fuel or "?"), ago(b.seen)))
   end
   if n == 0 then print("  (none)") end
 end

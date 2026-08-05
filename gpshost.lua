@@ -1,11 +1,14 @@
 --[[
   gpshost.lua  -  Easy GPS host for the Titan network (CC: Tweaked)
-  Titan-Version: 1.1.6
+  Titan-Version: 1.1.7
 
   Bots locate themselves with gps.locate(), which needs at least FOUR GPS host
   computers in range. Run this on each of those computers. On first run it asks
-  for the computer's own coordinates (or auto-detects them if a constellation
-  already exists), saves them, offers to auto-start on boot, then hosts forever.
+  for the MODEM's coordinates (or multi-samples GPS if a constellation already
+  exists), saves them, offers to auto-start on boot, then hosts forever.
+
+  Hosts must report the modem block — wrong host Y is the usual cause of bots
+  reading Y one block high/low.
 
   Also joins the Titan mesh and hosts an SSH shell (when lib/titan.lua is present)
   so you can jump in remotely and `reboot` if needed.
@@ -71,16 +74,40 @@ end
 openModem()
 os.setComputerLabel(os.getComputerLabel() or ("GPS-" .. os.getComputerID()))
 
+local function multiLocate(samples, timeout)
+  samples = samples or 9
+  local per = (timeout or 4) / samples
+  local xs, ys, zs = {}, {}, {}
+  for i = 1, samples do
+    local x, y, z = gps.locate(math.max(0.3, per))
+    if x then
+      xs[#xs + 1] = x; ys[#ys + 1] = y; zs[#zs + 1] = z
+    end
+    if i < samples then sleep(0.05) end
+  end
+  if #xs == 0 then return nil end
+  local function pick(t)
+    table.sort(t)
+    local lo, hi = t[1], t[#t]
+    local mid = (lo + hi) / 2
+    return math.floor(mid + 0.5), lo, hi
+  end
+  local x, xLo, xHi = pick(xs)
+  local y, yLo, yHi = pick(ys)
+  local z, zLo, zHi = pick(zs)
+  return x, y, z, { n = #xs, xLo = xLo, xHi = xHi, yLo = yLo, yHi = yHi, zLo = zLo, zHi = zHi }
+end
+
 local cfg = load()
 if not cfg then
-  print("Trying to auto-detect position...")
-  local x, y, z = gps.locate(2)
+  print("Trying to auto-detect modem position (multi-sample)...")
+  local x, y, z, info = multiLocate(9, 4)
   if x then
-    x, y, z = math.floor(x + 0.5), math.floor(y + 0.5), math.floor(z + 0.5)
-    print(("Auto-located: %d, %d, %d"):format(x, y, z))
+    print(("Auto-located: %d, %d, %d  (n=%d  Y %.2f..%.2f)"):format(
+      x, y, z, info.n, info.yLo, info.yHi))
   else
-    print("No existing GPS. Enter THIS computer's block coordinates.")
-    print("(In-game press F3; point at this computer to read 'Targeted Block'.)")
+    print("No existing GPS. Enter THIS MODEM's block coordinates.")
+    print("(F3 → Targeted Block on the modem itself, not the computer.)")
     x = askNum("X")
     y = askNum("Y")
     z = askNum("Z")

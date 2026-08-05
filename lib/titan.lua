@@ -1,6 +1,6 @@
 --[[
   titan.lua  -  Shared library for the Titan bot network (CC: Tweaked)
-  Titan-Version: 1.2.5
+  Titan-Version: 1.2.6
 
   Provides:
     * Rednet protocol constants + message type enum
@@ -1404,18 +1404,141 @@ end
 --   * a working GPS constellation in range (see README).
 --------------------------------------------------------------------------------
 
+--------------------------------------------------------------------------------
+-- GPS fix: multi-sample with high/low tracking for accurate block coords.
+-- Y is especially noisy (modem offset + constellation error); sampling and
+-- taking the median between the observed high/low cuts that error down.
+--------------------------------------------------------------------------------
+local function axisStats(vals)
+  local sorted = {}
+  for i = 1, #vals do sorted[i] = vals[i] end
+  table.sort(sorted)
+  local lo, hi = sorted[1], sorted[#sorted]
+  local n = #sorted
+  local med
+  if n % 2 == 1 then
+    med = sorted[(n + 1) / 2]
+  else
+    med = (sorted[n / 2] + sorted[n / 2 + 1]) / 2
+  end
+  -- Prefer the midpoint of the observed range when the spread is small
+  -- (typical GPS flicker); otherwise trust the median.
+  local mid = (lo + hi) / 2
+  local pick = (hi - lo) <= 1.5 and mid or med
+  return math.floor(pick + 0.5), lo, hi, med
+end
+
+-- opts: timeout (total budget secs), samples, bias {x,y,z}
+-- Returns x, y, z, info  or  nil, err
+-- info = { x,y,z, xLo,xHi,yLo,yHi,zLo,zHi, n, rawY, spreadY }
+function titan.gpsFix(opts)
+  opts = type(opts) == "table" and opts or {}
+  local samples = math.max(1, math.floor(tonumber(opts.samples) or 5))
+  local budget  = tonumber(opts.timeout) or 2.5
+  local per     = math.max(0.25, budget / samples)
+  local bias    = type(opts.bias) == "table" and opts.bias or {}
+  local bx = tonumber(bias.x) or 0
+  local by = tonumber(bias.y) or 0
+  local bz = tonumber(bias.z) or 0
+
+  local xs, ys, zs = {}, {}, {}
+  for i = 1, samples do
+    local x, y, z = gps.locate(per)
+    if x then
+      xs[#xs + 1] = x
+      ys[#ys + 1] = y
+      zs[#zs + 1] = z
+      -- Early exit: 3 agreeing block samples → good enough.
+      if #xs >= 3 then
+        local ax = math.floor(xs[#xs] + 0.5)
+        local ay = math.floor(ys[#ys] + 0.5)
+        local az = math.floor(zs[#zs] + 0.5)
+        local agree = 0
+        for j = #xs - 2, #xs do
+          if math.floor(xs[j] + 0.5) == ax
+             and math.floor(ys[j] + 0.5) == ay
+             and math.floor(zs[j] + 0.5) == az then
+            agree = agree + 1
+          end
+        end
+        if agree >= 3 then break end
+      end
+    end
+    if i < samples then sleep(0.05) end
+  end
+  if #xs == 0 then return nil, "no gps fix" end
+
+  local x, xLo, xHi = axisStats(xs)
+  local y, yLo, yHi = axisStats(ys)
+  local z, zLo, zHi = axisStats(zs)
+  x = x + bx; y = y + by; z = z + bz
+
+  local info = {
+    x = x, y = y, z = z,
+    xLo = xLo + bx, xHi = xHi + bx,
+    yLo = yLo + by, yHi = yHi + by,
+    zLo = zLo + bz, zHi = zHi + bz,
+    n = #xs,
+    rawY = (yLo + yHi) / 2 + by,
+    spreadY = (yHi - yLo),
+    spreadX = (xHi - xLo),
+    spreadZ = (zHi - zLo),
+  }
+  return x, y, z, info
+end
+
 local nav = {}
 titan.nav = nav
 
 nav.heading = nil        -- current facing (titan.NORTH/EAST/SOUTH/WEST) once calibrated
 nav.home    = nil        -- {x, y, z} set with nav.setHome()
 nav.FUEL_SLOT = 16       -- bottom-right inventory slot — dedicated fuel slot for turtles
+nav.GPS_SAMPLES = 5      -- samples per locate (status / movement)
+nav.gpsBias = { x = 0, y = 0, z = 0 }  -- modem-body offset (top modem: y = -1)
+nav.lastFix = nil        -- last gpsFix info (includes yLo / yHi)
 
--- Locate ourselves via GPS. Returns x, y, z or nil.
+function nav.setGpsBias(dx, dy, dz)
+  nav.gpsBias = {
+    x = tonumber(dx) or 0,
+    y = tonumber(dy) or 0,
+    z = tonumber(dz) or 0,
+  }
+  return nav.gpsBias
+end
+
+-- Locate via multi-sample GPS (tracks high/low, returns most accurate block).
+-- Returns x, y, z or nil. Detail in nav.lastFix (yLo / yHi / spreadY).
 function nav.locate(timeout)
-  local x, y, z = gps.locate(timeout or 2)
-  if not x then return nil end
-  return math.floor(x + 0.5), math.floor(y + 0.5), math.floor(z + 0.5)
+  local samples = nav.GPS_SAMPLES or 5
+  -- Movement path often passes timeout=1 or 2; keep it responsive.
+  local budget = tonumber(timeout) or 2
+  if budget < 1 then samples = math.min(samples, 3) end
+  local x, y, z, info = titan.gpsFix({
+    timeout = budget,
+    samples = samples,
+    bias = nav.gpsBias,
+  })
+  if not x then
+    nav.lastFix = nil
+    return nil
+  end
+  nav.lastFix = info
+  return x, y, z
+end
+
+-- Extra-careful fix for set-home / deploy / corners (more samples).
+function nav.locatePrecise(timeout)
+  local x, y, z, info = titan.gpsFix({
+    timeout = tonumber(timeout) or 4,
+    samples = 9,
+    bias = nav.gpsBias,
+  })
+  if not x then
+    nav.lastFix = nil
+    return nil
+  end
+  nav.lastFix = info
+  return x, y, z
 end
 
 -- Movement helpers. `dig` controls whether we may break blocks to pass.
