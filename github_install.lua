@@ -1,6 +1,6 @@
 --[[
   github_install.lua  -  Install the Titan system straight from a GitHub repo
-  Titan-Version: 1.1.7
+  Titan-Version: 1.1.8
 
   Point RAW_BASE at your repo's raw content root, then on each Minecraft device:
 
@@ -92,20 +92,48 @@ if RAW_BASE:find("YOURNAME/REPO") then
   return
 end
 
-term.clear(); term.setCursorPos(1, 1)
-print("== Titan GitHub Installer ==")
-print("Source: " .. RAW_BASE)
-print("")
-print("What is this device?")
-for _, r in ipairs(ROLES) do print("  " .. r.key .. ") " .. r.name) end
-print("")
-write("Choose 1-" .. #ROLES .. " (Q to cancel): ")
-local choice = read()
-if choice:lower() == "q" then print("Cancelled."); return end
+local function pickRole(title, sourceLine)
+  local lastKey = ROLES[#ROLES].key
+  while true do
+    local idx = 1
+    while idx <= #ROLES do
+      local _, h = term.getSize()
+      term.clear(); term.setCursorPos(1, 1)
+      print(title)
+      if sourceLine then print(sourceLine) end
+      print("What is this device?  (13=StorageManager)")
+      print("")
+      local budget = math.max(4, (h or 13) - 7)
+      local shown = 0
+      while idx <= #ROLES and shown < budget do
+        local r = ROLES[idx]
+        print("  " .. r.key .. ") " .. r.name)
+        idx = idx + 1
+        shown = shown + 1
+      end
+      print("")
+      if idx <= #ROLES then
+        write("Enter #, or Enter=more (Q cancel): ")
+      else
+        write("Choose 1-" .. lastKey .. " (Q cancel): ")
+      end
+      local choice = tostring(read() or "")
+      if choice:lower() == "q" then return nil end
+      if choice ~= "" then
+        for _, r in ipairs(ROLES) do
+          if r.key == choice then return r end
+        end
+        print("Invalid choice."); sleep(1.2)
+        idx = 1
+      elseif idx > #ROLES then
+        idx = 1
+      end
+    end
+  end
+end
 
-local role
-for _, r in ipairs(ROLES) do if r.key == choice then role = r; break end end
-if not role then print("Invalid choice."); return end
+local role = pickRole("== Titan GitHub Installer ==", "Source: " .. RAW_BASE)
+if not role then print("Cancelled."); return end
 
 local files, hasVersions = {}, false
 for _, path in ipairs(role.files) do

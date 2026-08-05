@@ -1,6 +1,6 @@
 --[[
   install.lua  -  Titan network installer (CC: Tweaked)
-  Titan-Version: 1.1.7
+  Titan-Version: 1.1.8
 
   Downloads the Titan bot-network system onto this device from a running
   `host.lua` on the same rednet network (no pastebin / external web host).
@@ -124,17 +124,46 @@ end
 
 print(("Host: %s (#%d) - %d files available."):format(
   hostMsg.label or "?", hostId, #(hostMsg.files or {})))
-print("")
-print("What is this device?")
-for _, r in ipairs(ROLES) do print("  " .. r.key .. ") " .. r.name) end
-print("")
-write("Choose 1-" .. #ROLES .. " (or Q to cancel): ")
-local choice = read()
-if choice:lower() == "q" then print("Cancelled."); return end
 
-local role
-for _, r in ipairs(ROLES) do if r.key == choice then role = r; break end end
-if not role then print("Invalid choice. Cancelled."); return end
+local function pickRole()
+  local lastKey = ROLES[#ROLES].key
+  while true do
+    local idx = 1
+    while idx <= #ROLES do
+      local _, h = term.getSize()
+      print("")
+      print("What is this device?  (13=StorageManager)")
+      local budget = math.max(4, (h or 13) - 6)
+      local shown = 0
+      local start = idx
+      while idx <= #ROLES and shown < budget do
+        local r = ROLES[idx]
+        print("  " .. r.key .. ") " .. r.name)
+        idx = idx + 1
+        shown = shown + 1
+      end
+      if idx <= #ROLES then
+        write("Enter #, or Enter=more (Q cancel): ")
+      else
+        write("Choose 1-" .. lastKey .. " (Q cancel): ")
+      end
+      local choice = tostring(read() or "")
+      if choice:lower() == "q" then return nil end
+      if choice ~= "" then
+        for _, r in ipairs(ROLES) do
+          if r.key == choice then return r end
+        end
+        print("Invalid choice.")
+        idx = start
+      elseif idx > #ROLES then
+        idx = 1
+      end
+    end
+  end
+end
+
+local role = pickRole()
+if not role then print("Cancelled."); return end
 
 -- Always ship the versions catalog with every role.
 local files, hasVersions = {}, false
