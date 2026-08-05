@@ -1,6 +1,6 @@
 --[[
   datacenter.lua  -  Titan Data Center (CC: Tweaked)   [ single, self-contained script ]
-  Titan-Version: 1.1.0
+  Titan-Version: 1.1.2
 
   ONE script that every computer/terminal in your data center runs. It works out
   its own role automatically:
@@ -67,6 +67,8 @@ local MSG = {
   REGISTER     = "register",       -- station -> master : my name
   REGISTRY_REQ = "registry_req",   -- station -> master : send me the station list
   REGISTRY     = "registry",       -- master -> station : the station list
+  DEVICE_AUTH  = "device_auth",    -- bot/worker -> data server : re-auth after boot/OTA
+  AUTH_OK      = "auth_ok",        -- data server -> bot : acknowledged
   PING         = "ping",
   PONG         = "pong",
 }
@@ -76,6 +78,7 @@ local session  = { mode = "bot", user = nil } -- mode: "bot" (locked) | "admin"
 local station  = { name = nil }
 local netbots  = {}                          -- [id] = { name, botType, x,y,z, fuel, state, task, seen }
 local pending  = {}                          -- [id] = { name, x,y,z, seen } workers awaiting deployment
+local authed   = {}                          -- [id] = { name, kind, hostname, seen } bots authed with this DC
 
 --==============================================================================
 -- Small helpers
@@ -622,6 +625,29 @@ local function serviceLoop()
         end
       elseif t == MSG.PING then
         rednet.send(id, { type = MSG.PONG, name = station.name }, PROTOCOL)
+      elseif t == MSG.DEVICE_AUTH or t == "device_auth" then
+        -- Bots / workers / miners re-auth with the Parent Center after boot or OTA.
+        local name = msg.hostname or msg.name or ("#" .. id)
+        local kind = msg.kind or "bot"
+        authed[id] = { name = name, hostname = name, kind = kind, seen = os.epoch("utc") }
+        if kind == "worker" or kind == "worker?" then
+          -- Keep pending visible until deploy if we only have an auth ping.
+          if not netbots[id] and not pending[id] then
+            pending[id] = { name = name, seen = os.epoch("utc") }
+          end
+        else
+          local prev = netbots[id] or {}
+          netbots[id] = {
+            name = name, botType = prev.botType or kind,
+            x = prev.x, y = prev.y, z = prev.z,
+            fuel = prev.fuel, state = prev.state or "authed",
+            task = prev.task, seen = os.epoch("utc"),
+          }
+        end
+        rednet.send(id, {
+          type = MSG.AUTH_OK, name = station.name, station = station.name,
+        }, PROTOCOL)
+        print(("[auth] %s #%d (%s)"):format(name, id, kind))
       end
     end
   end

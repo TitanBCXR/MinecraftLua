@@ -1,6 +1,6 @@
 --[[
   titan.lua  -  Shared library for the Titan bot network (CC: Tweaked)
-  Titan-Version: 1.1.1
+  Titan-Version: 1.1.4
 
   Provides:
     * Rednet protocol constants + message type enum
@@ -175,6 +175,7 @@ end
 -- Use titan.networkLoop(kind) as one parallel task in every program.
 --------------------------------------------------------------------------------
 titan.ROUTER_PROTOCOL = "titan_router"
+titan.DC_PROTOCOL     = "titan_dc"
 
 -- Hostname shared on every network registration. Uses the computer label; if
 -- none is set yet, assigns "<Kind>-<id>" (e.g. Worker-12) so the roster never
@@ -204,33 +205,148 @@ function titan.setHostname(name, kind)
   return name
 end
 
+-- Persisted network membership (main router id, last auth).
+titan.NET_CFG = ".titan-net"
+-- Kinds that also re-auth with the Parent Center / data server.
+titan.DC_AUTH_KINDS = { bot = true, worker = true, miner = true }
+
+function titan.readNetCfg()
+  if not fs.exists(titan.NET_CFG) then return {} end
+  local f = fs.open(titan.NET_CFG, "r"); local d = textutils.unserialize(f.readAll()); f.close()
+  return type(d) == "table" and d or {}
+end
+
+function titan.writeNetCfg(c)
+  local f = fs.open(titan.NET_CFG, "w"); f.write(textutils.serialize(c)); f.close()
+end
+
+function titan.getMainRouterId()
+  local c = titan.readNetCfg()
+  return c.mainRouterId
+end
+
+function titan.setMainRouterId(id)
+  local c = titan.readNetCfg()
+  c.mainRouterId = id
+  c.authedAt = os.epoch("utc")
+  titan.writeNetCfg(c)
+end
+
+-- Discover the MAIN router (not modem-only repeaters). Returns id or nil.
+function titan.findMainRouter(timeout)
+  rednet.broadcast({ type = "where_main", name = os.getComputerLabel() }, titan.ROUTER_PROTOCOL)
+  local deadline = os.clock() + (timeout or 3)
+  while os.clock() < deadline do
+    local id, msg = rednet.receive(titan.ROUTER_PROTOCOL, deadline - os.clock())
+    if id and type(msg) == "table" and msg.type == "main_here" then
+      titan.setMainRouterId(id)
+      return id, msg
+    end
+  end
+  -- Fall back to a remembered id.
+  return titan.getMainRouterId()
+end
+
 function titan.announce(kind)
   if type(kind) == "string" and kind ~= "" then lastAnnounceKind = kind end
   local host = titan.hostname(lastAnnounceKind)
   rednet.broadcast({
     type = "hello", kind = lastAnnounceKind, name = host, hostname = host,
+    mainRouterId = titan.getMainRouterId(),
   }, titan.ROUTER_PROTOCOL)
 end
 
--- Announce periodically AND listen for an OTA "update" command from a router.
--- Prefer titan.networkLoop() in new code (includes the mesh relay too).
+-- Re-auth with the Parent Center / data server (bots, workers, miners).
+function titan.authWithDataCenter(kind)
+  local host = titan.hostname(kind)
+  rednet.broadcast({
+    type = "device_auth", kind = kind or lastAnnounceKind,
+    name = host, hostname = host, from = os.getComputerID(),
+  }, titan.DC_PROTOCOL)
+  local deadline = os.clock() + 3
+  while os.clock() < deadline do
+    local id, msg = rednet.receive(titan.DC_PROTOCOL, deadline - os.clock())
+    if id and type(msg) == "table" and msg.type == "auth_ok" then
+      local c = titan.readNetCfg()
+      c.dataCenterId = id
+      c.dcAuthedAt = os.epoch("utc")
+      titan.writeNetCfg(c)
+      return true, id
+    end
+  end
+  return false, "no data center response"
+end
+
+-- Full network re-auth: find main router, announce, and (for bots) auth with DC.
+-- Returns ok, detail.
+function titan.reauth(kind)
+  kind = kind or lastAnnounceKind or "device"
+  local mainId, mainMsg = titan.findMainRouter(3)
+  titan.announce(kind)
+  -- Also send a directed hello if we know the main router.
+  if mainId then
+    rednet.send(mainId, {
+      type = "hello", kind = kind, name = titan.hostname(kind),
+      hostname = titan.hostname(kind), auth = true,
+    }, titan.ROUTER_PROTOCOL)
+  end
+
+  local detail = { mainRouterId = mainId, mainLabel = mainMsg and (mainMsg.hostname or mainMsg.label) }
+  if titan.DC_AUTH_KINDS[kind] then
+    local ok, dcId = titan.authWithDataCenter(kind)
+    detail.dataCenter = ok and dcId or nil
+    detail.dcOk = ok
+  end
+  return mainId ~= nil, detail
+end
+
+-- Announce periodically AND listen for OTA update / forced reauth from main router.
 function titan.registerLoop(kind, period)
   period = period or 20
-  local nextAnnounce = 0
+  -- Re-auth immediately on boot / after OTA reboot.
+  print("[net] Re-authenticating with the network...")
+  local ok, detail = titan.reauth(kind)
+  if ok then
+    print(("[net] Main router #%s (%s)"):format(
+      tostring(detail.mainRouterId), tostring(detail.mainLabel or "?")))
+  else
+    print("[net] No main router found yet — will keep trying.")
+  end
+  if titan.DC_AUTH_KINDS[kind] then
+    if detail and detail.dcOk then
+      print(("[net] Data center auth ok (#%s)"):format(tostring(detail.dataCenter)))
+    else
+      print("[net] Data center auth pending (Parent Center offline?)")
+    end
+  end
+
+  local nextAnnounce = os.clock() + period
   while true do
     if os.clock() >= nextAnnounce then
       titan.announce(kind)
       nextAnnounce = os.clock() + period
     end
     local id, msg = rednet.receive(titan.ROUTER_PROTOCOL, math.max(0.2, nextAnnounce - os.clock()))
-    if type(msg) == "table" and msg.type == "update" then
-      print("")
-      print(("[OTA] Update requested by #%s. Re-downloading files..."):format(tostring(id)))
-      local ok, err = titan.updateSelf()
-      if ok then
-        print("[OTA] Updated. Rebooting in 2s..."); os.sleep(2); os.reboot()
-      else
-        print("[OTA] Update failed: " .. tostring(err))
+    if type(msg) == "table" then
+      -- Optional app hook (e.g. locator radar) — runs before built-in handlers.
+      if type(titan.onRouterMessage) == "function" then
+        pcall(titan.onRouterMessage, id, msg)
+      end
+      if msg.type == "main_claim" or msg.type == "main_here" then
+        titan.setMainRouterId(id)
+      elseif msg.type == "reauth" then
+        print("[net] Re-auth requested by router #" .. tostring(id))
+        titan.reauth(kind)
+      elseif msg.type == "update" then
+        print("")
+        print(("[OTA] Update from router #%s — downloading, then reboot + re-auth..."):format(tostring(id)))
+        if msg.mainRouterId then titan.setMainRouterId(msg.mainRouterId) end
+        local uok, err = titan.updateSelf()
+        if uok then
+          print("[OTA] Updated. Rebooting in 2s (will re-auth on boot)..."); os.sleep(2); os.reboot()
+        else
+          print("[OTA] Update failed: " .. tostring(err))
+        end
       end
     end
   end
@@ -1190,8 +1306,6 @@ end
 -- the master floppy to verify the attempt.  Returns false when no master is
 -- online (so setup is denied unless a master exists).
 --------------------------------------------------------------------------------
-titan.DC_PROTOCOL = "titan_dc"
-
 function titan.findMaster(timeout)
   rednet.broadcast({ type = "where_master" }, titan.DC_PROTOCOL)
   local deadline = os.clock() + (timeout or 2)
