@@ -1,6 +1,6 @@
 --[[
   titan.lua  -  Shared library for the Titan bot network (CC: Tweaked)
-  Titan-Version: 1.2.2
+  Titan-Version: 1.2.5
 
   Provides:
     * Rednet protocol constants + message type enum
@@ -1023,6 +1023,18 @@ end
 -- Default GitHub raw root (same as github_install.lua). Trailing slash required.
 titan.GITHUB_RAW_BASE = "https://raw.githubusercontent.com/TitanBCXR/MinecraftLua/main/"
 
+-- HTTP GET helper for OTA / GitHub fetches (must be above fetchGithubVersions).
+local function otaHttp(url)
+  if not http then return nil, "http disabled" end
+  local h = http.get(url)
+  if not h then return nil, "request failed" end
+  local code = h.getResponseCode and h.getResponseCode() or 200
+  local data = h.readAll(); h.close()
+  if code ~= 200 then return nil, "HTTP " .. tostring(code) end
+  if not data or data == "" then return nil, "empty" end
+  return data
+end
+
 -- Fetch versions.lua from GitHub (or any raw base). Returns catalog or nil, err.
 function titan.fetchGithubVersions(base)
   base = base or titan.GITHUB_RAW_BASE
@@ -1266,17 +1278,6 @@ local function otaWriteFile(path, data)
   local dir = fs.getDir(path)
   if dir and dir ~= "" and not fs.exists(dir) then fs.makeDir(dir) end
   local f = fs.open(path, "w"); f.write(data); f.close()
-end
-
-local function otaHttp(url)
-  if not http then return nil, "http disabled" end
-  local h = http.get(url)
-  if not h then return nil, "request failed" end
-  local code = h.getResponseCode and h.getResponseCode() or 200
-  local data = h.readAll(); h.close()
-  if code ~= 200 then return nil, "HTTP " .. tostring(code) end
-  if not data or data == "" then return nil, "empty" end
-  return data
 end
 
 local function otaFindHost(timeout)
