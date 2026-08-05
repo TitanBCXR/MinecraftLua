@@ -531,9 +531,12 @@ computer with a wireless (ideally **ender**) modem. It does three things:
   direct modem range still reach each other. Chain several routers to blanket a
   big base; duplicate messages are de-duplicated so they never loop. (Same
   mechanism as CraftOS's built-in `repeat`, but with a roster + dashboard.)
-- **Directory:** listens to every Titan protocol and keeps a live registry of
-  who's online (bots, workers, hubs, POIs, data center, tablets). With a monitor
-  attached it shows the roster + relay stats.
+- **Directory + status board:** listens to every Titan protocol and remembers
+  every system that has registered (hostnames persist in `router_roster.cfg`
+  across reboots). Attach a **monitor** to the main router for a live board:
+  each system shows as **ONLINE** (green) or **OFFLINE** (red), sorted with
+  online hosts first. Console `devices` lists the same; `forget <id|host>`
+  drops a remembered entry.
 - **GPS host:** routers double as GPS hosts. On first run each router asks for
   its coordinates (or auto-detects if a constellation already exists) and then
   answers `gps.locate` requests. Place **4+ routers, spread out**, and they *are*
@@ -541,9 +544,8 @@ computer with a wireless (ideally **ender**) modem. It does three things:
   computers needed. Coords are saved to `router.cfg`; re-set them any time with
   the `gpshost <x> <y> <z>` console command.
 
-Install it via the installer → **"Network router"** (option **11**;
-self-contained, no lib). Console: `devices`, `ping`, `stats`, `gpshost`,
-`update`, `exit`.
+Install it via the installer → **"Network router"** (option **11**). Console:
+`devices`, `forget`, `ping`, `stats`, `gpshost`, `update`, `ssh`, `exit`.
 
 **OTA update:** from the main router console, run `update` (confirms first).
 Every device that was installed via an installer (and has a `.titan-install`

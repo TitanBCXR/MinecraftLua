@@ -11,10 +11,11 @@
        cover a large base; duplicate messages are de-duplicated so they don't
        loop forever.
 
-    2. DIRECTORY - it listens to every Titan protocol and keeps a live registry
-       of who's online (bots, workers, hubs, POIs, data center, tablets). Any
-       device can `net`-register/confirm it's connected (see console.lua's `net`
-       command). With a monitor attached it shows the roster + relay stats.
+    2. DIRECTORY - it listens to every Titan protocol and keeps a registry of
+       systems it has seen. The roster is REMEMBERED across reboots
+       (router_roster.cfg). Attach a monitor for a live board that shows each
+       hostname as ONLINE or OFFLINE. Any device can `net`-register/confirm
+       it's connected (see console.lua's `net` command).
 
     3. GPS HOST - routers double as GPS hosts. On first run it asks for this
        router's coordinates (or auto-detects if a constellation already exists)
@@ -54,12 +55,15 @@ if monitor then monitor.setTextScale(0.5) end
 --------------------------------------------------------------------------------
 -- State
 --------------------------------------------------------------------------------
-local seen    = {}   -- [id] = { name, kind, seen }
+local seen    = {}   -- [id] = { name, hostname, kind, seen }
 local relayed = {}   -- [nMessageID] = timerId  (de-dup with 30s expiry)
 local stats   = { relayed = 0 }
+local rosterDirty = false
+local ONLINE_SECS = 45   -- heard within this window => ONLINE on the board
 
 -- Router config (persists this router's GPS host coordinates so it re-hosts on boot).
 local RCFG      = "router.cfg"
+local ROSTER    = "router_roster.cfg"
 local gpsCoords = nil
 local function loadRouterCfg()
   if not fs.exists(RCFG) then return nil end
@@ -73,10 +77,77 @@ end
 local function now() return os.epoch("utc") end
 local function ago(ts) return math.floor((now() - (ts or 0)) / 1000) end
 
+local function isOnline(d)
+  return d and d.seen and ago(d.seen) < ONLINE_SECS
+end
+
+local function countOnlineOffline()
+  local on, off = 0, 0
+  for _, d in pairs(seen) do
+    if isOnline(d) then on = on + 1 else off = off + 1 end
+  end
+  return on, off
+end
+
 local function deviceCount()
+  local on = countOnlineOffline()
+  return on
+end
+
+-- Persist remembered systems so the monitor still lists them when offline.
+local function saveRoster()
+  local list = {}
+  for id, d in pairs(seen) do
+    list[tostring(id)] = {
+      hostname = d.hostname or d.name,
+      name = d.hostname or d.name,
+      kind = d.kind,
+      seen = d.seen or 0,
+    }
+  end
+  local f = fs.open(ROSTER, "w"); f.write(textutils.serialize(list)); f.close()
+  rosterDirty = false
+end
+
+local function loadRoster()
+  if not fs.exists(ROSTER) then return 0 end
+  local f = fs.open(ROSTER, "r"); local d = textutils.unserialize(f.readAll()); f.close()
+  if type(d) ~= "table" then return 0 end
   local n = 0
-  for _, d in pairs(seen) do if ago(d.seen) < 30 then n = n + 1 end end
+  for sid, e in pairs(d) do
+    local id = tonumber(sid)
+    if id and type(e) == "table" then
+      local host = e.hostname or e.name or ("#" .. id)
+      seen[id] = {
+        hostname = host, name = host,
+        kind = e.kind or "device",
+        seen = tonumber(e.seen) or 0,
+      }
+      n = n + 1
+    end
+  end
   return n
+end
+
+-- Sorted id list: ONLINE first, then hostname, then id.
+local function sortedIds()
+  local ids = {}
+  for id in pairs(seen) do ids[#ids + 1] = id end
+  table.sort(ids, function(a, b)
+    local da, db = seen[a], seen[b]
+    local oa, ob = isOnline(da), isOnline(db)
+    if oa ~= ob then return oa end
+    local na = tostring(da.hostname or da.name or "")
+    local nb = tostring(db.hostname or db.name or "")
+    if na ~= nb then return na:lower() < nb:lower() end
+    return a < b
+  end)
+  return ids
+end
+
+local remembered = loadRoster()
+if remembered > 0 then
+  print(("Loaded %d remembered system(s) from %s."):format(remembered, ROSTER))
 end
 
 -- Guess a device's role from the message it sent.
@@ -133,23 +204,29 @@ local function directoryLoop()
       local kind = classify(msg)
       local prev = seen[id]
       -- Prefer explicit hostname from registration; fall back to name / prior.
-      local host = msg.hostname or msg.name or (prev and prev.name)
+      local host = msg.hostname or msg.name or (prev and (prev.hostname or prev.name))
+      local wasOnline = prev and isOnline(prev)
       seen[id] = {
         name = host,
         hostname = host,
         kind = kind or (prev and prev.kind) or "device",
         seen = now(),
       }
+      rosterDirty = true
       if not prev then
-        print(("[+] %s #%d (%s)"):format(seen[id].hostname or "?", id, seen[id].kind))
-      elseif host and prev.name ~= host then
+        print(("[+] %s #%d (%s) ONLINE"):format(seen[id].hostname or "?", id, seen[id].kind))
+      elseif host and prev.hostname ~= host and prev.name ~= host then
         print(("[~] #%d hostname -> %s"):format(id, host))
+      elseif prev and not wasOnline then
+        print(("[*] %s #%d back ONLINE"):format(host or "?", id))
       end
       -- Answer register/discovery so a device can confirm it's on the network.
       if proto == PROTO_ROUTER and msg.type == "hello" then
         local rname = os.getComputerLabel() or ("Router-" .. os.getComputerID())
+        local on, off = countOnlineOffline()
         rednet.send(id, {
-          type = "here", label = rname, hostname = rname, devices = deviceCount(),
+          type = "here", label = rname, hostname = rname,
+          devices = on, online = on, offline = off,
         }, PROTO_ROUTER)
       end
     end
@@ -157,33 +234,69 @@ local function directoryLoop()
 end
 
 --------------------------------------------------------------------------------
--- Dashboard (only when a monitor is attached, to avoid fighting the console)
+-- Dashboard (monitor): remembered systems with ONLINE / OFFLINE status
 --------------------------------------------------------------------------------
 local function draw()
+  -- Pick up a monitor attached after boot.
+  if not monitor then
+    monitor = peripheral.find("monitor")
+    if monitor then monitor.setTextScale(0.5) end
+  end
+  if not monitor then return end
+
   local out = monitor
   local w, h = out.getSize()
   out.setBackgroundColor(colors.black); out.clear()
   local function line(y, txt, c)
     out.setCursorPos(1, y); out.setTextColor(c or colors.white); out.write(tostring(txt):sub(1, w))
   end
-  line(1, ("== TITAN ROUTER #%d ==  modems:%d"):format(os.getComputerID(), #modems), colors.yellow)
-  line(2, ("relayed:%d  online:%d%s"):format(stats.relayed, deviceCount(),
-    gpsCoords and ("  GPS " .. gpsCoords.x .. "," .. gpsCoords.y .. "," .. gpsCoords.z) or ""), colors.lime)
-  line(3, "ID   KIND     HOSTNAME        AGE", colors.lightGray)
+
+  local on, off = countOnlineOffline()
+  local gpsStr = gpsCoords and ("  GPS " .. gpsCoords.x .. "," .. gpsCoords.y .. "," .. gpsCoords.z) or ""
+  line(1, ("== TITAN ROUTER #%d ==  modems:%d%s"):format(os.getComputerID(), #modems, gpsStr), colors.yellow)
+  line(2, ("ONLINE:%d  OFFLINE:%d  relayed:%d"):format(on, off, stats.relayed),
+    on > 0 and colors.lime or colors.orange)
+  line(3, "ID   STATUS   KIND     HOSTNAME", colors.lightGray)
+
   local y = 4
-  for id, d in pairs(seen) do
-    if y >= h then break end
-    if ago(d.seen) < 60 then
-      local host = d.hostname or d.name or "?"
-      line(y, ("%-4d %-8s %-15s %ss"):format(id, (d.kind or "?"):sub(1, 8), host:sub(1, 15), ago(d.seen)),
-        ago(d.seen) > 30 and colors.gray or colors.white)
-      y = y + 1
+  for _, id in ipairs(sortedIds()) do
+    if y > h then break end
+    local d = seen[id]
+    local host = d.hostname or d.name or "?"
+    local online = isOnline(d)
+    local status = online and "ONLINE" or "OFFLINE"
+    local age = d.seen and d.seen > 0 and (ago(d.seen) .. "s") or "-"
+    local row = ("%-4d %-8s %-8s %s"):format(id, status, (d.kind or "?"):sub(1, 8), host)
+    if #row > w - 6 then row = row:sub(1, w - 6) end
+    line(y, row, online and colors.lime or colors.red)
+    -- age tucked on the right if there's room
+    local ageStr = tostring(age)
+    if w >= #row + #ageStr + 1 then
+      out.setCursorPos(w - #ageStr + 1, y)
+      out.setTextColor(colors.gray)
+      out.write(ageStr)
     end
+    y = y + 1
+  end
+  if y == 4 then
+    line(4, "(no systems registered yet)", colors.gray)
   end
 end
 
 local function drawLoop()
-  while true do draw(); sleep(1) end
+  while true do
+    draw()
+    if rosterDirty then saveRoster() end
+    sleep(1)
+  end
+end
+
+-- Persist roster even without a monitor.
+local function rosterSaveLoop()
+  while true do
+    if rosterDirty then saveRoster() end
+    sleep(5)
+  end
 end
 
 -- Periodically nudge the network so devices that booted before us also register.
@@ -223,30 +336,56 @@ local function consoleLoop()
     if cmd == "" then
       -- ignore
     elseif cmd == "help" then
-      print("devices  - list everyone the router has heard")
+      print("devices  - list remembered systems (ONLINE / OFFLINE)")
+      print("forget <id|host> - remove a system from the remembered roster")
       print("ping     - re-discover the network")
-      print("stats    - relay + device counts")
+      print("stats    - relay + online/offline counts")
       print("gpshost [x y z] - show / set this router's GPS host coords")
       print("update   - OTA: tell every device to re-download its files & reboot")
       print("ssh <id|label> [cmd] - remote shell (needs lib/titan.lua + master pw)")
       print("exit")
     elseif cmd == "devices" or cmd == "list" then
+      local on, off = countOnlineOffline()
+      print(("Remembered systems — ONLINE:%d  OFFLINE:%d"):format(on, off))
       local n = 0
-      for id, d in pairs(seen) do
-        if ago(d.seen) < 60 then
-          n = n + 1
-          print(("#%-3d %-8s %-18s %ss"):format(
-            id, d.kind or "?", d.hostname or d.name or "?", ago(d.seen)))
+      for _, id in ipairs(sortedIds()) do
+        local d = seen[id]
+        n = n + 1
+        local st = isOnline(d) and "ONLINE" or "OFFLINE"
+        local age = (d.seen and d.seen > 0) and (ago(d.seen) .. "s ago") or "never"
+        print(("#%-3d %-8s %-8s %-18s %s"):format(
+          id, st, d.kind or "?", d.hostname or d.name or "?", age))
+      end
+      if n == 0 then print("(none yet — wait for devices to register)") end
+    elseif cmd == "forget" then
+      local ref = a[2]
+      if not ref then print("Usage: forget <id|hostname>"); else
+        local id = tonumber(ref)
+        if not id then
+          local want = ref:lower()
+          for sid, d in pairs(seen) do
+            local host = tostring(d.hostname or d.name or ""):lower()
+            if host == want or host:find(want, 1, true) then id = sid; break end
+          end
+        end
+        if id and seen[id] then
+          print(("Forgot %s (#%d)."):format(seen[id].hostname or "?", id))
+          seen[id] = nil
+          rosterDirty = true
+          saveRoster()
+        else
+          print("Unknown system: " .. tostring(ref))
         end
       end
-      if n == 0 then print("(no devices heard yet)") end
     elseif cmd == "ping" then
       rednet.broadcast({ type = "ping" }, "titan_net")
       rednet.broadcast({ type = "ping" }, "titan_dc")
+      rednet.broadcast({ type = "ping" }, PROTO_ROUTER)
       print("Pinged.")
     elseif cmd == "stats" then
-      print(("Relayed %d messages. %d devices online. %d modem(s)."):format(
-        stats.relayed, deviceCount(), #modems))
+      local on, off = countOnlineOffline()
+      print(("Relayed %d messages. ONLINE:%d OFFLINE:%d. %d modem(s)."):format(
+        stats.relayed, on, off, #modems))
     elseif cmd == "gpshost" then
       if a[2] and a[3] and a[4] then
         saveRouterCfg({ gps = { x = tonumber(a[2]), y = tonumber(a[3]), z = tonumber(a[4]) } })
@@ -319,10 +458,15 @@ if fs.exists("lib/titan.lua") then
   titanLib = dofile("lib/titan.lua")
 end
 
-local tasks = { repeaterLoop, directoryLoop, pingLoop, consoleLoop }
+local tasks = { repeaterLoop, directoryLoop, pingLoop, consoleLoop, rosterSaveLoop, drawLoop }
 if gpsCoords then tasks[#tasks + 1] = gpsHostLoop end
-if monitor then tasks[#tasks + 1] = drawLoop end
 if titanLib then tasks[#tasks + 1] = function() titanLib.sshHostLoop("router") end end
+if monitor then
+  print("Monitor attached — showing ONLINE/OFFLINE system board.")
+else
+  print("No monitor yet — attach one anytime; the board will appear.")
+end
 parallel.waitForAny(table.unpack(tasks))
-if monitor then monitor.clear() end
+if monitor then pcall(function() monitor.clear() end) end
+if rosterDirty then saveRoster() end
 print("Router stopped.")
