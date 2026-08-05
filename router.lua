@@ -1,6 +1,6 @@
 --[[
   router.lua  -  Titan network router / repeater (CC: Tweaked)
-  Titan-Version: 1.2.12
+  Titan-Version: 1.2.13
 
   Place one (or several) of these to tie the whole network together over
   wireless and/or wired modems. Roles:
@@ -2394,19 +2394,24 @@ end
 --------------------------------------------------------------------------------
 if fs.exists("lib/titan.lua") then
   titanLib = dofile("lib/titan.lua")
-  titanLib.setSshHandler(function(line)
-    local a = {}
-    for w in tostring(line):gmatch("%S+") do a[#a + 1] = w end
-    local r = handleRouterCommand(a)
-    if r == "exit" then
-      print("Over SSH: type `exit` to disconnect (router keeps running).")
+  -- Needs lib/titan.lua >= 1.2.8. Guard so a partial OTA doesn't crash the router.
+  if titanLib.setSshHandler then
+    titanLib.setSshHandler(function(line)
+      local a = {}
+      for w in tostring(line):gmatch("%S+") do a[#a + 1] = w end
+      local r = handleRouterCommand(a)
+      if r == "exit" then
+        print("Over SSH: type `exit` to disconnect (router keeps running).")
+        return true
+      end
+      if r == false then
+        print("Unknown: " .. tostring(a[1] or ""))
+      end
       return true
-    end
-    if r == false then
-      print("Unknown: " .. tostring(a[1] or ""))
-    end
-    return true
-  end)
+    end)
+  else
+    print("[ssh] Update lib/titan.lua (run `update`) for full remote commands.")
+  end
 end
 
 --------------------------------------------------------------------------------

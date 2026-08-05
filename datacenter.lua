@@ -1,6 +1,6 @@
 --[[
   datacenter.lua  -  Titan Data Center (CC: Tweaked)   [ single, self-contained script ]
-  Titan-Version: 1.2.3
+  Titan-Version: 1.2.4
 
   ONE script that every computer/terminal in your data center runs. It works out
   its own role automatically:
@@ -885,29 +885,32 @@ local dcTitan = nil
 if fs.exists("lib/titan.lua") then
   dcTitan = dofile("lib/titan.lua")
   -- SSH already checked the master password — run admin commands directly.
-  dcTitan.setSshHandler(function(line)
-    local cmd, rest = tostring(line or ""):match("^%s*(%S*)%s*(.-)%s*$")
-    cmd = (cmd or ""):lower()
-    if cmd == "" then return true end
-    if cmd == "exit" or cmd == "quit" then
-      print("Over SSH: type `exit` to disconnect (Parent Center keeps running).")
-      return true
-    end
-    if cmd == "password" or cmd == "login" then
-      print("Already authenticated over SSH.")
+  -- Needs lib/titan.lua >= 1.2.8.
+  if dcTitan.setSshHandler then
+    dcTitan.setSshHandler(function(line)
+      local cmd, rest = tostring(line or ""):match("^%s*(%S*)%s*(.-)%s*$")
+      cmd = (cmd or ""):lower()
+      if cmd == "" then return true end
+      if cmd == "exit" or cmd == "quit" then
+        print("Over SSH: type `exit` to disconnect (Parent Center keeps running).")
+        return true
+      end
+      if cmd == "password" or cmd == "login" then
+        print("Already authenticated over SSH.")
+        session.mode = "admin"
+        session.user = session.user or "ssh"
+        return true
+      end
+      if cmd == "lock" or cmd == "logout" then
+        print("Over SSH: lock ignored (session stays authed until disconnect).")
+        return true
+      end
       session.mode = "admin"
       session.user = session.user or "ssh"
+      handleAdmin(cmd, rest)
       return true
-    end
-    if cmd == "lock" or cmd == "logout" then
-      print("Over SSH: lock ignored (session stays authed until disconnect).")
-      return true
-    end
-    session.mode = "admin"
-    session.user = session.user or "ssh"
-    handleAdmin(cmd, rest)
-    return true
-  end)
+    end)
+  end
   tasks[#tasks + 1] = function() dcTitan.sshHostLoop("datacenter") end
 end
 parallel.waitForAny(table.unpack(tasks))

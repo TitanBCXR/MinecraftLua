@@ -1,6 +1,6 @@
 --[[
   console.lua  -  Basic terminal commands for a CC: Tweaked device
-  Titan-Version: 1.1.7
+  Titan-Version: 1.1.8
 
   A tiny, self-contained command console you can run on any computer or turtle.
   It gives you a handful of everyday commands (files, labels, GPS, fuel, movement)
@@ -443,20 +443,22 @@ end
 -- Mesh announce + hop relay + inbound SSH shell while the console is open.
 local tasks = { promptLoop }
 if titanLib then
-  titanLib.setSshHandler(function(line)
-    if not line or line == "" then return true end
-    local low = tostring(line):lower():match("^%s*(.-)%s*$") or ""
-    if low == "exit" or low == "quit" then
-      print("Over SSH: type `exit` to disconnect (console keeps running).")
+  if titanLib.setSshHandler then
+    titanLib.setSshHandler(function(line)
+      if not line or line == "" then return true end
+      local low = tostring(line):lower():match("^%s*(.-)%s*$") or ""
+      if low == "exit" or low == "quit" then
+        print("Over SSH: type `exit` to disconnect (console keeps running).")
+        return true
+      end
+      if low == "ssh" or low:match("^ssh%s") then
+        print("Nested ssh from an SSH session is not supported.")
+        return true
+      end
+      dispatch(line)
       return true
-    end
-    if low == "ssh" or low:match("^ssh%s") then
-      print("Nested ssh from an SSH session is not supported.")
-      return true
-    end
-    dispatch(line)
-    return true
-  end)
+    end)
+  end
   tasks[#tasks + 1] = function() titanLib.networkLoop("console") end
 else
   tasks[#tasks + 1] = relayLoop
