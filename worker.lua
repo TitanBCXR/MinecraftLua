@@ -1,6 +1,6 @@
 --[[
   worker.lua  -  Builder / Gatherer bot for the Titan network (CC: Tweaked)
-  Titan-Version: 1.2.1
+  Titan-Version: 1.2.2
 
   A TURTLE that is either a BUILDER or a GATHERER. It registers with the
   "Bots Computer" (botserver.lua), learns/keeps its type, and then works.
@@ -382,11 +382,40 @@ end
 -- which only an admin (unlocked by the disk-drive password lock) can send.
 --==============================================================================
 
+-- Hand off a miner deploy to miner.lua (write cfg + startup, then reboot).
+local function handoffToMiner(d)
+  if not fs.exists("miner.lua") then
+    return false, "miner.lua not installed — copy miner.lua onto this turtle, then redeploy"
+  end
+  local name = d.name
+  if not name or name == "" then name = "Miner-" .. os.getComputerID() end
+  local mcfg = {
+    name = name,
+    botType = "miner",
+    deposit = d.deposit,
+  }
+  local f = fs.open("miner.cfg", "w")
+  f.write(textutils.serialize(mcfg))
+  f.close()
+  local sf = fs.open("startup.lua", "w")
+  sf.write('shell.run("miner.lua")\n')
+  sf.close()
+  os.setComputerLabel(name)
+  print(("Handing off to miner.lua as '%s' — rebooting..."):format(name))
+  return true, "handoff"
+end
+
 -- Apply a deploy payload { botType, name, deposit } from the Parent Center.
--- Returns true, or false + reason. Calibrates + sets home as a side effect.
+-- Returns true [, "handoff"], or false + reason.
 local function applyDeployment(d)
   local t = tostring(d.botType or ""):lower()
-  if t ~= "builder" and t ~= "gatherer" then return false, "bad type" end
+  if t == "mine" then t = "miner" end
+  if t == "miner" then
+    return handoffToMiner(d)
+  end
+  if t ~= "builder" and t ~= "gatherer" then
+    return false, "bad type (want builder|gatherer|miner)"
+  end
   local name = d.name
   if not name or name == "" then name = t .. "-" .. os.getComputerID() end
 
@@ -423,7 +452,16 @@ local function awaitDeployment()
            and p2.type == MSG.WORKER_DEPLOY then
       local ok, why = applyDeployment(p2)
       if ok then
-        titan.send(p1, MSG.WORKER_DEPLOYED, { name = cfg.name, botType = cfg.botType })
+        local handoff = (why == "handoff")
+        titan.send(p1, MSG.WORKER_DEPLOYED, {
+          name = handoff and (p2.name or os.getComputerLabel()) or cfg.name,
+          botType = handoff and "miner" or cfg.botType,
+          handoff = handoff or nil,
+        })
+        if handoff then
+          sleep(0.3)
+          os.reboot()
+        end
         return
       else
         titan.send(p1, MSG.WORKER_DEPLOYED, { ok = false, err = why })
@@ -490,7 +528,17 @@ local function receiveLoop()
         enqueue(function()
           local ok, why = applyDeployment(msg)
           if ok then
-            titan.send(id, MSG.WORKER_DEPLOYED, { name = cfg.name, botType = cfg.botType })
+            local handoff = (why == "handoff")
+            titan.send(id, MSG.WORKER_DEPLOYED, {
+              name = handoff and (msg.name or os.getComputerLabel()) or cfg.name,
+              botType = handoff and "miner" or cfg.botType,
+              handoff = handoff or nil,
+            })
+            if handoff then
+              sleep(0.3)
+              os.reboot()
+              return
+            end
             print(("Re-deployed as %s '%s'."):format(cfg.botType, cfg.name))
             setStatus("idle", "-")
           else

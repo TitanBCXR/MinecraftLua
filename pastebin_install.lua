@@ -52,7 +52,7 @@ local ROLES = {
   { key = "5", name = "Bots Computer (worker server)",    run = "botserver.lua",
     files = { "lib/titan.lua", "botserver.lua" } },
   { key = "6", name = "Worker (builder/gatherer turtle)", run = "worker.lua",
-    files = { "lib/titan.lua", "worker.lua" } },
+    files = { "lib/titan.lua", "worker.lua", "miner.lua", "exclude.txt" } },
   { key = "7", name = "Terminal console (basic commands)", run = "console.lua",
     files = { "lib/titan.lua", "console.lua" } },
   { key = "8", name = "Admin tablet (pocket console)",     run = "admin.lua",

@@ -1,6 +1,6 @@
 --[[
   miner.lua  -  Area miner turtle for the Titan network (CC: Tweaked)
-  Titan-Version: 1.2.2
+  Titan-Version: 1.2.3
 
   Digs a rectangular "box":
     * set1 / set2  — opposite corners (defines the X/Z footprint)
@@ -606,6 +606,10 @@ end
 --------------------------------------------------------------------------------
 local function applyDeployment(d)
   local t = tostring(d.botType or ""):lower()
+  if t == "mine" then t = "miner" end
+  if t == "builder" or t == "gatherer" then
+    return false, "this turtle runs miner.lua — install/run worker.lua for builder/gatherer"
+  end
   if t ~= "miner" then return false, "bad type (want miner)" end
   local name = d.name
   if not name or name == "" then name = "Miner-" .. os.getComputerID() end

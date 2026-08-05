@@ -1,6 +1,6 @@
 --[[
   datacenter.lua  -  Titan Data Center (CC: Tweaked)   [ single, self-contained script ]
-  Titan-Version: 1.2.0
+  Titan-Version: 1.2.1
 
   ONE script that every computer/terminal in your data center runs. It works out
   its own role automatically:
@@ -452,8 +452,18 @@ local function cmdDeploy(rest)
   local a = {}
   for w in tostring(rest):gmatch("%S+") do a[#a + 1] = w end
   local ref, btype, name = a[1], (a[2] or ""):lower(), a[3]
-  if not ref or not BOT_TYPES[btype] or not name then
+  -- Aliases
+  if btype == "mine" then btype = "miner" end
+  if btype == "build" then btype = "builder" end
+  if btype == "gather" then btype = "gatherer" end
+
+  if not ref or not name then
     print("Usage: deploy <id|name> <builder|gatherer|miner> <name> [depX depY depZ]")
+    print("Example: deploy 12 miner Diggy 100 64 200")
+    return
+  end
+  if not BOT_TYPES[btype] then
+    print(("Unknown type '%s'. Use: builder, gatherer, or miner"):format(tostring(a[2] or "")))
     return
   end
 
@@ -465,6 +475,16 @@ local function cmdDeploy(rest)
   end
   if not targetId then print("No pending bot '" .. ref .. "' (try 'pending')."); return end
 
+  local pend = pending[targetId]
+  if pend and pend.kind then
+    local k = tostring(pend.kind):lower()
+    if btype == "miner" and (k == "worker" or k == "worker?") then
+      print("Note: that turtle is running worker.lua — it will hand off to miner.lua if installed.")
+    elseif (btype == "builder" or btype == "gatherer") and k == "miner" then
+      print("Note: that turtle is running miner.lua — install/run worker.lua for builder/gatherer.")
+    end
+  end
+
   local deposit
   if a[4] and a[5] and a[6] then
     deposit = { x = tonumber(a[4]), y = tonumber(a[5]), z = tonumber(a[6]) }
@@ -474,13 +494,20 @@ local function cmdDeploy(rest)
     { type = "worker_deploy", botType = btype, name = name, deposit = deposit }, NET_PROTOCOL)
   print(("Deploy sent to #%d: %s '%s'%s"):format(targetId, btype, name,
     deposit and ("  deposit " .. ("%d,%d,%d"):format(deposit.x, deposit.y, deposit.z)) or ""))
-  local deadline = os.clock() + 5
+  local deadline = os.clock() + 8
   while os.clock() < deadline do
     local id, msg = rednet.receive(NET_PROTOCOL, deadline - os.clock())
     if id == targetId and type(msg) == "table" and msg.type == "worker_deployed" then
-      if msg.ok == false then print("Bot rejected: " .. tostring(msg.err))
+      if msg.ok == false then
+        print("Bot rejected: " .. tostring(msg.err))
+        if tostring(msg.err or ""):find("miner%.lua") then
+          print("Tip: install miner.lua on that turtle (installer option / host copy), then redeploy.")
+        end
       else
         print(("Deployed: %s is now a %s."):format(msg.name or ("#" .. id), msg.botType or btype))
+        if msg.handoff then
+          print("(Turtle is switching to miner.lua and rebooting.)")
+        end
         netbots[targetId] = netbots[targetId] or {}
         netbots[targetId].name = msg.name or name
         netbots[targetId].botType = msg.botType or btype
@@ -493,7 +520,7 @@ local function cmdDeploy(rest)
       return
     end
   end
-  print("(No confirmation yet - the bot may still be calibrating.)")
+  print("(No confirmation yet - the bot may still be calibrating / rebooting into miner.lua.)")
 end
 
 --==============================================================================
