@@ -1,18 +1,19 @@
 --[[
   miner.lua  -  Area miner turtle for the Titan network (CC: Tweaked)
-  Titan-Version: 1.2.4
+  Titan-Version: 1.2.5
 
   Digs a rectangular "box":
     * set1 <x> <z> / set2 <x> <z> — opposite corners (X/Z footprint)
     * ystart / yend — vertical range (mine from start Y down to end Y)
     * sety <start> <end> — set both Y levels at once
+    * home / start — return point; chest is one block BEHIND home (auto)
 
   Never breaks blocks listed in exclude.txt (or titan.RESTRICTED).
 
   Fresh miners wait for Parent Center deploy:
     deploy <id> miner <name> [depX depY depZ]
 
-  Then: set1 <x> <z> / set2 <x> <z> / sety <ystart> <yend> / deposit / mine
+  Then: set1 <x> <z> / set2 <x> <z> / sety <ystart> <yend> / home / mine
 
   NETWORK: joins the Titan mesh; status+assignment go to botserver + datacenter.
 
@@ -38,8 +39,10 @@ local cfg = {
   yStart = nil,     -- starting (top) Y level, inclusive
   yEnd = nil,       -- ending (bottom) Y level, inclusive
   floorY = nil,     -- legacy alias for yEnd (migrated on load)
-  deposit = nil,    -- {x,y,z} stand above chest and dropDown
-  home = nil,       -- start / return point
+  deposit = nil,    -- legacy: stand above chest and dropDown (optional)
+  chest = nil,      -- {x,y,z} chest block (default: one block behind home)
+  home = nil,       -- start / return point (face the mine; chest behind)
+  homeFacing = nil, -- titan.NORTH/EAST/SOUTH/WEST when home was set
 }
 
 local state = {
@@ -196,26 +199,116 @@ local function invFull()
   return true
 end
 
-local function dumpInventory()
-  if not cfg.deposit then
-    print("No deposit set. Use `deposit` while standing above a chest.")
-    return false
+-- Unit vector for a compass heading.
+local function headingDelta(h)
+  if h == titan.NORTH then return 0, -1 end
+  if h == titan.SOUTH then return 0,  1 end
+  if h == titan.EAST  then return 1,  0 end
+  if h == titan.WEST  then return -1, 0 end
+  return nil
+end
+
+local function ensureHeading()
+  if nav.heading ~= nil then return nav.heading end
+  local ok, err = nav.calibrate(true)
+  if not ok then print("Calibrate warning: " .. tostring(err)) end
+  return nav.heading
+end
+
+-- Chest sits one block behind the start/home facing.
+local function chestBehindHome(home, facing)
+  home = home or cfg.home
+  facing = facing or cfg.homeFacing or nav.heading
+  if not home or facing == nil then return nil end
+  local dx, dz = headingDelta(facing)
+  if not dx then return nil end
+  -- Behind = opposite of facing.
+  return {
+    x = home.x - dx,
+    y = home.y,
+    z = home.z - dz,
+  }
+end
+
+local function ensureChest()
+  if cfg.chest then return cfg.chest end
+  local c = chestBehindHome()
+  if c then
+    cfg.chest = c
+    saveCfg()
   end
-  setStatus("depositing", "dumping to " .. fmt(cfg.deposit))
-  local ok, err = nav.travelTo(cfg.deposit.x, cfg.deposit.y, cfg.deposit.z)
-  if not ok then
-    print("Could not reach deposit: " .. tostring(err))
-    return false
+  return cfg.chest
+end
+
+-- Face a neighboring block from the turtle's current position.
+local function faceToward(tx, tz)
+  local x, _, z = nav.locate(1)
+  if not x then return false end
+  local dx, dz = tx - x, tz - z
+  if math.abs(dx) >= math.abs(dz) then
+    if dx > 0 then nav.face(titan.EAST)
+    elseif dx < 0 then nav.face(titan.WEST)
+    else return false end
+  else
+    if dz > 0 then nav.face(titan.SOUTH)
+    elseif dz < 0 then nav.face(titan.NORTH)
+    else return false end
   end
-  local fuelSlot = nav.FUEL_SLOT or 16
-  for s = 1, 16 do
-    if s ~= fuelSlot then
-      turtle.select(s)
-      turtle.dropDown()
-    end
-  end
-  turtle.select(1)
   return true
+end
+
+local function dumpInventory()
+  local chest = ensureChest()
+  local fuelSlot = nav.FUEL_SLOT or 16
+
+  -- Preferred: home start + chest one block behind → face chest and drop().
+  if chest and cfg.home then
+    setStatus("depositing", "chest @ " .. fmt(chest))
+    local ok, err = nav.travelTo(cfg.home.x, cfg.home.y, cfg.home.z)
+    if not ok then
+      print("Could not reach home/chest: " .. tostring(err))
+      return false
+    end
+    if cfg.homeFacing ~= nil then
+      -- Face the mine again, then turn 180 to look at the chest.
+      pcall(nav.face, cfg.homeFacing)
+      turtle.turnRight(); turtle.turnRight()
+      if nav.heading ~= nil then nav.heading = (nav.heading + 2) % 4 end
+    else
+      faceToward(chest.x, chest.z)
+    end
+    for s = 1, 16 do
+      if s ~= fuelSlot then
+        turtle.select(s)
+        turtle.drop()
+      end
+    end
+    turtle.select(1)
+    -- Face back toward the mine for the next trip out.
+    if cfg.homeFacing ~= nil then pcall(nav.face, cfg.homeFacing) end
+    return true
+  end
+
+  -- Legacy: stand above a deposit point and dropDown.
+  if cfg.deposit then
+    setStatus("depositing", "dumping to " .. fmt(cfg.deposit))
+    local ok, err = nav.travelTo(cfg.deposit.x, cfg.deposit.y, cfg.deposit.z)
+    if not ok then
+      print("Could not reach deposit: " .. tostring(err))
+      return false
+    end
+    for s = 1, 16 do
+      if s ~= fuelSlot then
+        turtle.select(s)
+        turtle.dropDown()
+      end
+    end
+    turtle.select(1)
+    return true
+  end
+
+  print("No chest. Set `home` facing the mine (chest one block behind), or `chest <x> <y> <z>`.")
+  return false
 end
 
 local function ensureSpace()
@@ -297,10 +390,17 @@ local function mineVolume()
   print(("Mining box  X %d..%d  Z %d..%d  Y %d -> %d"):format(
     b.minX, b.maxX, b.minZ, b.maxZ, b.topY, b.floorY))
 
-  -- Remember home if not set
+  -- Remember home + chest-behind if not set
   if not cfg.home then
     local x, y, z = nav.locatePrecise(3)
-    if x then cfg.home = { x = x, y = y, z = z }; saveCfg() end
+    if x then
+      cfg.home = { x = x, y = y, z = z }
+      cfg.homeFacing = nav.heading or cfg.homeFacing
+      if not cfg.chest then cfg.chest = chestBehindHome() end
+      saveCfg()
+    end
+  elseif not cfg.chest then
+    ensureChest()
   end
 
   if nav.heading == nil then
@@ -431,8 +531,10 @@ local function printStatus()
     print(("Y range: start=%s  end=%s"):format(
       tostring(cfg.yStart or "?"), tostring(cfg.yEnd or cfg.floorY or "?")))
   end
-  print(("deposit: %s"):format(fmt(cfg.deposit)))
   print(("home: %s"):format(fmt(cfg.home)))
+  local chest = cfg.chest or chestBehindHome()
+  print(("chest: %s%s"):format(fmt(chest), cfg.chest and "" or " (auto behind home)"))
+  if cfg.deposit then print(("deposit (legacy): %s"):format(fmt(cfg.deposit))) end
   local b = bounds()
   if b then
     local dx = b.maxX - b.minX + 1
@@ -476,7 +578,32 @@ local function setCornerXZ(field, x, z, y)
   return true
 end
 
+local function setHomeHere()
+  local x, y, z = nav.locatePrecise(4)
+  if not x then print("No GPS signal."); return false end
+  local facing = ensureHeading()
+  cfg.home = { x = x, y = y, z = z }
+  cfg.homeFacing = facing
+  nav.home = cfg.home
+  local chest = chestBehindHome(cfg.home, facing)
+  if chest then
+    cfg.chest = chest
+  end
+  saveCfg()
+  local dirs = { [0] = "N", [1] = "E", [2] = "S", [3] = "W" }
+  print(("home = %s  facing %s"):format(fmt(cfg.home), dirs[facing] or "?"))
+  if cfg.chest then
+    print(("chest = %s  (one block behind home)"):format(fmt(cfg.chest)))
+  else
+    print("Could not compute chest behind home (calibrate heading, then `home` again).")
+  end
+  return true
+end
+
 local function markHere(field)
+  if field == "home" then
+    return setHomeHere()
+  end
   local x, y, z = nav.locatePrecise(4)
   if not x then print("No GPS signal."); return end
   cfg[field] = { x = x, y = y, z = z }
@@ -528,8 +655,10 @@ local function consoleLoop()
       print("  ystart <y> / yend <y>    set start or end Y alone")
       print("  yhere start|end          use current GPS Y")
       print("OTHER:")
-      print("  deposit   stand ABOVE a chest; dump inventory here")
-      print("  home      mark return point")
+      print("  home / start   mark start (face the mine; chest = 1 block behind)")
+      print("  chest          show / recompute behind home")
+      print("  chest <x y z>  set chest block manually")
+      print("  deposit        legacy: stand ABOVE a chest (dropDown)")
       print("  exclude   reload & show exclude.txt")
       print("  mine      dig the box from startY down to endY")
       print("  stop | status | dump | goto <x> <y> <z>")
@@ -600,8 +729,33 @@ local function consoleLoop()
       end
     elseif cmd == "deposit" then
       markHere("deposit")
-    elseif cmd == "home" then
-      markHere("home")
+      print("(Legacy dropDown mode. Prefer `home` with chest behind.)")
+    elseif cmd == "home" or cmd == "start" then
+      setHomeHere()
+    elseif cmd == "chest" then
+      if a[2] and a[3] and a[4] then
+        local x, y, z = tonumber(a[2]), tonumber(a[3]), tonumber(a[4])
+        if not x then
+          print("Usage: chest <x> <y> <z>   or   chest   (recompute behind home)")
+        else
+          cfg.chest = { x = math.floor(x), y = math.floor(y), z = math.floor(z) }
+          saveCfg()
+          print("chest = " .. fmt(cfg.chest))
+        end
+      else
+        if not cfg.home then
+          print("Set `home` first (stand at start, face the mine).")
+        else
+          local c = chestBehindHome()
+          if c then
+            cfg.chest = c
+            saveCfg()
+            print("chest = " .. fmt(cfg.chest) .. "  (behind home)")
+          else
+            print("Need heading — run `home` again facing the mine.")
+          end
+        end
+      end
     elseif cmd == "exclude" then
       loadExclude()
       print("Excluded blocks:")
@@ -661,10 +815,21 @@ local function applyDeployment(d)
   cfg.name = name
   cfg.botType = "miner"
   cfg.home = home or cfg.home
-  if d.deposit then cfg.deposit = d.deposit end
+  cfg.homeFacing = nav.heading or cfg.homeFacing
+  if cfg.home and not cfg.chest then
+    cfg.chest = chestBehindHome(cfg.home, cfg.homeFacing)
+  end
+  if d.deposit then
+    -- Parent Center coords are treated as the chest block (behind start).
+    cfg.chest = d.deposit
+    cfg.deposit = nil
+  end
   saveCfg()
   os.setComputerLabel(name)
   if cfg.home then nav.home = cfg.home end
+  if cfg.chest then
+    print(("chest @ %s (behind home)"):format(fmt(cfg.chest)))
+  end
   return true
 end
 
@@ -808,11 +973,14 @@ if not quarryReady() then
   print("Miner '" .. cfg.name .. "' online — box not fully set.")
   print("  1) set1 <x> <z>   then   set2 <x> <z>")
   print("  2) sety <startY> <endY>   e.g. sety 80 -59")
-  print("  3) deposit (above chest) then mine")
+  print("  3) home  (face the mine; chest = one block behind)")
+  print("  4) mine")
 else
   local b = bounds()
   print(("Miner '%s' online. Box ready X[%d..%d] Z[%d..%d] Y[%d->%d]."):format(
     cfg.name, b.minX, b.maxX, b.minZ, b.maxZ, b.topY, b.floorY))
+  if cfg.home and not cfg.chest then ensureChest() end
+  if cfg.chest then print("chest @ " .. fmt(cfg.chest)) end
 end
 setStatus("idle", "-")
 
