@@ -61,10 +61,13 @@ function jobs.mine(_)
 end
 
 function jobs.deposit(_)
-  -- Example: drop everything downward (e.g. into a chest under the bot).
+  -- Drop everything downward except the dedicated fuel slot (bottom-right = 16).
+  local fuelSlot = nav.FUEL_SLOT or 16
   for slot = 1, 16 do
-    turtle.select(slot)
-    turtle.dropDown()
+    if slot ~= fuelSlot then
+      turtle.select(slot)
+      turtle.dropDown()
+    end
   end
   turtle.select(1)
   return true

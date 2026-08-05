@@ -125,9 +125,12 @@ local function selectAny(pred)
   return false
 end
 
--- Empty everything in inventory downward (into a chest below the bot).
+-- Empty inventory downward (into a chest below the bot), keeping the fuel slot.
 local function dumpAllDown()
-  for s = 1, 16 do turtle.select(s); turtle.dropDown() end
+  local fuelSlot = nav.FUEL_SLOT or 16
+  for s = 1, 16 do
+    if s ~= fuelSlot then turtle.select(s); turtle.dropDown() end
+  end
   turtle.select(1)
 end
 
@@ -150,11 +153,14 @@ local function doCollect(post)
   setStatus("working", "collecting")
   while turtle.suckDown() do end                        -- pull everything up
 
-  -- Return items the chest's filter does NOT accept.
+  -- Return items the chest's filter does NOT accept (never touch fuel slot).
+  local fuelSlot = nav.FUEL_SLOT or 16
   for s = 1, 16 do
-    local d = turtle.getItemDetail(s)
-    if d and not titan.itemAccepted(d.name, post) then
-      turtle.select(s); turtle.dropDown()
+    if s ~= fuelSlot then
+      local d = turtle.getItemDetail(s)
+      if d and not titan.itemAccepted(d.name, post) then
+        turtle.select(s); turtle.dropDown()
+      end
     end
   end
   turtle.select(1)
@@ -174,6 +180,7 @@ local function doCollect(post)
 end
 
 local function doCoal(need)
+  local fuelSlot = nav.FUEL_SLOT or 16
   -- Source coal from storage first.
   local storage = cfg.deposit or nav.home
   if storage then
@@ -181,20 +188,24 @@ local function doCoal(need)
     local ok, r = goAboveChest(storage)
     if not ok then reportStuck(r); return end
     while turtle.suckDown() do end
-    for s = 1, 16 do                                    -- keep only coal
-      local d = turtle.getItemDetail(s)
-      if d and not isCoal(d.name) then turtle.select(s); turtle.dropDown() end
+    for s = 1, 16 do                                    -- keep only coal (+ own fuel slot)
+      if s ~= fuelSlot then
+        local d = turtle.getItemDetail(s)
+        if d and not isCoal(d.name) then turtle.select(s); turtle.dropDown() end
+      end
     end
     turtle.select(1)
   end
 
-  -- Deliver to the requesting bot's chest.
+  -- Deliver to the requesting bot's chest (never empty our dedicated fuel slot).
   setStatus("moving", "coal -> " .. fmt(need.pos))
   local ok2, r2 = goAboveChest(need.pos)
   if not ok2 then reportStuck(r2); return end
   for s = 1, 16 do
-    local d = turtle.getItemDetail(s)
-    if d and isCoal(d.name) then turtle.select(s); turtle.dropDown() end
+    if s ~= fuelSlot then
+      local d = turtle.getItemDetail(s)
+      if d and isCoal(d.name) then turtle.select(s); turtle.dropDown() end
+    end
   end
   turtle.select(1)
   titan.broadcast(MSG.COAL_DONE, { target = need.from })

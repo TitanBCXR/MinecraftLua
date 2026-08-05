@@ -894,6 +894,7 @@ titan.nav = nav
 
 nav.heading = nil        -- current facing (titan.NORTH/EAST/SOUTH/WEST) once calibrated
 nav.home    = nil        -- {x, y, z} set with nav.setHome()
+nav.FUEL_SLOT = 16       -- bottom-right inventory slot — dedicated fuel slot for turtles
 
 -- Locate ourselves via GPS. Returns x, y, z or nil.
 function nav.locate(timeout)
@@ -1004,11 +1005,16 @@ function nav.calibrate(dig)
 end
 
 -- Ensure we have enough fuel; refuel from inventory if low. Returns level.
+-- Prefers the dedicated fuel slot (bottom-right = 16), then other slots.
 function nav.ensureFuel(min)
   min = min or 1
   if turtle.getFuelLevel() == "unlimited" then return "unlimited" end
   if turtle.getFuelLevel() < min then
+    local order = { nav.FUEL_SLOT }
     for slot = 1, 16 do
+      if slot ~= nav.FUEL_SLOT then order[#order + 1] = slot end
+    end
+    for _, slot in ipairs(order) do
       turtle.select(slot)
       if turtle.refuel(0) then       -- is this item a fuel?
         turtle.refuel()

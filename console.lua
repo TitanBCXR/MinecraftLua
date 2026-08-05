@@ -367,10 +367,14 @@ if turtle then
     print("fuel: " .. tostring(turtle.getFuelLevel()))
   end)
 
-  def("refuel", "consume fuel items from inventory", function()
-    for s = 1, 16 do turtle.select(s); turtle.refuel() end
+  def("refuel", "consume fuel from bottom-right slot (16), then others", function()
+    local fuelSlot = (titanLib and titanLib.nav and titanLib.nav.FUEL_SLOT) or 16
+    turtle.select(fuelSlot); turtle.refuel()
+    for s = 1, 16 do
+      if s ~= fuelSlot then turtle.select(s); turtle.refuel() end
+    end
     turtle.select(1)
-    print("fuel: " .. tostring(turtle.getFuelLevel()))
+    print("fuel: " .. tostring(turtle.getFuelLevel()) .. " (fuel slot " .. fuelSlot .. ")")
   end)
 
   local moves = {

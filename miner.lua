@@ -169,9 +169,12 @@ local function dumpInventory()
     print("Could not reach deposit: " .. tostring(err))
     return false
   end
+  local fuelSlot = nav.FUEL_SLOT or 16
   for s = 1, 16 do
-    turtle.select(s)
-    turtle.dropDown()
+    if s ~= fuelSlot then
+      turtle.select(s)
+      turtle.dropDown()
+    end
   end
   turtle.select(1)
   return true
