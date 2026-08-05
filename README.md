@@ -404,10 +404,9 @@ the two corner Y values down to `floorY`. When the inventory fills it returns to
 
 # Terminal console (`console.lua`)
 
-A tiny, self-contained command console for any computer or turtle — a friendly
-superset of the default CraftOS shell. Install it with the installer (pick
-**"Terminal console"**) or drop `console.lua` on a device and run it. No
-dependencies.
+A command console for any computer or turtle — a friendly superset of the
+default CraftOS shell. Install with the installer → **"Terminal console"**
+(pulls `console.lua` + `lib/titan.lua` for `ssh` / mesh).
 
 Any command it doesn't recognise is passed through to the normal shell, so you
 keep `edit`, `lua`, etc.
@@ -422,9 +421,29 @@ mkdir <dir>       make a directory       rm <path>        delete a file/dir
 run <prog> ...    run a program
 label [name]      get/set the label      id               show computer id
 time              in-game time and day   about            version info
-pos               locate via GPS         reboot|shutdown  power control
+pos               locate via GPS         net              find Titan router
+ssh <id|label> [cmd...]   remote shell (master password)
+reboot|shutdown   power control
 exit | quit       leave the console
 ```
+
+---
+
+# Remote shell (`ssh`)
+
+Rednet "SSH" to any Titan device on the mesh (bots, workers, miners, routers,
+Parent Center, etc.). Gated by the **Parent Center master password**.
+
+```
+ssh 12                 interactive session on computer #12
+ssh Miner-5            by label (partial match ok)
+ssh Worker-3 ls        one-shot: run `ls` remotely and print output
+```
+
+On the far side, each line runs through that computer's CraftOS `shell` (output
+captured and sent back). Type `exit` to disconnect. Every program using
+`titan.networkLoop` hosts an SSH endpoint; console/admin/router also have an
+`ssh` client command.
 
 On a **turtle** you also get:
 
@@ -464,6 +483,7 @@ BOT   : send <bot> <poi>            dispatch to a named POI
         return <bot> | refuel <bot> | stop <bot>
 DEPLOY: deploy <bot> <builder|gatherer> <name> [x y z]
 BUILD : scan <bot> <name> <W> <H> <L> | build <bot> <name> [x y z]
+REMOTE: ssh <id|label> [cmd...]     remote shell (also needs master password)
         login | lock | exit
 ```
 
@@ -531,11 +551,16 @@ manifest) re-downloads its files from the same source (GitHub / pastebin /
 install host) and reboots. Keep `host.lua` running if the fleet was installed
 that way.
 
-**Auto-registration:** every networked program (bot, worker, hub, POI, Bots
-Computer, data center, admin tablet, locator, miner) announces itself to the
-router on startup and re-announces every ~20s, so they appear in the router's
-directory automatically — no manual step. The router also periodically pings
-the network, so devices register no matter which booted first.
+**Auto-registration + mesh relay:** every networked program (bot, worker/builder/
+gatherer, miner/excavator, hub, POI, Bots Computer, data center, admin tablet,
+locator, console, install host) announces itself to the router **and runs a
+local rednet hop relay**. If a turtle is in wireless range of peers but not the
+main router, it still forwards traffic — so deploy/commands/status hop across
+the fleet. The router also periodically pings the network so devices register
+no matter which booted first.
+
+**Mesh API** (in `lib/titan.lua`): programs call `titan.networkLoop("kind")` as
+a parallel task — that covers announce, OTA update listen, and hop relay.
 
 **Manual check from any device:** the terminal console (`console.lua`) has a
 `net` command — it pings the router and reports `Connected via Router #<id>

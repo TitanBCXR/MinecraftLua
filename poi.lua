@@ -135,5 +135,5 @@ end
 
 print("POI '" .. cfg.name .. "' online.")
 parallel.waitForAny(beaconLoop, replyLoop, menuLoop,
-  function() titan.registerLoop("poi") end)
+  function() titan.networkLoop("poi") end)
 print("POI stopped.")

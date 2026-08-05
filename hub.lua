@@ -255,6 +255,6 @@ local function consoleLoop()
 end
 
 parallel.waitForAny(networkLoop, consoleLoop,
-  function() titan.registerLoop("hub") end)
+  function() titan.networkLoop("hub") end)
 if monitor then monitor.clear() end
 print("Titan hub stopped.")

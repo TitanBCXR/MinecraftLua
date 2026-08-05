@@ -31,6 +31,7 @@
 local PROTO_ROUTER = "titan_router"           -- discovery / register handshake
 local REPEAT       = rednet.CHANNEL_REPEAT     -- 65533
 local BROADCAST    = rednet.CHANNEL_BROADCAST  -- 65535
+local titanLib     = nil                       -- optional lib/titan.lua (SSH)
 
 --------------------------------------------------------------------------------
 -- Modems: open normal rednet (id + broadcast) AND the repeat channel.
@@ -220,6 +221,7 @@ local function consoleLoop()
       print("stats    - relay + device counts")
       print("gpshost [x y z] - show / set this router's GPS host coords")
       print("update   - OTA: tell every device to re-download its files & reboot")
+      print("ssh <id|label> [cmd] - remote shell (needs lib/titan.lua + master pw)")
       print("exit")
     elseif cmd == "devices" or cmd == "list" then
       local n = 0
@@ -247,7 +249,7 @@ local function consoleLoop()
         print("Not hosting GPS. Usage: gpshost <x> <y> <z>")
       end
     elseif cmd == "update" then
-      -- Broadcast OTA to every device running titan.registerLoop (they re-download
+      -- Broadcast OTA to every device running titan.networkLoop (they re-download
       -- from their install source via .titan-install and reboot).
       write("Push OTA update to the whole fleet? [y/N] ")
       if read():lower() ~= "y" then print("Cancelled."); else
@@ -255,6 +257,17 @@ local function consoleLoop()
           type = "update", from = os.getComputerID(), name = os.getComputerLabel(),
         }, PROTO_ROUTER)
         print("Update broadcast sent. Devices with .titan-install will re-download & reboot.")
+      end
+    elseif cmd == "ssh" then
+      if not a[2] then print("Usage: ssh <id|label> [command...]")
+      elseif not titanLib then
+        print("ssh needs lib/titan.lua on this router (re-install router role).")
+      else
+        local target = a[2]
+        local parts = {}
+        for i = 3, #a do parts[#parts + 1] = a[i] end
+        local cmdline = #parts > 0 and table.concat(parts, " ") or nil
+        titanLib.sshConnect(target, cmdline)
       end
     elseif cmd == "exit" or cmd == "quit" then
       return
@@ -293,9 +306,15 @@ else
 end
 
 --------------------------------------------------------------------------------
+-- Shared lib instance (SSH host + client must share one reply inbox).
+if fs.exists("lib/titan.lua") then
+  titanLib = dofile("lib/titan.lua")
+end
+
 local tasks = { repeaterLoop, directoryLoop, pingLoop, consoleLoop }
 if gpsCoords then tasks[#tasks + 1] = gpsHostLoop end
 if monitor then tasks[#tasks + 1] = drawLoop end
+if titanLib then tasks[#tasks + 1] = function() titanLib.sshHostLoop("router") end end
 parallel.waitForAny(table.unpack(tasks))
 if monitor then monitor.clear() end
 print("Router stopped.")

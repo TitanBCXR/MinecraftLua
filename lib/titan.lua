@@ -100,16 +100,35 @@ end
 -- Networking
 --------------------------------------------------------------------------------
 
--- Open the first wireless (or wired) modem we can find. Returns the side.
+-- Open every attached modem for rednet AND the rednet repeat channel, so this
+-- device can join the routing mesh (see titan.relayLoop / titan.networkLoop).
+-- Returns the first modem side found.
 function titan.openModem()
-  -- Prefer an already-open modem.
+  local found = nil
   for _, side in ipairs(rs and rs.getSides() or redstone.getSides()) do
     if peripheral.getType(side) == "modem" then
       if not rednet.isOpen(side) then rednet.open(side) end
-      return side
+      -- CHANNEL_REPEAT (65533): CraftOS hop channel used by router.lua and every
+      -- mesh peer. Opening it here lets relayLoop forward traffic for neighbours.
+      pcall(peripheral.call, side, "open", rednet.CHANNEL_REPEAT)
+      if not found then found = side end
     end
   end
-  error("No modem attached. Place a (wireless) modem on this device.", 0)
+  if not found then
+    error("No modem attached. Place a (wireless) modem on this device.", 0)
+  end
+  return found
+end
+
+-- List every modem side that is currently open for rednet (for relays).
+function titan.modemSides()
+  local sides = {}
+  for _, side in ipairs(rs and rs.getSides() or redstone.getSides()) do
+    if peripheral.getType(side) == "modem" and rednet.isOpen(side) then
+      sides[#sides + 1] = side
+    end
+  end
+  return sides
 end
 
 -- Wrap a payload in a standard envelope and send it to a specific computer id.
@@ -140,12 +159,17 @@ function titan.recv(timeout)
 end
 
 --------------------------------------------------------------------------------
--- Router registration (see router.lua)
+-- Routing mesh (see router.lua)
 --
--- Any device announces itself to the network router so it shows in the router's
--- live directory. registerLoop() is meant to run as one of a program's parallel
--- tasks: it announces immediately, then re-announces periodically so the roster
--- stays fresh regardless of who booted first.
+-- Every Titan device should join the mesh so messages hop across wireless range:
+--   * announce  -> show up in the router's directory
+--   * relayLoop -> re-transmit rednet hops (same mechanism as CraftOS `repeat`
+--                 and router.lua), so a builder/gatherer/miner in range can
+--                 forward traffic for peers that can't hear the main router
+--   * OTA       -> accept fleet update broadcasts from the main router
+--   * SSH host  -> accept remote shell sessions (see titan.sshConnect)
+--
+-- Use titan.networkLoop(kind) as one parallel task in every program.
 --------------------------------------------------------------------------------
 titan.ROUTER_PROTOCOL = "titan_router"
 
@@ -154,9 +178,7 @@ function titan.announce(kind)
 end
 
 -- Announce periodically AND listen for an OTA "update" command from a router.
--- Runs as one of a program's parallel tasks. When the network router broadcasts
--- an update (router's `update` console command), this re-downloads the device's
--- files from wherever it was installed and reboots. See titan.updateSelf below.
+-- Prefer titan.networkLoop() in new code (includes the mesh relay too).
 function titan.registerLoop(kind, period)
   period = period or 20
   local nextAnnounce = 0
@@ -177,6 +199,275 @@ function titan.registerLoop(kind, period)
       end
     end
   end
+end
+
+-- Mesh repeater: forward rednet hop packets on CHANNEL_REPEAT (de-duplicated).
+-- Faithful to CraftOS `repeat` / router.lua. Safe to run on every bot — if the
+-- main router is out of range, nearby workers/miners keep the network linked.
+function titan.relayLoop()
+  local REPEAT = rednet.CHANNEL_REPEAT
+  local relayed = {}   -- [nMessageID] = timerId
+  -- Ensure the repeat channel is open (in case openModem ran before an upgrade).
+  for _, side in ipairs(titan.modemSides()) do
+    pcall(peripheral.call, side, "open", REPEAT)
+  end
+  while true do
+    local event, p1, p2, p3, p4 = os.pullEvent()
+    if event == "modem_message" then
+      local side, channel, replyChannel, message = p1, p2, p3, p4
+      if channel == REPEAT and type(message) == "table"
+         and message.nMessageID and message.nRecipient then
+        if not relayed[message.nMessageID] then
+          relayed[message.nMessageID] = os.startTimer(30)
+          local sides = titan.modemSides()
+          if #sides == 0 then sides = { side } end
+          for _, m in ipairs(sides) do
+            peripheral.call(m, "transmit", REPEAT, replyChannel, message)
+            if message.nRecipient ~= REPEAT then
+              peripheral.call(m, "transmit", message.nRecipient, replyChannel, message)
+            end
+          end
+        end
+      end
+    elseif event == "timer" then
+      for mid, timer in pairs(relayed) do
+        if timer == p1 then relayed[mid] = nil; break end
+      end
+    end
+  end
+end
+
+-- Full mesh participation: announce + OTA listener + hop relay + SSH host.
+-- Drop this into parallel.waitForAny as:  function() titan.networkLoop("worker") end
+function titan.networkLoop(kind, period)
+  parallel.waitForAny(
+    function() titan.registerLoop(kind, period) end,
+    function() titan.relayLoop() end,
+    function() titan.sshHostLoop(kind) end
+  )
+end
+
+--------------------------------------------------------------------------------
+-- Remote shell ("SSH") over rednet
+--
+-- From console/admin:  ssh <id|label>           interactive session
+--                      ssh <id|label> <command>  one-shot remote exec
+--
+-- Auth: master password (verified via the Parent Center), same as admin tablet.
+-- Every device running titan.networkLoop hosts an SSH endpoint.
+--------------------------------------------------------------------------------
+titan.SSH_PROTOCOL = "titan_ssh"
+
+local sshSessions = {}   -- [token] = { clientId, expires }
+local sshClientQ  = {}   -- inbox for replies (host loop + client share one receiver)
+
+local function sshSend(id, msg)
+  rednet.send(id, msg, titan.SSH_PROTOCOL)
+end
+
+local function sshNewToken()
+  return tostring(os.getComputerID()) .. "-" .. tostring(os.epoch("utc")) .. "-" .. tostring(math.random(1000, 9999))
+end
+
+-- Wait for a client-bound SSH reply from the shared inbox (filled by sshHostLoop).
+local function sshClientWait(timeout, pred)
+  local deadline = os.clock() + (timeout or 5)
+  while os.clock() < deadline do
+    for i = 1, #sshClientQ do
+      local item = sshClientQ[i]
+      if pred(item.id, item.msg) then
+        table.remove(sshClientQ, i)
+        return item.id, item.msg
+      end
+    end
+    os.sleep(0.05)
+  end
+  return nil
+end
+
+-- Capture shell output by redirecting the terminal to a string buffer.
+local function sshCaptureRun(cmdline)
+  if not shell then return "(no shell on this device)", false end
+  local out, ox, oy = {}, 1, 1
+  local fake = {}
+  function fake.write(s) out[#out + 1] = tostring(s) end
+  function fake.blit(t) out[#out + 1] = tostring(t) end
+  function fake.clear() end
+  function fake.clearLine() end
+  function fake.getCursorPos() return ox, oy end
+  function fake.setCursorPos(x, y) ox, oy = x or 1, y or 1 end
+  function fake.getSize() return 51, 19 end
+  function fake.scroll() out[#out + 1] = "\n" end
+  function fake.setCursorBlink() end
+  function fake.isColor() return term.isColor and term.isColor() or false end
+  function fake.isColour() return fake.isColor() end
+  function fake.getTextColor() return colors.white end
+  function fake.getBackgroundColor() return colors.black end
+  function fake.setTextColor() end
+  function fake.setBackgroundColor() end
+  function fake.getTextColour() return colors.white end
+  function fake.getBackgroundColour() return colors.black end
+  function fake.setTextColour() end
+  function fake.setBackgroundColour() end
+  local old = term.redirect(fake)
+  local ok = shell.run(cmdline)
+  term.redirect(old)
+  local text = table.concat(out)
+  if text == "" then text = ok and "(ok)" or "(failed)" end
+  return text, ok and true or false
+end
+
+-- Resolve a computer id or label to an id. Broadcasts a ping; peers reply.
+function titan.sshResolve(ref, timeout)
+  local asNum = tonumber(ref)
+  if asNum then return asNum end
+  local want = tostring(ref or ""):lower()
+  if want == "" then return nil end
+  rednet.broadcast({ type = "ssh_ping", want = want }, titan.SSH_PROTOCOL)
+  local id = sshClientWait(timeout or 2, function(_, m)
+    if type(m) ~= "table" or m.type ~= "ssh_pong" then return false end
+    local name = tostring(m.name or ""):lower()
+    return name == want or name:find(want, 1, true) ~= nil
+  end)
+  return id
+end
+
+-- Host: accept SSH sessions / one-shot exec / name pings.
+-- Also feeds client-bound replies into sshClientQ so this device can be a client
+-- at the same time (admin tablet ssh'ing out while hosting its own endpoint).
+function titan.sshHostLoop(kind)
+  kind = kind or "device"
+  while true do
+    local id, msg = rednet.receive(titan.SSH_PROTOCOL)
+    if type(msg) ~= "table" or not id then
+      -- ignore
+    elseif msg.type == "ssh_pong" or msg.type == "ssh_ok"
+        or msg.type == "ssh_deny" or msg.type == "ssh_result" then
+      sshClientQ[#sshClientQ + 1] = { id = id, msg = msg }
+
+    elseif msg.type == "ssh_ping" then
+      local name = os.getComputerLabel() or ("#" .. os.getComputerID())
+      local want = tostring(msg.want or ""):lower()
+      if want == "" or name:lower() == want or name:lower():find(want, 1, true)
+         or tostring(os.getComputerID()) == want then
+        sshSend(id, { type = "ssh_pong", name = name, kind = kind })
+      end
+
+    elseif msg.type == "ssh_open" then
+      if type(msg.password) ~= "string" or not titan.checkPassword(msg.password) then
+        sshSend(id, { type = "ssh_deny", reason = "auth failed (need master password + Parent Center online)" })
+      else
+        local token = sshNewToken()
+        sshSessions[token] = { clientId = id, expires = os.clock() + 600 }
+        sshSend(id, {
+          type = "ssh_ok", token = token,
+          name = os.getComputerLabel() or ("#" .. os.getComputerID()),
+          kind = kind, id = os.getComputerID(),
+        })
+      end
+
+    elseif msg.type == "ssh_exec" then
+      local sess = msg.token and sshSessions[msg.token]
+      if not sess or sess.clientId ~= id or os.clock() > sess.expires then
+        sshSend(id, { type = "ssh_result", ok = false, out = "session expired - reconnect with ssh" })
+      else
+        sess.expires = os.clock() + 600
+        local line = tostring(msg.line or "")
+        if line == "" then
+          sshSend(id, { type = "ssh_result", ok = true, out = "" })
+        elseif line:lower() == "exit" or line:lower() == "logout" then
+          sshSessions[msg.token] = nil
+          sshSend(id, { type = "ssh_result", ok = true, out = "logged out", close = true })
+        else
+          local out, ok = sshCaptureRun(line)
+          sshSend(id, { type = "ssh_result", ok = ok, out = out })
+        end
+      end
+
+    elseif msg.type == "ssh_close" then
+      if msg.token then sshSessions[msg.token] = nil end
+    end
+  end
+end
+
+-- Client: open a session (prompts for master password). Returns token, hostMsg or nil, err.
+function titan.sshOpen(hostId, password)
+  if not password then
+    write("Master password: ")
+    password = read("*")
+  end
+  sshSend(hostId, {
+    type = "ssh_open", password = password,
+    name = os.getComputerLabel(), from = os.getComputerID(),
+  })
+  local id, msg = sshClientWait(5, function(sid, m)
+    return sid == hostId and type(m) == "table" and (m.type == "ssh_ok" or m.type == "ssh_deny")
+  end)
+  if not msg then return nil, "timeout - is the target online and on the mesh?" end
+  if msg.type == "ssh_ok" then return msg.token, msg end
+  return nil, msg.reason or "denied"
+end
+
+function titan.sshExec(hostId, token, line)
+  sshSend(hostId, { type = "ssh_exec", token = token, line = line })
+  local _, msg = sshClientWait(30, function(sid, m)
+    return sid == hostId and type(m) == "table" and m.type == "ssh_result"
+  end)
+  return msg or { ok = false, out = "timeout waiting for remote output" }
+end
+
+function titan.sshClose(hostId, token)
+  if hostId and token then sshSend(hostId, { type = "ssh_close", token = token }) end
+end
+
+-- Interactive (or one-shot) SSH client. target = id or label; cmdline optional.
+function titan.sshConnect(target, cmdline)
+  local hostId = titan.sshResolve(target, 2)
+  if not hostId then
+    printError("ssh: host not found: " .. tostring(target))
+    return false
+  end
+  if hostId == os.getComputerID() then
+    printError("ssh: that is this computer")
+    return false
+  end
+
+  local token, info = titan.sshOpen(hostId)
+  if not token then
+    printError("ssh: " .. tostring(info))
+    return false
+  end
+  print(("Connected to %s (#%d) [%s]"):format(
+    info.name or "?", info.id or hostId, info.kind or "?"))
+  print("Type commands remotely. 'exit' to disconnect.")
+
+  local function runLine(line)
+    local res = titan.sshExec(hostId, token, line)
+    if res.out and res.out ~= "" then print(res.out) end
+    if res.close then return false end
+    return true
+  end
+
+  if cmdline and cmdline ~= "" then
+    runLine(cmdline)
+    titan.sshClose(hostId, token)
+    return true
+  end
+
+  while true do
+    write(("ssh:%s> "):format(info.name or hostId))
+    local line = read()
+    if not line then break end
+    local low = line:lower()
+    if low == "exit" or low == "logout" then
+      runLine(line)
+      break
+    end
+    if not runLine(line) then break end
+  end
+  titan.sshClose(hostId, token)
+  print("Disconnected.")
+  return true
 end
 
 --------------------------------------------------------------------------------

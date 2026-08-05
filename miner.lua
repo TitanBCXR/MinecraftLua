@@ -18,6 +18,9 @@
   exclude.txt (next to this program): one block id per line, # for comments.
   Edit it on the turtle or copy a template from the install host.
 
+  NETWORK: joins the Titan routing mesh (announce + hop relay) so quarry status
+  and remote commands can hop through nearby builders/gatherers/routers.
+
   Requires: wireless modem, fuel, GPS constellation, lib/titan.lua.
 ]]
 
@@ -507,9 +510,10 @@ if not cfg.loc1 or not cfg.loc2 or cfg.floorY == nil then
   print("")
 end
 
+-- networkLoop: register with the router + relay hops (excavator is a mesh peer).
 parallel.waitForAny(
   consoleLoop,
   statusLoop,
-  function() titan.registerLoop("miner") end
+  function() titan.networkLoop("miner") end
 )
 print("Miner stopped.")

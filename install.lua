@@ -28,13 +28,13 @@ local ROLES = {
   { key = "3", name = "POI (location computer)",           run = "poi.lua",
     files = { "lib/titan.lua", "poi.lua" } },
   { key = "4", name = "Parent Center (data center)",       run = "datacenter.lua",
-    files = { "datacenter.lua" } },
+    files = { "lib/titan.lua", "datacenter.lua" } },
   { key = "5", name = "Bots Computer (worker server)",     run = "botserver.lua",
     files = { "lib/titan.lua", "botserver.lua" } },
   { key = "6", name = "Worker (builder/gatherer turtle)",  run = "worker.lua",
     files = { "lib/titan.lua", "worker.lua" } },
   { key = "7", name = "Terminal console (basic commands)",  run = "console.lua",
-    files = { "console.lua" } },
+    files = { "lib/titan.lua", "console.lua" } },
   { key = "8", name = "Admin tablet (pocket console)",      run = "admin.lua",
     files = { "lib/titan.lua", "admin.lua" } },
   { key = "9", name = "GPS host (needs 4+ for navigation)", run = "gpshost.lua",
@@ -42,7 +42,7 @@ local ROLES = {
   { key = "10", name = "GPS locator (pocket)",              run = "locator.lua",
     files = { "lib/titan.lua", "locator.lua" } },
   { key = "11", name = "Network router (repeater + GPS)",    run = "router.lua",
-    files = { "router.lua" } },
+    files = { "lib/titan.lua", "router.lua" } },
   { key = "12", name = "Miner (area quarry turtle)",         run = "miner.lua",
     files = { "lib/titan.lua", "miner.lua", "exclude.txt" } },
   { key = "13", name = "Install host (share files to others)", run = "host.lua",
@@ -56,13 +56,16 @@ local ROLES = {
 }
 
 local function openModem()
+  local found = nil
   for _, side in ipairs(redstone.getSides()) do
     if peripheral.getType(side) == "modem" then
       if not rednet.isOpen(side) then rednet.open(side) end
-      return side
+      pcall(peripheral.call, side, "open", rednet.CHANNEL_REPEAT)
+      if not found then found = side end
     end
   end
-  error("No modem attached. Place a (wireless) modem on this device.", 0)
+  if not found then error("No modem attached. Place a (wireless) modem on this device.", 0) end
+  return found
 end
 
 -- Find a host on the network. Returns hostId, hostMsg or nil.

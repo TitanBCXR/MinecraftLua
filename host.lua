@@ -30,13 +30,43 @@ local FILES = {
 }
 
 local function openModem()
+  local found = nil
   for _, side in ipairs(redstone.getSides()) do
     if peripheral.getType(side) == "modem" then
       if not rednet.isOpen(side) then rednet.open(side) end
-      return side
+      pcall(peripheral.call, side, "open", rednet.CHANNEL_REPEAT)
+      if not found then found = side end
     end
   end
-  error("No modem attached. Place a (wireless) modem on this computer.", 0)
+  if not found then error("No modem attached. Place a (wireless) modem on this computer.", 0) end
+  return found
+end
+
+-- Relay install traffic across the mesh so distant devices can still reach us.
+local function relayLoop()
+  local REPEAT, relayed = rednet.CHANNEL_REPEAT, {}
+  while true do
+    local event, p1, p2, p3, p4 = os.pullEvent()
+    if event == "modem_message" then
+      local side, channel, replyChannel, message = p1, p2, p3, p4
+      if channel == REPEAT and type(message) == "table"
+         and message.nMessageID and message.nRecipient and not relayed[message.nMessageID] then
+        relayed[message.nMessageID] = os.startTimer(30)
+        for _, s in ipairs(redstone.getSides()) do
+          if peripheral.getType(s) == "modem" and rednet.isOpen(s) then
+            peripheral.call(s, "transmit", REPEAT, replyChannel, message)
+            if message.nRecipient ~= REPEAT then
+              peripheral.call(s, "transmit", message.nRecipient, replyChannel, message)
+            end
+          end
+        end
+      end
+    elseif event == "timer" then
+      for mid, timer in pairs(relayed) do
+        if timer == p1 then relayed[mid] = nil; break end
+      end
+    end
+  end
 end
 
 -- Build the manifest of available files (path + size).
@@ -71,27 +101,32 @@ term.clear(); term.setCursorPos(1, 1)
 print("== Titan Install Host ==")
 print(("Serving %d files as '%s' (#%d)."):format(#manifest(), os.getComputerLabel(), os.getComputerID()))
 print("Run 'install.lua' on other devices to pull them.")
+print("Mesh relay on — install traffic hops through the routing network.")
 print("Press Ctrl+T to stop.")
 print("")
 
-while true do
-  local id, msg = rednet.receive(PROTOCOL)
-  if type(msg) == "table" then
-    if msg.type == "discover" then
-      rednet.send(id, {
-        type  = "host_here",
-        label = os.getComputerLabel(),
-        files = manifest(),
-      }, PROTOCOL)
-      print(("[discover] #%d"):format(id))
+local function serveLoop()
+  while true do
+    local id, msg = rednet.receive(PROTOCOL)
+    if type(msg) == "table" then
+      if msg.type == "discover" then
+        rednet.send(id, {
+          type  = "host_here",
+          label = os.getComputerLabel(),
+          files = manifest(),
+        }, PROTOCOL)
+        print(("[discover] #%d"):format(id))
 
-    elseif msg.type == "get" then
-      local data = readFile(msg.path)
-      rednet.send(id, {
-        type = "file", path = msg.path, ok = data ~= nil, data = data,
-      }, PROTOCOL)
-      print(("[get] %s -> #%d (%s)"):format(
-        tostring(msg.path), id, data and (#data .. "b") or "missing"))
+      elseif msg.type == "get" then
+        local data = readFile(msg.path)
+        rednet.send(id, {
+          type = "file", path = msg.path, ok = data ~= nil, data = data,
+        }, PROTOCOL)
+        print(("[get] %s -> #%d (%s)"):format(
+          tostring(msg.path), id, data and (#data .. "b") or "missing"))
+      end
     end
   end
 end
+
+parallel.waitForAny(serveLoop, relayLoop)

@@ -36,11 +36,39 @@ local function resolve(p)
   return fs.combine(cwd, p)
 end
 
--- Open every attached modem so gps/rednet work.
+-- Open every attached modem so gps/rednet work, plus the repeat channel for mesh.
 local function openModems()
   for _, side in ipairs(peripheral.getNames()) do
-    if peripheral.getType(side) == "modem" and not rednet.isOpen(side) then
-      rednet.open(side)
+    if peripheral.getType(side) == "modem" then
+      if not rednet.isOpen(side) then rednet.open(side) end
+      pcall(peripheral.call, side, "open", rednet.CHANNEL_REPEAT)
+    end
+  end
+end
+
+-- Background mesh relay so a console device also hops rednet for neighbours.
+local function relayLoop()
+  local REPEAT, relayed = rednet.CHANNEL_REPEAT, {}
+  while true do
+    local event, p1, p2, p3, p4 = os.pullEvent()
+    if event == "modem_message" then
+      local side, channel, replyChannel, message = p1, p2, p3, p4
+      if channel == REPEAT and type(message) == "table"
+         and message.nMessageID and message.nRecipient and not relayed[message.nMessageID] then
+        relayed[message.nMessageID] = os.startTimer(30)
+        for _, s in ipairs(peripheral.getNames()) do
+          if peripheral.getType(s) == "modem" and rednet.isOpen(s) then
+            peripheral.call(s, "transmit", REPEAT, replyChannel, message)
+            if message.nRecipient ~= REPEAT then
+              peripheral.call(s, "transmit", message.nRecipient, replyChannel, message)
+            end
+          end
+        end
+      end
+    elseif event == "timer" then
+      for mid, timer in pairs(relayed) do
+        if timer == p1 then relayed[mid] = nil; break end
+      end
     end
   end
 end
@@ -169,6 +197,30 @@ def("net", "find/register with the Titan router", function()
   end
 end)
 
+-- Loaded once so the SSH host loop and client share the same reply inbox.
+local titanLib = nil
+if fs.exists("lib/titan.lua") then
+  titanLib = dofile("lib/titan.lua")
+end
+
+def("ssh", "remote shell: ssh <id|label> [command...]", function(a)
+  openModems()
+  if not a[1] then
+    print("Usage: ssh <computer id or label> [command]")
+    print("  ssh 3              interactive session")
+    print("  ssh Miner-12 ls    run one command remotely")
+    print("Auth: Parent Center master password.")
+    return
+  end
+  if not titanLib then
+    printError("ssh needs lib/titan.lua (re-install via Titan installer, or copy lib/).")
+    return
+  end
+  local target = table.remove(a, 1)
+  local cmdline = #a > 0 and table.concat(a, " ") or nil
+  titanLib.sshConnect(target, cmdline)
+end)
+
 def("reboot", "restart this device", function() os.reboot() end)
 def("shutdown", "power off this device", function() os.shutdown() end)
 def("exit", "leave the console", function() running = false end)
@@ -235,16 +287,26 @@ color(colors.yellow)
 print("== Titan console v" .. VERSION .. " ==")
 color(colors.white)
 print("Type 'help' for commands, 'exit' to quit.")
+openModems()
 
-while running do
-  color(colors.cyan)
-  write((os.getComputerLabel() or ("#" .. os.getComputerID())) .. ":/" .. cwd .. "> ")
-  color(colors.white)
-  local line = read(nil, history, complete)
-  if line and line:match("%S") then
-    history[#history + 1] = line
-    dispatch(line)
+local function promptLoop()
+  while running do
+    color(colors.cyan)
+    write((os.getComputerLabel() or ("#" .. os.getComputerID())) .. ":/" .. cwd .. "> ")
+    color(colors.white)
+    local line = read(nil, history, complete)
+    if line and line:match("%S") then
+      history[#history + 1] = line
+      dispatch(line)
+    end
   end
 end
+
+-- Relay + SSH host while the console is open (mesh + inbound remote shell).
+local tasks = { promptLoop, relayLoop }
+if titanLib then
+  tasks[#tasks + 1] = function() titanLib.sshHostLoop("console") end
+end
+parallel.waitForAny(table.unpack(tasks))
 
 print("Console closed.")

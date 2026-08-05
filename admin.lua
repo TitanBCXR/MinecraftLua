@@ -189,6 +189,7 @@ local function consoleLoop()
       print("       return <bot> | refuel <bot> | stop <bot>")
       print("DEPLOY: deploy <bot> <builder|gatherer> <name> [x y z]")
       print("BUILD: scan <bot> <name> <W H L> | build <bot> <name> [x y z]")
+      print("ssh <id|label> [cmd...]  remote shell (master password)")
       print("login | lock | exit")
 
     elseif cmd == "live" then
@@ -283,6 +284,21 @@ local function consoleLoop()
         print("Build order sent.")
       elseif id then print("Usage: build <bot> <name> [x y z]") end
 
+    elseif cmd == "ssh" then
+      if not a[2] then
+        print("Usage: ssh <id|label> [command...]")
+      elseif requireAuth() then
+        local target = a[2]
+        local cmdline
+        if a[3] then
+          local parts = {}
+          for i = 3, #a do parts[#parts + 1] = a[i] end
+          cmdline = table.concat(parts, " ")
+        end
+        -- Already unlocked locally; still need password on the wire for the host.
+        titan.sshConnect(target, cmdline)
+      end
+
     elseif cmd == "login" then
       requireAuth()
     elseif cmd == "lock" or cmd == "logout" then
@@ -297,5 +313,5 @@ end
 
 print("Titan admin tablet online.")
 parallel.waitForAny(listenerLoop, consoleLoop,
-  function() titan.registerLoop("admin") end)
+  function() titan.networkLoop("admin") end)
 print("Admin console closed.")

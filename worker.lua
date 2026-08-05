@@ -29,6 +29,11 @@
       on the restricted list), saves it to builds/<name>.txt, and uploads it.
     * Can BUILD a preset at its current position from blocks in its inventory.
 
+  NETWORK: joins the Titan routing mesh (titan.networkLoop) — announces to the
+  router directory and relays rednet hops while in range, so Parent Center
+  deploys and bot-server orders can reach this turtle even when the main router
+  is out of direct range (as long as some mesh peer can hear both sides).
+
   Requires: wireless modem, fuel, a GPS constellation. Uses lib/titan.lua.
 ]]
 
@@ -556,7 +561,11 @@ end
 --==============================================================================
 cfg = loadCfg()
 if not cfg or not cfg.botType then
-  awaitDeployment()                                        -- wait for the Parent Center to deploy us
+  -- Stay on the mesh while waiting so Parent Center deploys can hop through peers.
+  parallel.waitForAny(
+    awaitDeployment,
+    function() titan.networkLoop("worker") end
+  )
 else
   os.setComputerLabel(cfg.name)
   -- Recover heading/home each boot.
@@ -566,5 +575,7 @@ end
 
 print(("Titan %s '%s' online."):format(cfg.botType, cfg.name))
 setStatus("idle", "-")
+-- networkLoop: announce to the router directory AND relay rednet hops so this
+-- builder/gatherer extends the mesh while it's in wireless range of peers.
 parallel.waitForAny(receiveLoop, statusLoop, workerLoop, roleTicker, consoleLoop,
-  function() titan.registerLoop("worker") end)
+  function() titan.networkLoop("worker") end)

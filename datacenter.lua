@@ -82,13 +82,44 @@ local pending  = {}                          -- [id] = { name, x,y,z, seen } wor
 local function trim(s) return (tostring(s):gsub("[\r\n%s]+$", "")) end
 
 local function openModem()
+  local found = nil
   for _, side in ipairs(redstone.getSides()) do
     if peripheral.getType(side) == "modem" then
       if not rednet.isOpen(side) then rednet.open(side) end
-      return side
+      -- Join the routing mesh so Parent Center traffic can hop via nearby peers.
+      pcall(peripheral.call, side, "open", rednet.CHANNEL_REPEAT)
+      if not found then found = side end
     end
   end
-  error("No modem attached. Place a (wireless) modem on this computer.", 0)
+  if not found then error("No modem attached. Place a (wireless) modem on this computer.", 0) end
+  return found
+end
+
+-- Mesh repeater (same hop protocol as router.lua / CraftOS `repeat`).
+local function relayLoop()
+  local REPEAT, relayed = rednet.CHANNEL_REPEAT, {}
+  while true do
+    local event, p1, p2, p3, p4 = os.pullEvent()
+    if event == "modem_message" then
+      local side, channel, replyChannel, message = p1, p2, p3, p4
+      if channel == REPEAT and type(message) == "table"
+         and message.nMessageID and message.nRecipient and not relayed[message.nMessageID] then
+        relayed[message.nMessageID] = os.startTimer(30)
+        for _, s in ipairs(redstone.getSides()) do
+          if peripheral.getType(s) == "modem" and rednet.isOpen(s) then
+            peripheral.call(s, "transmit", REPEAT, replyChannel, message)
+            if message.nRecipient ~= REPEAT then
+              peripheral.call(s, "transmit", message.nRecipient, replyChannel, message)
+            end
+          end
+        end
+      end
+    elseif event == "timer" then
+      for mid, timer in pairs(relayed) do
+        if timer == p1 then relayed[mid] = nil; break end
+      end
+    end
+  end
 end
 
 local function loadConfig()
@@ -749,4 +780,11 @@ elseif not discoverMaster(1) then
   print("No master online yet (logins will be denied until one appears).")
 end
 
-parallel.waitForAny(serviceLoop, registerLoop, displayLoop, botLoop, uiLoop)
+local tasks = { serviceLoop, registerLoop, displayLoop, botLoop, uiLoop, relayLoop }
+-- Inbound SSH when lib is present (Parent Center install now ships lib/titan.lua).
+local dcTitan = nil
+if fs.exists("lib/titan.lua") then
+  dcTitan = dofile("lib/titan.lua")
+  tasks[#tasks + 1] = function() dcTitan.sshHostLoop("datacenter") end
+end
+parallel.waitForAny(table.unpack(tasks))

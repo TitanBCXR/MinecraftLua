@@ -260,5 +260,5 @@ end
 
 print("Titan locator online.")
 parallel.waitForAny(listenerLoop, consoleLoop,
-  function() titan.registerLoop("locator") end)
+  function() titan.networkLoop("locator") end)
 print("Locator closed.")

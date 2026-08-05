@@ -192,4 +192,4 @@ end
 
 print("Titan bot online: " .. (os.getComputerLabel() or ("#" .. os.getComputerID())))
 parallel.waitForAny(receiveLoop, statusLoop, workerLoop,
-  function() titan.registerLoop("bot") end)
+  function() titan.networkLoop("bot") end)
