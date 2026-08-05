@@ -462,3 +462,31 @@ exit
 Bearings are absolute compass directions (e.g. `84m NE up3`). Once you start
 walking, it infers your facing from movement and adds a relative cue
 (`ahead` / `left` / `right` / `behind`).
+
+---
+
+# Network router (`router.lua`)
+
+Ties the whole network together over wireless. Run one (or several) on a
+computer with a wireless (ideally **ender**) modem. It does two things:
+
+- **Repeater:** re-transmits rednet traffic — **both broadcasts and directed
+  messages** (bot commands, worker deploys, auth checks) — so devices out of
+  direct modem range still reach each other. Chain several routers to blanket a
+  big base; duplicate messages are de-duplicated so they never loop. (Same
+  mechanism as CraftOS's built-in `repeat`, but with a roster + dashboard.)
+- **Directory:** listens to every Titan protocol and keeps a live registry of
+  who's online (bots, workers, hubs, POIs, data center, tablets). With a monitor
+  attached it shows the roster + relay stats.
+
+Install it via the installer → **"Network router"** (self-contained, no lib).
+Console: `devices`, `ping`, `stats`, `exit`.
+
+**Register / check connectivity from any device:** the terminal console
+(`console.lua`) has a `net` command — it pings the router and reports
+`Connected via Router #<id> (<n> devices online)`, or tells you no router is in
+range.
+
+Tip: with **ender modems** you already have unlimited range, so a router is
+mainly useful for **plain wireless modems** (extending range) or as a **central
+directory/monitor** of everything on the network.

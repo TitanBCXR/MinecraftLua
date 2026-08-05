@@ -44,9 +44,11 @@ local ROLES = {
     files = { "gpshost.lua" } },
   { key = "10", name = "GPS locator (pocket)",              run = "locator.lua",
     files = { "lib/titan.lua", "locator.lua" } },
-  { key = "11", name = "Everything (all files, no auto-run)", run = nil,
+  { key = "11", name = "Network router (repeater)",         run = "router.lua",
+    files = { "router.lua" } },
+  { key = "12", name = "Everything (all files, no auto-run)", run = nil,
     files = { "lib/titan.lua", "hub.lua", "bot.lua", "poi.lua", "worker.lua", "botserver.lua",
-              "datacenter.lua", "console.lua", "admin.lua", "gpshost.lua", "locator.lua" } },
+              "datacenter.lua", "console.lua", "admin.lua", "gpshost.lua", "locator.lua", "router.lua" } },
 }
 
 --==============================================================================
@@ -130,7 +132,7 @@ local LABELS = {
   ["datacenter.lua"] = "ParentCenter", ["botserver.lua"] = "BotsComputer",
   ["worker.lua"] = "Worker", ["console.lua"] = "Console",
   ["admin.lua"] = "Admin", ["host.lua"] = "Host", ["gpshost.lua"] = "GPS",
-  ["locator.lua"] = "Locator",
+  ["locator.lua"] = "Locator", ["router.lua"] = "Router",
 }
 local lbl = role.run and LABELS[role.run]
 if lbl and not os.getComputerLabel() then

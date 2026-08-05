@@ -151,6 +151,24 @@ def("pos", "locate via GPS", function()
   end
 end)
 
+def("net", "find/register with the Titan router", function()
+  openModems()
+  rednet.broadcast({ type = "hello" }, "titan_router")
+  local deadline, found = os.clock() + 2, false
+  while os.clock() < deadline do
+    local id, msg = rednet.receive("titan_router", deadline - os.clock())
+    if id == nil then break end
+    if type(msg) == "table" and msg.type == "here" then
+      found = true
+      print(("Connected via Router #%d '%s' (%d devices online)"):format(
+        id, msg.label or "?", msg.devices or 0))
+    end
+  end
+  if not found then
+    printError("No router found. Run router.lua on a computer with a modem in range.")
+  end
+end)
+
 def("reboot", "restart this device", function() os.reboot() end)
 def("shutdown", "power off this device", function() os.shutdown() end)
 def("exit", "leave the console", function() running = false end)
