@@ -1,0 +1,4 @@
+# Normalize line endings. CC: Tweaked / Lua are happiest with LF.
+* text=auto eol=lf
+*.lua text eol=lf
+*.md  text eol=lf

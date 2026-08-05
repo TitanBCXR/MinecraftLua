@@ -1,0 +1,15 @@
+# --- CC: Tweaked runtime files (generated on the in-game computers, not source) ---
+*.cfg              # poi.cfg, worker.cfg, station.cfg, ...
+master.pw          # master-password floppy contents (secret!)
+builds/            # scanned build presets uploaded/saved at runtime
+computer/          # world-save computer mounts, if ever copied in
+disk/              # world-save disk mounts, if ever copied in
+
+# --- OS / editor cruft ---
+.DS_Store
+Thumbs.db
+desktop.ini
+*.swp
+*.tmp
+.vscode/
+.idea/
