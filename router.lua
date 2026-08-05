@@ -1,6 +1,6 @@
 --[[
   router.lua  -  Titan network router / repeater (CC: Tweaked)
-  Titan-Version: 1.2.4
+  Titan-Version: 1.2.5
 
   Place one (or several) of these to tie the whole network together over
   wireless and/or wired modems. Roles:
@@ -105,6 +105,13 @@ local function patchRouterCfg(patch)
   return c
 end
 local function isMain() return routerRole == "main" end
+
+-- Time helpers (must be above noteDeviceVersion / startUpdateCampaign).
+local function now() return os.epoch("utc") end
+local function ago(ts) return math.floor((now() - (ts or 0)) / 1000) end
+local function isOnline(d)
+  return d and d.seen and d.seen > 0 and ago(d.seen) < ONLINE_SECS
+end
 
 --------------------------------------------------------------------------------
 -- Modem name registry (MAIN): unique names from a pool, persisted in router.cfg.
@@ -375,13 +382,6 @@ local function broadcastFleetMap()
     x = gpsCoords and gpsCoords.x, y = gpsCoords and gpsCoords.y,
     z = gpsCoords and gpsCoords.z, nodes = nodes,
   }, PROTO_ROUTER)
-end
-
-local function now() return os.epoch("utc") end
-local function ago(ts) return math.floor((now() - (ts or 0)) / 1000) end
-
-local function isOnline(d)
-  return d and d.seen and d.seen > 0 and ago(d.seen) < ONLINE_SECS
 end
 
 local function isWiredFresh(id)

@@ -13,7 +13,7 @@ return {
   packages = {
     ["lib/titan.lua"]      = "1.2.5",
     ["console.lua"]        = "1.1.6",
-    ["router.lua"]         = "1.2.4",
+    ["router.lua"]         = "1.2.5",
     ["host.lua"]           = "1.1.6",
     ["install.lua"]        = "1.1.6",
     ["github_install.lua"] = "1.1.6",
