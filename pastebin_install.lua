@@ -1,6 +1,6 @@
 --[[
   pastebin_install.lua  -  Pastebin bootstrap installer for the Titan system
-  Titan-Version: 1.1.6
+  Titan-Version: 1.1.7
 
   Pulls the Titan files straight from Pastebin (no in-game host needed). Upload
   each file to pastebin.com once, paste its CODE into the table below, then
@@ -33,6 +33,7 @@ local CODES = {
   ["locator.lua"]   = "",
   ["router.lua"]    = "",
   ["miner.lua"]     = "",
+  ["storage_manager.lua"] = "",
   ["exclude.txt"]   = "",
   ["versions.lua"]  = "",
 }
@@ -65,10 +66,12 @@ local ROLES = {
     files = { "lib/titan.lua", "router.lua" } },
   { key = "12", name = "Miner (area quarry turtle)",       run = "miner.lua",
     files = { "lib/titan.lua", "miner.lua", "exclude.txt" } },
-  { key = "13", name = "Everything (all files, no auto-run)", run = nil,
+  { key = "13", name = "StorageManager (Create storage)", run = "storage_manager.lua",
+    files = { "lib/titan.lua", "storage_manager.lua" } },
+  { key = "14", name = "Everything (all files, no auto-run)", run = nil,
     files = { "lib/titan.lua", "hub.lua", "bot.lua", "poi.lua", "worker.lua", "botserver.lua",
               "datacenter.lua", "console.lua", "admin.lua", "gpshost.lua", "locator.lua", "router.lua",
-              "miner.lua", "exclude.txt", "versions.lua" } },
+              "miner.lua", "storage_manager.lua", "exclude.txt", "versions.lua" } },
 }
 
 --==============================================================================
@@ -181,6 +184,7 @@ local LABELS = {
   ["worker.lua"] = "Worker", ["console.lua"] = "Console",
   ["admin.lua"] = "Admin", ["host.lua"] = "Host", ["gpshost.lua"] = "GPS",
   ["locator.lua"] = "Locator", ["router.lua"] = "Router", ["miner.lua"] = "Miner",
+  ["storage_manager.lua"] = "StorageManager",
 }
 local lbl = role.run and LABELS[role.run]
 if lbl and not os.getComputerLabel() then
