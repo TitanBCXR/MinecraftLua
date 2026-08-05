@@ -1,5 +1,6 @@
 --[[
   bot.lua  -  Turtle "bot" for the Titan network (CC: Tweaked)
+  Titan-Version: 1.1.0
 
   Runs on a TURTLE that has:
     * a wireless modem (equipped on left/right, or a modem block placed on it)

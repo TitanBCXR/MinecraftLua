@@ -1,3 +1,4 @@
+# Titan-Version: 1.0.0
 # Miner exclude list — one block/item id per line.
 # The miner will NOT break these (or anything on titan.RESTRICTED).
 # Lines starting with # are comments. Blank lines are ignored.

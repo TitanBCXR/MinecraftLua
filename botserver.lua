@@ -1,5 +1,6 @@
 --[[
   botserver.lua  -  "Bots Computer" for the Titan network (CC: Tweaked)
+  Titan-Version: 1.1.0
 
   The coordination hub for builder & gatherer bots (worker.lua). Runs on a
   computer with a wireless modem (and optionally a monitor).

@@ -1,5 +1,6 @@
 --[[
   gpshost.lua  -  Easy GPS host for the Titan network (CC: Tweaked)
+  Titan-Version: 1.1.0
 
   Bots locate themselves with gps.locate(), which needs at least FOUR GPS host
   computers in range. Run this on each of those computers. On first run it asks

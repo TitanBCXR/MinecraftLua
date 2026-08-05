@@ -1,5 +1,6 @@
 --[[
   console.lua  -  Basic terminal commands for a CC: Tweaked device
+  Titan-Version: 1.1.1
 
   A tiny, self-contained command console you can run on any computer or turtle.
   It gives you a handful of everyday commands (files, labels, GPS, fuel, movement)
@@ -238,51 +239,56 @@ end
 
 local function showPackages()
   if not needTitan("packages") then return end
-  local info, err = titanLib.listPackages()
-  if not info then
-    printError(err or "no packages")
-    return
-  end
-  print("== Installed packages ==")
-  print("role   : " .. tostring(info.role))
-  print("source : " .. tostring(info.source))
-  if info.base then print("base   : " .. tostring(info.base)) end
-  if info.run then print("run    : " .. tostring(info.run)) end
-  print("files:")
-  for _, f in ipairs(info.files) do
-    if f.present then
-      print(("  %-22s %6db"):format(f.path, f.size))
-    else
-      print(("  %-22s MISSING"):format(f.path))
-    end
+  local info = titanLib.listPackages()
+  print("== Packages ==")
+  print("system : v" .. tostring(info.system or "—"))
+  if info.source then print("source : " .. tostring(info.source)) end
+  print("file   : packages  (desired list — edit or use add/remove)")
+  print("")
+  print(("%-16s %s"):format("PACKAGE", "VERSION"))
+  print(("%-16s %s"):format("-------", "-------"))
+  for _, p in ipairs(info.packages or {}) do
+    local ver = p.present and tostring(p.version or "—") or "MISSING"
+    local mark = p.extra and " *" or ""
+    print(("%-16s %s%s"):format(p.name, ver, mark))
   end
   print("")
-  print("Run 'update' to re-download all packages from the install source.")
+  print("* = on disk but not in the `packages` file (won't be updated)")
+  print("update           download every package listed in `packages`")
+  print("packages add X   add a desired package, then run update")
 end
 
 local function runPackageUpdate(autoReboot)
   if not needTitan("update") then return end
   openModems()
-  local info = titanLib.listPackages()
-  if not info then
-    printError("No .titan-install manifest. Install this device with an installer first.")
+  local desired = titanLib.readPackageList()
+  if not desired or #desired == 0 then
+    printError("No `packages` file. Install via an installer, or: packages add <name>")
     return
   end
-  print(("Updating %d file(s) from %s ..."):format(#info.files, info.source))
+  local info = titanLib.listPackages()
+  print(("Updating %d package(s) from %s ..."):format(#desired, tostring(info.source or "?")))
   if info.source == "host" then
     print("(needs host.lua running on the install computer)")
+  elseif not info.source then
+    printError("No .titan-install source. Install this device with an installer first.")
+    return
   end
   local ok, detail = titanLib.updateSelf({
     onProgress = function(path, good, msg)
-      if good then print("  ok   " .. path .. " (" .. msg .. ")")
-      else printError("  FAIL " .. path .. " — " .. msg) end
+      local name = titanLib.packageName(path)
+      if good then print(("  ok   %-16s %s"):format(name, msg))
+      else printError(("  FAIL %-16s %s"):format(name, msg)) end
     end,
   })
   if not ok then
     printError("Update failed: " .. tostring(detail))
     return
   end
-  print(("Updated %s package file(s)."):format(tostring(detail)))
+  local updated = type(detail) == "table" and detail.updated or detail
+  print(("Done. updated=%s"):format(tostring(updated)))
+  local after = titanLib.listPackages()
+  print("system version: v" .. tostring(after.system or "—"))
   if autoReboot then
     print("Rebooting..."); sleep(1); os.reboot()
   end
@@ -291,21 +297,40 @@ local function runPackageUpdate(autoReboot)
   if yn == "" or yn == "y" then os.reboot() end
 end
 
-def("packages", "list installed Titan packages (or: packages update)", function(a)
+def("packages", "list/add/remove desired packages; packages update to download", function(a)
   local sub = (a[1] or ""):lower()
   if sub == "update" or sub == "upgrade" then
     runPackageUpdate(a[2] == "-y" or a[2] == "--yes")
+  elseif sub == "add" then
+    if not needTitan("packages") then return end
+    if not a[2] then print("Usage: packages add <name|path>"); return end
+    local path, err = titanLib.addPackage(table.concat(a, " ", 2))
+    if not path then printError(tostring(err)) 
+    elseif err == "already listed" then print(path .. " already in packages")
+    else
+      print("Added to packages: " .. path)
+      print("Run 'update' to download it.")
+    end
+  elseif sub == "remove" or sub == "rm" then
+    if not needTitan("packages") then return end
+    if not a[2] then print("Usage: packages remove <name|path>"); return end
+    local path, err = titanLib.removePackage(table.concat(a, " ", 2))
+    if not path then printError(tostring(err))
+    else print("Removed from packages: " .. path) end
   elseif sub == "help" then
-    print("packages          list installed files + source")
-    print("packages update   re-download all packages")
-    print("update [-y]       same as packages update")
+    print("packages              list desired packages + versions")
+    print("packages add <name>   add to the packages file")
+    print("packages remove <name> remove from the packages file")
+    print("packages update       download everything in packages")
+    print("update [-y]           same as packages update")
+    print("Edit the `packages` file directly if you prefer.")
   else
     showPackages()
   end
 end)
 alias("pkgs", "packages")
 
-def("update", "re-download installed packages from their install source", function(a)
+def("update", "download every package listed in the packages file", function(a)
   local flag = (a[1] or ""):lower()
   runPackageUpdate(flag == "-y" or flag == "--yes" or flag == "yes")
 end)

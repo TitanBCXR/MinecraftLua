@@ -1,5 +1,6 @@
 --[[
   hub.lua  -  Control computer for the Titan bot network (CC: Tweaked)
+  Titan-Version: 1.1.0
 
   Runs on a normal (or advanced) computer that has:
     * a wireless modem  (to talk to bots & POIs)

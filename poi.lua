@@ -1,5 +1,6 @@
 --[[
   poi.lua  -  "Point of Interest" computer for the Titan network (CC: Tweaked)
+  Titan-Version: 1.1.0
 
   Runs on a normal (or advanced) computer placed AT a location you care about
   (a mine, a farm, a base, a smelter, etc). It has:

@@ -1,5 +1,6 @@
 --[[
   pastebin_install.lua  -  Pastebin bootstrap installer for the Titan system
+  Titan-Version: 1.1.0
 
   Pulls the Titan files straight from Pastebin (no in-game host needed). Upload
   each file to pastebin.com once, paste its CODE into the table below, then
@@ -33,6 +34,7 @@ local CODES = {
   ["router.lua"]    = "",
   ["miner.lua"]     = "",
   ["exclude.txt"]   = "",
+  ["versions.lua"]  = "",
 }
 
 --==============================================================================
@@ -66,7 +68,7 @@ local ROLES = {
   { key = "13", name = "Everything (all files, no auto-run)", run = nil,
     files = { "lib/titan.lua", "hub.lua", "bot.lua", "poi.lua", "worker.lua", "botserver.lua",
               "datacenter.lua", "console.lua", "admin.lua", "gpshost.lua", "locator.lua", "router.lua",
-              "miner.lua", "exclude.txt" } },
+              "miner.lua", "exclude.txt", "versions.lua" } },
 }
 
 --==============================================================================
@@ -113,10 +115,17 @@ local role
 for _, r in ipairs(ROLES) do if r.key == choice then role = r; break end end
 if not role then print("Invalid choice."); return end
 
+local files, hasVersions = {}, false
+for _, path in ipairs(role.files) do
+  files[#files + 1] = path
+  if path == "versions.lua" then hasVersions = true end
+end
+if not hasVersions then files[#files + 1] = "versions.lua" end
+
 print("")
 print("Installing: " .. role.name)
 local failed = {}
-for _, path in ipairs(role.files) do
+for _, path in ipairs(files) do
   write("  " .. path .. " ... ")
   local data, err = fetch(path)
   if data then
@@ -138,13 +147,31 @@ end
 print("")
 print("Install complete.")
 
+local sysVer = "1.1.0"
+if fs.exists("versions.lua") then
+  local ok, cat = pcall(dofile, "versions.lua")
+  if ok and type(cat) == "table" and cat.system then sysVer = cat.system end
+end
+
+-- Desired packages list (`packages` file) — edit anytime, then run `update`.
+if fs.exists("lib/titan.lua") then
+  local ok, titan = pcall(dofile, "lib/titan.lua")
+  if ok and titan and titan.writePackageList then files = titan.writePackageList(files) end
+else
+  local pf = fs.open("packages", "w")
+  pf.write("# Titan packages — desired packages for this computer\n")
+  pf.write("# One path per line. Edit this list, then run: update\n#\n")
+  for _, path in ipairs(files) do pf.write(path .. "\n") end
+  pf.close()
+end
+
 -- Record how this device was installed so it can self-update later when the
 -- network router pushes an OTA update (see lib/titan.lua : titan.updateSelf).
 -- We keep only the paste codes this role actually needs.
 local roleCodes = {}
-for _, path in ipairs(role.files) do roleCodes[path] = CODES[path] end
+for _, path in ipairs(files) do roleCodes[path] = CODES[path] end
 writeFile(".titan-install", textutils.serialize({
-  source = "pastebin", role = role.name, run = role.run, files = role.files, codes = roleCodes,
+  source = "pastebin", role = role.name, run = role.run, files = files, codes = roleCodes, version = sysVer,
 }))
 
 -- Give this device a role-based label if it doesn't have one yet.

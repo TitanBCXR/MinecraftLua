@@ -1,5 +1,6 @@
 --[[
   admin.lua  -  Titan admin console for a POCKET computer ("Live" tablet)
+  Titan-Version: 1.1.0
 
   A mobile master terminal you keep on you. It listens to the whole Titan
   network and lets you monitor and command it from your pocket:

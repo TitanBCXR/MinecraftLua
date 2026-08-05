@@ -1,5 +1,6 @@
 --[[
   miner.lua  -  Area miner turtle for the Titan network (CC: Tweaked)
+  Titan-Version: 1.1.0
 
   Digs a rectangular volume defined by two corner positions and a floor Y.
   Never breaks blocks listed in exclude.txt (or titan.RESTRICTED).

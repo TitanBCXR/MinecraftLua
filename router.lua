@@ -1,5 +1,6 @@
 --[[
   router.lua  -  Titan network router / repeater (CC: Tweaked)
+  Titan-Version: 1.1.0
 
   Place one (or several) of these to tie the whole network together over
   wireless. It does two jobs:

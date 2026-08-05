@@ -1,5 +1,6 @@
 --[[
   worker.lua  -  Builder / Gatherer bot for the Titan network (CC: Tweaked)
+  Titan-Version: 1.1.0
 
   A TURTLE that is either a BUILDER or a GATHERER. It registers with the
   "Bots Computer" (botserver.lua), learns/keeps its type, and then works.

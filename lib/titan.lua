@@ -1,5 +1,6 @@
 --[[
   titan.lua  -  Shared library for the Titan bot network (CC: Tweaked)
+  Titan-Version: 1.1.1
 
   Provides:
     * Rednet protocol constants + message type enum
@@ -506,14 +507,21 @@ function titan.sshConnect(target, cmdline)
 end
 
 --------------------------------------------------------------------------------
--- OTA self-update
+-- Packages + OTA self-update
 --
--- Each installer records HOW this device was installed in `.titan-install`
--- (source + file list + where to fetch from). The network router can then push
--- an "update" to the whole fleet; every device re-downloads its own files from
--- the same source it came from and reboots. No per-device config needed.
+-- Each installed device keeps a plain-text `packages` file listing the desired
+-- package paths (one per line). `update` downloads everything in that list from
+-- the install source recorded in `.titan-install`. Edit `packages` (or use
+-- `packages add` / `packages remove`) to change what this computer should have.
 --------------------------------------------------------------------------------
-titan.MANIFEST = ".titan-install"
+titan.MANIFEST      = ".titan-install"
+titan.PACKAGES_FILE = "packages"
+titan.VERSIONS_FILE = "versions.lua"
+
+-- Skip these roots when scanning for local packages.
+local SCAN_SKIP = {
+  rom = true, [".git"] = true, disk = true, builds = true,
+}
 
 function titan.readManifest()
   if not fs.exists(titan.MANIFEST) then return nil end
@@ -525,28 +533,218 @@ function titan.writeManifest(m)
   local f = fs.open(titan.MANIFEST, "w"); f.write(textutils.serialize(m)); f.close()
 end
 
--- Return install package info for display, or nil + error.
--- { source, role, run, base, files = { { path, size, present }, ... } }
+-- Short package name for display (lib/titan.lua -> titan, console.lua -> console).
+function titan.packageName(path)
+  local base = fs.getName(path or "")
+  base = base:gsub("%.lua$", ""):gsub("%.txt$", "")
+  return base ~= "" and base or tostring(path)
+end
+
+-- Load local versions.lua catalog if present.
+function titan.loadVersionCatalog()
+  if not fs.exists(titan.VERSIONS_FILE) then return nil end
+  local ok, cat = pcall(dofile, titan.VERSIONS_FILE)
+  if ok and type(cat) == "table" then return cat end
+  return nil
+end
+
+-- Read `-- Titan-Version: x.y.z` from the first lines of a file.
+function titan.readFileVersion(path)
+  if not fs.exists(path) or fs.isDir(path) then return nil end
+  local f = fs.open(path, "r")
+  if not f then return nil end
+  for _ = 1, 40 do
+    local line = f.readLine()
+    if not line then break end
+    local ver = line:match("[Tt]itan%-[Vv]ersion:%s*([%d%.]+)")
+    if ver then f.close(); return ver end
+    ver = line:match("^%-%-%s*[Vv]ersion:%s*([%d%.]+)")
+    if ver then f.close(); return ver end
+  end
+  f.close()
+  return nil
+end
+
+function titan.packageVersion(path, catalog)
+  catalog = catalog or titan.loadVersionCatalog()
+  if catalog and catalog.packages and catalog.packages[path] then
+    return catalog.packages[path]
+  end
+  return titan.readFileVersion(path)
+end
+
+-- Resolve a short name ("console", "titan") or path to a package path.
+function titan.resolvePackagePath(ref)
+  ref = tostring(ref or ""):gsub("^%s+", ""):gsub("%s+$", "")
+  if ref == "" then return nil end
+  if ref:find("[/\\.]") or ref:match("%.lua$") or ref:match("%.txt$") then
+    return ref
+  end
+  local catalog = titan.loadVersionCatalog()
+  if catalog and catalog.packages then
+    local want = ref:lower()
+    for path in pairs(catalog.packages) do
+      if titan.packageName(path):lower() == want then return path end
+    end
+  end
+  if fs.exists(ref .. ".lua") then return ref .. ".lua" end
+  if fs.exists("lib/" .. ref .. ".lua") then return "lib/" .. ref .. ".lua" end
+  return ref .. ".lua"
+end
+
+-- Write the desired-packages file (human-editable).
+function titan.writePackageList(paths)
+  local seen, list = {}, {}
+  for _, path in ipairs(paths or {}) do
+    if path and path ~= "" and not seen[path] then
+      seen[path] = true
+      list[#list + 1] = path
+    end
+  end
+  table.sort(list)
+  if not seen[titan.VERSIONS_FILE] then
+    -- versions catalog should always be tracked
+    list[#list + 1] = titan.VERSIONS_FILE
+    table.sort(list)
+  end
+  local f = fs.open(titan.PACKAGES_FILE, "w")
+  f.write("# Titan packages — desired packages for this computer\n")
+  f.write("# One path per line. Edit this list, then run: update\n")
+  f.write("# Commands: packages add <name> | packages remove <name>\n")
+  f.write("#\n")
+  for _, path in ipairs(list) do
+    f.write(path .. "\n")
+  end
+  f.close()
+  return list
+end
+
+-- Read desired packages from `packages`. Migrates from .titan-install if needed.
+function titan.readPackageList()
+  if fs.exists(titan.PACKAGES_FILE) and not fs.isDir(titan.PACKAGES_FILE) then
+    local list, seen = {}, {}
+    local f = fs.open(titan.PACKAGES_FILE, "r")
+    while true do
+      local line = f.readLine()
+      if not line then break end
+      line = line:match("^%s*(.-)%s*$") or ""
+      if line ~= "" and not line:find("^#") then
+        if not seen[line] then
+          seen[line] = true
+          list[#list + 1] = line
+        end
+      end
+    end
+    f.close()
+    if #list > 0 then return list end
+  end
+
+  -- Migrate / seed from install manifest.
+  local m = titan.readManifest()
+  if m and type(m.files) == "table" and #m.files > 0 then
+    return titan.writePackageList(m.files)
+  end
+  return nil
+end
+
+function titan.addPackage(ref)
+  local path = titan.resolvePackagePath(ref)
+  if not path then return nil, "invalid package" end
+  local list = titan.readPackageList() or {}
+  for _, p in ipairs(list) do if p == path then return path, "already listed" end end
+  list[#list + 1] = path
+  titan.writePackageList(list)
+  local m = titan.readManifest()
+  if m then
+    m.files = titan.readPackageList()
+    titan.writeManifest(m)
+  end
+  return path
+end
+
+function titan.removePackage(ref)
+  local path = titan.resolvePackagePath(ref)
+  if not path then return nil, "invalid package" end
+  if path == titan.VERSIONS_FILE then return nil, "cannot remove versions.lua" end
+  local list, kept = titan.readPackageList() or {}, {}
+  local found = false
+  for _, p in ipairs(list) do
+    if p == path then found = true
+    else kept[#kept + 1] = p end
+  end
+  if not found then return nil, "not in packages list" end
+  titan.writePackageList(kept)
+  local m = titan.readManifest()
+  if m then
+    m.files = titan.readPackageList()
+    titan.writeManifest(m)
+  end
+  return path
+end
+
+-- Recursively find all .lua files (and known Titan extras) on this computer.
+function titan.scanLocalScripts(dir, out)
+  out = out or {}
+  dir = dir or ""
+  local ok, list = pcall(fs.list, dir == "" and "" or dir)
+  if not ok or type(list) ~= "table" then return out end
+  for _, name in ipairs(list) do
+    if not SCAN_SKIP[name] and name ~= titan.PACKAGES_FILE then
+      local path = (dir == "" or dir == "/") and name or (dir .. "/" .. name)
+      if fs.isDir(path) then
+        titan.scanLocalScripts(path, out)
+      elseif name:match("%.lua$") or name == "exclude.txt" or name == "versions.lua" then
+        out[#out + 1] = path
+      end
+    end
+  end
+  return out
+end
+
+-- List desired packages (from `packages` file) + any extra local scripts.
+-- Display is name + version.
 function titan.listPackages()
   local m = titan.readManifest()
-  if not m or type(m.files) ~= "table" then
-    return nil, "no install manifest (.titan-install) — re-install this device with an installer"
+  local catalog = titan.loadVersionCatalog()
+  local desired = titan.readPackageList() or {}
+  local inList, paths = {}, {}
+
+  for _, path in ipairs(desired) do
+    inList[path] = true
+    paths[#paths + 1] = path
   end
-  local files = {}
-  for _, path in ipairs(m.files) do
+
+  for _, path in ipairs(titan.scanLocalScripts()) do
+    if not inList[path] then
+      paths[#paths + 1] = path
+      inList[path] = "extra"
+    end
+  end
+
+  table.sort(paths)
+  local packages = {}
+  for _, path in ipairs(paths) do
     local present = fs.exists(path) and not fs.isDir(path)
-    files[#files + 1] = {
+    local ver = present and titan.packageVersion(path, catalog) or nil
+    packages[#packages + 1] = {
+      name = titan.packageName(path),
+      version = ver or "—",
       path = path,
       present = present,
-      size = present and fs.getSize(path) or 0,
+      extra = inList[path] == "extra",
+      tracked = inList[path] == true,
     }
   end
+
   return {
-    source = m.source or "?",
-    role = m.role or "?",
-    run = m.run,
-    base = m.base,
-    files = files,
+    system = (catalog and catalog.system) or (m and m.version) or "—",
+    source = m and m.source or nil,
+    role = m and m.role or nil,
+    run = m and m.run or nil,
+    base = m and m.base or nil,
+    packages = packages,
+    desired = desired,
+    files = packages,
   }
 end
 
@@ -573,7 +771,7 @@ local function otaFindHost(timeout)
   while os.clock() < deadline do
     local id, msg = rednet.receive("titan_install", deadline - os.clock())
     if id == nil then break end
-    if type(msg) == "table" and msg.type == "host_here" then return id end
+    if type(msg) == "table" and msg.type == "host_here" then return id, msg end
   end
   return nil
 end
@@ -591,47 +789,96 @@ local function otaFromHost(hostId, path)
   return nil, "timeout"
 end
 
--- Re-download this device's files from its install source.
--- opts.onProgress(path, ok, detail) is optional. Returns ok, err.
-function titan.updateSelf(opts)
-  opts = opts or {}
-  local m = titan.readManifest()
-  if not m or type(m.files) ~= "table" then
-    return false, "no install manifest (.titan-install) on this device"
-  end
-
-  local getter
+local function otaBuildGetter(m)
+  if not m then return nil, "no install manifest (.titan-install) — install via an installer first" end
   if m.source == "github" then
-    if not m.base then return false, "manifest missing base url" end
-    getter = function(path) return otaHttp(m.base .. path .. "?cb=" .. os.epoch("utc")) end
+    if not m.base then return nil, "manifest missing base url" end
+    return function(path) return otaHttp(m.base .. path .. "?cb=" .. os.epoch("utc")) end
   elseif m.source == "pastebin" then
-    getter = function(path)
+    return function(path)
       local code = m.codes and m.codes[path]
       if not code then return nil, "no pastebin code" end
       return otaHttp("https://pastebin.com/raw/" .. code .. "?cb=" .. os.epoch("utc"))
     end
   elseif m.source == "host" then
-    local hostId = otaFindHost(3)
-    if not hostId then return false, "no install host online (run host.lua on the install computer)" end
-    getter = function(path) return otaFromHost(hostId, path) end
-  else
-    return false, "unknown install source: " .. tostring(m.source)
+    local hostId, hostMsg = otaFindHost(3)
+    if not hostId then return nil, "no install host online (run host.lua on the install computer)" end
+    local hostFiles = {}
+    if hostMsg and type(hostMsg.files) == "table" then
+      for _, ent in ipairs(hostMsg.files) do
+        if type(ent) == "table" and ent.path then hostFiles[ent.path] = true
+        elseif type(ent) == "string" then hostFiles[ent] = true end
+      end
+    end
+    return function(path)
+      if next(hostFiles) and not hostFiles[path] then return nil, "not on host" end
+      return otaFromHost(hostId, path)
+    end, hostId
   end
+  return nil, "unknown install source: " .. tostring(m.source)
+end
+
+-- Update set = whatever is listed in the `packages` file (desired packages).
+local function otaCollectUpdatePaths()
+  local list = titan.readPackageList()
+  if not list or #list == 0 then return nil, "no packages file — install via an installer, or create a `packages` list" end
+  local seen, paths = {}, {}
+  for _, path in ipairs(list) do
+    if path and path ~= "" and not seen[path] then
+      seen[path] = true
+      paths[#paths + 1] = path
+    end
+  end
+  if not seen[titan.VERSIONS_FILE] then
+    paths[#paths + 1] = titan.VERSIONS_FILE
+  end
+  table.sort(paths, function(a, b)
+    if a == titan.VERSIONS_FILE then return true end
+    if b == titan.VERSIONS_FILE then return false end
+    return a < b
+  end)
+  return paths
+end
+
+-- Re-download every package listed in the `packages` file from the install source.
+-- opts.onProgress(path, ok, detail) optional. Returns ok, detail.
+function titan.updateSelf(opts)
+  opts = opts or {}
+  local m = titan.readManifest()
+  local getter, gerr = otaBuildGetter(m)
+  if not getter then return false, gerr end
+
+  local paths, perr = otaCollectUpdatePaths()
+  if not paths then return false, perr end
 
   local failed, okCount = {}, 0
-  for _, path in ipairs(m.files) do
+
+  for _, path in ipairs(paths) do
     local data, err = getter(path)
     if data then
       otaWriteFile(path, data)
       okCount = okCount + 1
-      if opts.onProgress then opts.onProgress(path, true, #data .. "b") end
+      if opts.onProgress then
+        local ver = data:match("[Tt]itan%-[Vv]ersion:%s*([%d%.]+)") or ""
+        opts.onProgress(path, true, (#data .. "b") .. (ver ~= "" and (" v" .. ver) or ""))
+      end
     else
       failed[#failed + 1] = path .. " (" .. tostring(err) .. ")"
       if opts.onProgress then opts.onProgress(path, false, tostring(err)) end
     end
   end
+
+  -- Keep packages file + manifest in sync; refresh system version.
+  local finalList = titan.writePackageList(paths)
+  if m then
+    local cat = titan.loadVersionCatalog()
+    m.files = finalList
+    m.version = (cat and cat.system) or m.version
+    titan.writeManifest(m)
+  end
+
   if #failed > 0 then return false, "failed: " .. table.concat(failed, ", ") end
-  return true, okCount
+  return true, { updated = okCount, skipped = 0 }
 end
 
 --------------------------------------------------------------------------------

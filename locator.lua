@@ -1,5 +1,6 @@
 --[[
   locator.lua  -  Pocket GPS locator for the Titan network (CC: Tweaked)
+  Titan-Version: 1.1.0
 
   A handheld you carry: it shows your live GPS position, lets you save waypoints,
   and gives distance + compass bearing to each. It can also pull the network's
