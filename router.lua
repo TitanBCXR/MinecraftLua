@@ -1,6 +1,6 @@
 --[[
   router.lua  -  Titan network router / repeater (CC: Tweaked)
-  Titan-Version: 1.2.2
+  Titan-Version: 1.2.4
 
   Place one (or several) of these to tie the whole network together over
   wireless and/or wired modems. Roles:
@@ -75,7 +75,8 @@ local BOOT_EPOCH = os.epoch("utc")
 --------------------------------------------------------------------------------
 local seen    = {}   -- [id] = { name, hostname, kind, seen }
 local relayed = {}   -- [nMessageID] = timerId  (de-dup with 30s expiry)
-local stats   = { relayed = 0 }
+-- Relay counters (named relayStats so it never clashes with screens.stats).
+local relayStats = { relayed = 0 }
 local rosterDirty = false
 local ONLINE_SECS = 45   -- heard within this window => ONLINE on the board
 -- Multi-monitor boards (main): roster / stats / gps. Names from peripheral.getName.
@@ -486,6 +487,79 @@ local function clearRosterIfModem()
   end
 end
 
+-- MODEM routers only persist a slim cfg: role + route to MAIN (+ optional
+-- GPS / assigned hostname). Strip MAIN-only keys (roster, name pool, screens…).
+local function sanitizeModemCfg(opts)
+  opts = opts or {}
+  if isMain() then return nil end
+  local c = loadRouterCfg() or {}
+  local slim = { role = "modem" }
+  if not opts.clearMain then
+    local mid = tonumber(opts.mainRouterId) or tonumber(c.mainRouterId)
+    if mid then slim.mainRouterId = mid end
+  end
+  if not opts.clearName then
+    if type(c.assignedName) == "string" and c.assignedName ~= "" then
+      slim.assignedName = c.assignedName
+    end
+    if c.manualHostname then slim.manualHostname = true end
+  end
+  if c.gps then slim.gps = c.gps end
+  if c.gpsHost == false then slim.gpsHost = false end
+  saveRouterCfg(slim)
+  return slim
+end
+
+-- Wipe routing data. MAIN: roster (+ optional name registry).
+-- MODEM: in-memory state + slim cfg keeping only the path to MAIN.
+local function resetRouting(mode)
+  mode = (mode or "routes"):lower()
+  if mode == "" then mode = "routes" end
+  local clearNames = (mode == "all" or mode == "names")
+  local clearMain = (mode == "all" or mode == "hard")
+  if mode == "names" and not isMain() then
+    return false, "name registry is MAIN-only"
+  end
+  if mode ~= "routes" and mode ~= "all" and mode ~= "names" and mode ~= "hard" then
+    return false, "usage: reset [routes|names|all|hard]"
+  end
+
+  if isMain() then
+    if mode ~= "names" then
+      seen = {}
+      wiredDirect = {}
+      rosterDirty = false
+      if fs.exists(ROSTER) then pcall(fs.delete, ROSTER) end
+      updateCampaign = nil
+    end
+    if clearNames then
+      nameAssign = {}
+      saveNameRegistry(namePool())
+    end
+    if mode == "names" then
+      return true, "Cleared modem name assignments."
+    elseif clearNames then
+      return true, "Cleared roster + modem name assignments."
+    end
+    return true, "Cleared roster / routing data (names kept). Use `reset all` to also clear names."
+  end
+
+  -- MODEM
+  seen = {}
+  wiredDirect = {}
+  rosterDirty = false
+  if fs.exists(ROSTER) then pcall(fs.delete, ROSTER) end
+  local slim = sanitizeModemCfg({ clearMain = clearMain, clearName = clearNames or clearMain })
+  local mid = slim and slim.mainRouterId
+  if clearMain then
+    return true, "Cleared modem routing. Will rediscover MAIN on next hello."
+  end
+  if mid then
+    return true, ("Cleared modem routing. Kept route to MAIN #%d."):format(mid)
+  end
+  return true, "Cleared modem routing. No MAIN id stored yet — run and wait for hello."
+end
+
 -- Sorted id list: ONLINE, UNKNOWN, OFFLINE, then hostname, then id.
 local function sortedIds()
   local ids = {}
@@ -558,7 +632,7 @@ local function repeaterLoop()
          and message.nMessageID and message.nRecipient then
         if not relayed[message.nMessageID] then
           relayed[message.nMessageID] = os.startTimer(30)
-          stats.relayed = stats.relayed + 1
+          relayStats.relayed = relayStats.relayed + 1
           for _, m in ipairs(modems) do
             peripheral.call(m, "transmit", REPEAT, replyChannel, message)
             if message.nRecipient ~= REPEAT then
@@ -949,19 +1023,26 @@ local function drawStats(out, y0, y1)
   local on, off, unk = countOnlineOffline()
   local remembered = 0
   for _ in pairs(seen) do remembered = remembered + 1 end
+  local cyan = colors.cyan or colors.lightBlue
+  local nRf = wirelessModems and #wirelessModems or 0
+  local nWire = wiredModems and #wiredModems or 0
+  local nModems = modems and #modems or (nRf + nWire)
+  local nRelayed = (relayStats and tonumber(relayStats.relayed)) or 0
   monLine(out, w, y0, "== STATS ==", colors.white)
-  local rows = {
-    { ("Router #%d  [%s]"):format(os.getComputerID(), routerRole:upper()), colors.white },
-    { ("Hostname: %s"):format(os.getComputerLabel() or "?"), colors.lightGray },
-    { ("Uptime: %s"):format(uptimeStr()), colors.white },
-    { ("Modems: %d  (rf:%d wire:%d)"):format(#modems, #wirelessModems, #wiredModems), colors.white },
-    { ("Relayed: %d"):format(stats.relayed), colors.cyan },
-    { ("Online: %d"):format(on), colors.lime },
-    { ("Wired: %d"):format(countWiredOnline()), colors.cyan },
-    { ("Offline: %d"):format(off), colors.red },
-    { ("Unknown: %d"):format(unk), colors.yellow },
-    { ("Remembered: %d"):format(remembered), colors.white },
-  }
+  local rows = {}
+  local function addRow(txt, col)
+    rows[#rows + 1] = { txt, col }
+  end
+  addRow(string.format("Router #%d  [%s]", os.getComputerID(), tostring(routerRole or "?"):upper()), colors.white)
+  addRow(string.format("Hostname: %s", tostring(os.getComputerLabel() or "?")), colors.lightGray)
+  addRow(string.format("Uptime: %s", uptimeStr()), colors.white)
+  addRow(string.format("Modems: %d  (rf:%d wire:%d)", nModems, nRf, nWire), colors.white)
+  addRow(string.format("Relayed: %d", nRelayed), cyan)
+  addRow(string.format("Online: %d", on), colors.lime)
+  addRow(string.format("Wired: %d", countWiredOnline()), cyan)
+  addRow(string.format("Offline: %d", off), colors.red)
+  addRow(string.format("Unknown: %d", unk), colors.yellow)
+  addRow(string.format("Remembered: %d", remembered), colors.white)
   local y = y0 + 1
   for _, r in ipairs(rows) do
     if y > y1 then return end
@@ -974,7 +1055,7 @@ local function drawStats(out, y0, y1)
   table.sort(keys)
   for _, k in ipairs(keys) do
     if y > y1 then break end
-    monLine(out, w, y, ("  %-10s %d"):format(k, kinds[k]), colors.white)
+    monLine(out, w, y, string.format("  %-10s %d", k, kinds[k]), colors.white)
     y = y + 1
   end
   if #keys == 0 and y <= y1 then
@@ -1008,7 +1089,7 @@ local function drawGps(out, y0, y1)
   if lx then
     put(("  %.1f, %.1f, %.1f"):format(lx, ly, lz), colors.lime)
   else
-    put("  (no fix — need 4 hosts)", colors.orange)
+    put("  (no fix - need 4 hosts)", colors.orange)
   end
   put("", colors.white)
   put("Constellation: place 4+", colors.gray)
@@ -1601,7 +1682,9 @@ local function consoleLoop()
       print("hostname [name|auto] - set name (modems: auto = accept main assign)")
       print("stats    - relay counts (+ roster if main)")
       print("gpshost [x y z] - show / set this router's GPS host coords")
+      print("reset [routes|names|all|hard] - wipe routing data (confirm)")
       if isMain() then
+        print("  routes = roster; names = name assigns; all = both")
         print("map [true|false|view] - monitors: map vs stats boards (default false)")
         print("versions - local vs GitHub package versions")
         print("devices  - list remembered systems (ONLINE / OFFLINE)")
@@ -1615,6 +1698,8 @@ local function consoleLoop()
         print("update [aoe|status] - fleet OTA from GitHub; track reboot ACKs")
         print("reauth   - tell the fleet to re-auth now (no download)")
         print("github [url] - show / set GitHub raw base for versions")
+      else
+        print("  routes = keep MAIN id; hard/all = also forget MAIN + name")
       end
       print("ssh <id|label> [cmd] - remote shell; jumps via modems (reboot ok)")
       print("exit")
@@ -1655,7 +1740,7 @@ local function consoleLoop()
         for _, id in ipairs(sortedIds()) do
           local d = seen[id]
           n = n + 1
-          local st = statusOf(d)
+          local st = statusOf(d, id)
           local age = (d.seen and d.seen > 0) and (ago(d.seen) .. "s ago") or "never"
           print(("#%-3d %-8s %-8s %-18s %s"):format(
             id, st, d.kind or "?", d.hostname or d.name or "?", age))
@@ -1683,6 +1768,48 @@ local function consoleLoop()
           else
             print("Unknown system: " .. tostring(ref))
           end
+        end
+      end
+    elseif cmd == "reset" then
+      local mode = (a[2] or "routes"):lower()
+      if mode == "route" then mode = "routes" end
+      local label
+      if isMain() then
+        if mode == "names" then
+          label = "Clear modem NAME assignments on MAIN?"
+        elseif mode == "all" or mode == "hard" then
+          label = "Clear MAIN roster AND modem name assignments?"
+          mode = "all"
+        else
+          label = "Clear MAIN roster / routing data? (keeps modem names)"
+          mode = "routes"
+        end
+      else
+        if mode == "all" or mode == "hard" then
+          label = "Clear modem routing AND forget MAIN id + assigned name?"
+          mode = "hard"
+        else
+          label = "Clear modem routing data? (keeps route to MAIN)"
+          mode = "routes"
+        end
+      end
+      write(label .. " [y/N] ")
+      if read():lower() ~= "y" then
+        print("Cancelled.")
+      else
+        local ok, msg = resetRouting(mode)
+        if ok then
+          print(msg)
+          if isMain() then
+            claimMain()
+            print("Re-broadcast MAIN claim. Devices will re-register on next hello.")
+          else
+            print("Rebooting modem to reload slim cfg...")
+            sleep(1)
+            os.reboot()
+          end
+        else
+          print(tostring(msg))
         end
       end
     elseif cmd == "map" or cmd == "fmap" or cmd == "fleetmap" or cmd == "display" then
@@ -1856,11 +1983,11 @@ local function consoleLoop()
       if isMain() then
         local on, off = countOnlineOffline()
         print(("[%s] Relayed %d. ONLINE:%d WIRED:%d OFFLINE:%d. rf:%d wire:%d"):format(
-          routerRole:upper(), stats.relayed, on, countWiredOnline(), off,
+          routerRole:upper(), relayStats.relayed, on, countWiredOnline(), off,
           #wirelessModems, #wiredModems))
       else
         print(("[MODEM] Relayed %d messages. rf:%d wire:%d"):format(
-          stats.relayed, #wirelessModems, #wiredModems))
+          relayStats.relayed, #wirelessModems, #wiredModems))
       end
     elseif cmd == "screens" or cmd == "monitors" then
       if not isMain() then print("Screens are MAIN-only."); else
@@ -2186,7 +2313,13 @@ if isMain() then
   end
 else
   clearRosterIfModem()
-  print("MODEM mode: mesh hop + relay (no roster). Use `main` to promote.")
+  local slim = sanitizeModemCfg()
+  if slim and slim.mainRouterId then
+    print(("MODEM mode: mesh hop + relay. Route to MAIN #%d."):format(slim.mainRouterId))
+  else
+    print("MODEM mode: mesh hop + relay (no roster). Waiting for MAIN…")
+  end
+  print("Cfg stores only MAIN route (+ name/GPS). Type `reset` to wipe routing data.")
 end
 parallel.waitForAny(table.unpack(tasks))
 for _, role in ipairs(SCREEN_ROLES) do

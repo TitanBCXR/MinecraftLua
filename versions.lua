@@ -5,15 +5,15 @@
   The console `packages` command shows these names + versions.
   Installers / OTA updates ship this file so devices know what they have.
 
-  Titan-Version: 1.2.2
+  Titan-Version: 1.2.4
 ]]
 
 return {
-  system = "1.2.2",
+  system = "1.2.4",
   packages = {
     ["lib/titan.lua"]      = "1.2.2",
     ["console.lua"]        = "1.1.6",
-    ["router.lua"]         = "1.2.2",
+    ["router.lua"]         = "1.2.4",
     ["host.lua"]           = "1.1.6",
     ["install.lua"]        = "1.1.6",
     ["github_install.lua"] = "1.1.6",
@@ -29,6 +29,6 @@ return {
     ["gpshost.lua"]        = "1.1.6",
     ["locator.lua"]        = "1.1.9",
     ["exclude.txt"]        = "1.0.0",
-    ["versions.lua"]       = "1.2.2",
+    ["versions.lua"]       = "1.2.4",
   },
 }
