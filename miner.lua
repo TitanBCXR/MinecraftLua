@@ -1,9 +1,9 @@
 --[[
   miner.lua  -  Area miner turtle for the Titan network (CC: Tweaked)
-  Titan-Version: 1.2.3
+  Titan-Version: 1.2.4
 
   Digs a rectangular "box":
-    * set1 / set2  — opposite corners (defines the X/Z footprint)
+    * set1 <x> <z> / set2 <x> <z> — opposite corners (X/Z footprint)
     * ystart / yend — vertical range (mine from start Y down to end Y)
     * sety <start> <end> — set both Y levels at once
 
@@ -12,7 +12,7 @@
   Fresh miners wait for Parent Center deploy:
     deploy <id> miner <name> [depX depY depZ]
 
-  Then: set1 / set2 / sety <ystart> <yend> / deposit / mine
+  Then: set1 <x> <z> / set2 <x> <z> / sety <ystart> <yend> / deposit / mine
 
   NETWORK: joins the Titan mesh; status+assignment go to botserver + datacenter.
 
@@ -284,7 +284,7 @@ local function mineVolume()
   local b = bounds()
   if not b then
     print("Define the box first:")
-    print("  set1 / set2     opposite corners (X/Z)")
+    print("  set1 <x> <z>   then   set2 <x> <z>")
     print("  sety <startY> <endY>   or   ystart <y> / yend <y>")
     return false
   end
@@ -447,6 +447,35 @@ local function printStatus()
     state.dug, state.skipped, tostring(turtle.getFuelLevel())))
 end
 
+local function printXZBox()
+  if not (cfg.loc1 and cfg.loc2) then return end
+  print(("X/Z box: %d..%d , %d..%d"):format(
+    math.min(cfg.loc1.x, cfg.loc2.x), math.max(cfg.loc1.x, cfg.loc2.x),
+    math.min(cfg.loc1.z, cfg.loc2.z), math.max(cfg.loc1.z, cfg.loc2.z)))
+  print("Next: sety <startY> <endY>  (or ystart / yend)")
+end
+
+-- set1/set2 corners: X/Z required. Y is unused for the footprint (kept for status).
+local function setCornerXZ(field, x, z, y)
+  x, z = tonumber(x), tonumber(z)
+  if not x or not z then
+    print(("Usage: %s <x> <z>"):format(field == "loc1" and "set1" or "set2"))
+    print("Example: set1 100 200")
+    return false
+  end
+  y = tonumber(y)
+  if not y then
+    local gx, gy, gz = nav.locate(1)
+    y = gy or 0
+  end
+  cfg[field] = { x = math.floor(x), y = math.floor(y), z = math.floor(z) }
+  saveCfg()
+  print(("%s = %d, %d  (X,Z)"):format(
+    field == "loc1" and "set1" or "set2", cfg[field].x, cfg[field].z))
+  printXZBox()
+  return true
+end
+
 local function markHere(field)
   local x, y, z = nav.locatePrecise(4)
   if not x then print("No GPS signal."); return end
@@ -459,12 +488,7 @@ local function markHere(field)
   else
     print(("%s set to %s"):format(field, fmt(cfg[field])))
   end
-  if (field == "loc1" or field == "loc2") and cfg.loc1 and cfg.loc2 then
-    print(("X/Z box: %d..%d , %d..%d"):format(
-      math.min(cfg.loc1.x, cfg.loc2.x), math.max(cfg.loc1.x, cfg.loc2.x),
-      math.min(cfg.loc1.z, cfg.loc2.z), math.max(cfg.loc1.z, cfg.loc2.z)))
-    print("Next: sety <startY> <endY>  (or ystart / yend)")
-  end
+  if field == "loc1" or field == "loc2" then printXZBox() end
 end
 
 local function setYStart(y)
@@ -497,7 +521,9 @@ local function consoleLoop()
       -- ignore
     elseif cmd == "help" then
       print("BOX (opposite corners + Y range):")
-      print("  set1 / set2              mark opposite corners (X/Z footprint)")
+      print("  set1 <x> <z>             corner A (X/Z)")
+      print("  set2 <x> <z>             corner B (X/Z)")
+      print("  set1 here / set2 here    use current GPS X/Z")
       print("  sety <startY> <endY>     vertical range (e.g. sety 80 -59)")
       print("  ystart <y> / yend <y>    set start or end Y alone")
       print("  yhere start|end          use current GPS Y")
@@ -516,9 +542,23 @@ local function consoleLoop()
         if name then print("hostname set: " .. name) else print(tostring(err)) end
       end
     elseif cmd == "set1" or cmd == "corner1" then
-      markHere("loc1")
+      local sub = (a[2] or ""):lower()
+      if sub == "" then
+        print("Usage: set1 <x> <z>   or   set1 here")
+      elseif sub == "here" or sub == "gps" or sub == "me" then
+        markHere("loc1")
+      else
+        setCornerXZ("loc1", a[2], a[3], a[4])
+      end
     elseif cmd == "set2" or cmd == "corner2" then
-      markHere("loc2")
+      local sub = (a[2] or ""):lower()
+      if sub == "" then
+        print("Usage: set2 <x> <z>   or   set2 here")
+      elseif sub == "here" or sub == "gps" or sub == "me" then
+        markHere("loc2")
+      else
+        setCornerXZ("loc2", a[2], a[3], a[4])
+      end
     elseif cmd == "sety" then
       local ys, ye = tonumber(a[2]), tonumber(a[3])
       if ys and ye then
@@ -766,7 +806,7 @@ pcall(nav.calibrate, true)
 
 if not quarryReady() then
   print("Miner '" .. cfg.name .. "' online — box not fully set.")
-  print("  1) set1 / set2     opposite corners of the area")
+  print("  1) set1 <x> <z>   then   set2 <x> <z>")
   print("  2) sety <startY> <endY>   e.g. sety 80 -59")
   print("  3) deposit (above chest) then mine")
 else
