@@ -1,6 +1,6 @@
 --[[
   datacenter.lua  -  Titan Data Center (CC: Tweaked)   [ single, self-contained script ]
-  Titan-Version: 1.2.1
+  Titan-Version: 1.2.2
 
   ONE script that every computer/terminal in your data center runs. It works out
   its own role automatically:
@@ -678,6 +678,17 @@ local function serviceLoop()
           if not netbots[id] and not pending[id] then
             pending[id] = { name = name, kind = kind, seen = os.epoch("utc") }
           end
+        elseif kind == "storage" then
+          -- StorageManager nodes: track as online systems, never "pending deploy".
+          local prev = netbots[id] or {}
+          netbots[id] = {
+            name = name, botType = "storage",
+            x = prev.x, y = prev.y, z = prev.z,
+            fuel = prev.fuel, state = "online",
+            task = prev.task or "stock", assignment = "storage",
+            seen = os.epoch("utc"),
+          }
+          pending[id] = nil
         else
           local prev = netbots[id] or {}
           netbots[id] = {

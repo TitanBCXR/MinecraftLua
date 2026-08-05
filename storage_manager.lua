@@ -1,21 +1,24 @@
 --[[
   storage_manager.lua  -  Titan Storage Manager (Create + inventories)
-  Titan-Version: 1.0.1
+  Titan-Version: 1.0.2
 
   Watches Create mod storage (Stock Ticker) and/or any attached inventory
   peripherals (Create vaults, chests, barrels, drawers, …).
+
+  Joins the Titan mesh (router roster, Parent Center auth, remote stock
+  queries). Create stock still comes from the local Stock Ticker link.
 
   Placement tips (Create):
     * Put a Stock Ticker on a face of this computer, then:
         ticker back     (or front / left / right / up / down)
     * Link the ticker to your Create packager / stock network as usual.
-    * Optional: attach vaults/chests via wired modems for inventory fallback.
+    * Modem (wireless/wired) required for the Titan network.
 
   Console:
     status | stock [filter] | find <item>
     request <item> [count] [address]   (Create Stock Ticker)
     ticker [side]   set/show Stock Ticker direction
-    sides | invs | refresh | hostname [name]
+    sides | invs | refresh | net | hostname [name]
     help | exit
 
   Run:  storage_manager
@@ -23,6 +26,8 @@
 ]]
 
 local titan = dofile("lib/titan.lua")
+local MSG  = titan.MSG
+local P    = titan.PROTOCOL
 
 titan.openModem()
 os.setComputerLabel(os.getComputerLabel() or ("StorageManager-" .. os.getComputerID()))
@@ -59,6 +64,8 @@ local cache = {
   totals = {},            -- [name] = count
   invCount = 0,
   updated = 0,
+  netMain = nil,          -- main router id when linked
+  netOk = false,
 }
 
 local monitor = peripheral.find("monitor")
@@ -395,14 +402,15 @@ local function drawMonitor()
   local units = 0
   for _, r in ipairs(cache.items) do units = units + r.count end
 
+  local net = cache.netOk and ("NET:#" .. tostring(cache.netMain or "?")) or "NET:--"
   line(1, "== STORAGE MANAGER ==", colors.yellow)
-  line(2, ("mode:%s  types:%d  items:%d"):format(mode, kinds, units), colors.lime)
+  line(2, ("mode:%s  types:%d  %s"):format(mode, kinds, net), colors.lime)
   if cache.tickerName then
     local side = cache.tickerSide or cfg.tickerSide or "?"
-    line(3, ("ticker %s @ %s"):format(tostring(side), tostring(cache.tickerName)):sub(1, w), colors.lightGray)
+    line(3, ("ticker %s  items:%d"):format(tostring(side), units):sub(1, w), colors.lightGray)
   else
-    line(3, ("inventories: %d  (ticker side: %s)"):format(
-      cache.invCount, tostring(cfg.tickerSide or "auto")), colors.lightGray)
+    line(3, ("inv:%d  ticker:%s  items:%d"):format(
+      cache.invCount, tostring(cfg.tickerSide or "auto"), units):sub(1, w), colors.lightGray)
   end
   line(4, "COUNT   ITEM", colors.gray)
 
@@ -474,6 +482,7 @@ local function consoleLoop()
       print("address [name]      default Create package address")
       print("invs                list tickers + inventories")
       print("refresh             rescan peripherals")
+      print("net                 Titan mesh / Parent Center link")
       print("hostname [name]     get/set label")
       print("exit")
     elseif cmd == "status" then
@@ -484,6 +493,21 @@ local function consoleLoop()
       print(("inventories: %d"):format(cache.invCount))
       print(("item types: %d"):format(#cache.items))
       print(("request address: %s"):format(tostring(cfg.requestAddress)))
+      print(("titan net: %s"):format(
+        cache.netOk and ("linked to MAIN #" .. tostring(cache.netMain)) or "not linked (need router)"))
+      drawMonitor()
+    elseif cmd == "net" or cmd == "network" or cmd == "link" then
+      print("Linking to Titan network...")
+      local ok = pcall(titan.reauth, "storage")
+      cache.netMain = titan.getMainRouterId()
+      cache.netOk = cache.netMain ~= nil
+      announceStorage()
+      if cache.netOk then
+        print(("Linked. MAIN router #%d. Hostname: %s"):format(
+          cache.netMain, os.getComputerLabel() or "?"))
+      else
+        print("No MAIN router found. Place/start a router with `main`, then `net` again.")
+      end
       drawMonitor()
     elseif cmd == "ticker" or cmd == "side" or cmd == "stockticker" then
       local dir = a[2]
@@ -597,6 +621,95 @@ local function consoleLoop()
 end
 
 --------------------------------------------------------------------------------
+-- Titan network: announce + answer stock queries
+--------------------------------------------------------------------------------
+local function statusPayload()
+  local kinds, units = #cache.items, 0
+  for _, r in ipairs(cache.items) do units = units + r.count end
+  return {
+    name = os.getComputerLabel(),
+    kind = "storage",
+    mode = cache.mode,
+    tickerSide = cache.tickerSide or cfg.tickerSide,
+    ticker = cache.tickerName,
+    invCount = cache.invCount,
+    types = kinds,
+    items = units,
+    address = cfg.requestAddress,
+  }
+end
+
+function announceStorage()
+  local payload = statusPayload()
+  titan.broadcast(MSG.STORAGE_HELLO, payload)
+  -- Also show up on the router directory with useful metadata.
+  rednet.broadcast({
+    type = "hello",
+    kind = "storage",
+    name = payload.name,
+    hostname = payload.name,
+    mode = payload.mode,
+    types = payload.types,
+    items = payload.items,
+  }, titan.ROUTER_PROTOCOL or "titan_router")
+end
+
+local function netServiceLoop()
+  -- Initial mesh join + Parent Center auth.
+  pcall(titan.reauth, "storage")
+  cache.netMain = titan.getMainRouterId()
+  cache.netOk = cache.netMain ~= nil
+  announceStorage()
+  local helloT = os.startTimer(20)
+  while true do
+    local ev, p1, p2, p3 = os.pullEvent()
+    if ev == "timer" and p1 == helloT then
+      cache.netMain = titan.getMainRouterId()
+      cache.netOk = cache.netMain ~= nil
+      if not cache.netOk then pcall(titan.findMainRouter, 1) end
+      cache.netMain = titan.getMainRouterId()
+      cache.netOk = cache.netMain ~= nil
+      announceStorage()
+      helloT = os.startTimer(20)
+    elseif ev == "rednet_message" and p3 == P and type(p2) == "table" then
+      local msg, from = p2, p1
+      local t = msg.type
+      if t == MSG.STORAGE_PING or t == MSG.PING then
+        titan.send(from, MSG.STORAGE_STATUS, statusPayload())
+        if t == MSG.PING then
+          titan.send(from, MSG.PONG, statusPayload())
+        end
+      elseif t == MSG.STORAGE_STOCK_REQ then
+        -- Keep replies fresh enough for remote finders.
+        if (os.epoch("utc") - (cache.updated or 0)) > 10000 then refresh() end
+        local filter = msg.filter
+        local limit = tonumber(msg.limit) or 40
+        local rows = filteredRows(filter, limit)
+        local slim = {}
+        for i, r in ipairs(rows) do
+          slim[i] = {
+            name = r.name, count = r.count,
+            displayName = r.displayName,
+          }
+        end
+        titan.send(from, MSG.STORAGE_STOCK, {
+          ok = true, mode = cache.mode, filter = filter,
+          items = slim, types = #cache.items,
+        })
+      elseif t == MSG.STORAGE_REQUEST then
+        local ok, nOrErr, resolved, addr = requestItems(
+          msg.item or msg.name, msg.count, msg.address)
+        titan.send(from, MSG.STORAGE_REQUEST_ACK, {
+          ok = ok, err = not ok and nOrErr or nil,
+          matched = ok and nOrErr or nil,
+          item = resolved, count = msg.count, address = addr,
+        })
+      end
+    end
+  end
+end
+
+--------------------------------------------------------------------------------
 -- Background loops
 --------------------------------------------------------------------------------
 local function refreshLoop()
@@ -620,10 +733,21 @@ local function peripheralLoop()
 end
 
 --------------------------------------------------------------------------------
+print("Joining Titan network as StorageManager...")
+pcall(titan.reauth, "storage")
+cache.netMain = titan.getMainRouterId()
+cache.netOk = cache.netMain ~= nil
+if cache.netOk then
+  print(("Network linked (MAIN #%d)."):format(cache.netMain))
+else
+  print("No MAIN router yet — will keep trying. Run `net` after the router is up.")
+end
+
 parallel.waitForAny(
   consoleLoop,
   refreshLoop,
   peripheralLoop,
+  netServiceLoop,
   function() titan.networkLoop("storage") end
 )
 print("StorageManager stopped.")

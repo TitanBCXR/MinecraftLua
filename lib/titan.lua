@@ -1,6 +1,6 @@
 --[[
   titan.lua  -  Shared library for the Titan bot network (CC: Tweaked)
-  Titan-Version: 1.2.6
+  Titan-Version: 1.2.7
 
   Provides:
     * Rednet protocol constants + message type enum
@@ -58,6 +58,15 @@ titan.MSG = {
   WORKER_AWAIT    = "worker_await",    -- worker -> parent center : unconfigured, awaiting deployment
   WORKER_DEPLOY   = "worker_deploy",   -- parent center -> worker : deploy config (type, name, deposit)
   WORKER_DEPLOYED = "worker_deployed", -- worker -> parent center : deployment applied
+
+  -- StorageManager (Create stock / inventories) network API
+  STORAGE_HELLO   = "storage_hello",   -- storage -> fleet : I am a storage node
+  STORAGE_PING    = "storage_ping",    -- anyone -> storage : who/status?
+  STORAGE_STATUS  = "storage_status",  -- storage -> asker : mode, counts, ticker
+  STORAGE_STOCK_REQ = "storage_stock_req", -- anyone -> storage : filter?, limit?
+  STORAGE_STOCK   = "storage_stock",   -- storage -> asker : item rows
+  STORAGE_REQUEST = "storage_request", -- anyone -> storage : request Create package
+  STORAGE_REQUEST_ACK = "storage_request_ack",
 }
 
 -- Compass headings (Minecraft world axes).
@@ -250,7 +259,7 @@ end
 -- Persisted network membership (main router id, last auth).
 titan.NET_CFG = ".titan-net"
 -- Kinds that also re-auth with the Parent Center / data server.
-titan.DC_AUTH_KINDS = { bot = true, worker = true, miner = true }
+titan.DC_AUTH_KINDS = { bot = true, worker = true, miner = true, storage = true }
 
 function titan.readNetCfg()
   if not fs.exists(titan.NET_CFG) then return {} end
