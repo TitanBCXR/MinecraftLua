@@ -1,6 +1,6 @@
 --[[
   admin.lua  -  Titan admin console for a POCKET computer ("Live" tablet)
-  Titan-Version: 1.1.8
+  Titan-Version: 1.1.9
 
   A mobile master terminal you keep on you. It listens to the whole Titan
   network and lets you monitor and command it from your pocket:
@@ -187,6 +187,7 @@ local function handleCommand(a)
     print("VIEW : live | bots | pois | pending | stuck | ping")
     print("BOT  : send <bot> <poi> | goto <bot> <x y z>")
     print("       return <bot> | refuel <bot> | stop <bot>")
+    print("       mine <bot> | continue <bot>   (miners)")
     print("DEPLOY: deploy <bot> <builder|gatherer|miner> <name> [x y z]")
     print("BUILD: scan <bot> <name> <W H L> | build <bot> <name> [x y z]")
     print("ssh <id|label> [cmd...]  remote shell (full device commands)")
@@ -264,6 +265,20 @@ local function handleCommand(a)
   elseif cmd == "stop" then
     local id = needBot(a[2])
     if id and requireAuth() then titan.send(id, MSG.COMMAND, { cmd = "stop" }); print("Stopped " .. a[2]) end
+
+  elseif cmd == "mine" then
+    local id = needBot(a[2])
+    if id and requireAuth() then
+      titan.send(id, MSG.COMMAND, { cmd = "mine" })
+      print("Mine queued on " .. a[2])
+    end
+
+  elseif cmd == "continue" or cmd == "resume" then
+    local id = needBot(a[2])
+    if id and requireAuth() then
+      titan.send(id, MSG.COMMAND, { cmd = "continue" })
+      print("Continue queued on " .. a[2])
+    end
 
   elseif cmd == "deploy" then
     local id = findBot(a[2]) or tonumber(a[2])

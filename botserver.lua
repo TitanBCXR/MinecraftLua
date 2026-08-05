@@ -1,6 +1,6 @@
 --[[
   botserver.lua  -  "Bots Computer" for the Titan network (CC: Tweaked)
-  Titan-Version: 1.2.2
+  Titan-Version: 1.2.3
 
   Coordination hub for the three bot types:
     * builder  / gatherer  (worker.lua)
@@ -317,7 +317,7 @@ local function handleCommand(a)
     print("gathers | coal | builds | alerts | ping")
     print("scan <bot> <name> <W> <H> <L>")
     print("build <bot> <name> [x y z]")
-    print("mine <bot> | stop <bot>")
+    print("mine <bot> | continue <bot> | stop <bot>")
     print("order <bot> goto <x> <y> <z>")
     print("assign <bot> <text> | unassign <bot>")
     print("exit")
@@ -369,6 +369,15 @@ local function handleCommand(a)
       titan.send(id, MSG.COMMAND, { cmd = "mine" })
       assigns[id] = "mine volume"
       print("Mine order sent to " .. a[2])
+    end
+  elseif cmd == "continue" or cmd == "resume" then
+    local id = findBot(a[2])
+    if not id then print("Usage: continue <bot>")
+    elseif bots[id].botType ~= "miner" then print("That bot is not a miner.")
+    else
+      titan.send(id, MSG.COMMAND, { cmd = "continue" })
+      assigns[id] = "continue mine"
+      print("Continue order sent to " .. a[2])
     end
   elseif cmd == "stop" then
     local id = findBot(a[2])

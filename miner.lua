@@ -1,12 +1,14 @@
 --[[
   miner.lua  -  Area miner turtle for the Titan network (CC: Tweaked)
-  Titan-Version: 1.2.6
+  Titan-Version: 1.2.7
 
   Digs a rectangular "box":
     * set1 <x> <z> / set2 <x> <z> — opposite corners (X/Z footprint)
     * ystart / yend — vertical range (mine from start Y down to end Y)
     * sety <start> <end> — set both Y levels at once
     * home / start — return point; chest is one block BEHIND home (auto)
+    * mine — start (writes miner_job.cfg with corners + Y + init pos)
+    * continue — resume after unload/reboot from GPS / saved progress
 
   Never breaks blocks listed in exclude.txt (or titan.RESTRICTED).
 
@@ -29,6 +31,7 @@ titan.openModem()
 os.setComputerLabel(os.getComputerLabel() or ("Miner-" .. os.getComputerID()))
 
 local CFG     = "miner.cfg"
+local JOB     = "miner_job.cfg"  -- active quarry for `continue` after unload
 local EXCLUDE = "exclude.txt"
 
 local cfg = {
@@ -53,6 +56,7 @@ local state = {
   skipped = 0,
 }
 local mineRequested = false
+local continueRequested = false
 
 local exclude = {}   -- [blockName] = true
 
@@ -167,6 +171,102 @@ end
 
 local function quarryReady()
   return bounds() ~= nil
+end
+
+--------------------------------------------------------------------------------
+-- Persisted mine job (survive chunk unload / reboot)
+--------------------------------------------------------------------------------
+local function loadJob()
+  if not fs.exists(JOB) then return nil end
+  local f = fs.open(JOB, "r")
+  if not f then return nil end
+  local d = textutils.unserialize(f.readAll()); f.close()
+  return type(d) == "table" and d or nil
+end
+
+local function saveJob(job)
+  if type(job) ~= "table" then return end
+  local f = fs.open(JOB, "w")
+  if not f then return end
+  f.write(textutils.serialize(job))
+  f.close()
+end
+
+local function clearJob()
+  if fs.exists(JOB) then pcall(fs.delete, JOB) end
+end
+
+local function applyJobToCfg(job)
+  if type(job) ~= "table" then return false end
+  if job.loc1 then cfg.loc1 = job.loc1 end
+  if job.loc2 then cfg.loc2 = job.loc2 end
+  if job.yStart ~= nil then cfg.yStart = job.yStart end
+  if job.yEnd ~= nil then
+    cfg.yEnd = job.yEnd
+    cfg.floorY = job.yEnd
+  end
+  if job.home then cfg.home = job.home; nav.home = job.home end
+  if job.chest then cfg.chest = job.chest end
+  if job.homeFacing ~= nil then cfg.homeFacing = job.homeFacing end
+  saveCfg()
+  return quarryReady()
+end
+
+-- Serpentine X direction for a Z row (minZ starts eastbound).
+local function zDirAt(b, z)
+  local k = (z or b.minZ) - b.minZ
+  if k < 0 then k = 0 end
+  return (k % 2 == 0) and 1 or -1
+end
+
+local function touchJobProgress(job, y, z, zDir, x)
+  if not job then return end
+  job.y = y
+  job.z = z
+  job.zDir = zDir
+  job.x = x
+  job.dug = state.dug
+  job.skipped = state.skipped
+  job.updated = os.epoch("utc")
+  saveJob(job)
+end
+
+-- Pick resume cell from GPS (preferred) or last saved progress.
+local function resolveResume(job, b)
+  local cx, cy, cz = nav.locatePrecise(4)
+  local y = job.y or b.topY
+  local z = job.z or b.minZ
+  local x = job.x
+  local zDir = job.zDir or zDirAt(b, z)
+  local from = "saved progress"
+
+  if cx then
+    local ix = math.floor(cx + 0.5)
+    local iy = math.floor(cy + 0.5)
+    local iz = math.floor(cz + 0.5)
+    local inBox = ix >= b.minX and ix <= b.maxX
+      and iz >= b.minZ and iz <= b.maxZ
+      and iy >= (b.floorY - 1) and iy <= (b.topY + 1)
+    if inBox then
+      y = math.max(b.floorY, math.min(b.topY, iy))
+      z = math.max(b.minZ, math.min(b.maxZ, iz))
+      x = math.max(b.minX, math.min(b.maxX, ix))
+      zDir = zDirAt(b, z)
+      from = "GPS"
+    else
+      print(("At %d,%d,%d (outside box) — using saved progress."):format(ix, iy, iz))
+      if job.init then
+        print(("Job init was %s"):format(fmt(job.init)))
+      end
+    end
+  else
+    print("No GPS — using saved progress from miner_job.cfg.")
+  end
+
+  return {
+    y = y, z = z, x = x, zDir = zDir, from = from,
+    gps = cx and { x = math.floor(cx + 0.5), y = math.floor(cy + 0.5), z = math.floor(cz + 0.5) } or nil,
+  }
 end
 
 --------------------------------------------------------------------------------
@@ -372,8 +472,26 @@ end
 
 --------------------------------------------------------------------------------
 -- Quarry: layer by layer, serpentine X/Z in the corner box, yStart -> yEnd
+-- opts.resume = true  -> load miner_job.cfg and continue from GPS / progress
 --------------------------------------------------------------------------------
-local function mineVolume()
+local function mineVolume(opts)
+  opts = opts or {}
+  local resuming = opts.resume == true
+  local job
+
+  if resuming then
+    job = loadJob()
+    if not job or job.active == false then
+      print("No active mine job. Start one with `mine` first.")
+      return false
+    end
+    if not applyJobToCfg(job) then
+      print("Saved job is incomplete (need set1/set2/sety).")
+      return false
+    end
+    print("Loaded mine job from miner_job.cfg")
+  end
+
   local b = bounds()
   if not b then
     print("Define the box first:")
@@ -384,7 +502,46 @@ local function mineVolume()
 
   loadExclude()
   state.stop = false
-  state.dug, state.skipped = 0, 0
+
+  local resumeY, resumeZ, resumeX, resumeZDir
+  if resuming then
+    state.dug = tonumber(job.dug) or 0
+    state.skipped = tonumber(job.skipped) or 0
+    local r = resolveResume(job, b)
+    resumeY, resumeZ, resumeX, resumeZDir = r.y, r.z, r.x, r.zDir
+    print(("Continuing from %s: X=%s Z=%d Y=%d (zDir=%d)"):format(
+      r.from, tostring(resumeX or "?"), resumeZ, resumeY, resumeZDir))
+    if job.init then
+      print(("Job init location: %s"):format(fmt(job.init)))
+    end
+  else
+    state.dug, state.skipped = 0, 0
+    local ix, iy, iz = nav.locatePrecise(3)
+    local init = (ix and { x = ix, y = iy, z = iz }) or cfg.home
+    job = {
+      active = true,
+      loc1 = cfg.loc1,
+      loc2 = cfg.loc2,
+      yStart = b.topY,
+      yEnd = b.floorY,
+      init = init,
+      home = cfg.home,
+      chest = cfg.chest,
+      homeFacing = cfg.homeFacing,
+      y = b.topY,
+      z = b.minZ,
+      zDir = 1,
+      x = b.minX,
+      dug = 0,
+      skipped = 0,
+      started = os.epoch("utc"),
+      updated = os.epoch("utc"),
+    }
+    saveJob(job)
+    print("Saved mine job -> miner_job.cfg (use `continue` after unload)")
+    resumeY, resumeZ, resumeX, resumeZDir = b.topY, b.minZ, nil, 1
+  end
+
   setStatus("mining", ("box %d..%d,%d..%d Y%d->%d"):format(
     b.minX, b.maxX, b.minZ, b.maxZ, b.topY, b.floorY))
   print(("Mining box  X %d..%d  Z %d..%d  Y %d -> %d"):format(
@@ -398,6 +555,11 @@ local function mineVolume()
       cfg.homeFacing = nav.heading or cfg.homeFacing
       if not cfg.chest then cfg.chest = chestBehindHome() end
       saveCfg()
+      if job then
+        job.home, job.chest, job.homeFacing = cfg.home, cfg.chest, cfg.homeFacing
+        if not job.init then job.init = { x = x, y = y, z = z } end
+        saveJob(job)
+      end
     end
   elseif not cfg.chest then
     ensureChest()
@@ -408,49 +570,54 @@ local function mineVolume()
     if not ok then
       print("Calibrate failed: " .. tostring(err))
       setStatus("error", "calibrate failed")
+      touchJobProgress(job, resumeY, resumeZ, resumeZDir, resumeX)
       return false
     end
   end
 
-  for y = b.topY, b.floorY, -1 do
+  for y = resumeY, b.floorY, -1 do
     if state.stop then break end
     setStatus("mining", ("layer Y=%d"):format(y))
     print(("--- Layer Y=%d ---"):format(y))
 
-    local zDir = 1
-    local z = b.minZ
+    local z = (y == resumeY) and resumeZ or b.minZ
+    local zDir = (y == resumeY) and (resumeZDir or zDirAt(b, z)) or 1
     while z <= b.maxZ do
       if state.stop then break end
 
-      -- Start of this Z-row: travel to the entry corner for this row
       local startX = (zDir == 1) and b.minX or b.maxX
       local endX   = (zDir == 1) and b.maxX or b.minX
-      local ok, err = nav.moveTo(startX, y, z, { dig = true })
-      if not ok then
-        -- If destination cell is excluded bedrock-like, skip the row cell by cell
-        print("moveTo failed: " .. tostring(err) .. " — trying cell-by-cell")
+      local step   = zDir
+      local x = startX
+      -- Mid-row resume: start at current X on this layer/row only.
+      if y == resumeY and z == resumeZ and resumeX ~= nil then
+        x = resumeX
+        -- Clear one-shot resume so later rows start at the edge.
+        resumeX, resumeZ, resumeY = nil, nil, nil
       end
 
-      -- Face along the row
+      local ok, err = nav.moveTo(x, y, z, { dig = true })
+      if not ok then
+        print("moveTo failed: " .. tostring(err) .. " — trying cell-by-cell")
+      end
+      touchJobProgress(job, y, z, zDir, x)
+
       nav.face(zDir == 1 and titan.EAST or titan.WEST)
 
-      local x = startX
-      local step = zDir  -- +1 east, -1 west for X
       while true do
         if state.stop then break end
         if not ensureFuel() or not ensureSpace() then
+          touchJobProgress(job, y, z, zDir, x)
           setStatus("error", state.task)
           return false
         end
 
-        -- Dig the column we're standing in (down already handled by being at y)
-        -- Also clear above/below slightly if something dropped? just clear forward path.
-        local cx, cy, cz = nav.locate(1)
+        local cx = nav.locate(1)
         if not cx then
+          touchJobProgress(job, y, z, zDir, x)
           print("Lost GPS"); setStatus("error", "no GPS"); return false
         end
 
-        -- We're done with this row when we've covered endX
         if (step == 1 and x >= endX) or (step == -1 and x <= endX) then
           break
         end
@@ -458,9 +625,7 @@ local function mineVolume()
         local moved, why = stepForward()
         if not moved then
           if tostring(why):find("^excluded") then
-            -- Skip past excluded block: try to go around via dig-up path or jump Z
             print("Skip excluded at row: " .. tostring(why))
-            -- Attempt: dig up, forward over, down — only if air/safe
             tryDig("up")
             if turtle.up() then
               local ok2 = turtle.forward()
@@ -470,7 +635,6 @@ local function mineVolume()
                 x = x + step
               else
                 turtle.down()
-                -- give up on this cell; advance logical x and try nav.moveTo next
                 x = x + step
                 nav.moveTo(x, y, z, { dig = true })
                 nav.face(step == 1 and titan.EAST or titan.WEST)
@@ -489,32 +653,50 @@ local function mineVolume()
         else
           x = x + step
         end
+        touchJobProgress(job, y, z, zDir, x)
       end
 
       z = z + 1
       zDir = -zDir
+      touchJobProgress(job, y, z <= b.maxZ and z or b.maxZ, zDir,
+        (zDir == 1) and b.minX or b.maxX)
     end
 
-    -- Drop to next layer (unless this was the floor)
     if y > b.floorY and not state.stop then
       local okd, whyd = goDownOne()
       if not okd and not tostring(whyd):find("^excluded") then
         print("Could not descend: " .. tostring(whyd))
       end
+      touchJobProgress(job, y - 1, b.minZ, 1, b.minX)
     end
   end
 
   -- Dump leftovers and return home
-  if cfg.deposit then dumpInventory() end
+  if cfg.deposit or cfg.chest or cfg.home then dumpInventory() end
   if cfg.home then
     setStatus("returning", "home")
     nav.travelTo(cfg.home.x, cfg.home.y, cfg.home.z)
   end
 
-  setStatus(state.stop and "stopped" or "idle",
-    ("done dug=%d skipped=%d"):format(state.dug, state.skipped))
-  print(("Mine finished. dug=%d skipped=%d"):format(state.dug, state.skipped))
+  if state.stop then
+    touchJobProgress(job, job.y, job.z, job.zDir, job.x)
+    job.active = true
+    saveJob(job)
+    setStatus("stopped", ("paused dug=%d — `continue` to resume"):format(state.dug))
+    print(("Mine paused. dug=%d skipped=%d  (run `continue`)"):format(state.dug, state.skipped))
+  else
+    job.active = false
+    job.finished = os.epoch("utc")
+    job.dug, job.skipped = state.dug, state.skipped
+    saveJob(job)
+    setStatus("idle", ("done dug=%d skipped=%d"):format(state.dug, state.skipped))
+    print(("Mine finished. dug=%d skipped=%d"):format(state.dug, state.skipped))
+  end
   return true
+end
+
+local function continueMine()
+  return mineVolume({ resume = true })
 end
 
 --------------------------------------------------------------------------------
@@ -547,6 +729,14 @@ local function printStatus()
   end
   print(("dug=%d skipped=%d fuel=%s"):format(
     state.dug, state.skipped, tostring(turtle.getFuelLevel())))
+  local job = loadJob()
+  if job and job.active ~= false then
+    print(("job: ACTIVE  progress Y=%s Z=%s X=%s  (continue to resume)"):format(
+      tostring(job.y), tostring(job.z), tostring(job.x)))
+    if job.init then print("job init: " .. fmt(job.init)) end
+  elseif job then
+    print("job: finished (miner_job.cfg kept for reference)")
+  end
 end
 
 local function printXZBox()
@@ -655,7 +845,8 @@ local function handleCommand(a)
     print("  chest <x y z>  set chest block manually")
     print("  deposit        legacy: stand ABOVE a chest (dropDown)")
     print("  exclude   reload & show exclude.txt")
-    print("  mine      dig the box from startY down to endY")
+    print("  mine      dig the box (saves miner_job.cfg)")
+    print("  continue  resume after unload/reboot from GPS/job")
     print("  stop | status | dump | goto <x> <y> <z>")
     print("  hostname [name] | exit")
   elseif cmd == "hostname" or cmd == "host" then
@@ -767,9 +958,19 @@ local function handleCommand(a)
     else
       mineVolume()
     end
+  elseif cmd == "continue" or cmd == "resume" then
+    if state.status == "mining" then print("Already mining.")
+    else
+      local job = loadJob()
+      if not job or job.active == false then
+        print("No active mine job in miner_job.cfg. Run `mine` first.")
+      else
+        continueMine()
+      end
+    end
   elseif cmd == "stop" then
     state.stop = true
-    print("Stop requested.")
+    print("Stop requested (job kept — `continue` to resume).")
   elseif cmd == "dump" then
     dumpInventory()
   elseif cmd == "goto" then
@@ -921,12 +1122,28 @@ local function receiveLoop()
             titan.send(id, MSG.ACK, { ok = false, err = "already mining" })
           else
             mineRequested = true
+            continueRequested = false
             setStatus("idle", "mine queued")
             titan.send(id, MSG.ACK, { ok = true, task = "mine queued" })
+          end
+        elseif cmd == "continue" or cmd == "resume" then
+          if state.status == "mining" then
+            titan.send(id, MSG.ACK, { ok = false, err = "already mining" })
+          else
+            local job = loadJob()
+            if not job or job.active == false then
+              titan.send(id, MSG.ACK, { ok = false, err = "no active mine job" })
+            else
+              continueRequested = true
+              mineRequested = false
+              setStatus("idle", "continue queued")
+              titan.send(id, MSG.ACK, { ok = true, task = "continue queued" })
+            end
           end
         elseif cmd == "stop" then
           state.stop = true
           mineRequested = false
+          continueRequested = false
           titan.send(id, MSG.ACK, { ok = true, task = "stop" })
         elseif cmd == "goto" and msg.x then
           setStatus("moving", ("goto %d,%d,%d"):format(msg.x, msg.y, msg.z))
@@ -963,6 +1180,9 @@ local function jobLoop()
     if mineRequested and state.status ~= "mining" then
       mineRequested = false
       mineVolume()
+    elseif continueRequested and state.status ~= "mining" then
+      continueRequested = false
+      continueMine()
     end
     sleep(0.4)
   end
@@ -992,6 +1212,11 @@ os.setComputerLabel(cfg.name)
 if cfg.home then nav.home = cfg.home end
 pcall(nav.calibrate, true)
 
+local bootJob = loadJob()
+if bootJob and bootJob.active ~= false then
+  applyJobToCfg(bootJob)
+end
+
 if not quarryReady() then
   print("Miner '" .. cfg.name .. "' online — box not fully set.")
   print("  1) set1 <x> <z>   then   set2 <x> <z>")
@@ -1004,6 +1229,13 @@ else
     cfg.name, b.minX, b.maxX, b.minZ, b.maxZ, b.topY, b.floorY))
   if cfg.home and not cfg.chest then ensureChest() end
   if cfg.chest then print("chest @ " .. fmt(cfg.chest)) end
+end
+if bootJob and bootJob.active ~= false then
+  print("Active mine job found (miner_job.cfg). Type `continue` to resume.")
+  if bootJob.init then print("  init @ " .. fmt(bootJob.init)) end
+  print(("  last progress Y=%s Z=%s X=%s dug=%s"):format(
+    tostring(bootJob.y), tostring(bootJob.z), tostring(bootJob.x),
+    tostring(bootJob.dug or 0)))
 end
 setStatus("idle", "-")
 
