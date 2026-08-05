@@ -70,11 +70,10 @@ or **"Everything"** to pull the whole system onto one machine.
 
 ### Install from GitHub
 
-If this repo is on GitHub (public), point `github_install.lua`'s `RAW_BASE` at
-your raw repo root and run it on each device:
+`github_install.lua`'s `RAW_BASE` is set to this repo, so on each device just run:
 
 ```
-wget run https://raw.githubusercontent.com/<user>/<repo>/main/github_install.lua
+wget run https://raw.githubusercontent.com/TitanBCXR/MinecraftLua/main/github_install.lua
 ```
 
 It pulls the chosen role's files straight from GitHub. Use the **raw**

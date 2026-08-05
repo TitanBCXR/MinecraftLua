@@ -18,7 +18,7 @@
 -- 1) SET THIS to your repo's raw root (keep the trailing slash).
 --    Format: https://raw.githubusercontent.com/<user>/<repo>/<branch>/
 --==============================================================================
-local RAW_BASE = "https://raw.githubusercontent.com/YOURNAME/REPO/main/"
+local RAW_BASE = "https://raw.githubusercontent.com/TitanBCXR/MinecraftLua/main/"
 
 --==============================================================================
 -- 2) Roles -> which files they need + what to auto-run (matches the README)
