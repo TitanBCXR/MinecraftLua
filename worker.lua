@@ -1,6 +1,6 @@
 --[[
   worker.lua  -  Builder / Gatherer bot for the Titan network (CC: Tweaked)
-  Titan-Version: 1.1.0
+  Titan-Version: 1.2.0
 
   A TURTLE that is either a BUILDER or a GATHERER. It registers with the
   "Bots Computer" (botserver.lua), learns/keeps its type, and then works.
@@ -415,7 +415,9 @@ local function awaitDeployment()
     local ev, p1, p2, p3 = os.pullEvent()
     if ev == "timer" and p1 == beacon then
       local x, y, z = nav.locate(1)
-      titan.broadcast(MSG.WORKER_AWAIT, { x = x, y = y, z = z })
+      titan.broadcast(MSG.WORKER_AWAIT, {
+        name = os.getComputerLabel(), kind = "worker", x = x, y = y, z = z,
+      })
       beacon = os.startTimer(3)
     elseif ev == "rednet_message" and p3 == P and type(p2) == "table"
            and p2.type == MSG.WORKER_DEPLOY then
@@ -439,8 +441,10 @@ local function statusLoop()
   while true do
     local x, y, z = nav.locate(1)
     titan.broadcast(MSG.STATUS, {
+      name = cfg.name,
       x = x, y = y, z = z, fuel = turtle.getFuelLevel(),
-      state = state.status, task = state.task, botType = cfg.botType,
+      state = state.status, task = state.task,
+      assignment = state.task, botType = cfg.botType,
     })
     -- Builders ask for coal when low.
     if cfg.botType == "builder" and cfg.chest and type(turtle.getFuelLevel()) == "number"

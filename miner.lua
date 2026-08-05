@@ -1,32 +1,28 @@
 --[[
   miner.lua  -  Area miner turtle for the Titan network (CC: Tweaked)
-  Titan-Version: 1.1.0
+  Titan-Version: 1.2.1
 
-  Digs a rectangular volume defined by two corner positions and a floor Y.
+  Digs a rectangular "box":
+    * set1 / set2  — opposite corners (defines the X/Z footprint)
+    * ystart / yend — vertical range (mine from start Y down to end Y)
+    * sety <start> <end> — set both Y levels at once
+
   Never breaks blocks listed in exclude.txt (or titan.RESTRICTED).
 
-  Setup (console):
-    set1              mark location 1 at current GPS position
-    set2              mark location 2 at current GPS position
-    sety <y>          floor Y to dig down to (inclusive)
-    deposit           mark current position as the dump chest (stand ABOVE it)
-    exclude           show exclude.txt contents
-    mine              start mining the volume
-    stop              abort the current mine job
-    status            show config + progress
-    home              return to deposit / home
+  Fresh miners wait for Parent Center deploy:
+    deploy <id> miner <name> [depX depY depZ]
 
-  exclude.txt (next to this program): one block id per line, # for comments.
-  Edit it on the turtle or copy a template from the install host.
+  Then: set1 / set2 / sety <ystart> <yend> / deposit / mine
 
-  NETWORK: joins the Titan routing mesh (announce + hop relay) so quarry status
-  and remote commands can hop through nearby builders/gatherers/routers.
+  NETWORK: joins the Titan mesh; status+assignment go to botserver + datacenter.
 
   Requires: wireless modem, fuel, GPS constellation, lib/titan.lua.
 ]]
 
 local titan = dofile("lib/titan.lua")
 local nav   = titan.nav
+local MSG   = titan.MSG
+local P     = titan.PROTOCOL
 
 titan.openModem()
 os.setComputerLabel(os.getComputerLabel() or ("Miner-" .. os.getComputerID()))
@@ -35,9 +31,13 @@ local CFG     = "miner.cfg"
 local EXCLUDE = "exclude.txt"
 
 local cfg = {
-  loc1 = nil,       -- {x,y,z} corner 1
-  loc2 = nil,       -- {x,y,z} corner 2
-  floorY = nil,     -- dig down to this Y (inclusive)
+  name = nil,
+  botType = "miner",
+  loc1 = nil,       -- opposite corner A (X/Z box; Y ignored for depth)
+  loc2 = nil,       -- opposite corner B
+  yStart = nil,     -- starting (top) Y level, inclusive
+  yEnd = nil,       -- ending (bottom) Y level, inclusive
+  floorY = nil,     -- legacy alias for yEnd (migrated on load)
   deposit = nil,    -- {x,y,z} stand above chest and dropDown
   home = nil,       -- start / return point
 }
@@ -49,6 +49,7 @@ local state = {
   dug    = 0,
   skipped = 0,
 }
+local mineRequested = false
 
 local exclude = {}   -- [blockName] = true
 
@@ -61,9 +62,20 @@ local function loadCfg()
   if type(d) == "table" then
     for k, v in pairs(d) do cfg[k] = v end
   end
+  -- Migrate older configs: floorY -> yEnd; corner Y -> yStart if missing.
+  if cfg.yEnd == nil and cfg.floorY ~= nil then
+    cfg.yEnd = cfg.floorY
+  end
+  if cfg.yStart == nil and cfg.loc1 and cfg.loc2 then
+    local y1 = tonumber(cfg.loc1.y)
+    local y2 = tonumber(cfg.loc2.y)
+    if y1 and y2 then cfg.yStart = math.max(y1, y2) end
+  end
 end
 
 local function saveCfg()
+  -- Keep floorY mirrored for older tools that still read it.
+  if cfg.yEnd ~= nil then cfg.floorY = cfg.yEnd end
   local f = fs.open(CFG, "w"); f.write(textutils.serialize(cfg)); f.close()
 end
 
@@ -112,20 +124,46 @@ local function setStatus(s, t)
   if t then state.task = t end
 end
 
+local function yRange()
+  local ys = tonumber(cfg.yStart)
+  local ye = tonumber(cfg.yEnd or cfg.floorY)
+  if ys == nil or ye == nil then return nil end
+  -- Allow either order; mining always goes high -> low.
+  return math.max(ys, ye), math.min(ys, ye)
+end
+
+local function assignmentText()
+  if state.status == "mining" or state.status == "moving" then
+    return state.task or "mining"
+  end
+  local topY, floorY = yRange()
+  if cfg.loc1 and cfg.loc2 and topY then
+    return ("box Y%d->%d dug=%d"):format(topY, floorY, state.dug or 0)
+  end
+  return state.task or "unconfigured"
+end
+
 --------------------------------------------------------------------------------
--- Bounds from loc1 / loc2
+-- Box: opposite corners (X/Z) + start/end Y levels
 --------------------------------------------------------------------------------
 local function bounds()
-  if not cfg.loc1 or not cfg.loc2 or cfg.floorY == nil then return nil end
+  if not cfg.loc1 or not cfg.loc2 then return nil end
+  local topY, floorY = yRange()
+  if not topY then return nil end
   local x1, z1 = cfg.loc1.x, cfg.loc1.z
   local x2, z2 = cfg.loc2.x, cfg.loc2.z
-  local topY = math.max(cfg.loc1.y, cfg.loc2.y)
   return {
     minX = math.min(x1, x2), maxX = math.max(x1, x2),
     minZ = math.min(z1, z2), maxZ = math.max(z1, z2),
-    topY = topY,
-    floorY = cfg.floorY,
+    topY = topY,      -- start Y (highest)
+    floorY = floorY,  -- end Y (lowest)
+    yStart = topY,
+    yEnd = floorY,
   }
+end
+
+local function quarryReady()
+  return bounds() ~= nil
 end
 
 --------------------------------------------------------------------------------
@@ -240,23 +278,23 @@ local function goDownOne()
 end
 
 --------------------------------------------------------------------------------
--- Quarry: layer by layer, serpentine X/Z within bounds, down to floorY
+-- Quarry: layer by layer, serpentine X/Z in the corner box, yStart -> yEnd
 --------------------------------------------------------------------------------
 local function mineVolume()
   local b = bounds()
   if not b then
-    print("Set loc1, loc2, and floor Y first (set1 / set2 / sety).")
-    return false
-  end
-  if b.floorY > b.topY then
-    print(("floorY (%d) is above the area top (%d)."):format(b.floorY, b.topY))
+    print("Define the box first:")
+    print("  set1 / set2     opposite corners (X/Z)")
+    print("  sety <startY> <endY>   or   ystart <y> / yend <y>")
     return false
   end
 
   loadExclude()
   state.stop = false
   state.dug, state.skipped = 0, 0
-  setStatus("mining", ("quarry %d..%d,%d..%d Y%d->%d"):format(
+  setStatus("mining", ("box %d..%d,%d..%d Y%d->%d"):format(
+    b.minX, b.maxX, b.minZ, b.maxZ, b.topY, b.floorY))
+  print(("Mining box  X %d..%d  Z %d..%d  Y %d -> %d"):format(
     b.minX, b.maxX, b.minZ, b.maxZ, b.topY, b.floorY))
 
   -- Remember home if not set
@@ -384,16 +422,26 @@ end
 --------------------------------------------------------------------------------
 local function printStatus()
   print(("status: %s  task: %s"):format(state.status, state.task))
-  print(("loc1: %s"):format(fmt(cfg.loc1)))
-  print(("loc2: %s"):format(fmt(cfg.loc2)))
-  print(("floorY: %s"):format(tostring(cfg.floorY)))
+  print(("corner1 (set1): %s"):format(fmt(cfg.loc1)))
+  print(("corner2 (set2): %s"):format(fmt(cfg.loc2)))
+  local topY, floorY = yRange()
+  if topY then
+    print(("Y range: start=%d  end=%d  (mine high -> low)"):format(topY, floorY))
+  else
+    print(("Y range: start=%s  end=%s"):format(
+      tostring(cfg.yStart or "?"), tostring(cfg.yEnd or cfg.floorY or "?")))
+  end
   print(("deposit: %s"):format(fmt(cfg.deposit)))
   print(("home: %s"):format(fmt(cfg.home)))
   local b = bounds()
   if b then
-    local cells = (b.maxX - b.minX + 1) * (b.maxZ - b.minZ + 1) * (b.topY - b.floorY + 1)
-    print(("volume: %dx%dx%d (~%d cells)"):format(
-      b.maxX - b.minX + 1, b.maxZ - b.minZ + 1, b.topY - b.floorY + 1, cells))
+    local dx = b.maxX - b.minX + 1
+    local dz = b.maxZ - b.minZ + 1
+    local dy = b.topY - b.floorY + 1
+    print(("box: %dx%dx%d (~%d blocks)  X[%d..%d] Z[%d..%d] Y[%d..%d]"):format(
+      dx, dz, dy, dx * dz * dy, b.minX, b.maxX, b.minZ, b.maxZ, b.topY, b.floorY))
+  else
+    print("box: incomplete — need set1, set2, and ystart+yend (or sety)")
   end
   print(("dug=%d skipped=%d fuel=%s"):format(
     state.dug, state.skipped, tostring(turtle.getFuelLevel())))
@@ -405,10 +453,33 @@ local function markHere(field)
   cfg[field] = { x = x, y = y, z = z }
   saveCfg()
   print(("%s set to %s"):format(field, fmt(cfg[field])))
+  if (field == "loc1" or field == "loc2") and cfg.loc1 and cfg.loc2 then
+    print(("X/Z box: %d..%d , %d..%d"):format(
+      math.min(cfg.loc1.x, cfg.loc2.x), math.max(cfg.loc1.x, cfg.loc2.x),
+      math.min(cfg.loc1.z, cfg.loc2.z), math.max(cfg.loc1.z, cfg.loc2.z)))
+    print("Next: sety <startY> <endY>  (or ystart / yend)")
+  end
+end
+
+local function setYStart(y)
+  y = tonumber(y)
+  if not y then return nil, "need a number" end
+  cfg.yStart = math.floor(y)
+  saveCfg()
+  return cfg.yStart
+end
+
+local function setYEnd(y)
+  y = tonumber(y)
+  if not y then return nil, "need a number" end
+  cfg.yEnd = math.floor(y)
+  cfg.floorY = cfg.yEnd
+  saveCfg()
+  return cfg.yEnd
 end
 
 local function consoleLoop()
-  print(("Titan miner #%d. Type 'help'."):format(os.getComputerID()))
+  print(("Titan miner '%s'. Type 'help'."):format(cfg.name or ("#" .. os.getComputerID())))
   printStatus()
   while true do
     write("miner> ")
@@ -419,18 +490,18 @@ local function consoleLoop()
     if cmd == "" then
       -- ignore
     elseif cmd == "help" then
-      print("set1 / set2     mark corners at current GPS")
-      print("sety <y>        floor Y to dig down to")
-      print("deposit         stand ABOVE a chest; dump inventory here")
-      print("home            mark current pos as return point")
-      print("exclude         reload & show exclude.txt")
-      print("mine            start quarrying the volume")
-      print("stop            abort mining")
-      print("status          show config / progress")
-      print("goto <x> <y> <z>")
-      print("dump            travel to deposit and drop inventory")
-      print("hostname [name] get or set network hostname")
-      print("exit")
+      print("BOX (opposite corners + Y range):")
+      print("  set1 / set2              mark opposite corners (X/Z footprint)")
+      print("  sety <startY> <endY>     vertical range (e.g. sety 80 -59)")
+      print("  ystart <y> / yend <y>    set start or end Y alone")
+      print("  yhere start|end          use current GPS Y")
+      print("OTHER:")
+      print("  deposit   stand ABOVE a chest; dump inventory here")
+      print("  home      mark return point")
+      print("  exclude   reload & show exclude.txt")
+      print("  mine      dig the box from startY down to endY")
+      print("  stop | status | dump | goto <x> <y> <z>")
+      print("  hostname [name] | exit")
     elseif cmd == "hostname" or cmd == "host" then
       if not a[2] then
         print("hostname: " .. (os.getComputerLabel() or "?"))
@@ -438,15 +509,42 @@ local function consoleLoop()
         local name, err = titan.setHostname(table.concat(a, " ", 2), "miner")
         if name then print("hostname set: " .. name) else print(tostring(err)) end
       end
-    elseif cmd == "set1" then
+    elseif cmd == "set1" or cmd == "corner1" then
       markHere("loc1")
-    elseif cmd == "set2" then
+    elseif cmd == "set2" or cmd == "corner2" then
       markHere("loc2")
     elseif cmd == "sety" then
-      local y = tonumber(a[2])
-      if not y then print("Usage: sety <y>"); else
-        cfg.floorY = math.floor(y); saveCfg()
-        print("floorY = " .. cfg.floorY)
+      local ys, ye = tonumber(a[2]), tonumber(a[3])
+      if ys and ye then
+        setYStart(ys); setYEnd(ye)
+        local topY, floorY = yRange()
+        print(("Y range: start=%d  end=%d  (will mine %d -> %d)"):format(
+          ys, ye, topY, floorY))
+      elseif ys and not ye then
+        -- Back-compat: sety <y> alone sets the end (bottom) level.
+        setYEnd(ys)
+        print(("yend (bottom) = %d   (also: sety <startY> <endY>)"):format(cfg.yEnd))
+      else
+        print("Usage: sety <startY> <endY>")
+        print("  startY = top of the box (begin mining here)")
+        print("  endY   = bottom of the box (stop here, inclusive)")
+      end
+    elseif cmd == "ystart" or cmd == "ytop" or cmd == "starty" then
+      local y, err = setYStart(a[2])
+      if y then print("ystart (top) = " .. y) else print("Usage: ystart <y>  (" .. tostring(err) .. ")") end
+    elseif cmd == "yend" or cmd == "ybottom" or cmd == "endy" or cmd == "floor" then
+      local y, err = setYEnd(a[2])
+      if y then print("yend (bottom) = " .. y) else print("Usage: yend <y>  (" .. tostring(err) .. ")") end
+    elseif cmd == "yhere" then
+      local which = (a[2] or ""):lower()
+      local x, y, z = nav.locate(2)
+      if not y then print("No GPS signal.")
+      elseif which == "start" or which == "top" or which == "ystart" then
+        setYStart(y); print("ystart = " .. cfg.yStart .. " (current GPS Y)")
+      elseif which == "end" or which == "bottom" or which == "yend" then
+        setYEnd(y); print("yend = " .. cfg.yEnd .. " (current GPS Y)")
+      else
+        print("Usage: yhere start | yhere end")
       end
     elseif cmd == "deposit" then
       markHere("deposit")
@@ -457,13 +555,16 @@ local function consoleLoop()
       print("Excluded blocks:")
       local n = 0
       for name in pairs(exclude) do print("  " .. name); n = n + 1 end
-      if n == 0 then print("  (none — edit exclude.txt)") end
+      if n == 0 then print("  (none - edit exclude.txt)") end
       print("(also respects titan.RESTRICTED / computercraft:*)")
     elseif cmd == "status" then
       printStatus()
     elseif cmd == "mine" then
-      if state.status == "mining" then print("Already mining."); else
-        -- run mine in this coroutine so stop can interrupt via flag
+      if state.status == "mining" then print("Already mining.")
+      elseif not quarryReady() then
+        print("Box incomplete. Need set1, set2, and sety <start> <end>.")
+        printStatus()
+      else
         mineVolume()
       end
     elseif cmd == "stop" then
@@ -483,20 +584,75 @@ local function consoleLoop()
       state.stop = true
       return
     else
-      print("Unknown: " .. cmd)
+      print("Unknown: " .. cmd .. "  (type 'help')")
     end
   end
 end
 
 --------------------------------------------------------------------------------
--- Status broadcast (so hub/router can see the miner)
+-- Deploy (Parent Center) + status + remote orders
 --------------------------------------------------------------------------------
+local function applyDeployment(d)
+  local t = tostring(d.botType or ""):lower()
+  if t ~= "miner" then return false, "bad type (want miner)" end
+  local name = d.name
+  if not name or name == "" then name = "Miner-" .. os.getComputerID() end
+  print(("Deploying as miner '%s'..."):format(name))
+  local ok, err = nav.calibrate(true)
+  if not ok then print("Calibrate warning: " .. tostring(err)) end
+  local hx, hy, hz = nav.locate(2)
+  local home = hx and { x = hx, y = hy, z = hz } or nil
+  cfg.name = name
+  cfg.botType = "miner"
+  cfg.home = home or cfg.home
+  if d.deposit then cfg.deposit = d.deposit end
+  saveCfg()
+  os.setComputerLabel(name)
+  if cfg.home then nav.home = cfg.home end
+  return true
+end
+
+local function awaitDeployment()
+  setStatus("await", "awaiting deployment")
+  os.setComputerLabel(os.getComputerLabel() or ("miner-" .. os.getComputerID()))
+  print("Unconfigured miner. Waiting for Parent Center deploy...")
+  print("  deploy <id> miner <name> [depX depY depZ]")
+  local beacon = os.startTimer(0)
+  while true do
+    local ev, p1, p2, p3 = os.pullEvent()
+    if ev == "timer" and p1 == beacon then
+      local x, y, z = nav.locate(1)
+      titan.broadcast(MSG.WORKER_AWAIT, {
+        name = os.getComputerLabel(), kind = "miner", x = x, y = y, z = z,
+      })
+      beacon = os.startTimer(3)
+    elseif ev == "rednet_message" and p3 == P and type(p2) == "table"
+           and p2.type == MSG.WORKER_DEPLOY then
+      local ok, why = applyDeployment(p2)
+      if ok then
+        titan.send(p1, MSG.WORKER_DEPLOYED, { name = cfg.name, botType = "miner" })
+        return
+      else
+        titan.send(p1, MSG.WORKER_DEPLOYED, { ok = false, err = why })
+        print("Deploy rejected: " .. tostring(why))
+      end
+    end
+  end
+end
+
 local function statusLoop()
+  titan.broadcast(MSG.BOT_REGISTER, {
+    name = cfg.name or os.getComputerLabel(),
+    botType = "miner", home = cfg.home or nav.home,
+  })
   while true do
     local x, y, z = nav.locate(1)
-    titan.broadcast(titan.MSG.STATUS, {
+    local asg = assignmentText()
+    titan.broadcast(MSG.STATUS, {
+      name = cfg.name or os.getComputerLabel(),
       status = state.status,
       task   = state.task,
+      assignment = asg,
       x = x, y = y, z = z,
       fuel   = turtle.getFuelLevel(),
       dug    = state.dug,
@@ -506,26 +662,106 @@ local function statusLoop()
   end
 end
 
+local function receiveLoop()
+  while true do
+    local id, msg = rednet.receive(P)
+    if type(msg) == "table" then
+      local t = msg.type
+      if t == MSG.COMMAND then
+        local cmd = tostring(msg.cmd or ""):lower()
+        if cmd == "mine" then
+          if state.status == "mining" then
+            titan.send(id, MSG.ACK, { ok = false, err = "already mining" })
+          else
+            mineRequested = true
+            setStatus("idle", "mine queued")
+            titan.send(id, MSG.ACK, { ok = true, task = "mine queued" })
+          end
+        elseif cmd == "stop" then
+          state.stop = true
+          mineRequested = false
+          titan.send(id, MSG.ACK, { ok = true, task = "stop" })
+        elseif cmd == "goto" and msg.x then
+          setStatus("moving", ("goto %d,%d,%d"):format(msg.x, msg.y, msg.z))
+          local ok, err = nav.travelTo(msg.x, msg.y, msg.z)
+          setStatus("idle", "-")
+          titan.send(id, MSG.ACK, { ok = ok, err = err })
+        elseif cmd == "return" or cmd == "home" then
+          setStatus("moving", "-> home")
+          nav.goHome({ dig = true })
+          setStatus("idle", "-")
+          titan.send(id, MSG.ACK, { ok = true, task = "home" })
+        elseif cmd == "dump" then
+          dumpInventory()
+          titan.send(id, MSG.ACK, { ok = true, task = "dump" })
+        end
+      elseif t == MSG.WORKER_DEPLOY then
+        local ok, why = applyDeployment(msg)
+        titan.send(id, MSG.WORKER_DEPLOYED, {
+          ok = ok, err = why, name = cfg.name, botType = "miner",
+        })
+      elseif t == MSG.PING then
+        titan.send(id, MSG.PONG, {
+          state = state.status, botType = "miner",
+          name = cfg.name or os.getComputerLabel(),
+          assignment = assignmentText(),
+        })
+      end
+    end
+  end
+end
+
+local function jobLoop()
+  while true do
+    if mineRequested and state.status ~= "mining" then
+      mineRequested = false
+      mineVolume()
+    end
+    sleep(0.4)
+  end
+end
+
 --------------------------------------------------------------------------------
 loadCfg()
 loadExclude()
-if cfg.home then nav.home = cfg.home end
 
--- First-run hint
-if not cfg.loc1 or not cfg.loc2 or cfg.floorY == nil then
-  print("Miner not fully configured yet.")
-  print("  1) Walk to corner 1 → set1")
-  print("  2) Walk to corner 2 → set2")
-  print("  3) sety <floorY>   (e.g. sety -59)")
-  print("  4) Stand above a chest → deposit")
-  print("  5) Edit exclude.txt, then → mine")
-  print("")
+-- Migrate older miner.cfg (no deploy name) so existing quarries keep running.
+if not cfg.name then
+  if cfg.loc1 or cfg.loc2 or cfg.yStart ~= nil or cfg.yEnd ~= nil or cfg.floorY ~= nil then
+    cfg.name = os.getComputerLabel() or ("Miner-" .. os.getComputerID())
+    cfg.botType = "miner"
+    saveCfg()
+  end
 end
 
--- networkLoop: register with the router + relay hops (excavator is a mesh peer).
+if not cfg.name then
+  parallel.waitForAny(
+    awaitDeployment,
+    function() titan.networkLoop("miner") end
+  )
+end
+
+os.setComputerLabel(cfg.name)
+if cfg.home then nav.home = cfg.home end
+pcall(nav.calibrate, true)
+
+if not quarryReady() then
+  print("Miner '" .. cfg.name .. "' online — box not fully set.")
+  print("  1) set1 / set2     opposite corners of the area")
+  print("  2) sety <startY> <endY>   e.g. sety 80 -59")
+  print("  3) deposit (above chest) then mine")
+else
+  local b = bounds()
+  print(("Miner '%s' online. Box ready X[%d..%d] Z[%d..%d] Y[%d->%d]."):format(
+    cfg.name, b.minX, b.maxX, b.minZ, b.maxZ, b.topY, b.floorY))
+end
+setStatus("idle", "-")
+
 parallel.waitForAny(
   consoleLoop,
   statusLoop,
+  receiveLoop,
+  jobLoop,
   function() titan.networkLoop("miner") end
 )
 print("Miner stopped.")

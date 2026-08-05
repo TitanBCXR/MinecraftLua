@@ -1,6 +1,6 @@
 --[[
   datacenter.lua  -  Titan Data Center (CC: Tweaked)   [ single, self-contained script ]
-  Titan-Version: 1.1.2
+  Titan-Version: 1.2.0
 
   ONE script that every computer/terminal in your data center runs. It works out
   its own role automatically:
@@ -33,12 +33,11 @@
     * Admin command `storage` / `find <item>` scans attached inventory peripherals
       (chests, barrels, drawers, ME/RS bridges exposed as inventories, ...).
 
-  WORKER DEPLOYMENT (this is the "Parent Center" role):
-    * Builder/gatherer turtles running worker.lua power on unconfigured and wait.
-    * `pending` lists them; `deploy <id> <builder|gatherer> <name> [x y z]` pushes
-      their config over the network. Both are ADMIN commands, so they're gated
-      behind the master-password login (the disk-drive lock) - a worker cannot be
-      deployed unless someone has logged into a Parent Center terminal.
+  WORKER / BOT DEPLOYMENT (this is the "Parent Center" role):
+    * Manages all three bot types: builder, gatherer (worker.lua), and miner
+      (miner.lua). Unconfigured turtles wait; `pending` lists them.
+    * `deploy <id> <builder|gatherer|miner> <name> [x y z]` pushes config.
+      ADMIN only (master-password lock). Deposit coords optional (chest / dump).
 
   BOOTSTRAP (first master password):
     * Insert a blank floppy in a master-to-be computer and run `initmaster` from
@@ -76,8 +75,9 @@ local MSG = {
 local registry = {}                          -- [id] = { name, seen, master }
 local session  = { mode = "bot", user = nil } -- mode: "bot" (locked) | "admin"
 local station  = { name = nil }
-local netbots  = {}                          -- [id] = { name, botType, x,y,z, fuel, state, task, seen }
-local pending  = {}                          -- [id] = { name, x,y,z, seen } workers awaiting deployment
+local BOT_TYPES = { builder = true, gatherer = true, miner = true }
+local netbots  = {}                          -- [id] = { name, botType, x,y,z, fuel, state, task, seen, assignment }
+local pending  = {}                          -- [id] = { name, x,y,z, seen, kind } awaiting deployment
 local authed   = {}                          -- [id] = { name, kind, hostname, seen } bots authed with this DC
 
 --==============================================================================
@@ -428,41 +428,42 @@ end
 -- Worker deployment (admin only -> gated behind the disk-drive password lock)
 --==============================================================================
 
--- List worker turtles that are powered on but unconfigured (awaiting deploy).
+-- List turtles that are powered on but unconfigured (awaiting deploy).
 local function cmdPending()
   local nowMs, count = os.epoch("utc"), 0
-  print("Workers awaiting deployment:")
+  print("Bots awaiting deployment (builder / gatherer / miner):")
   for id, w in pairs(pending) do
     if (nowMs - (w.seen or 0)) < 20000 then
       count = count + 1
       local age = math.floor((nowMs - (w.seen or 0)) / 1000)
       local pos = w.x and ("%d,%d,%d"):format(w.x, w.y, w.z) or "?"
-      print(("  #%-3d %-14s @ %-14s (%ss)"):format(id, w.name or "?", pos, age))
+      local kind = w.kind or "worker"
+      print(("  #%-3d %-10s %-14s @ %-14s (%ss)"):format(
+        id, kind, w.name or "?", pos, age))
     end
   end
   if count == 0 then
-    print("  (none - power on a worker turtle running worker.lua with no config)")
+    print("  (none — boot worker.lua or miner.lua with no deploy name)")
   end
 end
 
--- Push a deploy config to a worker: deploy <id|name> <builder|gatherer> <name> [dx dy dz]
+-- Push deploy config: deploy <id|name> <builder|gatherer|miner> <name> [dx dy dz]
 local function cmdDeploy(rest)
   local a = {}
   for w in tostring(rest):gmatch("%S+") do a[#a + 1] = w end
   local ref, btype, name = a[1], (a[2] or ""):lower(), a[3]
-  if not ref or (btype ~= "builder" and btype ~= "gatherer") or not name then
-    print("Usage: deploy <id|name> <builder|gatherer> <name> [depX depY depZ]")
+  if not ref or not BOT_TYPES[btype] or not name then
+    print("Usage: deploy <id|name> <builder|gatherer|miner> <name> [depX depY depZ]")
     return
   end
 
-  -- Resolve the target: numeric id, else match a pending worker's label.
   local targetId = tonumber(ref)
   if not targetId then
     for id, w in pairs(pending) do
       if w.name and w.name:lower() == ref:lower() then targetId = id; break end
     end
   end
-  if not targetId then print("No pending worker '" .. ref .. "' (try 'pending')."); return end
+  if not targetId then print("No pending bot '" .. ref .. "' (try 'pending')."); return end
 
   local deposit
   if a[4] and a[5] and a[6] then
@@ -473,18 +474,26 @@ local function cmdDeploy(rest)
     { type = "worker_deploy", botType = btype, name = name, deposit = deposit }, NET_PROTOCOL)
   print(("Deploy sent to #%d: %s '%s'%s"):format(targetId, btype, name,
     deposit and ("  deposit " .. ("%d,%d,%d"):format(deposit.x, deposit.y, deposit.z)) or ""))
-  -- Wait briefly for the worker to confirm.
-  local deadline = os.clock() + 3
+  local deadline = os.clock() + 5
   while os.clock() < deadline do
     local id, msg = rednet.receive(NET_PROTOCOL, deadline - os.clock())
     if id == targetId and type(msg) == "table" and msg.type == "worker_deployed" then
-      if msg.ok == false then print("Worker rejected: " .. tostring(msg.err))
-      else print(("Deployed: %s is now a %s."):format(msg.name or ("#" .. id), msg.botType or btype)) end
+      if msg.ok == false then print("Bot rejected: " .. tostring(msg.err))
+      else
+        print(("Deployed: %s is now a %s."):format(msg.name or ("#" .. id), msg.botType or btype))
+        netbots[targetId] = netbots[targetId] or {}
+        netbots[targetId].name = msg.name or name
+        netbots[targetId].botType = msg.botType or btype
+        netbots[targetId].state = "idle"
+        netbots[targetId].task = "-"
+        netbots[targetId].assignment = "-"
+        netbots[targetId].seen = os.epoch("utc")
+      end
       pending[targetId] = nil
       return
     end
   end
-  print("(No confirmation yet - the worker may still be calibrating.)")
+  print("(No confirmation yet - the bot may still be calibrating.)")
 end
 
 --==============================================================================
@@ -522,20 +531,27 @@ local function handleAdmin(cmd, rest)
   elseif cmd == "scan" then
     cmdScan()
   elseif cmd == "bots" then
-    local nowMs, total, gath, build, working = os.epoch("utc"), 0, 0, 0, 0
+    local nowMs = os.epoch("utc")
+    local total, gath, build, mine, working = 0, 0, 0, 0, 0
     for _, b in pairs(netbots) do
       if (nowMs - (b.seen or 0)) < 15000 then
         total = total + 1
         if b.botType == "gatherer" then gath = gath + 1
-        elseif b.botType == "builder" then build = build + 1 end
-        if b.state == "moving" or b.state == "working" then working = working + 1 end
+        elseif b.botType == "builder" then build = build + 1
+        elseif b.botType == "miner" then mine = mine + 1 end
+        if b.state == "moving" or b.state == "working" or b.state == "mining" then
+          working = working + 1
+        end
       end
     end
-    print(("Bots active: %d  (gathering %d, building %d, working %d)"):format(total, gath, build, working))
+    print(("Bots active: %d  (build:%d gather:%d mine:%d busy:%d)"):format(
+      total, build, gath, mine, working))
     for id, b in pairs(netbots) do
       local age = math.floor((nowMs - (b.seen or 0)) / 1000)
-      print(("  #%-3d %-12s %-8s %d,%d,%d %s (%ss)"):format(
-        id, b.name or "?", b.botType or "?", b.x or 0, b.y or 0, b.z or 0, b.state or "?", age))
+      local asg = b.assignment or b.task or "-"
+      print(("  #%-3d %-12s %-8s %-8s %s @ %d,%d,%d (%ss)"):format(
+        id, b.name or "?", b.botType or "?", b.state or "?",
+        tostring(asg):sub(1, 18), b.x or 0, b.y or 0, b.z or 0, age))
     end
   elseif cmd == "pending" then
     cmdPending()
@@ -554,8 +570,8 @@ local function handleAdmin(cmd, rest)
       local b = found.b
       print(("Bot %s (#%d)  type: %s"):format(b.name or "?", found.id, b.botType or "?"))
       print(("  location: %d, %d, %d"):format(b.x or 0, b.y or 0, b.z or 0))
-      print(("  state: %s   task: %s   fuel: %s"):format(
-        b.state or "?", b.task or "-", tostring(b.fuel or "?")))
+      print(("  state: %s   assignment: %s   fuel: %s"):format(
+        b.state or "?", b.assignment or b.task or "-", tostring(b.fuel or "?")))
     end
   elseif cmd == "rename" or cmd == "hostname" or cmd == "host" then
     cmdRename(rest)
@@ -577,11 +593,11 @@ local function handleAdmin(cmd, rest)
     print("  storage            scan attached storage")
     print("  find <item>        search storage for an item")
     print("  scan               find online computers & master floppy")
-    print("  bots               live bot roster (active, gathering/building)")
-    print("  bot <name>         a bot's location, state and task")
+    print("  bots               live roster (builder / gatherer / miner)")
+    print("  bot <name>         location, state, assignment")
     print("  locate <name>      alias of 'bot'")
-    print("  pending            workers awaiting deployment")
-    print("  deploy <id> <builder|gatherer> <name> [x y z]   deploy a worker")
+    print("  pending            bots awaiting deployment")
+    print("  deploy <id> <builder|gatherer|miner> <name> [x y z]")
     print("  rename|hostname <name>  rename this station (updates router roster)")
     print("  setmaster          change master password (master only)")
     print("  who | status       session / station info")
@@ -630,10 +646,10 @@ local function serviceLoop()
         local name = msg.hostname or msg.name or ("#" .. id)
         local kind = msg.kind or "bot"
         authed[id] = { name = name, hostname = name, kind = kind, seen = os.epoch("utc") }
-        if kind == "worker" or kind == "worker?" then
+        if kind == "worker" or kind == "worker?" or kind == "miner" then
           -- Keep pending visible until deploy if we only have an auth ping.
           if not netbots[id] and not pending[id] then
-            pending[id] = { name = name, seen = os.epoch("utc") }
+            pending[id] = { name = name, kind = kind, seen = os.epoch("utc") }
           end
         else
           local prev = netbots[id] or {}
@@ -641,7 +657,8 @@ local function serviceLoop()
             name = name, botType = prev.botType or kind,
             x = prev.x, y = prev.y, z = prev.z,
             fuel = prev.fuel, state = prev.state or "authed",
-            task = prev.task, seen = os.epoch("utc"),
+            task = prev.task, assignment = prev.assignment or prev.task,
+            seen = os.epoch("utc"),
           }
         end
         rednet.send(id, {
@@ -672,24 +689,29 @@ local function registerLoop()
 end
 
 -- Listen to the bot network (titan_net) so this computer can display and query
--- the live bot roster (active count, gathering vs building, locations, tasks).
+-- the live bot roster (builder / gatherer / miner status + assignments).
 local function botLoop()
   while true do
     local id, msg = rednet.receive(NET_PROTOCOL)
     if type(msg) == "table" and id then
-      if msg.type == "bot_register" or msg.type == "status" then
+      if msg.type == "bot_register" or msg.type == "status" or msg.type == "register" then
         local b = netbots[id] or {}
-        b.name = msg.name or b.name
+        b.name = msg.name or msg.hostname or b.name
         b.botType = msg.botType or b.botType
         b.x, b.y, b.z = msg.x or b.x, msg.y or b.y, msg.z or b.z
         b.fuel = msg.fuel ~= nil and msg.fuel or b.fuel
         b.state = msg.state or b.state
         b.task = msg.task or b.task
+        b.assignment = msg.assignment or msg.task or b.assignment
+        if msg.dug ~= nil then b.dug = msg.dug end
         b.seen = os.epoch("utc")
         netbots[id] = b
-        pending[id] = nil                       -- a configured worker is no longer pending
+        if b.botType and BOT_TYPES[b.botType] then pending[id] = nil end
       elseif msg.type == "worker_await" then
-        pending[id] = { name = msg.name, x = msg.x, y = msg.y, z = msg.z, seen = os.epoch("utc") }
+        pending[id] = {
+          name = msg.name, kind = msg.kind or "worker",
+          x = msg.x, y = msg.y, z = msg.z, seen = os.epoch("utc"),
+        }
       elseif msg.type == "worker_deployed" then
         pending[id] = nil
       end
@@ -697,18 +719,21 @@ local function botLoop()
   end
 end
 
--- Count active bots (seen recently) and how many of each type are working.
+-- Count active bots (seen recently) by type.
 local function botStats()
-  local nowMs, total, gath, build, working = os.epoch("utc"), 0, 0, 0, 0
+  local nowMs, total, gath, build, mine, working = os.epoch("utc"), 0, 0, 0, 0, 0
   for _, b in pairs(netbots) do
     if (nowMs - (b.seen or 0)) < 15000 then
       total = total + 1
       if b.botType == "gatherer" then gath = gath + 1
-      elseif b.botType == "builder" then build = build + 1 end
-      if b.state == "moving" or b.state == "working" then working = working + 1 end
+      elseif b.botType == "builder" then build = build + 1
+      elseif b.botType == "miner" then mine = mine + 1 end
+      if b.state == "moving" or b.state == "working" or b.state == "mining" then
+        working = working + 1
+      end
     end
   end
-  return total, gath, build, working
+  return total, gath, build, mine, working
 end
 
 -- If a monitor is attached, show the station list (on the master) or a lock screen.
@@ -731,25 +756,28 @@ local function drawMonitor(mon)
         age > 45 and colors.gray or colors.white)
       y = y + 1
     end
-    -- Bot network summary.
-    local total, gath, build, working = botStats()
+    -- Bot network summary (builder / gatherer / miner).
+    local total, gath, build, mine, working = botStats()
     y = y + 1
     line(y, "-- BOT NETWORK --", colors.orange); y = y + 1
-    line(y, ("Active: %d   Gathering: %d   Building: %d   Working: %d"):format(
-      total, gath, build, working), colors.lime); y = y + 1
+    line(y, ("Active:%d  build:%d gather:%d mine:%d busy:%d"):format(
+      total, build, gath, mine, working), colors.lime); y = y + 1
     local nowMs2, npend = os.epoch("utc"), 0
     for _, w in pairs(pending) do if (nowMs2 - (w.seen or 0)) < 20000 then npend = npend + 1 end end
     if npend > 0 then
-      line(y, ("Awaiting deployment: %d  (admin: 'pending' / 'deploy')"):format(npend), colors.orange)
+      line(y, ("Awaiting deploy: %d  (admin: pending / deploy)"):format(npend), colors.orange)
       y = y + 1
     end
+    line(y, "NAME         TYPE     STATE    ASSIGNMENT", colors.lightGray); y = y + 1
     local h = select(2, mon.getSize())
     for id, b in pairs(netbots) do
       if y >= h then break end
       if (os.epoch("utc") - (b.seen or 0)) < 15000 then
-        line(y, ("%-12s %-8s %d,%d,%d %s"):format(
+        local asg = tostring(b.assignment or b.task or "-"):sub(1, 16)
+        line(y, ("%-12s %-8s %-8s %s"):format(
           (b.name or ("#" .. id)):sub(1, 12), (b.botType or "?"):sub(1, 8),
-          b.x or 0, b.y or 0, b.z or 0, (b.task or "-")))
+          tostring(b.state or "?"):sub(1, 8), asg),
+          (b.state == "idle" or b.state == "authed") and colors.white or colors.cyan)
         y = y + 1
       end
     end
