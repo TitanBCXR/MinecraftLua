@@ -1,6 +1,6 @@
 --[[
   titan.lua  -  Shared library for the Titan bot network (CC: Tweaked)
-  Titan-Version: 1.1.6
+  Titan-Version: 1.2.0
 
   Provides:
     * Rednet protocol constants + message type enum
@@ -247,13 +247,50 @@ function titan.findMainRouter(timeout)
   return titan.getMainRouterId()
 end
 
+function titan.systemVersion()
+  local cat = titan.loadVersionCatalog()
+  return (cat and cat.system) or nil
+end
+
 function titan.announce(kind)
   if type(kind) == "string" and kind ~= "" then lastAnnounceKind = kind end
   local host = titan.hostname(lastAnnounceKind)
   rednet.broadcast({
     type = "hello", kind = lastAnnounceKind, name = host, hostname = host,
     mainRouterId = titan.getMainRouterId(),
+    version = titan.systemVersion(),
   }, titan.ROUTER_PROTOCOL)
+end
+
+-- After a successful OTA, leave a flag so the next boot can ACK the main router.
+titan.UPDATED_FLAG = ".titan-updated"
+
+function titan.markPendingUpdateAck(prevVersion, targetVersion)
+  local f = fs.open(titan.UPDATED_FLAG, "w")
+  f.write(textutils.serialize({
+    prev = prevVersion, target = targetVersion, at = os.epoch("utc"),
+  }))
+  f.close()
+end
+
+-- If we just finished an OTA reboot, tell the main router we are updated.
+function titan.reportUpdatedIfPending(kind)
+  if not fs.exists(titan.UPDATED_FLAG) then return false end
+  local f = fs.open(titan.UPDATED_FLAG, "r")
+  local d = textutils.unserialize(f.readAll()); f.close()
+  pcall(fs.delete, titan.UPDATED_FLAG)
+  local host = titan.hostname(kind)
+  local ver = titan.systemVersion()
+  rednet.broadcast({
+    type = "updated", kind = kind or lastAnnounceKind,
+    name = host, hostname = host,
+    version = ver,
+    prev = type(d) == "table" and d.prev or nil,
+    target = type(d) == "table" and d.target or nil,
+    from = os.getComputerID(),
+  }, titan.ROUTER_PROTOCOL)
+  print(("[OTA] Reported updated -> v%s"):format(tostring(ver or "?")))
+  return true
 end
 
 -- Re-auth with the Parent Center / data server (bots, workers, miners).
@@ -319,6 +356,8 @@ function titan.registerLoop(kind, period)
       print("[net] Data center auth pending (Parent Center offline?)")
     end
   end
+  -- If this boot follows a fleet OTA, ACK the main router.
+  titan.reportUpdatedIfPending(kind)
 
   local nextAnnounce = os.clock() + period
   while true do
@@ -339,13 +378,20 @@ function titan.registerLoop(kind, period)
         titan.reauth(kind)
       elseif msg.type == "update" then
         print("")
-        print(("[OTA] Update from router #%s — downloading, then reboot + re-auth..."):format(tostring(id)))
+        print(("[OTA] AoE update from router #%s (target v%s) — downloading..."):format(
+          tostring(id), tostring(msg.targetVersion or "?")))
         if msg.mainRouterId then titan.setMainRouterId(msg.mainRouterId) end
+        local prev = titan.systemVersion()
         local uok, err = titan.updateSelf()
         if uok then
-          print("[OTA] Updated. Rebooting in 2s (will re-auth on boot)..."); os.sleep(2); os.reboot()
+          titan.markPendingUpdateAck(prev, msg.targetVersion or titan.systemVersion())
+          print("[OTA] Updated. Rebooting in 2s (will ACK main on boot)..."); os.sleep(2); os.reboot()
         else
           print("[OTA] Update failed: " .. tostring(err))
+          rednet.send(id, {
+            type = "update_fail", version = prev, err = tostring(err),
+            name = titan.hostname(kind), hostname = titan.hostname(kind),
+          }, titan.ROUTER_PROTOCOL)
         end
       end
     end
@@ -929,6 +975,48 @@ function titan.loadVersionCatalog()
   local ok, cat = pcall(dofile, titan.VERSIONS_FILE)
   if ok and type(cat) == "table" then return cat end
   return nil
+end
+
+-- Default GitHub raw root (same as github_install.lua). Trailing slash required.
+titan.GITHUB_RAW_BASE = "https://raw.githubusercontent.com/TitanBCXR/MinecraftLua/main/"
+
+-- Fetch versions.lua from GitHub (or any raw base). Returns catalog or nil, err.
+function titan.fetchGithubVersions(base)
+  base = base or titan.GITHUB_RAW_BASE
+  if type(base) ~= "string" or base == "" then return nil, "no github base" end
+  if not base:find("/$") then base = base .. "/" end
+  local data, err = otaHttp(base .. "versions.lua?cb=" .. os.epoch("utc"))
+  if not data then return nil, err end
+  local loader, lerr = load(data, "@versions.lua", "t", {})
+  if not loader then
+    -- CraftOS sometimes exposes loadstring
+    if loadstring then
+      loader, lerr = loadstring(data)
+      if loader then setfenv(loader, {}) end
+    end
+  end
+  if not loader then return nil, "parse failed: " .. tostring(lerr) end
+  local ok, cat = pcall(loader)
+  if not ok or type(cat) ~= "table" then return nil, "invalid versions.lua" end
+  return cat, base
+end
+
+-- Compare dotted versions: -1 if a<b, 0 equal, 1 if a>b.
+function titan.versionCompare(a, b)
+  local function parts(v)
+    local t = {}
+    for n in tostring(v or "0"):gmatch("%d+") do t[#t + 1] = tonumber(n) or 0 end
+    if #t == 0 then t[1] = 0 end
+    return t
+  end
+  local pa, pb = parts(a), parts(b)
+  local n = math.max(#pa, #pb)
+  for i = 1, n do
+    local x, y = pa[i] or 0, pb[i] or 0
+    if x < y then return -1 end
+    if x > y then return 1 end
+  end
+  return 0
 end
 
 -- Read `-- Titan-Version: x.y.z` from the first lines of a file.

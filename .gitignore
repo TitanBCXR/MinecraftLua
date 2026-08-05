@@ -3,6 +3,7 @@
 master.pw          # master-password floppy contents (secret!)
 .titan-install     # per-device install source manifest (runtime)
 .titan-net         # remembered main router / data-center auth (runtime)
+.titan-updated     # pending OTA ack flag (runtime)
 packages           # per-device desired package list (runtime)
 builds/            # scanned build presets uploaded/saved at runtime
 computer/          # world-save computer mounts, if ever copied in

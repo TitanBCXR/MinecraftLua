@@ -1,12 +1,13 @@
 --[[
   router.lua  -  Titan network router / repeater (CC: Tweaked)
-  Titan-Version: 1.1.9
+  Titan-Version: 1.2.0
 
   Place one (or several) of these to tie the whole network together over
   wireless. Roles:
 
     MAIN  - directory, OTA update, re-auth authority, GPS host, repeater.
-            Devices re-auth to the main router after boot / fleet update.
+            Tracks GitHub versions.lua; `update aoe` pushes fleet OTA and
+            collects `updated` ACKs after devices reboot.
             Attach up to 3+ monitors for ROSTER / STATS / GPS boards.
     MODEM - repeater (+ optional GPS host) only. Use for coverage; not the
             network authority. Main assigns each a unique name from a pool;
@@ -207,6 +208,111 @@ local function releaseModemName(id)
     nameAssign[id] = nil
     saveNameRegistry()
   end
+end
+
+--------------------------------------------------------------------------------
+-- GitHub version tracking + fleet OTA campaign (MAIN)
+--------------------------------------------------------------------------------
+local DEFAULT_GH_BASE = "https://raw.githubusercontent.com/TitanBCXR/MinecraftLua/main/"
+local ghState = {
+  base = DEFAULT_GH_BASE,
+  remote = nil,       -- last fetched catalog
+  checkedAt = 0,
+  lastAlert = nil,    -- last remote.system we alerted about
+}
+-- Active AoE update: { version, sentAt, expected = { [id]=name }, acked = { [id]={...} } }
+local updateCampaign = nil
+
+local function githubBase()
+  local c = loadRouterCfg() or {}
+  if type(c.githubBase) == "string" and c.githubBase ~= "" then
+    return c.githubBase:find("/$") and c.githubBase or (c.githubBase .. "/")
+  end
+  if titanLib and titanLib.GITHUB_RAW_BASE then return titanLib.GITHUB_RAW_BASE end
+  return DEFAULT_GH_BASE
+end
+
+local function localSystemVersion()
+  if titanLib and titanLib.systemVersion then return titanLib.systemVersion() end
+  if fs.exists("versions.lua") then
+    local ok, cat = pcall(dofile, "versions.lua")
+    if ok and type(cat) == "table" then return cat.system end
+  end
+  return nil
+end
+
+local function fetchGithubVersions()
+  local base = githubBase()
+  ghState.base = base
+  if titanLib and titanLib.fetchGithubVersions then
+    local cat, err = titanLib.fetchGithubVersions(base)
+    if not cat then return nil, err end
+    ghState.remote = cat
+    ghState.checkedAt = os.epoch("utc")
+    return cat
+  end
+  -- Fallback without lib helpers.
+  if not http then return nil, "http disabled (enable in ComputerCraft config)" end
+  local h = http.get(base .. "versions.lua?cb=" .. os.epoch("utc"))
+  if not h then return nil, "request failed" end
+  local data = h.readAll(); h.close()
+  if not data or data == "" then return nil, "empty response" end
+  local loader = load(data, "@versions.lua", "t", {})
+  if not loader then return nil, "parse failed" end
+  local ok, cat = pcall(loader)
+  if not ok or type(cat) ~= "table" then return nil, "invalid versions.lua" end
+  ghState.remote = cat
+  ghState.checkedAt = os.epoch("utc")
+  return cat
+end
+
+local function versionCmp(a, b)
+  if titanLib and titanLib.versionCompare then return titanLib.versionCompare(a, b) end
+  if tostring(a) == tostring(b) then return 0 end
+  if tostring(a) < tostring(b) then return -1 end
+  return 1
+end
+
+local function noteDeviceVersion(id, version, name, kind)
+  if not id then return end
+  local d = seen[id] or {}
+  d.version = version or d.version
+  d.hostname = name or d.hostname or d.name
+  d.name = d.hostname
+  d.kind = kind or d.kind or "device"
+  d.seen = now()
+  seen[id] = d
+  rosterDirty = true
+  if updateCampaign and version
+     and tostring(version) == tostring(updateCampaign.version) then
+    updateCampaign.acked[id] = {
+      name = d.hostname, version = version, at = os.epoch("utc"),
+    }
+  end
+end
+
+local function startUpdateCampaign(targetVersion)
+  local expected = {}
+  for id, d in pairs(seen) do
+    if isOnline(d) and id ~= os.getComputerID() then
+      expected[id] = d.hostname or d.name or ("#" .. id)
+    end
+  end
+  updateCampaign = {
+    version = targetVersion,
+    sentAt = os.epoch("utc"),
+    expected = expected,
+    acked = {},
+  }
+  return expected
+end
+
+local function campaignStatus()
+  if not updateCampaign then return nil end
+  local exp, ack = 0, 0
+  for _ in pairs(updateCampaign.expected) do exp = exp + 1 end
+  for _ in pairs(updateCampaign.acked) do ack = ack + 1 end
+  return exp, ack, updateCampaign
 end
 
 local function claimMain()
@@ -435,6 +541,7 @@ local function rosterTouch(id, msg, kind, doAssign)
     name = host, hostname = host,
     kind = kind or (prev and prev.kind) or "device",
     seen = now(), x = px, y = py, z = pz,
+    version = msg.version or (prev and prev.version),
   }
   rosterDirty = true
   if not prev then
@@ -474,12 +581,28 @@ local function directoryLoop()
         end
         rednet.send(id, reply, PROTO_ROUTER)
 
+      elseif proto == PROTO_ROUTER and (msg.type == "updated" or msg.type == "update_fail"
+          or msg.type == "version_report") then
+        local host = msg.hostname or msg.name or ("#" .. id)
+        noteDeviceVersion(id, msg.version, host, msg.kind or classify(msg))
+        if msg.type == "updated" then
+          print(("[OTA] ACK #%d %s -> v%s"):format(id, host, tostring(msg.version or "?")))
+          local exp, ack = campaignStatus()
+          if exp then
+            print(("[OTA] Campaign v%s: %d / %d acked"):format(
+              tostring(updateCampaign.version), ack, exp))
+          end
+        elseif msg.type == "update_fail" then
+          print(("[OTA] FAIL #%d %s: %s"):format(id, host, tostring(msg.err or "?")))
+        end
+
       elseif proto == PROTO_ROUTER and (msg.type == "hello" or msg.type == "where_main"
           or msg.type == "map_req" or msg.type == "hop_find_main") then
         local kind = classify(msg)
         local assignHostname, assignReboot = nil, false
         if msg.type == "hello" then
           assignHostname, assignReboot = rosterTouch(id, msg, kind, true)
+          if msg.version then noteDeviceVersion(id, msg.version, assignHostname or msg.hostname, kind) end
         else
           rosterTouch(id, msg, kind, false)
         end
@@ -850,6 +973,33 @@ local function pingLoop()
   end
 end
 
+-- Poll GitHub versions.lua; alert when remote system version is newer.
+local function githubWatchLoop()
+  sleep(5)
+  while true do
+    if isMain() then
+      local cat, err = fetchGithubVersions()
+      if cat and cat.system then
+        local localVer = localSystemVersion()
+        if versionCmp(localVer, cat.system) < 0
+           and ghState.lastAlert ~= cat.system then
+          ghState.lastAlert = cat.system
+          print("")
+          print(("[GitHub] New Titan v%s available (local %s)."):format(
+            tostring(cat.system), tostring(localVer or "?")))
+          print("[GitHub] Run `update aoe` to push fleet OTA from GitHub packages.")
+        end
+      elseif err then
+        -- Quiet unless first failure after boot.
+        if not ghState.remote then
+          print("[GitHub] Version check failed: " .. tostring(err))
+        end
+      end
+    end
+    sleep(300)  -- every 5 minutes
+  end
+end
+
 -- MODEM routers: mesh hop to MAIN (no local roster), accept unique name, reboot.
 -- rednet CHANNEL_REPEAT already relays; we also app-hop hello/where_main when
 -- a peer cannot hear main directly.
@@ -1012,19 +1162,27 @@ local function modemLoop()
         }, PROTO_ROUTER)
       end
 
-    elseif msg.type == "update" and id ~= os.getComputerID() then
+      elseif msg.type == "update" and id ~= os.getComputerID() then
       print("")
-      print(("[OTA] Update from router #%s — downloading, then reboot..."):format(tostring(id)))
+      print(("[OTA] AoE update from #%s (v%s) — downloading..."):format(
+        tostring(id), tostring(msg.targetVersion or "?")))
       if titanLib and titanLib.updateSelf then
+        local prev = titanLib.systemVersion and titanLib.systemVersion() or nil
         local ok, err = titanLib.updateSelf()
         if ok then
-          print("[OTA] Updated. Rebooting..."); sleep(2); os.reboot()
+          if titanLib.markPendingUpdateAck then
+            titanLib.markPendingUpdateAck(prev, msg.targetVersion)
+          end
+          print("[OTA] Updated. Rebooting (will ACK main)..."); sleep(2); os.reboot()
         else
-          print("[OTA] Failed: " .. tostring(err) .. " — rebooting anyway...")
-          sleep(2); os.reboot()
+          print("[OTA] Failed: " .. tostring(err))
+          rednet.send(id, {
+            type = "update_fail", version = prev, err = tostring(err),
+            name = os.getComputerLabel(), hostname = os.getComputerLabel(),
+          }, PROTO_ROUTER)
         end
       else
-        print("[OTA] No install source — rebooting..."); sleep(1); os.reboot()
+        print("[OTA] No titan updateSelf — rebooting..."); sleep(1); os.reboot()
       end
     end
   end
@@ -1260,6 +1418,7 @@ local function consoleLoop()
       print("gpshost [x y z] - show / set this router's GPS host coords")
       if isMain() then
         print("map      - zoomed-out fleet map (r=main, m=modem)")
+        print("versions - local vs GitHub package versions")
         print("devices  - list remembered systems (ONLINE / OFFLINE)")
         print("forget <id|host> - remove a system from the remembered roster")
         print("names    - modem name pool + assignments")
@@ -1268,8 +1427,9 @@ local function consoleLoop()
         print("screens  - list monitors + roster/stats/gps assignments")
         print("screen <roster|stats|gps> <name|side|auto>  assign a board")
         print("ping     - re-discover the network")
-        print("update   - OTA: fleet re-download, reboot, re-auth to main")
+        print("update [aoe|status] - fleet OTA from GitHub; track reboot ACKs")
         print("reauth   - tell the fleet to re-auth now (no download)")
+        print("github [url] - show / set GitHub raw base for versions")
       end
       print("ssh <id|label> [cmd] - remote shell; jumps via modems (reboot ok)")
       print("exit")
@@ -1551,18 +1711,128 @@ local function consoleLoop()
       else
         print("Not hosting GPS. Usage: gpshost <x> <y> <z>")
       end
+    elseif cmd == "versions" or cmd == "ver" then
+      if not isMain() then print("versions is MAIN-only."); else
+        print("Checking GitHub...")
+        local remote, err = fetchGithubVersions()
+        local localVer = localSystemVersion()
+        print(("Local system:  %s"):format(tostring(localVer or "?")))
+        if not remote then
+          print("GitHub:        (failed) " .. tostring(err))
+          print("Base: " .. githubBase())
+        else
+          print(("GitHub system: %s"):format(tostring(remote.system or "?")))
+          print("Base: " .. ghState.base)
+          local cmp = versionCmp(localVer, remote.system)
+          if cmp < 0 then print("Status: GitHub is NEWER — run `update aoe`")
+          elseif cmp > 0 then print("Status: local is ahead of GitHub")
+          else print("Status: up to date with GitHub") end
+          if type(remote.packages) == "table" then
+            local localCat = nil
+            if fs.exists("versions.lua") then
+              local ok, c = pcall(dofile, "versions.lua")
+              if ok then localCat = c end
+            end
+            local diffs = 0
+            for path, ver in pairs(remote.packages) do
+              local lv = localCat and localCat.packages and localCat.packages[path]
+              if tostring(lv or "") ~= tostring(ver) then
+                if diffs == 0 then print("Package diffs (local -> github):") end
+                diffs = diffs + 1
+                print(("  %-22s %s -> %s"):format(path, tostring(lv or "—"), tostring(ver)))
+              end
+            end
+            if diffs == 0 then print("All listed packages match GitHub.") end
+          end
+        end
+        -- Fleet versions from roster
+        print("Fleet (online):")
+        local any = false
+        for _, id in ipairs(sortedIds()) do
+          local d = seen[id]
+          if isOnline(d) then
+            any = true
+            print(("  #%-3d %-16s v%s"):format(
+              id, tostring(d.hostname or "?"):sub(1, 16), tostring(d.version or "?")))
+          end
+        end
+        if not any then print("  (none online yet)") end
+      end
+    elseif cmd == "github" then
+      if not isMain() then print("github is MAIN-only."); else
+        if a[2] then
+          local url = table.concat(a, " ", 2)
+          if not url:find("/$") then url = url .. "/" end
+          patchRouterCfg({ githubBase = url })
+          print("GitHub base saved: " .. url)
+        else
+          print("GitHub base: " .. githubBase())
+          print("Usage: github <raw-base-url/>")
+        end
+      end
     elseif cmd == "update" then
       if not isMain() then
         print("OTA update is MAIN-only. Run `main` on this machine, or use the main router.")
       else
-        write("Push OTA update? Fleet will download, reboot, and re-auth to this main. [y/N] ")
-        if read():lower() ~= "y" then print("Cancelled."); else
-          local rname = os.getComputerLabel() or ("Router-" .. os.getComputerID())
-          rednet.broadcast({
-            type = "update", from = os.getComputerID(), name = rname,
-            mainRouterId = os.getComputerID(), hostname = rname,
-          }, PROTO_ROUTER)
-          print("Update broadcast sent. Devices will re-download, reboot, and re-auth.")
+        local sub = (a[2] or "aoe"):lower()
+        if sub == "status" then
+          local exp, ack, camp = campaignStatus()
+          if not camp then
+            print("No active update campaign. Run `update aoe`.")
+          else
+            print(("Campaign target v%s  acked %d / %d"):format(
+              tostring(camp.version), ack, exp))
+            for id, name in pairs(camp.expected) do
+              local ainfo = camp.acked[id]
+              if ainfo then
+                print(("  OK  #%-3d %-16s v%s"):format(id, tostring(name):sub(1, 16), tostring(ainfo.version)))
+              else
+                local d = seen[id]
+                print(("  ... #%-3d %-16s have v%s"):format(
+                  id, tostring(name):sub(1, 16), tostring(d and d.version or "?")))
+              end
+            end
+          end
+        else
+          -- update / update aoe — check GitHub then broadcast fleet OTA
+          print("Checking GitHub versions...")
+          local remote, err = fetchGithubVersions()
+          local target = remote and remote.system or localSystemVersion()
+          if not remote then
+            print("GitHub check failed: " .. tostring(err))
+            print("Will still broadcast OTA using local packages / device install sources.")
+            target = localSystemVersion() or "unknown"
+          else
+            print(("GitHub Titan v%s  (local %s)"):format(
+              tostring(remote.system), tostring(localSystemVersion() or "?")))
+          end
+          write(("Push AoE OTA to fleet (target v%s)? Devices download, reboot, ACK. [y/N] "):format(
+            tostring(target)))
+          if read():lower() ~= "y" then print("Cancelled."); else
+            local expected = startUpdateCampaign(target)
+            local nExp = 0
+            for _ in pairs(expected) do nExp = nExp + 1 end
+            local rname = os.getComputerLabel() or ("Router-" .. os.getComputerID())
+            rednet.broadcast({
+              type = "update", from = os.getComputerID(), name = rname,
+              mainRouterId = os.getComputerID(), hostname = rname,
+              targetVersion = target, aoe = true,
+              githubBase = githubBase(),
+            }, PROTO_ROUTER)
+            print(("AoE update broadcast sent (v%s). Expecting up to %d ACK(s)."):format(
+              tostring(target), nExp))
+            print("Devices will reply `updated` after reboot. Watch with `update status`.")
+            -- Update this main router too (no reboot — stay up to collect ACKs).
+            if titanLib and titanLib.updateSelf then
+              print("Updating main router packages (no reboot)...")
+              local uok, uerr = titanLib.updateSelf()
+              if uok then
+                print("Main router packages refreshed to v" .. tostring(localSystemVersion() or target))
+              else
+                print("Main self-update failed: " .. tostring(uerr))
+              end
+            end
+          end
         end
       end
     elseif cmd == "reauth" then
@@ -1651,6 +1921,7 @@ if isMain() then
   tasks[#tasks + 1] = pingLoop
   tasks[#tasks + 1] = rosterSaveLoop
   tasks[#tasks + 1] = drawLoop
+  tasks[#tasks + 1] = githubWatchLoop
 else
   tasks[#tasks + 1] = modemLoop
 end
@@ -1658,6 +1929,15 @@ if gpsCoords then tasks[#tasks + 1] = gpsHostLoop end
 if titanLib then
   tasks[#tasks + 1] = function()
     titanLib.sshHostLoop(isMain() and "router" or "modem")
+  end
+  if not isMain() then
+    -- Modem also reports OTA ACK after reboot (same as networkLoop devices).
+    tasks[#tasks + 1] = function()
+      sleep(2)
+      titanLib.reportUpdatedIfPending("modem")
+      -- Keep announcing version via modemLoop hello; nothing else here.
+      while true do sleep(3600) end
+    end
   end
 end
 
