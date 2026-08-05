@@ -16,6 +16,11 @@
        device can `net`-register/confirm it's connected (see console.lua's `net`
        command). With a monitor attached it shows the roster + relay stats.
 
+    3. GPS HOST - routers double as GPS hosts. On first run it asks for this
+       router's coordinates (or auto-detects if a constellation already exists)
+       and then answers gps.locate PINGs. Place 4+ routers, spread out, and they
+       ARE your GPS constellation as well as the network backbone.
+
   Requirements: a computer with at least one WIRELESS modem (ENDER modems give
   unlimited range and are strongly recommended for a backbone router). Optional
   monitor for the dashboard. Self-contained - no lib needed.
@@ -51,6 +56,18 @@ if monitor then monitor.setTextScale(0.5) end
 local seen    = {}   -- [id] = { name, kind, seen }
 local relayed = {}   -- [nMessageID] = timerId  (de-dup with 30s expiry)
 local stats   = { relayed = 0 }
+
+-- Router config (persists this router's GPS host coordinates so it re-hosts on boot).
+local RCFG      = "router.cfg"
+local gpsCoords = nil
+local function loadRouterCfg()
+  if not fs.exists(RCFG) then return nil end
+  local f = fs.open(RCFG, "r"); local d = textutils.unserialize(f.readAll()); f.close()
+  return type(d) == "table" and d or nil
+end
+local function saveRouterCfg(c)
+  local f = fs.open(RCFG, "w"); f.write(textutils.serialize(c)); f.close()
+end
 
 local function now() return os.epoch("utc") end
 local function ago(ts) return math.floor((now() - (ts or 0)) / 1000) end
@@ -143,7 +160,8 @@ local function draw()
     out.setCursorPos(1, y); out.setTextColor(c or colors.white); out.write(tostring(txt):sub(1, w))
   end
   line(1, ("== TITAN ROUTER #%d ==  modems:%d"):format(os.getComputerID(), #modems), colors.yellow)
-  line(2, ("relayed:%d msgs   online:%d"):format(stats.relayed, deviceCount()), colors.lime)
+  line(2, ("relayed:%d  online:%d%s"):format(stats.relayed, deviceCount(),
+    gpsCoords and ("  GPS " .. gpsCoords.x .. "," .. gpsCoords.y .. "," .. gpsCoords.z) or ""), colors.lime)
   line(3, "ID   KIND     NAME            AGE", colors.lightGray)
   local y = 4
   for id, d in pairs(seen) do
@@ -169,6 +187,19 @@ local function pingLoop()
   end
 end
 
+-- Routers double as GPS hosts: answer gps.locate PINGs with our coordinates.
+-- (Faithful to the built-in `gps host` protocol.) Only run when gpsCoords is set.
+local function gpsHostLoop()
+  for _, side in ipairs(modems) do peripheral.call(side, "open", gps.CHANNEL_GPS) end
+  while true do
+    local _, side, ch, reply, message = os.pullEvent("modem_message")
+    if ch == gps.CHANNEL_GPS and message == "PING" and reply then
+      peripheral.call(side, "transmit", reply, gps.CHANNEL_GPS,
+        { gpsCoords.x, gpsCoords.y, gpsCoords.z })
+    end
+  end
+end
+
 --------------------------------------------------------------------------------
 -- Console
 --------------------------------------------------------------------------------
@@ -187,6 +218,8 @@ local function consoleLoop()
       print("devices  - list everyone the router has heard")
       print("ping     - re-discover the network")
       print("stats    - relay + device counts")
+      print("gpshost [x y z] - show / set this router's GPS host coords")
+      print("update   - OTA: tell every device to re-download its files & reboot")
       print("exit")
     elseif cmd == "devices" or cmd == "list" then
       local n = 0
@@ -204,6 +237,25 @@ local function consoleLoop()
     elseif cmd == "stats" then
       print(("Relayed %d messages. %d devices online. %d modem(s)."):format(
         stats.relayed, deviceCount(), #modems))
+    elseif cmd == "gpshost" then
+      if a[2] and a[3] and a[4] then
+        saveRouterCfg({ gps = { x = tonumber(a[2]), y = tonumber(a[3]), z = tonumber(a[4]) } })
+        print("Saved GPS coords. Rebooting to start hosting..."); sleep(1); os.reboot()
+      elseif gpsCoords then
+        print(("Hosting GPS at %d, %d, %d."):format(gpsCoords.x, gpsCoords.y, gpsCoords.z))
+      else
+        print("Not hosting GPS. Usage: gpshost <x> <y> <z>")
+      end
+    elseif cmd == "update" then
+      -- Broadcast OTA to every device running titan.registerLoop (they re-download
+      -- from their install source via .titan-install and reboot).
+      write("Push OTA update to the whole fleet? [y/N] ")
+      if read():lower() ~= "y" then print("Cancelled."); else
+        rednet.broadcast({
+          type = "update", from = os.getComputerID(), name = os.getComputerLabel(),
+        }, PROTO_ROUTER)
+        print("Update broadcast sent. Devices with .titan-install will re-download & reboot.")
+      end
     elseif cmd == "exit" or cmd == "quit" then
       return
     else
@@ -213,7 +265,36 @@ local function consoleLoop()
 end
 
 --------------------------------------------------------------------------------
+-- GPS hosting setup (routers double as GPS hosts). First run only; saved to cfg.
+--------------------------------------------------------------------------------
+local rcfg = loadRouterCfg()
+if rcfg and rcfg.gps then
+  gpsCoords = rcfg.gps
+elseif rcfg and rcfg.gpsHost == false then
+  -- previously opted out; leave GPS hosting off
+else
+  print("")
+  print("Routers double as GPS hosts (place 4+ spread out for a constellation).")
+  local x, y, z = gps.locate(2)
+  if x then
+    x, y, z = math.floor(x + 0.5), math.floor(y + 0.5), math.floor(z + 0.5)
+    print(("Auto-located: %d, %d, %d"):format(x, y, z))
+    gpsCoords = { x = x, y = y, z = z }
+  else
+    print("Enter this router's coordinates to host GPS (blank X = skip).")
+    write("X: "); local sx = read()
+    if sx ~= "" then
+      write("Y: "); local sy = read(); write("Z: "); local sz = read()
+      gpsCoords = { x = tonumber(sx) or 0, y = tonumber(sy) or 0, z = tonumber(sz) or 0 }
+    end
+  end
+  saveRouterCfg(gpsCoords and { gps = gpsCoords } or { gpsHost = false })
+  if gpsCoords then print(("Hosting GPS at %d, %d, %d."):format(gpsCoords.x, gpsCoords.y, gpsCoords.z)) end
+end
+
+--------------------------------------------------------------------------------
 local tasks = { repeaterLoop, directoryLoop, pingLoop, consoleLoop }
+if gpsCoords then tasks[#tasks + 1] = gpsHostLoop end
 if monitor then tasks[#tasks + 1] = drawLoop end
 parallel.waitForAny(table.unpack(tasks))
 if monitor then monitor.clear() end

@@ -41,14 +41,18 @@ local ROLES = {
     files = { "gpshost.lua" } },
   { key = "10", name = "GPS locator (pocket)",              run = "locator.lua",
     files = { "lib/titan.lua", "locator.lua" } },
-  { key = "11", name = "Network router (repeater)",         run = "router.lua",
+  { key = "11", name = "Network router (repeater + GPS)",    run = "router.lua",
     files = { "router.lua" } },
-  { key = "12", name = "Install host (share files to others)", run = "host.lua",
+  { key = "12", name = "Miner (area quarry turtle)",         run = "miner.lua",
+    files = { "lib/titan.lua", "miner.lua", "exclude.txt" } },
+  { key = "13", name = "Install host (share files to others)", run = "host.lua",
     files = { "lib/titan.lua", "hub.lua", "bot.lua", "poi.lua", "worker.lua", "botserver.lua",
-              "datacenter.lua", "console.lua", "admin.lua", "gpshost.lua", "locator.lua", "router.lua", "install.lua" } },
-  { key = "13", name = "Everything (all files, no auto-run)", run = nil,
+              "datacenter.lua", "console.lua", "admin.lua", "gpshost.lua", "locator.lua", "router.lua",
+              "miner.lua", "exclude.txt", "install.lua" } },
+  { key = "14", name = "Everything (all files, no auto-run)", run = nil,
     files = { "lib/titan.lua", "hub.lua", "bot.lua", "poi.lua", "worker.lua", "botserver.lua",
-              "datacenter.lua", "console.lua", "admin.lua", "gpshost.lua", "locator.lua", "router.lua", "install.lua" } },
+              "datacenter.lua", "console.lua", "admin.lua", "gpshost.lua", "locator.lua", "router.lua",
+              "miner.lua", "exclude.txt", "install.lua" } },
 }
 
 local function openModem()
@@ -151,13 +155,20 @@ end
 print("")
 print("Install complete.")
 
+-- Record how this device was installed so it can self-update later when the
+-- network router pushes an OTA update (see lib/titan.lua : titan.updateSelf).
+-- Source is "host": on update it re-discovers a running host.lua over rednet.
+writeFile(".titan-install", textutils.serialize({
+  source = "host", role = role.name, run = role.run, files = role.files,
+}))
+
 -- Give this device a role-based label if it doesn't have one yet.
 local LABELS = {
   ["hub.lua"] = "Hub", ["bot.lua"] = "Bot", ["poi.lua"] = "POI",
   ["datacenter.lua"] = "ParentCenter", ["botserver.lua"] = "BotsComputer",
   ["worker.lua"] = "Worker", ["console.lua"] = "Console",
   ["admin.lua"] = "Admin", ["host.lua"] = "Host", ["gpshost.lua"] = "GPS",
-  ["locator.lua"] = "Locator", ["router.lua"] = "Router",
+  ["locator.lua"] = "Locator", ["router.lua"] = "Router", ["miner.lua"] = "Miner",
 }
 local lbl = role.run and LABELS[role.run]
 if lbl and not os.getComputerLabel() then

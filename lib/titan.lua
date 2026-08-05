@@ -153,11 +153,126 @@ function titan.announce(kind)
   rednet.broadcast({ type = "hello", kind = kind, name = os.getComputerLabel() }, titan.ROUTER_PROTOCOL)
 end
 
+-- Announce periodically AND listen for an OTA "update" command from a router.
+-- Runs as one of a program's parallel tasks. When the network router broadcasts
+-- an update (router's `update` console command), this re-downloads the device's
+-- files from wherever it was installed and reboots. See titan.updateSelf below.
 function titan.registerLoop(kind, period)
+  period = period or 20
+  local nextAnnounce = 0
   while true do
-    titan.announce(kind)
-    os.sleep(period or 20)
+    if os.clock() >= nextAnnounce then
+      titan.announce(kind)
+      nextAnnounce = os.clock() + period
+    end
+    local id, msg = rednet.receive(titan.ROUTER_PROTOCOL, math.max(0.2, nextAnnounce - os.clock()))
+    if type(msg) == "table" and msg.type == "update" then
+      print("")
+      print(("[OTA] Update requested by #%s. Re-downloading files..."):format(tostring(id)))
+      local ok, err = titan.updateSelf()
+      if ok then
+        print("[OTA] Updated. Rebooting in 2s..."); os.sleep(2); os.reboot()
+      else
+        print("[OTA] Update failed: " .. tostring(err))
+      end
+    end
   end
+end
+
+--------------------------------------------------------------------------------
+-- OTA self-update
+--
+-- Each installer records HOW this device was installed in `.titan-install`
+-- (source + file list + where to fetch from). The network router can then push
+-- an "update" to the whole fleet; every device re-downloads its own files from
+-- the same source it came from and reboots. No per-device config needed.
+--------------------------------------------------------------------------------
+titan.MANIFEST = ".titan-install"
+
+function titan.readManifest()
+  if not fs.exists(titan.MANIFEST) then return nil end
+  local f = fs.open(titan.MANIFEST, "r"); local d = textutils.unserialize(f.readAll()); f.close()
+  return type(d) == "table" and d or nil
+end
+
+function titan.writeManifest(m)
+  local f = fs.open(titan.MANIFEST, "w"); f.write(textutils.serialize(m)); f.close()
+end
+
+local function otaWriteFile(path, data)
+  local dir = fs.getDir(path)
+  if dir and dir ~= "" and not fs.exists(dir) then fs.makeDir(dir) end
+  local f = fs.open(path, "w"); f.write(data); f.close()
+end
+
+local function otaHttp(url)
+  if not http then return nil, "http disabled" end
+  local h = http.get(url)
+  if not h then return nil, "request failed" end
+  local code = h.getResponseCode and h.getResponseCode() or 200
+  local data = h.readAll(); h.close()
+  if code ~= 200 then return nil, "HTTP " .. tostring(code) end
+  if not data or data == "" then return nil, "empty" end
+  return data
+end
+
+local function otaFindHost(timeout)
+  rednet.broadcast({ type = "discover" }, "titan_install")
+  local deadline = os.clock() + (timeout or 3)
+  while os.clock() < deadline do
+    local id, msg = rednet.receive("titan_install", deadline - os.clock())
+    if id == nil then break end
+    if type(msg) == "table" and msg.type == "host_here" then return id end
+  end
+  return nil
+end
+
+local function otaFromHost(hostId, path)
+  rednet.send(hostId, { type = "get", path = path }, "titan_install")
+  local deadline = os.clock() + 6
+  while os.clock() < deadline do
+    local id, msg = rednet.receive("titan_install", deadline - os.clock())
+    if id == hostId and type(msg) == "table" and msg.type == "file" and msg.path == path then
+      if msg.ok and msg.data then return msg.data end
+      return nil, "missing on host"
+    end
+  end
+  return nil, "timeout"
+end
+
+-- Re-download this device's files from its install source. Returns ok, err.
+function titan.updateSelf()
+  local m = titan.readManifest()
+  if not m or type(m.files) ~= "table" then
+    return false, "no install manifest (.titan-install) on this device"
+  end
+
+  local getter
+  if m.source == "github" then
+    if not m.base then return false, "manifest missing base url" end
+    getter = function(path) return otaHttp(m.base .. path .. "?cb=" .. os.epoch("utc")) end
+  elseif m.source == "pastebin" then
+    getter = function(path)
+      local code = m.codes and m.codes[path]
+      if not code then return nil, "no pastebin code" end
+      return otaHttp("https://pastebin.com/raw/" .. code .. "?cb=" .. os.epoch("utc"))
+    end
+  elseif m.source == "host" then
+    local hostId = otaFindHost(3)
+    if not hostId then return false, "no install host online" end
+    getter = function(path) return otaFromHost(hostId, path) end
+  else
+    return false, "unknown install source: " .. tostring(m.source)
+  end
+
+  local failed = {}
+  for _, path in ipairs(m.files) do
+    local data, err = getter(path)
+    if data then otaWriteFile(path, data)
+    else failed[#failed + 1] = path .. " (" .. tostring(err) .. ")" end
+  end
+  if #failed > 0 then return false, "failed: " .. table.concat(failed, ", ") end
+  return true
 end
 
 --------------------------------------------------------------------------------

@@ -5,6 +5,7 @@ A wireless dispatch system for Minecraft's **CC: Tweaked** mod:
 - **`hub.lua`** — control computer with a monitor that shows live bot status + a command console.
 - **`bot.lua`** — a turtle that reports status, navigates by GPS, and executes tasks.
 - **`poi.lua`** — a "point of interest" computer that marks a location by coordinates and can summon a bot.
+- **`miner.lua`** — quarry turtle: digs between two corners down to a floor Y, skipping `exclude.txt`.
 - **`lib/titan.lua`** — shared library (protocol, messaging, navigation). Copy this onto **every** device.
 
 ```
@@ -97,12 +98,13 @@ The `.lua` files also install by hand:
 
 Each device needs:
 
-| Device            | Files                          |
-|-------------------|--------------------------------|
-| Install host      | all files + `host.lua`         |
-| Hub computer      | `hub.lua`, `lib/titan.lua`     |
-| Each turtle (bot) | `bot.lua`, `lib/titan.lua`     |
-| Each POI computer | `poi.lua`, `lib/titan.lua`     |
+| Device            | Files                                      |
+|-------------------|--------------------------------------------|
+| Install host      | all files + `host.lua`                     |
+| Hub computer      | `hub.lua`, `lib/titan.lua`                 |
+| Each turtle (bot) | `bot.lua`, `lib/titan.lua`                 |
+| Miner turtle      | `miner.lua`, `lib/titan.lua`, `exclude.txt` |
+| Each POI computer | `poi.lua`, `lib/titan.lua`                 |
 
 (The **Install host** runs `host.lua` and serves everything else over rednet;
 see §3. Fresh devices only need `install.lua` to pull their files.)
@@ -359,6 +361,39 @@ Notes:
 
 ---
 
+# Miner (`miner.lua`)
+
+Quarry turtle. Marks two opposite corners of an area, a floor Y, and digs the
+box layer-by-layer. Blocks listed in `exclude.txt` (plus the built-in
+restricted list: bedrock, chests, computers, etc.) are **never broken**.
+
+Install via the installer → **"Miner"** (needs GPS + fuel + wireless modem).
+
+### Setup
+
+```
+set1              stand at corner 1 → mark GPS
+set2              stand at corner 2 → mark GPS
+sety <y>          floor Y to dig down to (e.g. sety -59)
+deposit           stand ABOVE a chest → dump inventory here when full
+home              optional return point
+exclude           reload & list exclude.txt
+mine              start
+stop              abort
+status            show config / progress
+```
+
+### `exclude.txt`
+
+One block/item id per line (`minecraft:obsidian`, etc.). `#` starts a comment.
+A starter file ships with the install; edit it on the turtle with `edit exclude.txt`.
+
+The mined volume is the XZ rectangle between loc1 and loc2, from the higher of
+the two corner Y values down to `floorY`. When the inventory fills it returns to
+`deposit`, drops everything down into the chest, then continues.
+
+---
+
 ## Notes & limitations
 
 - Navigation digs through obstacles by default and moves axis-by-axis (up → X → Z → down). It's simple, not a full pathfinder; keep routes reasonably clear or pre-tunnel long corridors.
@@ -469,7 +504,7 @@ walking, it infers your facing from movement and adds a relative cue
 # Network router (`router.lua`)
 
 Ties the whole network together over wireless. Run one (or several) on a
-computer with a wireless (ideally **ender**) modem. It does two things:
+computer with a wireless (ideally **ender**) modem. It does three things:
 
 - **Repeater:** re-transmits rednet traffic — **both broadcasts and directed
   messages** (bot commands, worker deploys, auth checks) — so devices out of
@@ -479,15 +514,28 @@ computer with a wireless (ideally **ender**) modem. It does two things:
 - **Directory:** listens to every Titan protocol and keeps a live registry of
   who's online (bots, workers, hubs, POIs, data center, tablets). With a monitor
   attached it shows the roster + relay stats.
+- **GPS host:** routers double as GPS hosts. On first run each router asks for
+  its coordinates (or auto-detects if a constellation already exists) and then
+  answers `gps.locate` requests. Place **4+ routers, spread out**, and they *are*
+  your GPS constellation as well as the network backbone — no separate GPS
+  computers needed. Coords are saved to `router.cfg`; re-set them any time with
+  the `gpshost <x> <y> <z>` console command.
 
 Install it via the installer → **"Network router"** (option **11**;
-self-contained, no lib). Console: `devices`, `ping`, `stats`, `exit`.
+self-contained, no lib). Console: `devices`, `ping`, `stats`, `gpshost`,
+`update`, `exit`.
+
+**OTA update:** from the main router console, run `update` (confirms first).
+Every device that was installed via an installer (and has a `.titan-install`
+manifest) re-downloads its files from the same source (GitHub / pastebin /
+install host) and reboots. Keep `host.lua` running if the fleet was installed
+that way.
 
 **Auto-registration:** every networked program (bot, worker, hub, POI, Bots
-Computer, data center, admin tablet, locator) announces itself to the router on
-startup and re-announces every ~20s, so they appear in the router's directory
-automatically — no manual step. The router also periodically pings the network,
-so devices register no matter which booted first.
+Computer, data center, admin tablet, locator, miner) announces itself to the
+router on startup and re-announces every ~20s, so they appear in the router's
+directory automatically — no manual step. The router also periodically pings
+the network, so devices register no matter which booted first.
 
 **Manual check from any device:** the terminal console (`console.lua`) has a
 `net` command — it pings the router and reports `Connected via Router #<id>

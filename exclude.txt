@@ -1,0 +1,20 @@
+# Miner exclude list — one block/item id per line.
+# The miner will NOT break these (or anything on titan.RESTRICTED).
+# Lines starting with # are comments. Blank lines are ignored.
+#
+# Examples:
+# minecraft:chest
+# minecraft:barrel
+# minecraft:spawner
+# minecraft:obsidian
+# create:mechanical_drill
+
+minecraft:bedrock
+minecraft:chest
+minecraft:trapped_chest
+minecraft:barrel
+minecraft:hopper
+minecraft:spawner
+minecraft:end_portal_frame
+minecraft:end_portal
+minecraft:obsidian
