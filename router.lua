@@ -1,27 +1,29 @@
 --[[
   router.lua  -  Titan network router / repeater (CC: Tweaked)
-  Titan-Version: 1.2.1
+  Titan-Version: 1.2.2
 
   Place one (or several) of these to tie the whole network together over
-  wireless. Roles:
+  wireless and/or wired modems. Roles:
 
     MAIN  - directory, OTA update, re-auth authority, GPS host, repeater.
             Tracks GitHub versions.lua; `update aoe` pushes fleet OTA and
             collects `updated` ACKs after devices reboot.
             Attach up to 3+ monitors for ROSTER / STATS / GPS boards.
+            Devices on the same wired cable as MAIN show as WIRED on roster.
     MODEM - repeater (+ optional GPS host) only. Use for coverage; not the
             network authority. Main assigns each a unique name from a pool;
             the modem sets it and reboots once. Set with `modem` / `main`.
 
     1. REPEATER - re-transmits rednet traffic (same idea as `repeat`) so devices
        out of direct range still reach each other. Both roles do this.
+       Relays across wireless <-> wired so mixed networks stay linked.
 
     2. DIRECTORY (main only) - registry of seen systems; multi-monitor boards
        (roster / stats / gps); answers hello / where_main for fleet re-auth.
 
     3. GPS HOST - routers can host GPS. Place 4+ spread out for a constellation.
 
-  Requirements: wireless modem (ender recommended). Optional monitors (main).
+  Requirements: modem (wireless and/or wired). Optional monitors (main).
 
   Run:  router
 ]]
@@ -29,20 +31,40 @@
 local PROTO_ROUTER = "titan_router"           -- discovery / register handshake
 local REPEAT       = rednet.CHANNEL_REPEAT     -- 65533
 local BROADCAST    = rednet.CHANNEL_BROADCAST  -- 65535
+local WIRED_CH     = 65012                    -- main <-> peer wired-link probe
+local WIRED_FRESH  = 45                       -- seconds a wired pong stays valid
 local titanLib     = nil                       -- optional lib/titan.lua (SSH)
 
 --------------------------------------------------------------------------------
 -- Modems: open normal rednet (id + broadcast) AND the repeat channel.
+-- Wired and wireless are both supported; the repeater bridges between them.
 --------------------------------------------------------------------------------
-local modems = {}
+local modems, wiredModems, wirelessModems = {}, {}, {}
+local wiredDirect = {}   -- [id] = os.clock() when last wired_pong heard on MAIN
+
+local function isWiredSide(side)
+  if not side or not peripheral.isPresent(side) then return false end
+  if peripheral.getType(side) ~= "modem" then return false end
+  local ok, wireless = pcall(peripheral.call, side, "isWireless")
+  return ok and wireless == false
+end
+
 for _, side in ipairs(peripheral.getNames()) do
   if peripheral.getType(side) == "modem" then
     modems[#modems + 1] = side
     if not rednet.isOpen(side) then rednet.open(side) end   -- so we can hear the roster
     peripheral.call(side, "open", REPEAT)                    -- so we can relay
+    if isWiredSide(side) then
+      wiredModems[#wiredModems + 1] = side
+      peripheral.call(side, "open", WIRED_CH)
+    else
+      wirelessModems[#wirelessModems + 1] = side
+    end
   end
 end
-if #modems == 0 then error("No modem attached. Put a (wireless) modem on this computer.", 0) end
+if #modems == 0 then
+  error("No modem attached. Put a wireless or wired modem on this computer.", 0)
+end
 
 os.setComputerLabel(os.getComputerLabel() or ("Router-" .. os.getComputerID()))
 
@@ -361,12 +383,21 @@ local function isOnline(d)
   return d and d.seen and d.seen > 0 and ago(d.seen) < ONLINE_SECS
 end
 
--- ONLINE = green, OFFLINE = red, UNKNOWN = yellow (remembered, never heard live).
-local function statusOf(d)
+local function isWiredFresh(id)
+  local t = wiredDirect[id]
+  return type(t) == "number" and (os.clock() - t) < WIRED_FRESH
+end
+
+-- ONLINE = green, WIRED = cyan (online + on MAIN's cable), OFFLINE = red,
+-- UNKNOWN = yellow (remembered, never heard live).
+local function statusOf(d, id)
   if not d or not d.seen or d.seen <= 0 then
     return "UNKNOWN", colors.yellow
   end
   if ago(d.seen) < ONLINE_SECS then
+    if d.wired or (id and isWiredFresh(id)) then
+      return "WIRED", colors.cyan
+    end
     return "ONLINE", colors.lime
   end
   return "OFFLINE", colors.red
@@ -374,13 +405,21 @@ end
 
 local function countOnlineOffline()
   local on, off, unk = 0, 0, 0
-  for _, d in pairs(seen) do
-    local st = statusOf(d)
-    if st == "ONLINE" then on = on + 1
+  for id, d in pairs(seen) do
+    local st = statusOf(d, id)
+    if st == "ONLINE" or st == "WIRED" then on = on + 1
     elseif st == "UNKNOWN" then unk = unk + 1
     else off = off + 1 end
   end
   return on, off, unk
+end
+
+local function countWiredOnline()
+  local n = 0
+  for id, d in pairs(seen) do
+    if statusOf(d, id) == "WIRED" then n = n + 1 end
+  end
+  return n
 end
 
 local function deviceCount()
@@ -388,9 +427,9 @@ local function deviceCount()
   return on
 end
 
-local function statusRank(d)
-  local st = statusOf(d)
-  if st == "ONLINE" then return 0 end
+local function statusRank(d, id)
+  local st = statusOf(d, id)
+  if st == "ONLINE" or st == "WIRED" then return 0 end
   if st == "UNKNOWN" then return 1 end
   return 2
 end
@@ -407,6 +446,7 @@ local function saveRoster()
       kind = d.kind,
       seen = d.seen or 0,
       x = d.x, y = d.y, z = d.z,
+      wired = d.wired and true or nil,
     }
   end
   local f = fs.open(ROSTER, "w"); f.write(textutils.serialize(list)); f.close()
@@ -428,6 +468,7 @@ local function loadRoster()
         kind = e.kind or "device",
         seen = tonumber(e.seen) or 0,
         x = tonumber(e.x), y = tonumber(e.y), z = tonumber(e.z),
+        wired = e.wired and true or nil,
       }
       n = n + 1
     end
@@ -451,7 +492,7 @@ local function sortedIds()
   for id in pairs(seen) do ids[#ids + 1] = id end
   table.sort(ids, function(a, b)
     local da, db = seen[a], seen[b]
-    local ra, rb = statusRank(da), statusRank(db)
+    local ra, rb = statusRank(da, a), statusRank(db, b)
     if ra ~= rb then return ra < rb end
     local na = tostring(da.hostname or da.name or "")
     local nb = tostring(db.hostname or db.name or "")
@@ -459,6 +500,36 @@ local function sortedIds()
     return a < b
   end)
   return ids
+end
+
+local function noteWiredDirect(id)
+  id = tonumber(id)
+  if not id or id == os.getComputerID() then return end
+  wiredDirect[id] = os.clock()
+  local d = seen[id]
+  if d and not d.wired then
+    d.wired = true
+    rosterDirty = true
+  elseif d then
+    d.wired = true
+  end
+end
+
+local function refreshWiredFlags()
+  for id, d in pairs(seen) do
+    local fresh = isWiredFresh(id)
+    if d.wired and not fresh and not isOnline(d) then
+      d.wired = nil
+      rosterDirty = true
+    elseif fresh and not d.wired then
+      d.wired = true
+      rosterDirty = true
+    elseif not fresh and d.wired and isOnline(d) then
+      -- Pong went stale while still online over RF — clear wired mark.
+      d.wired = nil
+      rosterDirty = true
+    end
+  end
 end
 
 -- Guess a device's role from the message it sent.
@@ -476,6 +547,7 @@ end
 
 --------------------------------------------------------------------------------
 -- 1) Repeater  (faithful to the built-in `repeat` program)
+-- Bridges wireless <-> wired by re-transmitting on every open modem.
 --------------------------------------------------------------------------------
 local function repeaterLoop()
   while true do
@@ -498,6 +570,55 @@ local function repeaterLoop()
     elseif event == "timer" then
       for mid, timer in pairs(relayed) do
         if timer == p1 then relayed[mid] = nil; break end
+      end
+    end
+  end
+end
+
+--------------------------------------------------------------------------------
+-- Wired-link probe (MAIN): only peers on the same networking-cable segment
+-- answer. Their roster status becomes WIRED (not merely ONLINE over RF).
+--------------------------------------------------------------------------------
+local function wiredLinkLoop()
+  if #wiredModems == 0 then
+    while true do sleep(3600) end
+  end
+  local nextProbe = 0
+  while true do
+    if isMain() and os.clock() >= nextProbe then
+      local probe = {
+        type = "wired_probe",
+        mainId = os.getComputerID(),
+        t = os.epoch("utc"),
+      }
+      for _, side in ipairs(wiredModems) do
+        pcall(peripheral.call, side, "transmit", WIRED_CH, WIRED_CH, probe)
+      end
+      nextProbe = os.clock() + 8
+      refreshWiredFlags()
+    end
+    local timeout = isMain() and math.max(0.2, nextProbe - os.clock()) or 5
+    local timer = os.startTimer(timeout)
+    while true do
+      local ev, p1, p2, p3, p4 = os.pullEvent()
+      if ev == "timer" and p1 == timer then break end
+      if ev == "modem_message" and p2 == WIRED_CH and type(p4) == "table" then
+        local side, msg = p1, p4
+        if isWiredSide(side) then
+          if msg.type == "wired_probe" and not isMain() then
+            local pong = {
+              type = "wired_pong",
+              id = os.getComputerID(),
+              name = os.getComputerLabel(),
+              kind = "modem",
+            }
+            for _, s in ipairs(wiredModems) do
+              pcall(peripheral.call, s, "transmit", WIRED_CH, WIRED_CH, pong)
+            end
+          elseif msg.type == "wired_pong" and isMain() then
+            noteWiredDirect(msg.id)
+          end
+        end
       end
     end
   end
@@ -544,6 +665,8 @@ local function rosterTouch(id, msg, kind, doAssign)
     kind = kind or (prev and prev.kind) or "device",
     seen = now(), x = px, y = py, z = pz,
     version = msg.version or (prev and prev.version),
+    -- Only MAIN's wired probe/pong marks a direct cable link (not RF relays).
+    wired = isWiredFresh(id) or nil,
   }
   rosterDirty = true
   if not prev then
@@ -791,7 +914,7 @@ local function drawRoster(out, y0, y1)
     if y > y1 then break end
     local d = seen[id]
     local host = d.hostname or d.name or "?"
-    local status, statusColor = statusOf(d)
+    local status, statusColor = statusOf(d, id)
     local age = d.seen and d.seen > 0 and (ago(d.seen) .. "s") or "-"
     -- ID + STATUS (colored) + KIND + HOSTNAME
     out.setCursorPos(1, y)
@@ -799,7 +922,7 @@ local function drawRoster(out, y0, y1)
     out.write(("%-4d "):format(id))
     out.setTextColor(statusColor)
     out.write(("%-8s "):format(status))
-    out.setTextColor(statusColor)
+    out.setTextColor(status == "WIRED" and colors.cyan or colors.white)
     local rest = ("%-8s %s"):format((d.kind or "?"):sub(1, 8), host)
     local used = 4 + 1 + 8 + 1
     local room = w - used - 6
@@ -831,9 +954,10 @@ local function drawStats(out, y0, y1)
     { ("Router #%d  [%s]"):format(os.getComputerID(), routerRole:upper()), colors.white },
     { ("Hostname: %s"):format(os.getComputerLabel() or "?"), colors.lightGray },
     { ("Uptime: %s"):format(uptimeStr()), colors.white },
-    { ("Modems: %d"):format(#modems), colors.white },
+    { ("Modems: %d  (rf:%d wire:%d)"):format(#modems, #wirelessModems, #wiredModems), colors.white },
     { ("Relayed: %d"):format(stats.relayed), colors.cyan },
     { ("Online: %d"):format(on), colors.lime },
+    { ("Wired: %d"):format(countWiredOnline()), colors.cyan },
     { ("Offline: %d"):format(off), colors.red },
     { ("Unknown: %d"):format(unk), colors.yellow },
     { ("Remembered: %d"):format(remembered), colors.white },
@@ -971,6 +1095,7 @@ local function drawLoop()
   loadScreenAssignments()
   loadDisplayMap()
   while true do
+    refreshWiredFlags()
     drawBoards()
     if rosterDirty then saveRoster() end
     sleep(1)
@@ -1251,6 +1376,7 @@ local function fleetMapNodes()
         kind = d.kind,
         x = d.x, y = d.y, z = d.z,
         main = false,
+        wired = d.wired or isWiredFresh(id) or nil,
       }
     end
   end
@@ -1327,9 +1453,9 @@ local function drawFleetMapOn(out, scale, opts)
 
   put(1, 1, ("FLEET MAP  origin %d,%d  %dm/cell"):format(ox, oz, scale), colors.yellow)
   if opts.interactive then
-    put(1, 2, "r=main  m=modem  N=up  +/- zoom  F fit  Q quit", colors.lightGray)
+    put(1, 2, "r=main  m=rf  w=wired  N=up  +/- zoom  F fit  Q quit", colors.lightGray)
   else
-    put(1, 2, "r=main  m=modem  N=up   (map true — monitors)", colors.lightGray)
+    put(1, 2, "r=main  m=rf  w=wired  N=up   (map true — monitors)", colors.lightGray)
   end
 
   local cx = left + math.floor(gw / 2)
@@ -1358,6 +1484,8 @@ local function drawFleetMapOn(out, scale, opts)
     local sx, sy = cellOf(n.x, n.z)
     if n.main or (n.kind == "router" and n.id == os.getComputerID()) then
       put(sx, sy, "r", colors.cyan)
+    elseif n.wired then
+      put(sx, sy, "w", colors.cyan)
     else
       put(sx, sy, "m", colors.lime)
     end
@@ -1367,7 +1495,7 @@ local function drawFleetMapOn(out, scale, opts)
   if y < 1 then y = th end
   local parts = {}
   for _, n in ipairs(nodes) do
-    local tag = (n.main or n.id == os.getComputerID()) and "r" or "m"
+    local tag = (n.main or n.id == os.getComputerID()) and "r" or (n.wired and "w" or "m")
     parts[#parts + 1] = ("%s:%s"):format(tag, tostring(n.name):sub(1, 10))
   end
   put(1, y, table.concat(parts, "  "):sub(1, tw), colors.white)
@@ -1456,8 +1584,8 @@ end
 -- Console
 --------------------------------------------------------------------------------
 local function consoleLoop()
-  print(("Titan router #%d [%s]. %d modem(s) repeating. Type 'help'."):format(
-    os.getComputerID(), routerRole:upper(), #modems))
+  print(("Titan router #%d [%s]. %d modem(s) (rf:%d wire:%d). Type 'help'."):format(
+    os.getComputerID(), routerRole:upper(), #modems, #wirelessModems, #wiredModems))
   while true do
     write(isMain() and "router> " or "modem> ")
     local a = {}
@@ -1727,10 +1855,12 @@ local function consoleLoop()
     elseif cmd == "stats" then
       if isMain() then
         local on, off = countOnlineOffline()
-        print(("[%s] Relayed %d. ONLINE:%d OFFLINE:%d. %d modem(s)."):format(
-          routerRole:upper(), stats.relayed, on, off, #modems))
+        print(("[%s] Relayed %d. ONLINE:%d WIRED:%d OFFLINE:%d. rf:%d wire:%d"):format(
+          routerRole:upper(), stats.relayed, on, countWiredOnline(), off,
+          #wirelessModems, #wiredModems))
       else
-        print(("[MODEM] Relayed %d messages. %d modem(s)."):format(stats.relayed, #modems))
+        print(("[MODEM] Relayed %d messages. rf:%d wire:%d"):format(
+          stats.relayed, #wirelessModems, #wiredModems))
       end
     elseif cmd == "screens" or cmd == "monitors" then
       if not isMain() then print("Screens are MAIN-only."); else
@@ -2001,7 +2131,7 @@ if fs.exists("lib/titan.lua") then
   titanLib = dofile("lib/titan.lua")
 end
 
-local tasks = { repeaterLoop, consoleLoop }
+local tasks = { repeaterLoop, consoleLoop, wiredLinkLoop }
 if isMain() then
   tasks[#tasks + 1] = directoryLoop
   tasks[#tasks + 1] = pingLoop

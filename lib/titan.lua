@@ -1,10 +1,10 @@
 --[[
   titan.lua  -  Shared library for the Titan bot network (CC: Tweaked)
-  Titan-Version: 1.2.0
+  Titan-Version: 1.2.2
 
   Provides:
     * Rednet protocol constants + message type enum
-    * Modem discovery / open helpers
+    * Modem discovery / open helpers (wireless + wired)
     * send / broadcast / recv wrappers with a consistent envelope
     * GPS-based turtle navigation (moveTo, goHome, heading calibration)
 
@@ -19,6 +19,8 @@ local titan = {}
 
 -- The rednet protocol name every device on the network shares.
 titan.PROTOCOL = "titan_net"
+-- Main-router wired-cable probe (must match router.lua WIRED_CH).
+titan.WIRED_CH = 65012
 
 -- Message types. All network traffic is a table with a `type` field.
 titan.MSG = {
@@ -101,22 +103,32 @@ end
 -- Networking
 --------------------------------------------------------------------------------
 
+local function titanIsWiredModem(side)
+  if not side or not peripheral.isPresent(side) then return false end
+  if peripheral.getType(side) ~= "modem" then return false end
+  local ok, wireless = pcall(peripheral.call, side, "isWireless")
+  return ok and wireless == false
+end
+
 -- Open every attached modem for rednet AND the rednet repeat channel, so this
 -- device can join the routing mesh (see titan.relayLoop / titan.networkLoop).
--- Returns the first modem side found.
+-- Supports wireless and wired modems. Returns the first modem side found.
 function titan.openModem()
   local found = nil
-  for _, side in ipairs(rs and rs.getSides() or redstone.getSides()) do
+  for _, side in ipairs(peripheral.getNames()) do
     if peripheral.getType(side) == "modem" then
       if not rednet.isOpen(side) then rednet.open(side) end
       -- CHANNEL_REPEAT (65533): CraftOS hop channel used by router.lua and every
       -- mesh peer. Opening it here lets relayLoop forward traffic for neighbours.
       pcall(peripheral.call, side, "open", rednet.CHANNEL_REPEAT)
+      if titanIsWiredModem(side) then
+        pcall(peripheral.call, side, "open", titan.WIRED_CH)
+      end
       if not found then found = side end
     end
   end
   if not found then
-    error("No modem attached. Place a (wireless) modem on this device.", 0)
+    error("No modem attached. Place a wireless or wired modem on this device.", 0)
   end
   return found
 end
@@ -124,12 +136,42 @@ end
 -- List every modem side that is currently open for rednet (for relays).
 function titan.modemSides()
   local sides = {}
-  for _, side in ipairs(rs and rs.getSides() or redstone.getSides()) do
+  for _, side in ipairs(peripheral.getNames()) do
     if peripheral.getType(side) == "modem" and rednet.isOpen(side) then
       sides[#sides + 1] = side
     end
   end
   return sides
+end
+
+function titan.wiredModemSides()
+  local sides = {}
+  for _, side in ipairs(titan.modemSides()) do
+    if titanIsWiredModem(side) then sides[#sides + 1] = side end
+  end
+  return sides
+end
+
+-- Answer MAIN's wired-cable probes so the roster can mark this device WIRED.
+function titan.wiredLinkLoop(kind)
+  for _, side in ipairs(titan.wiredModemSides()) do
+    pcall(peripheral.call, side, "open", titan.WIRED_CH)
+  end
+  while true do
+    local ev, side, ch, _, msg = os.pullEvent("modem_message")
+    if ev and ch == titan.WIRED_CH and type(msg) == "table"
+       and msg.type == "wired_probe" and titanIsWiredModem(side) then
+      local pong = {
+        type = "wired_pong",
+        id = os.getComputerID(),
+        name = titan.hostname(kind),
+        kind = kind or "device",
+      }
+      for _, s in ipairs(titan.wiredModemSides()) do
+        pcall(peripheral.call, s, "transmit", titan.WIRED_CH, titan.WIRED_CH, pong)
+      end
+    end
+  end
 end
 
 -- Wrap a payload in a standard envelope and send it to a specific computer id.
@@ -440,7 +482,8 @@ function titan.networkLoop(kind, period)
   parallel.waitForAny(
     function() titan.registerLoop(kind, period) end,
     function() titan.relayLoop() end,
-    function() titan.sshHostLoop(kind) end
+    function() titan.sshHostLoop(kind) end,
+    function() titan.wiredLinkLoop(kind) end
   )
 end
 
