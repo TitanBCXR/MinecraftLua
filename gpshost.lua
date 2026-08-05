@@ -1,11 +1,14 @@
 --[[
   gpshost.lua  -  Easy GPS host for the Titan network (CC: Tweaked)
-  Titan-Version: 1.1.0
+  Titan-Version: 1.1.6
 
   Bots locate themselves with gps.locate(), which needs at least FOUR GPS host
   computers in range. Run this on each of those computers. On first run it asks
   for the computer's own coordinates (or auto-detects them if a constellation
   already exists), saves them, offers to auto-start on boot, then hosts forever.
+
+  Also joins the Titan mesh and hosts an SSH shell (when lib/titan.lua is present)
+  so you can jump in remotely and `reboot` if needed.
 
   Requirements: a WIRELESS (ideally ENDER) modem on this computer.
 
@@ -47,6 +50,14 @@ local function askNum(label)
   end
 end
 
+local function openModem()
+  for _, side in ipairs(peripheral.getNames()) do
+    if peripheral.getType(side) == "modem" then
+      if not rednet.isOpen(side) then rednet.open(side) end
+    end
+  end
+end
+
 --------------------------------------------------------------------------------
 term.clear(); term.setCursorPos(1, 1)
 print("== Titan GPS Host ==")
@@ -57,11 +68,11 @@ if not hasWirelessModem() then
   return
 end
 
+openModem()
 os.setComputerLabel(os.getComputerLabel() or ("GPS-" .. os.getComputerID()))
 
 local cfg = load()
 if not cfg then
-  -- If a constellation already exists, we can self-locate; otherwise ask.
   print("Trying to auto-detect position...")
   local x, y, z = gps.locate(2)
   if x then
@@ -86,6 +97,29 @@ if not cfg then
 end
 
 print(("Hosting GPS at %d, %d, %d ..."):format(cfg.x, cfg.y, cfg.z))
-print("Set up 4+ of these, spread out. Ctrl+T to stop.")
--- Hand off to the built-in gps host program (hosts until stopped).
-shell.run("gps", "host", tostring(cfg.x), tostring(cfg.y), tostring(cfg.z))
+print("SSH shell on mesh when lib/titan.lua is installed. Ctrl+T to stop.")
+
+local function gpsHostLoop()
+  local modems = {}
+  for _, side in ipairs(peripheral.getNames()) do
+    if peripheral.getType(side) == "modem" then
+      modems[#modems + 1] = side
+      peripheral.call(side, "open", gps.CHANNEL_GPS)
+    end
+  end
+  while true do
+    local _, side, ch, reply, message = os.pullEvent("modem_message")
+    if ch == gps.CHANNEL_GPS and message == "PING" and reply then
+      peripheral.call(side, "transmit", reply, gps.CHANNEL_GPS,
+        { cfg.x, cfg.y, cfg.z })
+    end
+  end
+end
+
+if fs.exists("lib/titan.lua") then
+  local titan = dofile("lib/titan.lua")
+  parallel.waitForAny(gpsHostLoop, function() titan.networkLoop("gpshost") end)
+else
+  -- Fallback: stock gps host only (no remote shell).
+  shell.run("gps", "host", tostring(cfg.x), tostring(cfg.y), tostring(cfg.z))
+end

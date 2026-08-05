@@ -1,6 +1,6 @@
 --[[
   router.lua  -  Titan network router / repeater (CC: Tweaked)
-  Titan-Version: 1.1.5
+  Titan-Version: 1.1.6
 
   Place one (or several) of these to tie the whole network together over
   wireless. Roles:
@@ -837,7 +837,7 @@ local function consoleLoop()
         print("update   - OTA: fleet re-download, reboot, re-auth to main")
         print("reauth   - tell the fleet to re-auth now (no download)")
       end
-      print("ssh <id|label> [cmd] - remote shell (needs lib/titan.lua + master pw)")
+      print("ssh <id|label> [cmd] - remote shell; jumps via modems (reboot ok)")
       print("exit")
     elseif cmd == "role" then
       print(("Role: %s  (id #%d)"):format(routerRole, os.getComputerID()))

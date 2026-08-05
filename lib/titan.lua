@@ -1,6 +1,6 @@
 --[[
   titan.lua  -  Shared library for the Titan bot network (CC: Tweaked)
-  Titan-Version: 1.1.4
+  Titan-Version: 1.1.6
 
   Provides:
     * Rednet protocol constants + message type enum
@@ -401,16 +401,23 @@ end
 --------------------------------------------------------------------------------
 -- Remote shell ("SSH") over rednet
 --
--- From console/admin:  ssh <id|label>           interactive session
---                      ssh <id|label> <command>  one-shot remote exec
+-- From console/admin/router:  ssh <id|label>           interactive session
+--                             ssh <id|label> <command>  one-shot remote exec
 --
--- Auth: master password (verified via the Parent Center), same as admin tablet.
--- Every device running titan.networkLoop hosts an SSH endpoint.
+-- Jump: if the target is out of direct range, SSH hops through modem/router
+-- shells (proxy sessions) until it reaches the destination — same idea as
+-- jumping hosts. Auth: master password via the Parent Center.
+--
+-- Every device running titan.networkLoop (or sshHostLoop) hosts a shell.
+-- Built-in remote command: `reboot` (acks, then os.reboot).
 --------------------------------------------------------------------------------
 titan.SSH_PROTOCOL = "titan_ssh"
+titan.SSH_MAX_JUMPS = 8
 
-local sshSessions = {}   -- [token] = { clientId, expires }
-local sshClientQ  = {}   -- inbox for replies (host loop + client share one receiver)
+local sshSessions   = {}   -- [token] = session table
+local sshClientQ    = {}   -- inbox for replies (host loop + client share one receiver)
+local sshHostPending = {}  -- host requests received while a dial/jump is in progress
+local sshKind       = "device"
 
 local function sshSend(id, msg)
   rednet.send(id, msg, titan.SSH_PROTOCOL)
@@ -420,7 +427,12 @@ local function sshNewToken()
   return tostring(os.getComputerID()) .. "-" .. tostring(os.epoch("utc")) .. "-" .. tostring(math.random(1000, 9999))
 end
 
--- Wait for a client-bound SSH reply from the shared inbox (filled by sshHostLoop).
+local function sshIsClientReply(t)
+  return t == "ssh_pong" or t == "ssh_ok" or t == "ssh_deny" or t == "ssh_result"
+end
+
+-- Wait for a client-bound reply. Also pumps rednet so nested jump dials work
+-- while sshHostLoop is blocked inside a proxy handler.
 local function sshClientWait(timeout, pred)
   local deadline = os.clock() + (timeout or 5)
   while os.clock() < deadline do
@@ -431,14 +443,36 @@ local function sshClientWait(timeout, pred)
         return item.id, item.msg
       end
     end
-    os.sleep(0.05)
+    local remain = deadline - os.clock()
+    if remain <= 0 then break end
+    local id, msg = rednet.receive(titan.SSH_PROTOCOL, math.min(0.15, remain))
+    if type(msg) == "table" and id then
+      if sshIsClientReply(msg.type) then
+        if pred(id, msg) then return id, msg end
+        sshClientQ[#sshClientQ + 1] = { id = id, msg = msg }
+      else
+        sshHostPending[#sshHostPending + 1] = { id = id, msg = msg }
+      end
+    end
   end
-  return nil
+  return nil, nil
 end
 
 -- Capture shell output by redirecting the terminal to a string buffer.
+-- Returns out, ok [, doReboot]
 local function sshCaptureRun(cmdline)
-  if not shell then return "(no shell on this device)", false end
+  local low = tostring(cmdline or ""):match("^%s*(.-)%s*$") or ""
+  local lowl = low:lower()
+  -- Never shell.run("reboot") — it won't return an ack to the SSH client.
+  if lowl == "reboot" or lowl:match("^reboot%s") then
+    return "Rebooting...", true, true
+  end
+  if lowl == "id" or lowl == "whoami" then
+    return ("#%d %s"):format(os.getComputerID(), os.getComputerLabel() or ""), true, false
+  end
+  if not shell then
+    return "(no shell on this device)", false, false
+  end
   local out, ox, oy = {}, 1, 1
   local fake = {}
   function fake.write(s) out[#out + 1] = tostring(s) end
@@ -461,11 +495,59 @@ local function sshCaptureRun(cmdline)
   function fake.setTextColour() end
   function fake.setBackgroundColour() end
   local old = term.redirect(fake)
-  local ok = shell.run(cmdline)
+  local ok = shell.run(low)
   term.redirect(old)
   local text = table.concat(out)
   if text == "" then text = ok and "(ok)" or "(failed)" end
-  return text, ok and true or false
+  return text, ok and true or false, false
+end
+
+local function sshVisitedHas(visited, id)
+  if type(visited) ~= "table" then return false end
+  for _, v in ipairs(visited) do
+    if v == id then return true end
+  end
+  return false
+end
+
+local function sshVisitedNext(visited)
+  local n = {}
+  if type(visited) == "table" then
+    for i, v in ipairs(visited) do n[i] = v end
+  end
+  n[#n + 1] = os.getComputerID()
+  return n
+end
+
+-- Collect nearby SSH peers (for jump candidates). Prefer modem/router kinds.
+function titan.sshListPeers(timeout)
+  rednet.broadcast({ type = "ssh_ping", want = "", list = true }, titan.SSH_PROTOCOL)
+  local found, seen = {}, {}
+  local deadline = os.clock() + (timeout or 1.5)
+  while os.clock() < deadline do
+    local id, msg = sshClientWait(deadline - os.clock(), function(_, m)
+      return type(m) == "table" and m.type == "ssh_pong"
+    end)
+    if id and msg and not seen[id] and id ~= os.getComputerID() then
+      seen[id] = true
+      found[#found + 1] = {
+        id = id, name = msg.name or msg.hostname,
+        kind = msg.kind or "device",
+      }
+    end
+  end
+  table.sort(found, function(a, b)
+    local function rank(k)
+      k = tostring(k or "")
+      if k == "modem" or k == "router" then return 0 end
+      if k == "console" or k == "admin" or k == "datacenter" then return 1 end
+      return 2
+    end
+    local ra, rb = rank(a.kind), rank(b.kind)
+    if ra ~= rb then return ra < rb end
+    return (a.id or 0) < (b.id or 0)
+  end)
+  return found
 end
 
 -- Resolve a computer id or label to an id. Broadcasts a ping; peers reply.
@@ -475,33 +557,143 @@ function titan.sshResolve(ref, timeout)
   local want = tostring(ref or ""):lower()
   if want == "" then return nil end
   rednet.broadcast({ type = "ssh_ping", want = want }, titan.SSH_PROTOCOL)
-  local id = sshClientWait(timeout or 2, function(_, m)
+  local id = sshClientWait(timeout or 3, function(_, m)
     if type(m) ~= "table" or m.type ~= "ssh_pong" then return false end
-    local name = tostring(m.name or ""):lower()
+    local name = tostring(m.name or m.hostname or ""):lower()
     return name == want or name:find(want, 1, true) ~= nil
+      or tostring(m.id or "") == want
   end)
   return id
 end
 
--- Host: accept SSH sessions / one-shot exec / name pings.
--- Also feeds client-bound replies into sshClientQ so this device can be a client
--- at the same time (admin tablet ssh'ing out while hosting its own endpoint).
+-- Low-level open (no password prompt). Used by clients and jump proxies.
+local function sshDialOpen(hostId, password, timeout)
+  sshSend(hostId, {
+    type = "ssh_open", password = password,
+    name = os.getComputerLabel(), from = os.getComputerID(),
+  })
+  local _, msg = sshClientWait(timeout or 4, function(sid, m)
+    return sid == hostId and type(m) == "table" and (m.type == "ssh_ok" or m.type == "ssh_deny")
+  end)
+  if not msg then return nil, "timeout" end
+  if msg.type == "ssh_ok" then return msg.token, msg end
+  return nil, msg.reason or "denied"
+end
+
+-- Ask a hop to open a proxied session to target (may itself jump further).
+local function sshDialProxy(hopId, password, targetRef, visited, timeout)
+  sshSend(hopId, {
+    type = "ssh_proxy", password = password,
+    target = targetRef, visited = visited or { os.getComputerID() },
+    from = os.getComputerID(), name = os.getComputerLabel(),
+  })
+  local _, msg = sshClientWait(timeout or 8, function(sid, m)
+    return sid == hopId and type(m) == "table" and (m.type == "ssh_ok" or m.type == "ssh_deny")
+  end)
+  if not msg then return nil, "proxy timeout via #" .. tostring(hopId) end
+  if msg.type == "ssh_ok" then return msg.token, msg end
+  return nil, msg.reason or "proxy denied"
+end
+
+-- On this host: establish a path to target (direct or via further jumps).
+-- Returns tokenForClient, infoMsg or nil, err. Caller registers session for clientId.
+local function sshEstablishTo(targetRef, password, visited, clientId)
+  local depth = type(visited) == "table" and #visited or 0
+  if depth > titan.SSH_MAX_JUMPS then
+    return nil, "too many jumps (max " .. titan.SSH_MAX_JUMPS .. ")"
+  end
+
+  local targetId = tonumber(targetRef) or titan.sshResolve(targetRef, 2)
+  if not targetId then return nil, "target not found: " .. tostring(targetRef) end
+
+  if targetId == os.getComputerID() then
+    local token = sshNewToken()
+    local host = titan.hostname(sshKind)
+    sshSessions[token] = { clientId = clientId, expires = os.clock() + 600, isLocal = true }
+    return token, {
+      type = "ssh_ok", token = token, name = host, hostname = host,
+      kind = sshKind, id = os.getComputerID(), jumps = 0,
+    }
+  end
+
+  -- Direct dial to target.
+  local token, info = sshDialOpen(targetId, password, 3)
+  if token then
+    local my = sshNewToken()
+    sshSessions[my] = {
+      clientId = clientId, expires = os.clock() + 600,
+      proxyHop = targetId, proxyToken = token, proxyTo = targetId,
+    }
+    info = info or {}
+    return my, {
+      type = "ssh_ok", token = my,
+      name = info.name or info.hostname, hostname = info.hostname or info.name,
+      kind = info.kind, id = targetId, jumps = 1,
+      via = { os.getComputerID() },
+    }
+  end
+
+  -- Jump through other shell hosts (modems/routers first).
+  local peers = titan.sshListPeers(1.2)
+  local nextVisited = sshVisitedNext(visited)
+  for _, p in ipairs(peers) do
+    if p.id ~= targetId and p.id ~= clientId and not sshVisitedHas(nextVisited, p.id) then
+      local ptok, pinfo = sshDialProxy(p.id, password, targetId, nextVisited, 8)
+      if ptok then
+        local my = sshNewToken()
+        sshSessions[my] = {
+          clientId = clientId, expires = os.clock() + 600,
+          proxyHop = p.id, proxyToken = ptok, proxyTo = targetId,
+        }
+        local via = { os.getComputerID() }
+        if type(pinfo.via) == "table" then
+          for _, v in ipairs(pinfo.via) do via[#via + 1] = v end
+        else
+          via[#via + 1] = p.id
+        end
+        return my, {
+          type = "ssh_ok", token = my,
+          name = pinfo.name or pinfo.hostname, hostname = pinfo.hostname or pinfo.name,
+          kind = pinfo.kind, id = pinfo.id or targetId,
+          jumps = (pinfo.jumps or 1) + 1, via = via,
+        }
+      end
+    end
+  end
+  return nil, "unreachable (tried direct + " .. tostring(#peers) .. " jumps)"
+end
+
+local function sshRunLocal(line)
+  return sshCaptureRun(line)
+end
+
+-- Host: accept SSH sessions / proxy jumps / name pings.
 function titan.sshHostLoop(kind)
   kind = kind or "device"
+  sshKind = kind
   while true do
-    local id, msg = rednet.receive(titan.SSH_PROTOCOL)
+    local id, msg
+    if #sshHostPending > 0 then
+      local item = table.remove(sshHostPending, 1)
+      id, msg = item.id, item.msg
+    else
+      id, msg = rednet.receive(titan.SSH_PROTOCOL)
+    end
     if type(msg) ~= "table" or not id then
       -- ignore
-    elseif msg.type == "ssh_pong" or msg.type == "ssh_ok"
-        or msg.type == "ssh_deny" or msg.type == "ssh_result" then
+    elseif sshIsClientReply(msg.type) then
       sshClientQ[#sshClientQ + 1] = { id = id, msg = msg }
 
     elseif msg.type == "ssh_ping" then
       local name = titan.hostname(kind)
       local want = tostring(msg.want or ""):lower()
-      if want == "" or name:lower() == want or name:lower():find(want, 1, true)
+      if msg.list or want == "" or name:lower() == want
+         or name:lower():find(want, 1, true)
          or tostring(os.getComputerID()) == want then
-        sshSend(id, { type = "ssh_pong", name = name, hostname = name, kind = kind })
+        sshSend(id, {
+          type = "ssh_pong", name = name, hostname = name,
+          kind = kind, id = os.getComputerID(),
+        })
       end
 
     elseif msg.type == "ssh_open" then
@@ -514,8 +706,24 @@ function titan.sshHostLoop(kind)
         sshSend(id, {
           type = "ssh_ok", token = token,
           name = host, hostname = host,
-          kind = kind, id = os.getComputerID(),
+          kind = kind, id = os.getComputerID(), jumps = 0,
         })
+      end
+
+    elseif msg.type == "ssh_proxy" then
+      -- Jump request: open (or further-jump) a session to msg.target for this client.
+      if type(msg.password) ~= "string" or not titan.checkPassword(msg.password) then
+        sshSend(id, { type = "ssh_deny", reason = "auth failed (need master password + Parent Center online)" })
+      elseif sshVisitedHas(msg.visited, os.getComputerID()) then
+        sshSend(id, { type = "ssh_deny", reason = "jump loop" })
+      else
+        local token, info = sshEstablishTo(msg.target, msg.password, msg.visited, id)
+        if not token then
+          sshSend(id, { type = "ssh_deny", reason = tostring(info) })
+        else
+          info.token = token
+          sshSend(id, info)
+        end
       end
 
     elseif msg.type == "ssh_exec" then
@@ -528,15 +736,42 @@ function titan.sshHostLoop(kind)
         if line == "" then
           sshSend(id, { type = "ssh_result", ok = true, out = "" })
         elseif line:lower() == "exit" or line:lower() == "logout" then
+          if sess.proxyHop and sess.proxyToken then
+            sshSend(sess.proxyHop, { type = "ssh_close", token = sess.proxyToken })
+          end
           sshSessions[msg.token] = nil
           sshSend(id, { type = "ssh_result", ok = true, out = "logged out", close = true })
+        elseif sess.proxyHop and sess.proxyToken then
+          -- Forward through the jump chain.
+          sshSend(sess.proxyHop, {
+            type = "ssh_exec", token = sess.proxyToken, line = line,
+          })
+          local _, res = sshClientWait(45, function(sid, m)
+            return sid == sess.proxyHop and type(m) == "table" and m.type == "ssh_result"
+          end)
+          if not res then
+            sshSend(id, { type = "ssh_result", ok = false, out = "jump timeout" })
+          else
+            if res.close then
+              sshSessions[msg.token] = nil
+            end
+            sshSend(id, res)
+          end
         else
-          local out, ok = sshCaptureRun(line)
+          local out, ok, doReboot = sshRunLocal(line)
           sshSend(id, { type = "ssh_result", ok = ok, out = out })
+          if doReboot then
+            sleep(0.3)
+            os.reboot()
+          end
         end
       end
 
     elseif msg.type == "ssh_close" then
+      local sess = msg.token and sshSessions[msg.token]
+      if sess and sess.proxyHop and sess.proxyToken then
+        sshSend(sess.proxyHop, { type = "ssh_close", token = sess.proxyToken })
+      end
       if msg.token then sshSessions[msg.token] = nil end
     end
   end
@@ -548,21 +783,12 @@ function titan.sshOpen(hostId, password)
     write("Master password: ")
     password = read("*")
   end
-  sshSend(hostId, {
-    type = "ssh_open", password = password,
-    name = os.getComputerLabel(), from = os.getComputerID(),
-  })
-  local id, msg = sshClientWait(5, function(sid, m)
-    return sid == hostId and type(m) == "table" and (m.type == "ssh_ok" or m.type == "ssh_deny")
-  end)
-  if not msg then return nil, "timeout - is the target online and on the mesh?" end
-  if msg.type == "ssh_ok" then return msg.token, msg end
-  return nil, msg.reason or "denied"
+  return sshDialOpen(hostId, password, 5)
 end
 
 function titan.sshExec(hostId, token, line)
   sshSend(hostId, { type = "ssh_exec", token = token, line = line })
-  local _, msg = sshClientWait(30, function(sid, m)
+  local _, msg = sshClientWait(45, function(sid, m)
     return sid == hostId and type(m) == "table" and m.type == "ssh_result"
   end)
   return msg or { ok = false, out = "timeout waiting for remote output" }
@@ -572,29 +798,70 @@ function titan.sshClose(hostId, token)
   if hostId and token then sshSend(hostId, { type = "ssh_close", token = token }) end
 end
 
--- Interactive (or one-shot) SSH client. target = id or label; cmdline optional.
-function titan.sshConnect(target, cmdline)
-  local hostId = titan.sshResolve(target, 2)
-  if not hostId then
-    printError("ssh: host not found: " .. tostring(target))
-    return false
-  end
-  if hostId == os.getComputerID() then
-    printError("ssh: that is this computer")
-    return false
+-- Open with automatic modem/router jumps when the target is not directly reachable.
+-- Returns hopId, token, info or nil, err. hopId is who the client talks to (first hop).
+function titan.sshOpenRouted(target, password)
+  if not password then
+    write("Master password: ")
+    password = read("*")
   end
 
-  local token, info = titan.sshOpen(hostId)
+  local targetId = tonumber(target) or titan.sshResolve(target, 3)
+  if not targetId then return nil, nil, "host not found: " .. tostring(target) end
+  if targetId == os.getComputerID() then return nil, nil, "that is this computer" end
+
+  -- 1) Direct
+  print(("ssh: trying #%s direct..."):format(tostring(targetId)))
+  local token, info = sshDialOpen(targetId, password, 3)
+  if token then
+    info = info or {}
+    info.id = info.id or targetId
+    info.jumps = 0
+    return targetId, token, info
+  end
+
+  -- 2) Jump via modem/router (and other) shells
+  print("ssh: direct failed — jumping through mesh shells...")
+  local peers = titan.sshListPeers(1.5)
+  local visited = { os.getComputerID() }
+  for _, p in ipairs(peers) do
+    if p.id ~= targetId then
+      print(("ssh: jump via %s (#%d) [%s]..."):format(
+        tostring(p.name or "?"), p.id, tostring(p.kind or "?")))
+      local ptok, pinfo = sshDialProxy(p.id, password, targetId, visited, 10)
+      if ptok then
+        pinfo = pinfo or {}
+        pinfo.id = pinfo.id or targetId
+        local viaStr = ""
+        if type(pinfo.via) == "table" and #pinfo.via > 0 then
+          viaStr = " via " .. table.concat(pinfo.via, " -> ")
+        else
+          viaStr = (" via #%d"):format(p.id)
+        end
+        pinfo._viaNote = viaStr
+        return p.id, ptok, pinfo
+      end
+    end
+  end
+  return nil, nil, "unreachable — no jump path (are modems/routers running shells?)"
+end
+
+-- Interactive (or one-shot) SSH client. target = id or label; cmdline optional.
+function titan.sshConnect(target, cmdline)
+  local hopId, token, info = titan.sshOpenRouted(target)
   if not token then
     printError("ssh: " .. tostring(info))
     return false
   end
-  print(("Connected to %s (#%d) [%s]"):format(
-    info.name or "?", info.id or hostId, info.kind or "?"))
-  print("Type commands remotely. 'exit' to disconnect.")
+  local destName = info.name or info.hostname or tostring(target)
+  local destId = info.id or "?"
+  print(("Connected to %s (#%s) [%s]%s"):format(
+    destName, tostring(destId), tostring(info.kind or "?"),
+    info._viaNote or (info.jumps and info.jumps > 0 and (" jumps=" .. info.jumps) or "")))
+  print("Remote shell. Commands: reboot | exit")
 
   local function runLine(line)
-    local res = titan.sshExec(hostId, token, line)
+    local res = titan.sshExec(hopId, token, line)
     if res.out and res.out ~= "" then print(res.out) end
     if res.close then return false end
     return true
@@ -602,22 +869,22 @@ function titan.sshConnect(target, cmdline)
 
   if cmdline and cmdline ~= "" then
     runLine(cmdline)
-    titan.sshClose(hostId, token)
+    titan.sshClose(hopId, token)
     return true
   end
 
   while true do
-    write(("ssh:%s> "):format(info.name or hostId))
+    write(("ssh:%s> "):format(destName))
     local line = read()
     if not line then break end
-    local low = line:lower()
+    local low = line:lower():match("^%s*(.-)%s*$") or ""
     if low == "exit" or low == "logout" then
       runLine(line)
       break
     end
     if not runLine(line) then break end
   end
-  titan.sshClose(hostId, token)
+  titan.sshClose(hopId, token)
   print("Disconnected.")
   return true
 end

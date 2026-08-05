@@ -1,6 +1,6 @@
 --[[
   host.lua  -  Titan install host (CC: Tweaked)
-  Titan-Version: 1.1.0
+  Titan-Version: 1.1.6
 
   Run this on the ONE computer that already has all the Titan `.lua` files.
   It serves those files to other in-game devices over rednet, so you can install
@@ -130,4 +130,10 @@ local function serveLoop()
   end
 end
 
-parallel.waitForAny(serveLoop, relayLoop)
+local tasks = { serveLoop, relayLoop }
+-- Mesh announce + inbound SSH shell when lib is present.
+if fs.exists("lib/titan.lua") then
+  local titan = dofile("lib/titan.lua")
+  tasks[#tasks + 1] = function() titan.networkLoop("host") end
+end
+parallel.waitForAny(table.unpack(tasks))

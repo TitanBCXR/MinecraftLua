@@ -1,6 +1,6 @@
 --[[
   install.lua  -  Titan network installer (CC: Tweaked)
-  Titan-Version: 1.1.0
+  Titan-Version: 1.1.6
 
   Downloads the Titan bot-network system onto this device from a running
   `host.lua` on the same rednet network (no pastebin / external web host).
@@ -39,7 +39,7 @@ local ROLES = {
   { key = "8", name = "Admin tablet (pocket console)",      run = "admin.lua",
     files = { "lib/titan.lua", "admin.lua" } },
   { key = "9", name = "GPS host (needs 4+ for navigation)", run = "gpshost.lua",
-    files = { "gpshost.lua" } },
+    files = { "lib/titan.lua", "gpshost.lua" } },
   { key = "10", name = "GPS locator (pocket)",              run = "locator.lua",
     files = { "lib/titan.lua", "locator.lua" } },
   { key = "11", name = "Network router (repeater + GPS)",    run = "router.lua",

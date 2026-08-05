@@ -1,6 +1,6 @@
 --[[
   github_install.lua  -  Install the Titan system straight from a GitHub repo
-  Titan-Version: 1.1.0
+  Titan-Version: 1.1.6
 
   Point RAW_BASE at your repo's raw content root, then on each Minecraft device:
 
@@ -42,7 +42,7 @@ local ROLES = {
   { key = "8", name = "Admin tablet (pocket console)",      run = "admin.lua",
     files = { "lib/titan.lua", "admin.lua" } },
   { key = "9", name = "GPS host (needs 4+ for navigation)", run = "gpshost.lua",
-    files = { "gpshost.lua" } },
+    files = { "lib/titan.lua", "gpshost.lua" } },
   { key = "10", name = "GPS locator (pocket)",              run = "locator.lua",
     files = { "lib/titan.lua", "locator.lua" } },
   { key = "11", name = "Network router (repeater + GPS)",   run = "router.lua",

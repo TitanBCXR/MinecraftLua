@@ -1,6 +1,6 @@
 --[[
   pastebin_install.lua  -  Pastebin bootstrap installer for the Titan system
-  Titan-Version: 1.1.0
+  Titan-Version: 1.1.6
 
   Pulls the Titan files straight from Pastebin (no in-game host needed). Upload
   each file to pastebin.com once, paste its CODE into the table below, then
@@ -58,7 +58,7 @@ local ROLES = {
   { key = "8", name = "Admin tablet (pocket console)",     run = "admin.lua",
     files = { "lib/titan.lua", "admin.lua" } },
   { key = "9", name = "GPS host (needs 4+ for navigation)", run = "gpshost.lua",
-    files = { "gpshost.lua" } },
+    files = { "lib/titan.lua", "gpshost.lua" } },
   { key = "10", name = "GPS locator (pocket)",             run = "locator.lua",
     files = { "lib/titan.lua", "locator.lua" } },
   { key = "11", name = "Network router (repeater + GPS)",  run = "router.lua",

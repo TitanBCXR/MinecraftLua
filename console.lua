@@ -1,6 +1,6 @@
 --[[
   console.lua  -  Basic terminal commands for a CC: Tweaked device
-  Titan-Version: 1.1.1
+  Titan-Version: 1.1.6
 
   A tiny, self-contained command console you can run on any computer or turtle.
   It gives you a handful of everyday commands (files, labels, GPS, fuel, movement)
@@ -336,11 +336,12 @@ def("update", "download every package listed in the packages file", function(a)
 end)
 alias("upgrade", "update")
 
-def("ssh", "remote shell: ssh <id|label> [command...]", function(a)
+def("ssh", "remote shell (jumps via modems): ssh <id|label> [command...]", function(a)
   openModems()
   if not a[1] then
     print("Usage: ssh <computer id or label> [command]")
-    print("  ssh 3              interactive session")
+    print("  ssh 3              interactive (jumps through modem shells)")
+    print("  ssh Admin reboot   remote reboot via mesh jumps")
     print("  ssh Miner-12 ls    run one command remotely")
     print("Auth: Parent Center master password.")
     return
@@ -439,10 +440,12 @@ local function promptLoop()
   end
 end
 
--- Relay + SSH host while the console is open (mesh + inbound remote shell).
-local tasks = { promptLoop, relayLoop }
+-- Mesh announce + hop relay + inbound SSH shell while the console is open.
+local tasks = { promptLoop }
 if titanLib then
-  tasks[#tasks + 1] = function() titanLib.sshHostLoop("console") end
+  tasks[#tasks + 1] = function() titanLib.networkLoop("console") end
+else
+  tasks[#tasks + 1] = relayLoop
 end
 parallel.waitForAny(table.unpack(tasks))
 

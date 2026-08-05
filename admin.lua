@@ -1,6 +1,6 @@
 --[[
   admin.lua  -  Titan admin console for a POCKET computer ("Live" tablet)
-  Titan-Version: 1.1.0
+  Titan-Version: 1.1.6
 
   A mobile master terminal you keep on you. It listens to the whole Titan
   network and lets you monitor and command it from your pocket:
@@ -190,7 +190,7 @@ local function consoleLoop()
       print("       return <bot> | refuel <bot> | stop <bot>")
       print("DEPLOY: deploy <bot> <builder|gatherer> <name> [x y z]")
       print("BUILD: scan <bot> <name> <W H L> | build <bot> <name> [x y z]")
-      print("ssh <id|label> [cmd...]  remote shell (master password)")
+      print("ssh <id|label> [cmd...]  remote shell; jumps via modems (reboot ok)")
       print("hostname [name]  get or set this tablet's hostname")
       print("login | lock | exit")
 
@@ -296,7 +296,8 @@ local function consoleLoop()
 
     elseif cmd == "ssh" then
       if not a[2] then
-        print("Usage: ssh <id|label> [command...]")
+        print("Usage: ssh <id|label> [command...]  (jumps via modem/router shells)")
+        print("  Remote: reboot | exit")
       elseif requireAuth() then
         local target = a[2]
         local cmdline
