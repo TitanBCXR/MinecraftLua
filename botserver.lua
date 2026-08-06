@@ -1,6 +1,6 @@
 --[[
   botserver.lua  -  "Bots Computer" for the Titan network (CC: Tweaked)
-  Titan-Version: 1.2.4
+  Titan-Version: 1.2.5
 
   Coordination hub for the three bot types:
     * builder  / gatherer  (worker.lua)
@@ -10,8 +10,15 @@
   Parent Center (datacenter.lua) handles deploy/auth; this machine is the
   live ops board and order desk.
 
+  Site logistics (broadcast to all workers):
+    storage <x y z|here>   shared dump chest (workers empty here when full)
+    fuelchest <x y z|here> coal chest (workers keep 16–64 coal in fuel slot)
+
+  Workers get unique names (Builder-12, Gatherer-7) — never keep player labels.
+
   Console:
     bots | builders | gatherers | miners
+    storage | fuelchest | site
     gathers | coal | builds | alerts | ping
     scan  <bot> <name> <W> <H> <L>
     build <bot> <name> [x y z]
@@ -33,22 +40,67 @@ local BUILD_DIR = "builds"
 if not fs.exists(BUILD_DIR) then fs.makeDir(BUILD_DIR) end
 local CFG = "botserver.cfg"
 local monRate = 1
+local site = {
+  storage = nil,     -- {x,y,z} dump chest block
+  fuelChest = nil,   -- {x,y,z} coal chest block
+}
 
 local function loadServerCfg()
   if not fs.exists(CFG) then return end
   local f = fs.open(CFG, "r"); local d = textutils.unserialize(f.readAll()); f.close()
-  if type(d) == "table" and d.monRate then
-    monRate = titan.normalizeMonRate(d.monRate, 1)
-  end
+  if type(d) ~= "table" then return end
+  if d.monRate then monRate = titan.normalizeMonRate(d.monRate, 1) end
+  if type(d.storage) == "table" and d.storage.x then site.storage = d.storage end
+  if type(d.fuelChest) == "table" and d.fuelChest.x then site.fuelChest = d.fuelChest end
+  -- legacy alias
+  if not site.fuelChest and type(d.fuel) == "table" and d.fuel.x then site.fuelChest = d.fuel end
 end
 
 local function saveServerCfg()
   local f = fs.open(CFG, "w")
-  f.write(textutils.serialize({ monRate = monRate }))
+  f.write(textutils.serialize({
+    monRate = monRate, storage = site.storage, fuelChest = site.fuelChest,
+  }))
   f.close()
 end
 
 loadServerCfg()
+
+local function broadcastSite(toId)
+  local payload = {
+    storage = site.storage,
+    fuelChest = site.fuelChest,
+    deposit = site.storage, -- workers treat deposit/storage the same
+  }
+  if toId then titan.send(toId, MSG.SITE_CONFIG, payload)
+  else titan.broadcast(MSG.SITE_CONFIG, payload) end
+end
+
+local function parsePos(a, start)
+  start = start or 1
+  local mode = tostring(a[start] or ""):lower()
+  if mode == "here" or mode == "gps" then
+    local x, y, z = gps.locate(3)
+    if not x then return nil, "No GPS" end
+    return { x = math.floor(x), y = math.floor(y) - 1, z = math.floor(z) }
+  end
+  local x, y, z = tonumber(a[start]), tonumber(a[start + 1]), tonumber(a[start + 2])
+  if not (x and y and z) then return nil, "need <x> <y> <z> or here" end
+  return { x = math.floor(x), y = math.floor(y), z = math.floor(z) }
+end
+
+-- Force Type-<id> name if the bot still has a player / await label.
+local function ensureUniqueName(id, b)
+  if not b or not b.botType then return end
+  if b.botType ~= "builder" and b.botType ~= "gatherer" and b.botType ~= "miner" then return end
+  local want = titan.uniqueBotName(b.botType, id)
+  if b.name == want then b._named = true; return end
+  if b._named and b.name == want then return end
+  titan.send(id, MSG.COMMAND, { cmd = "rename", name = want })
+  b.name = want
+  b._named = true
+  print(("[name] #%d -> %s"):format(id, want))
+end
 
 local BOT_TYPES = { builder = true, gatherer = true, miner = true }
 
@@ -145,9 +197,10 @@ local function draw()
   line(1, "== TITAN BOTS ==", colors.yellow)
   line(2, ("active:%d  build:%d  gather:%d  mine:%d  busy:%d"):format(
     n.total, n.builder, n.gatherer, n.miner, n.busy), colors.lime)
-  line(3, "NAME         TYPE     STATE    ASSIGNMENT          POS         FUEL", colors.lightGray)
+  line(3, ("storage:%s  fuel:%s"):format(fmt(site.storage), fmt(site.fuelChest)), colors.cyan)
+  line(4, "NAME         TYPE     STATE    ASSIGNMENT          POS         FUEL", colors.lightGray)
 
-  local y = 4
+  local y = 5
   local function drawType(title, btype, color)
     if y >= h - 4 then return end
     line(y, ("-- %s --"):format(title), color or colors.orange)
@@ -234,7 +287,9 @@ local function handle(id, msg)
   local t = msg.type
   if t == MSG.BOT_REGISTER or t == MSG.REGISTER then
     local b = touchBot(id, msg)
-    autoPostFromChest(id, msg.chest)
+    autoPostFromChest(id, msg.chest, site.storage)
+    ensureUniqueName(id, b)
+    broadcastSite(id)
     if not b._announced then
       b._announced = true
       print(("[+] %s registered as %s (#%d)"):format(
@@ -242,17 +297,29 @@ local function handle(id, msg)
     end
 
   elseif t == MSG.STATUS then
-    touchBot(id, msg)
+    local b = touchBot(id, msg)
+    ensureUniqueName(id, b)
+
+  elseif t == MSG.SITE_CONFIG_REQ then
+    broadcastSite(id)
 
   elseif t == MSG.GATHER_POST then
     gathers[msg.id or id] = {
       id = msg.id or id, pos = msg.pos, accepts = msg.accepts, mode = msg.mode,
-      deposit = msg.deposit, seen = now(),
+      deposit = msg.deposit or site.storage, seen = now(),
     }
     print(("[+] gather post @ %s"):format(fmt(msg.pos)))
 
   elseif t == MSG.GATHER_LIST_REQ then
-    titan.send(id, MSG.GATHER_LIST, { gathers = gathers })
+    -- Inject site storage so gatherers always dump to the configured chest.
+    local out = {}
+    for gid, g in pairs(gathers) do
+      out[gid] = {
+        id = g.id, pos = g.pos, accepts = g.accepts, mode = g.mode,
+        deposit = site.storage or g.deposit, seen = g.seen,
+      }
+    end
+    titan.send(id, MSG.GATHER_LIST, { gathers = out })
 
   elseif t == MSG.GATHER_DONE then
     if gathers[msg.post] then gathers[msg.post].seen = now() end
@@ -333,6 +400,9 @@ local function handleCommand(a)
     return true
   elseif cmd == "help" then
     print("bots | builders | gatherers | miners")
+    print("storage [x y z|here]   dump chest for full workers")
+    print("fuelchest [x y z|here] coal chest (workers keep 16-64)")
+    print("site                   show storage + fuel chest")
     print("gathers | coal | builds | alerts | ping")
     print("scan <bot> <name> <W> <H> <L>")
     print("build <bot> <name> [x y z]")
@@ -348,6 +418,39 @@ local function handleCommand(a)
     end
     print(("Monitor refresh: %.2fs  (range %.2f–%ds)"):format(
       monRate, titan.MONRATE_MIN, titan.MONRATE_MAX))
+  elseif cmd == "site" then
+    print("storage:   " .. fmt(site.storage))
+    print("fuelchest: " .. fmt(site.fuelChest))
+    print("Workers dump full inventories at storage; refuel coal at fuelchest.")
+  elseif cmd == "storage" or cmd == "deposit" or cmd == "dump" then
+    if not a[2] then
+      print("storage: " .. fmt(site.storage))
+      print("Usage: storage <x> <y> <z>   or   storage here")
+      print("(stand above the chest and use `here` — saves chest block Y-1)")
+    else
+      local pos, err = parsePos(a, 2)
+      if not pos then print(tostring(err))
+      else
+        site.storage = pos
+        saveServerCfg()
+        broadcastSite()
+        print("Storage chest = " .. fmt(site.storage) .. " (broadcast to workers)")
+      end
+    end
+  elseif cmd == "fuelchest" or cmd == "fuel" or cmd == "coalchest" then
+    if not a[2] then
+      print("fuelchest: " .. fmt(site.fuelChest))
+      print("Usage: fuelchest <x> <y> <z>   or   fuelchest here")
+    else
+      local pos, err = parsePos(a, 2)
+      if not pos then print(tostring(err))
+      else
+        site.fuelChest = pos
+        saveServerCfg()
+        broadcastSite()
+        print("Fuel chest = " .. fmt(site.fuelChest) .. " (broadcast to workers)")
+      end
+    end
   elseif cmd == "bots" then
     local n = countByType()
     print(("Active %d  build:%d gather:%d mine:%d busy:%d"):format(

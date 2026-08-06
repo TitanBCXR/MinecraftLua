@@ -1,6 +1,6 @@
 --[[
   datacenter.lua  -  Titan Data Center (CC: Tweaked)   [ single, self-contained script ]
-  Titan-Version: 1.2.7
+  Titan-Version: 1.2.8
 
   ONE script that every computer/terminal in your data center runs. It works out
   its own role automatically:
@@ -36,8 +36,8 @@
   WORKER / BOT DEPLOYMENT (this is the "Parent Center" role):
     * Manages bot types: builder, gatherer (worker.lua), miner (miner.lua),
       and loader (loader.lua + Chunky Turtle). Unconfigured turtles wait.
-    * `deploy <id> <builder|gatherer|miner|loader> <name> [dep] [stage]`
-      ADMIN only (master-password lock). Stage = fleet parking sheet slot.
+    * `deploy <id> <builder|gatherer|miner|loader> [auto] [dep] [stage]`
+      ADMIN only. Unique name Type-<id> (player turtle labels ignored).
     * `flatten <x> <z> <W>x<D> <yEnd> [nBots] [yStart] [yband|strip]`
       yband = staggered Y bands (default); strip = X strips. Also accepts
       `site_job` from marker.lua computers.
@@ -472,21 +472,23 @@ local function cmdPending()
 end
 
 -- Push deploy config:
---   deploy <id|name> <builder|gatherer|miner|loader> <name> [depX depY depZ] [stageX stageY stageZ]
+--   deploy <id> <builder|gatherer|miner|loader> [auto|<ignoredName>] [depX depY depZ] [stage...]
+-- Names are always unique Type-<computerId> (player labels ignored).
 local function cmdDeploy(rest)
   local a = {}
   for w in tostring(rest):gmatch("%S+") do a[#a + 1] = w end
-  local ref, btype, name = a[1], (a[2] or ""):lower(), a[3]
+  local ref, btype = a[1], (a[2] or ""):lower()
   -- Aliases
   if btype == "mine" then btype = "miner" end
   if btype == "build" then btype = "builder" end
   if btype == "gather" then btype = "gatherer" end
   if btype == "chunk" or btype == "chunky" then btype = "loader" end
 
-  if not ref or not name then
-    print("Usage: deploy <id|name> <builder|gatherer|miner|loader> <name> [depX depY depZ] [stageX stageY stageZ]")
-    print("Example: deploy 12 miner Diggy 100 64 200")
-    print("Example: deploy 15 loader Chunk1 100 70 200")
+  if not ref or not btype or btype == "" then
+    print("Usage: deploy <id|name> <builder|gatherer|miner|loader> [auto] [depX depY depZ] [stageX stageY stageZ]")
+    print("Example: deploy 12 miner")
+    print("Example: deploy 12 builder auto 100 64 200")
+    print("Names are always unique (Builder-12, Miner-12) — player turtle labels are ignored.")
     return
   end
   if not BOT_TYPES[btype] then
@@ -514,22 +516,34 @@ local function cmdDeploy(rest)
     end
   end
 
+  -- Optional name token is ignored for uniqueness; coords may start at a[3] or a[4].
+  local coordAt = 3
+  if a[3] and not tonumber(a[3]) then
+    coordAt = 4  -- skip auto/custom name token
+  end
+  local prefixes = {
+    builder = "Builder", gatherer = "Gatherer", miner = "Miner", loader = "Loader",
+  }
+  local name = (prefixes[btype] or "Bot") .. "-" .. tostring(targetId)
+
   local deposit, stage
-  if a[4] and a[5] and a[6] then
-    local p = { x = tonumber(a[4]), y = tonumber(a[5]), z = tonumber(a[6]) }
-    if btype == "loader" then
-      stage = p
-    else
-      deposit = p
+  if a[coordAt] and a[coordAt + 1] and a[coordAt + 2] then
+    local p = {
+      x = tonumber(a[coordAt]), y = tonumber(a[coordAt + 1]), z = tonumber(a[coordAt + 2]),
+    }
+    if p.x and p.y and p.z then
+      if btype == "loader" then stage = p else deposit = p end
     end
   end
-  if a[7] and a[8] and a[9] then
-    stage = { x = tonumber(a[7]), y = tonumber(a[8]), z = tonumber(a[9]) }
+  if a[coordAt + 3] and a[coordAt + 4] and a[coordAt + 5] then
+    stage = {
+      x = tonumber(a[coordAt + 3]), y = tonumber(a[coordAt + 4]), z = tonumber(a[coordAt + 5]),
+    }
   end
 
   rednet.send(targetId,
     { type = "worker_deploy", botType = btype, name = name, deposit = deposit,
-      stage = stage, cruiseY = 150 }, NET_PROTOCOL)
+      storage = deposit, stage = stage, cruiseY = 150 }, NET_PROTOCOL)
   local extra = ""
   if deposit then
     extra = extra .. ("  deposit %d,%d,%d"):format(deposit.x, deposit.y, deposit.z)
@@ -999,7 +1013,8 @@ local function handleAdmin(cmd, rest)
     print("  bot <name>         location, state, assignment")
     print("  locate <name>      alias of 'bot'")
     print("  pending            bots awaiting deployment")
-    print("  deploy <id> <builder|gatherer|miner|loader> <name> [dep] [stage]")
+    print("  deploy <id> <builder|gatherer|miner|loader> [auto] [dep] [stage]")
+    print("                     (unique name Type-<id>; player labels ignored)")
     print("  flatten <x> <z> <W>x<D> <yEnd> [nBots] [yStart] [yband|strip]")
     print("  jobs               recent flatten / marker jobs")
     print("  permit <id|prefix:>   allow breaking Create/etc (shows on monitor)")

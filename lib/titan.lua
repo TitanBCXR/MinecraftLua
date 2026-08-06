@@ -1,6 +1,6 @@
 --[[
   titan.lua  -  Shared library for the Titan bot network (CC: Tweaked)
-  Titan-Version: 1.2.11
+  Titan-Version: 1.2.12
 
   Provides:
     * Rednet protocol constants + message type enum
@@ -76,6 +76,8 @@ titan.MSG = {
   LOADER_ASSIGN   = "loader_assign",   -- datacenter -> loader : escort this miner
   SITE_JOB        = "site_job",        -- marker -> datacenter : dig this marked box
   SITE_JOB_ACK    = "site_job_ack",    -- datacenter -> marker
+  SITE_CONFIG     = "site_config",     -- botserver -> workers : storage + fuel chest
+  SITE_CONFIG_REQ = "site_config_req", -- worker -> botserver : please send site_config
 }
 
 -- Compass headings (Minecraft world axes).
@@ -159,6 +161,31 @@ function titan.normalizeMonRate(secs, defaultSecs)
   if n < titan.MONRATE_MIN then n = titan.MONRATE_MIN end
   if n > titan.MONRATE_MAX then n = titan.MONRATE_MAX end
   return n
+end
+
+-- Fleet bot labels: Type-<computerId> (never reuse a player-placed turtle name).
+function titan.uniqueBotName(botType, computerId)
+  local t = tostring(botType or "bot"):lower()
+  local prefixes = {
+    builder = "Builder", gatherer = "Gatherer", miner = "Miner",
+    loader = "Loader", worker = "Worker", marker = "Site",
+  }
+  local p = prefixes[t] or "Bot"
+  return p .. "-" .. tostring(computerId or os.getComputerID())
+end
+
+-- True if a label looks like a Titan-assigned unique name (Builder-12, etc.).
+function titan.isUniqueBotName(name, botType)
+  if type(name) ~= "string" or name == "" then return false end
+  local prefix, id = name:match("^([A-Za-z]+)%-(%d+)$")
+  if not prefix or not id then return false end
+  if botType then
+    return name == titan.uniqueBotName(botType, id)
+  end
+  local known = {
+    Builder = true, Gatherer = true, Miner = true, Loader = true, Worker = true, Bot = true,
+  }
+  return known[prefix] == true
 end
 
 -- Decide whether a gatherer should pick up an item, given a gather request.
