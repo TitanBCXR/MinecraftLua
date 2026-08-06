@@ -1,6 +1,6 @@
 --[[
   titan.lua  -  Shared library for the Titan bot network (CC: Tweaked)
-  Titan-Version: 1.2.8
+  Titan-Version: 1.2.10
 
   Provides:
     * Rednet protocol constants + message type enum
@@ -67,6 +67,15 @@ titan.MSG = {
   STORAGE_STOCK   = "storage_stock",   -- storage -> asker : item rows
   STORAGE_REQUEST = "storage_request", -- anyone -> storage : request Create package
   STORAGE_REQUEST_ACK = "storage_request_ack",
+
+  -- Fleet mine / flatten jobs + Create break permits (Parent Center)
+  MINE_JOB        = "mine_job",        -- datacenter -> miner : strip to dig
+  MINE_JOB_ACK    = "mine_job_ack",    -- miner -> datacenter
+  PERMIT_SYNC     = "permit_sync",     -- datacenter -> fleet : allowed break list
+  PERMIT_REQUEST  = "permit_request",  -- anyone -> datacenter : ask to allow a block
+  LOADER_ASSIGN   = "loader_assign",   -- datacenter -> loader : escort this miner
+  SITE_JOB        = "site_job",        -- marker -> datacenter : dig this marked box
+  SITE_JOB_ACK    = "site_job_ack",    -- datacenter -> marker
 }
 
 -- Compass headings (Minecraft world axes).
@@ -81,13 +90,57 @@ titan.RESTRICTED = {
   ["minecraft:spawner"] = true,
   ["minecraft:end_portal_frame"] = true, ["minecraft:end_portal"] = true,
   ["minecraft:obsidian"] = true,
+  -- Rails / tracks (vanilla + common Create train track ids)
+  ["minecraft:rail"] = true,
+  ["minecraft:powered_rail"] = true,
+  ["minecraft:detector_rail"] = true,
+  ["minecraft:activator_rail"] = true,
 }
 -- Any block whose id starts with one of these prefixes is also protected
--- (keeps bots from mining computers, turtles, drives, disk-carts, etc.).
-titan.RESTRICTED_PREFIXES = { "computercraft:", "advancedperipherals:" }
+-- (keeps bots from mining computers, turtles, Create machines, train parts).
+-- Override specific ids / prefixes with titan.allowPermit / PERMIT_SYNC.
+titan.RESTRICTED_PREFIXES = {
+  "computercraft:", "advancedperipherals:",
+  "create:", "createaddition:", "railways:", "interiors:",
+}
+
+-- Temporary break permits from Parent Center: [id or "prefix:"] = expiresUtc|true
+titan.permits = {}
+
+function titan.clearPermits()
+  titan.permits = {}
+end
+
+function titan.setPermits(map)
+  titan.permits = type(map) == "table" and map or {}
+end
+
+function titan.allowPermit(key, expiresUtc)
+  if not key or key == "" then return end
+  titan.permits[tostring(key)] = expiresUtc or true
+end
+
+function titan.revokePermit(key)
+  if key then titan.permits[tostring(key)] = nil end
+end
+
+function titan.isPermitted(name)
+  if not name then return false end
+  local now = os.epoch("utc")
+  local exp = titan.permits[name]
+  if exp == true then return true end
+  if type(exp) == "number" and exp > now then return true end
+  for key, e in pairs(titan.permits) do
+    if type(key) == "string" and #key > 0 and name:sub(1, #key) == key then
+      if e == true or (type(e) == "number" and e > now) then return true end
+    end
+  end
+  return false
+end
 
 function titan.isRestricted(name)
   if not name then return false end
+  if titan.isPermitted(name) then return false end
   if titan.RESTRICTED[name] then return true end
   for _, p in ipairs(titan.RESTRICTED_PREFIXES) do
     if name:sub(1, #p) == p then return true end
@@ -1872,7 +1925,7 @@ end
 -- Restricted blocks are never broken; if the bot can't reach 250 it flies as
 -- high as it can.
 --------------------------------------------------------------------------------
-nav.CRUISE_Y   = 250   -- preferred travel altitude
+nav.CRUISE_Y   = 250   -- preferred travel altitude (fleet miners often use 150)
 nav.CRUISE_MIN = 12    -- only bother cruising for hops at least this far (horizontally)
 nav.repair     = nil   -- { x, z, cells = { [worldY] = blockName } } from the last descent
 
@@ -1943,7 +1996,8 @@ function nav.travelTo(tx, ty, tz, opts)
     return nav.moveTo(tx, ty, tz, opts)          -- short hop: go direct
   end
 
-  local _, reachedY = nav.ascendCruise(nav.CRUISE_Y)         -- 1) leave (+ repair old shaft)
+  local cruise = tonumber(opts.cruiseY) or nav.CRUISE_Y
+  local _, reachedY = nav.ascendCruise(cruise)               -- 1) leave (+ repair old shaft)
   local ok, why = nav.moveTo(tx, reachedY, tz, { dig = dig }) -- 2) fly across at altitude
   if not ok then return false, why end
   local _, gotY = nav.descendRecord(ty)                      -- 3) drop onto target

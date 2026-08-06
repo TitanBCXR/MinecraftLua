@@ -1,14 +1,16 @@
 --[[
   miner.lua  -  Area miner turtle for the Titan network (CC: Tweaked)
-  Titan-Version: 1.2.7
+  Titan-Version: 1.2.9
 
   Digs a rectangular "box":
     * set1 <x> <z> / set2 <x> <z> — opposite corners (X/Z footprint)
     * ystart / yend — vertical range (mine from start Y down to end Y)
     * sety <start> <end> — set both Y levels at once
-    * home / start — return point; chest is one block BEHIND home (auto)
+    * mine 5x5 <yEnd> — quick flatten from here (end Y = bottom)
+    * home / stage — return / fleet parking sheet
     * mine — start (writes miner_job.cfg with corners + Y + init pos)
     * continue — resume after unload/reboot from GPS / saved progress
+    * Parent Center can assign strip jobs (cruise Y ~150)
 
   Never breaks blocks listed in exclude.txt (or titan.RESTRICTED).
 
@@ -46,6 +48,8 @@ local cfg = {
   chest = nil,      -- {x,y,z} chest block (default: one block behind home)
   home = nil,       -- start / return point (face the mine; chest behind)
   homeFacing = nil, -- titan.NORTH/EAST/SOUTH/WEST when home was set
+  stage = nil,      -- fleet parking / sheet slot {x,y,z}
+  cruiseY = 150,    -- nav layer for long hops to jobs
 }
 
 local state = {
@@ -54,9 +58,11 @@ local state = {
   stop   = false,
   dug    = 0,
   skipped = 0,
+  jobId  = nil,
 }
 local mineRequested = false
 local continueRequested = false
+local pendingJob = nil  -- strip job from Parent Center
 
 local exclude = {}   -- [blockName] = true
 
@@ -283,6 +289,18 @@ local function tryDig(dir)
   if not present then return true, "air" end
   if isExcluded(data.name) then
     state.skipped = state.skipped + 1
+    -- Ask Parent Center to show a Create/train break permit request on the monitor.
+    local n = data.name
+    if n and (n:find("^create") or n:find("^railways") or n:find("rail")) then
+      local now = os.epoch("utc")
+      state._permitAsk = state._permitAsk or {}
+      if not state._permitAsk[n] or (now - state._permitAsk[n]) > 30000 then
+        state._permitAsk[n] = now
+        rednet.broadcast({
+          type = MSG.PERMIT_REQUEST, key = n, from = cfg.name or os.getComputerLabel(),
+        }, P)
+      end
+    end
     return false, "excluded:" .. data.name
   end
   if dig() then
@@ -825,6 +843,138 @@ local function setYEnd(y)
   return cfg.yEnd
 end
 
+local function headingVec(h)
+  h = h % 4
+  if h == titan.NORTH then return 0, -1
+  elseif h == titan.EAST then return 1, 0
+  elseif h == titan.SOUTH then return 0, 1
+  else return -1, 0 end
+end
+
+local function rightVec(h)
+  return headingVec((h + 1) % 4)
+end
+
+-- Quick flatten: mine WxD from current GPS, forward + right, down to yEnd.
+local function setupMineSize(w, d, yEnd)
+  w, d, yEnd = tonumber(w), tonumber(d), tonumber(yEnd)
+  if not (w and d and yEnd) or w < 1 or d < 1 then
+    return false, "Usage: mine <W>x<D> <yEnd>   e.g. mine 5x5 -59"
+  end
+  if nav.heading == nil then
+    local ok, err = nav.calibrate(true)
+    if not ok then return false, "calibrate: " .. tostring(err) end
+  end
+  local x, y, z = nav.locatePrecise(4)
+  if not x then return false, "no GPS" end
+  local fx, fz = headingVec(nav.heading)
+  local rx, rz = rightVec(nav.heading)
+  local x2 = x + fx * (d - 1) + rx * (w - 1)
+  local z2 = z + fz * (d - 1) + rz * (w - 1)
+  cfg.loc1 = { x = math.floor(x), y = math.floor(y), z = math.floor(z) }
+  cfg.loc2 = { x = math.floor(x2), y = math.floor(y), z = math.floor(z2) }
+  cfg.yStart = math.floor(y)
+  cfg.yEnd = math.floor(yEnd)
+  cfg.floorY = cfg.yEnd
+  if not cfg.home then
+    cfg.home = { x = cfg.loc1.x, y = cfg.loc1.y, z = cfg.loc1.z }
+    cfg.homeFacing = nav.heading
+  end
+  saveCfg()
+  return true, bounds()
+end
+
+local function applyStripJob(job)
+  if type(job) ~= "table" then return false, "bad job" end
+  local x1, z1 = tonumber(job.x1), tonumber(job.z1)
+  local x2, z2 = tonumber(job.x2), tonumber(job.z2)
+  local yEnd = tonumber(job.yEnd or job.y)
+  if not (x1 and z1 and x2 and z2 and yEnd) then
+    return false, "job needs x1,z1,x2,z2,yEnd"
+  end
+  cfg.loc1 = { x = math.floor(x1), z = math.floor(z1), y = tonumber(job.yStart) or 0 }
+  cfg.loc2 = { x = math.floor(x2), z = math.floor(z2), y = tonumber(job.yStart) or 0 }
+  cfg.yEnd = math.floor(yEnd)
+  cfg.floorY = cfg.yEnd
+  if job.yStart ~= nil then cfg.yStart = math.floor(tonumber(job.yStart)) end
+  if tonumber(job.cruiseY) then cfg.cruiseY = math.floor(tonumber(job.cruiseY)) end
+  state.jobId = job.jobId or job.id
+  saveCfg()
+  return true
+end
+
+local function goCruiseTo(tx, ty, tz)
+  local cruise = tonumber(cfg.cruiseY) or 150
+  return nav.travelTo(tx, ty, tz, { dig = true, cruiseY = cruise })
+end
+
+local function returnToStage()
+  local dest = cfg.stage or cfg.home
+  if not dest then return false, "no stage/home" end
+  setStatus("returning", "-> stage")
+  local ok, err = goCruiseTo(dest.x, dest.y, dest.z)
+  setStatus(ok and "idle" or "error", ok and "-" or tostring(err))
+  return ok, err
+end
+
+-- Run an assigned strip: fly via cruise, set top Y from arrival GPS if needed, dig, return.
+local function runAssignedJob(job)
+  local ok, err = applyStripJob(job)
+  if not ok then print(tostring(err)); return false end
+  local b = bounds()
+  if not b and cfg.yStart == nil then
+    -- yStart filled after arrival
+  end
+  local midX = math.floor((cfg.loc1.x + cfg.loc2.x) / 2)
+  local midZ = math.floor((cfg.loc1.z + cfg.loc2.z) / 2)
+  local approachY = tonumber(job.approachY) or tonumber(cfg.yStart) or (tonumber(cfg.cruiseY) or 150)
+  setStatus("moving", ("job %s via Y%d"):format(tostring(state.jobId or "?"), tonumber(cfg.cruiseY) or 150))
+  print(("Traveling to strip @ %d,%d (cruise %d)..."):format(midX, midZ, tonumber(cfg.cruiseY) or 150))
+  local tok, terr = goCruiseTo(midX, approachY, midZ)
+  if not tok then
+    setStatus("error", tostring(terr))
+    print("Travel failed: " .. tostring(terr))
+    return false
+  end
+  local _, y = nav.locatePrecise(3)
+  if tonumber(job.yStart) ~= nil then
+    -- Fleet / marker jobs pin the Y band — do not override from GPS.
+    cfg.yStart = math.floor(tonumber(job.yStart))
+    if tonumber(job.yEnd) ~= nil then
+      cfg.yEnd = math.floor(tonumber(job.yEnd))
+      cfg.floorY = cfg.yEnd
+    end
+    saveCfg()
+  elseif y and cfg.yStart == nil then
+    cfg.yStart = math.floor(y)
+    saveCfg()
+  elseif y then
+    cfg.yStart = math.max(cfg.yStart or y, math.floor(y))
+    saveCfg()
+  end
+  if not quarryReady() then
+    print("Strip not ready after arrival.")
+    setStatus("error", "bad strip")
+    return false
+  end
+  local bb = bounds()
+  if bb then
+    print(("Assigned dig Y[%d->%d] X[%d..%d] Z[%d..%d]"):format(
+      bb.topY, bb.floorY, bb.minX, bb.maxX, bb.minZ, bb.maxZ))
+  end
+  mineVolume()
+  if job.returnStage ~= false then
+    returnToStage()
+  end
+  if job.replyTo then
+    titan.send(job.replyTo, MSG.MINE_JOB_ACK, {
+      ok = true, jobId = state.jobId, dug = state.dug,
+      name = cfg.name, status = state.status,
+    })
+  end
+  return true
+end
+
 -- Returns "exit" to quit local console, false for unknown (shell fallthrough over SSH).
 local function handleCommand(a)
   local cmd = (a[1] or ""):lower()
@@ -845,8 +995,11 @@ local function handleCommand(a)
     print("  chest <x y z>  set chest block manually")
     print("  deposit        legacy: stand ABOVE a chest (dropDown)")
     print("  exclude   reload & show exclude.txt")
-    print("  mine      dig the box (saves miner_job.cfg)")
+    print("  mine                 dig configured box")
+    print("  mine <W>x<D> <yEnd>  flatten from here (e.g. mine 5x5 -59)")
     print("  continue  resume after unload/reboot from GPS/job")
+    print("  stage [here|x y z]   fleet parking sheet slot")
+    print("  cruise [y]           long-hop altitude (default 150)")
     print("  stop | status | dump | goto <x> <y> <z>")
     print("  hostname [name] | exit")
   elseif cmd == "hostname" or cmd == "host" then
@@ -952,11 +1105,57 @@ local function handleCommand(a)
     printStatus()
   elseif cmd == "mine" then
     if state.status == "mining" then print("Already mining.")
+    elseif a[2] then
+      -- mine 5x5 -59  OR  mine 5 5 -59
+      local w, d, yEnd
+      local m = tostring(a[2]):match("^(%d+)[xX](%d+)$")
+      if m then
+        w, d = tostring(a[2]):match("^(%d+)[xX](%d+)$")
+        yEnd = a[3]
+      else
+        w, d, yEnd = a[2], a[3], a[4]
+      end
+      local ok, bOrErr = setupMineSize(w, d, yEnd)
+      if not ok then print(tostring(bOrErr))
+      else
+        local b = bOrErr
+        print(("Box X[%d..%d] Z[%d..%d] Y %d -> %d"):format(
+          b.minX, b.maxX, b.minZ, b.maxZ, b.topY, b.floorY))
+        mineVolume()
+      end
     elseif not quarryReady() then
-      print("Box incomplete. Need set1, set2, and sety <start> <end>.")
+      print("Box incomplete. Need set1/set2/sety, or: mine <W>x<D> <yEnd>")
       printStatus()
     else
       mineVolume()
+    end
+  elseif cmd == "stage" then
+    if not a[2] or a[2]:lower() == "here" then
+      local x, y, z = nav.locatePrecise(3)
+      if not x then print("No GPS.") else
+        cfg.stage = { x = x, y = y, z = z }
+        saveCfg()
+        print("stage = " .. fmt(cfg.stage))
+      end
+    elseif a[2] and a[3] and a[4] then
+      cfg.stage = {
+        x = math.floor(tonumber(a[2])),
+        y = math.floor(tonumber(a[3])),
+        z = math.floor(tonumber(a[4])),
+      }
+      saveCfg()
+      print("stage = " .. fmt(cfg.stage))
+    else
+      print("stage: " .. fmt(cfg.stage))
+      print("Usage: stage here | stage <x> <y> <z>")
+    end
+  elseif cmd == "cruise" then
+    if not a[2] then
+      print("cruiseY = " .. tostring(cfg.cruiseY or 150))
+    else
+      cfg.cruiseY = math.floor(tonumber(a[2]) or 150)
+      saveCfg()
+      print("cruiseY = " .. cfg.cruiseY)
     end
   elseif cmd == "continue" or cmd == "resume" then
     if state.status == "mining" then print("Already mining.")
@@ -1048,6 +1247,14 @@ local function applyDeployment(d)
     cfg.chest = d.deposit
     cfg.deposit = nil
   end
+  if type(d.stage) == "table" and d.stage.x then
+    cfg.stage = {
+      x = math.floor(tonumber(d.stage.x)),
+      y = math.floor(tonumber(d.stage.y) or 64),
+      z = math.floor(tonumber(d.stage.z)),
+    }
+  end
+  if tonumber(d.cruiseY) then cfg.cruiseY = math.floor(tonumber(d.cruiseY)) end
   saveCfg()
   os.setComputerLabel(name)
   if cfg.home then nav.home = cfg.home end
@@ -1155,12 +1362,44 @@ local function receiveLoop()
           nav.goHome({ dig = true })
           setStatus("idle", "-")
           titan.send(id, MSG.ACK, { ok = true, task = "home" })
+        elseif cmd == "park" or cmd == "tostage" then
+          local ok, err = returnToStage()
+          titan.send(id, MSG.ACK, { ok = ok, err = err, task = "park" })
         elseif cmd == "dump" then
           dumpInventory()
           titan.send(id, MSG.ACK, { ok = true, task = "dump" })
+        elseif cmd == "stage" and msg.x then
+          cfg.stage = {
+            x = math.floor(tonumber(msg.x)),
+            y = math.floor(tonumber(msg.y) or 64),
+            z = math.floor(tonumber(msg.z)),
+          }
+          saveCfg()
+          titan.send(id, MSG.ACK, { ok = true, task = "stage set" })
+        end
+      elseif t == MSG.MINE_JOB then
+        if state.status == "mining" or state.status == "moving" then
+          titan.send(id, MSG.MINE_JOB_ACK, { ok = false, err = "busy", jobId = msg.jobId })
+        else
+          msg.replyTo = id
+          pendingJob = msg
+          setStatus("idle", "job queued")
+          titan.send(id, MSG.MINE_JOB_ACK, { ok = true, jobId = msg.jobId, queued = true })
+        end
+      elseif t == MSG.PERMIT_SYNC then
+        if type(msg.permits) == "table" then
+          titan.setPermits(msg.permits)
         end
       elseif t == MSG.WORKER_DEPLOY then
         local ok, why = applyDeployment(msg)
+        if ok and msg.stage then
+          cfg.stage = msg.stage
+          saveCfg()
+        end
+        if ok and tonumber(msg.cruiseY) then
+          cfg.cruiseY = math.floor(tonumber(msg.cruiseY))
+          saveCfg()
+        end
         titan.send(id, MSG.WORKER_DEPLOYED, {
           ok = ok, err = why, name = cfg.name, botType = "miner",
         })
@@ -1177,7 +1416,11 @@ end
 
 local function jobLoop()
   while true do
-    if mineRequested and state.status ~= "mining" then
+    if pendingJob and state.status ~= "mining" and state.status ~= "moving" then
+      local job = pendingJob
+      pendingJob = nil
+      runAssignedJob(job)
+    elseif mineRequested and state.status ~= "mining" then
       mineRequested = false
       mineVolume()
     elseif continueRequested and state.status ~= "mining" then
@@ -1185,6 +1428,14 @@ local function jobLoop()
       continueMine()
     end
     sleep(0.4)
+  end
+end
+
+-- Pull Create break permits from Parent Center on boot.
+local function permitLoop()
+  while true do
+    rednet.broadcast({ type = MSG.PERMIT_SYNC, want = true }, P)
+    sleep(60)
   end
 end
 
@@ -1244,6 +1495,7 @@ parallel.waitForAny(
   statusLoop,
   receiveLoop,
   jobLoop,
+  permitLoop,
   function() titan.networkLoop("miner") end
 )
 print("Miner stopped.")

@@ -1,6 +1,9 @@
-# Titan-Version: 1.0.0
+# Titan-Version: 1.0.1
 # Miner exclude list — one block/item id per line.
 # The miner will NOT break these (or anything on titan.RESTRICTED).
+# Create / train blocks are also protected by titan.RESTRICTED_PREFIXES
+# (create:, railways:, etc). To allow breaking them, unlock at Parent Center:
+#   permit create:          (all Create)  or  permit create:track
 # Lines starting with # are comments. Blank lines are ignored.
 #
 # Examples:

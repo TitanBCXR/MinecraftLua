@@ -1,6 +1,6 @@
 --[[
   datacenter.lua  -  Titan Data Center (CC: Tweaked)   [ single, self-contained script ]
-  Titan-Version: 1.2.4
+  Titan-Version: 1.2.6
 
   ONE script that every computer/terminal in your data center runs. It works out
   its own role automatically:
@@ -34,10 +34,15 @@
       (chests, barrels, drawers, ME/RS bridges exposed as inventories, ...).
 
   WORKER / BOT DEPLOYMENT (this is the "Parent Center" role):
-    * Manages all three bot types: builder, gatherer (worker.lua), and miner
-      (miner.lua). Unconfigured turtles wait; `pending` lists them.
-    * `deploy <id> <builder|gatherer|miner> <name> [x y z]` pushes config.
-      ADMIN only (master-password lock). Deposit coords optional (chest / dump).
+    * Manages bot types: builder, gatherer (worker.lua), miner (miner.lua),
+      and loader (loader.lua + Chunky Turtle). Unconfigured turtles wait.
+    * `deploy <id> <builder|gatherer|miner|loader> <name> [dep] [stage]`
+      ADMIN only (master-password lock). Stage = fleet parking sheet slot.
+    * `flatten <x> <z> <W>x<D> <yEnd> [nBots] [yStart] [yband|strip]`
+      yband = staggered Y bands (default); strip = X strips. Also accepts
+      `site_job` from marker.lua computers.
+    * `permit <id|prefix>` / `unpermit` / `permits` — allow breaking Create/etc
+      (shown on the master monitor). Create:* is protected by default.
 
   BOOTSTRAP (first master password):
     * Insert a blank floppy in a master-to-be computer and run `initmaster` from
@@ -75,10 +80,15 @@ local MSG = {
 local registry = {}                          -- [id] = { name, seen, master }
 local session  = { mode = "bot", user = nil } -- mode: "bot" (locked) | "admin"
 local station  = { name = nil }
-local BOT_TYPES = { builder = true, gatherer = true, miner = true }
+local BOT_TYPES = { builder = true, gatherer = true, miner = true, loader = true }
 local netbots  = {}                          -- [id] = { name, botType, x,y,z, fuel, state, task, seen, assignment }
 local pending  = {}                          -- [id] = { name, x,y,z, seen, kind } awaiting deployment
 local authed   = {}                          -- [id] = { name, kind, hostname, seen } bots authed with this DC
+local mineJobs = {}                          -- newest-first job summaries for the monitor
+local permits  = {}                          -- [blockId or prefix] = true | expiresUtc
+local permitReqs = {}                        -- pending human-visible permit requests
+local PERMIT_FILE = "break_permits.cfg"
+local nextJobId = 1
 
 --==============================================================================
 -- Small helpers
@@ -447,7 +457,8 @@ local function cmdPending()
   end
 end
 
--- Push deploy config: deploy <id|name> <builder|gatherer|miner> <name> [dx dy dz]
+-- Push deploy config:
+--   deploy <id|name> <builder|gatherer|miner|loader> <name> [depX depY depZ] [stageX stageY stageZ]
 local function cmdDeploy(rest)
   local a = {}
   for w in tostring(rest):gmatch("%S+") do a[#a + 1] = w end
@@ -456,14 +467,16 @@ local function cmdDeploy(rest)
   if btype == "mine" then btype = "miner" end
   if btype == "build" then btype = "builder" end
   if btype == "gather" then btype = "gatherer" end
+  if btype == "chunk" or btype == "chunky" then btype = "loader" end
 
   if not ref or not name then
-    print("Usage: deploy <id|name> <builder|gatherer|miner> <name> [depX depY depZ]")
+    print("Usage: deploy <id|name> <builder|gatherer|miner|loader> <name> [depX depY depZ] [stageX stageY stageZ]")
     print("Example: deploy 12 miner Diggy 100 64 200")
+    print("Example: deploy 15 loader Chunk1 100 70 200")
     return
   end
   if not BOT_TYPES[btype] then
-    print(("Unknown type '%s'. Use: builder, gatherer, or miner"):format(tostring(a[2] or "")))
+    print(("Unknown type '%s'. Use: builder, gatherer, miner, or loader"):format(tostring(a[2] or "")))
     return
   end
 
@@ -480,20 +493,37 @@ local function cmdDeploy(rest)
     local k = tostring(pend.kind):lower()
     if btype == "miner" and (k == "worker" or k == "worker?") then
       print("Note: that turtle is running worker.lua — it will hand off to miner.lua if installed.")
+    elseif btype == "loader" and k ~= "loader" then
+      print("Note: install/run loader.lua on that turtle (Chunky Turtle upgrade recommended).")
     elseif (btype == "builder" or btype == "gatherer") and k == "miner" then
       print("Note: that turtle is running miner.lua — install/run worker.lua for builder/gatherer.")
     end
   end
 
-  local deposit
+  local deposit, stage
   if a[4] and a[5] and a[6] then
-    deposit = { x = tonumber(a[4]), y = tonumber(a[5]), z = tonumber(a[6]) }
+    local p = { x = tonumber(a[4]), y = tonumber(a[5]), z = tonumber(a[6]) }
+    if btype == "loader" then
+      stage = p
+    else
+      deposit = p
+    end
+  end
+  if a[7] and a[8] and a[9] then
+    stage = { x = tonumber(a[7]), y = tonumber(a[8]), z = tonumber(a[9]) }
   end
 
   rednet.send(targetId,
-    { type = "worker_deploy", botType = btype, name = name, deposit = deposit }, NET_PROTOCOL)
-  print(("Deploy sent to #%d: %s '%s'%s"):format(targetId, btype, name,
-    deposit and ("  deposit " .. ("%d,%d,%d"):format(deposit.x, deposit.y, deposit.z)) or ""))
+    { type = "worker_deploy", botType = btype, name = name, deposit = deposit,
+      stage = stage, cruiseY = 150 }, NET_PROTOCOL)
+  local extra = ""
+  if deposit then
+    extra = extra .. ("  deposit %d,%d,%d"):format(deposit.x, deposit.y, deposit.z)
+  end
+  if stage then
+    extra = extra .. ("  stage %d,%d,%d"):format(stage.x, stage.y, stage.z)
+  end
+  print(("Deploy sent to #%d: %s '%s'%s"):format(targetId, btype, name, extra))
   local deadline = os.clock() + 8
   while os.clock() < deadline do
     local id, msg = rednet.receive(NET_PROTOCOL, deadline - os.clock())
@@ -521,6 +551,328 @@ local function cmdDeploy(rest)
     end
   end
   print("(No confirmation yet - the bot may still be calibrating / rebooting into miner.lua.)")
+end
+
+--------------------------------------------------------------------------------
+-- Break permits (Create / trains protected unless listed)
+--------------------------------------------------------------------------------
+local function loadPermits()
+  if not fs.exists(PERMIT_FILE) then return end
+  local f = fs.open(PERMIT_FILE, "r")
+  local d = textutils.unserialize(f.readAll()); f.close()
+  if type(d) == "table" then permits = d end
+end
+
+local function savePermits()
+  local f = fs.open(PERMIT_FILE, "w"); f.write(textutils.serialize(permits)); f.close()
+end
+
+local function broadcastPermits()
+  rednet.broadcast({ type = "permit_sync", permits = permits }, NET_PROTOCOL)
+end
+
+local function cmdPermits()
+  print("Break permits (Create/rails protected unless listed):")
+  local n = 0
+  for k, v in pairs(permits) do
+    n = n + 1
+    if v == true then print("  " .. k)
+    else print(("  %s  (until %s)"):format(k, tostring(v))) end
+  end
+  if n == 0 then print("  (none)") end
+  if #permitReqs > 0 then
+    print("Open requests:")
+    for i, r in ipairs(permitReqs) do
+      print(("  %d) %s  from %s"):format(i, r.key, tostring(r.from or "?")))
+    end
+  end
+end
+
+local function cmdPermit(rest)
+  local key = tostring(rest or ""):match("^%s*(%S+)")
+  if not key then
+    print("Usage: permit <blockId|prefix:>")
+    print("Example: permit create:  OR  permit create:track")
+    return
+  end
+  if key == "create" then key = "create:" end
+  permits[key] = true
+  savePermits()
+  broadcastPermits()
+  print("Permitted break: " .. key)
+  -- clear matching requests
+  local kept = {}
+  for _, r in ipairs(permitReqs) do
+    if r.key ~= key then kept[#kept + 1] = r end
+  end
+  permitReqs = kept
+end
+
+local function cmdUnpermit(rest)
+  local key = tostring(rest or ""):match("^%s*(%S+)")
+  if not key then print("Usage: unpermit <blockId|prefix:>"); return end
+  if key == "create" then key = "create:" end
+  permits[key] = nil
+  savePermits()
+  broadcastPermits()
+  print("Revoked: " .. key)
+end
+
+--------------------------------------------------------------------------------
+-- Fleet flatten / mine jobs
+--------------------------------------------------------------------------------
+local function idleOfType(botType)
+  local nowMs, list = os.epoch("utc"), {}
+  for id, b in pairs(netbots) do
+    if b.botType == botType and (nowMs - (b.seen or 0)) < 20000 then
+      local st = tostring(b.state or "")
+      if st == "idle" or st == "authed" or st == "online" or st == "-" or st == "parked" then
+        list[#list + 1] = id
+      end
+    end
+  end
+  table.sort(list)
+  return list
+end
+
+local function idleMiners() return idleOfType("miner") end
+local function idleLoaders() return idleOfType("loader") end
+
+-- Split XZ box into up to n vertical strips (along X).
+local function splitStrips(x, z, w, d, n)
+  n = math.max(1, math.min(n, w))
+  local strips, base, rem = {}, math.floor(w / n), w % n
+  local cursor = x
+  for i = 1, n do
+    local sw = base + (i <= rem and 1 or 0)
+    if sw < 1 then break end
+    strips[#strips + 1] = {
+      x1 = cursor, z1 = z,
+      x2 = cursor + sw - 1, z2 = z + d - 1,
+    }
+    cursor = cursor + sw
+  end
+  return strips
+end
+
+-- Split vertical range into n contiguous Y bands (top -> bottom). Staggers miners
+-- so they are not all chewing the same layer at once.
+local function splitYBands(yTop, yEnd, n)
+  yTop, yEnd = math.floor(yTop), math.floor(yEnd)
+  if yEnd > yTop then yTop, yEnd = yEnd, yTop end
+  local height = yTop - yEnd + 1
+  n = math.max(1, math.min(n, height))
+  local bands, base, rem = {}, math.floor(height / n), height % n
+  local cursor = yTop
+  for i = 1, n do
+    local h = base + (i <= rem and 1 or 0)
+    if h < 1 then break end
+    local ys, ye = cursor, cursor - h + 1
+    bands[#bands + 1] = { yStart = ys, yEnd = ye }
+    cursor = ye - 1
+  end
+  return bands
+end
+
+-- Core fleet dispatch used by flatten + site markers.
+-- opts: yStart, mode ("yband"|"strip"), cruiseY, returnStage, source, name, replyTo
+local function dispatchAreaJobs(x, z, w, d, yEnd, nBots, opts)
+  opts = opts or {}
+  local yStart = tonumber(opts.yStart)
+  local mode = tostring(opts.mode or "yband"):lower()
+  if mode == "xz" or mode == "x" then mode = "strip" end
+  if mode == "y" or mode == "layer" or mode == "layers" then mode = "yband" end
+  local cruiseY = tonumber(opts.cruiseY) or 150
+  local returnStage = opts.returnStage ~= false
+
+  local idle = idleMiners()
+  if #idle == 0 then return false, "No idle miners online." end
+
+  x, z, w, d, yEnd = math.floor(x), math.floor(z), math.floor(w), math.floor(d), math.floor(yEnd)
+  if not yStart then
+    -- Default top = max(nearby miner Y, yEnd+1) — marker should send yStart.
+    yStart = yEnd + math.max(1, math.min(64, d))
+  end
+  yStart = math.floor(yStart)
+  if yEnd > yStart then yStart, yEnd = yEnd, yStart end
+
+  if mode == "strip" then
+    nBots = nBots or math.min(#idle, math.max(1, math.ceil(w / 5)))
+    nBots = math.min(nBots, #idle, w)
+  else
+    local height = yStart - yEnd + 1
+    nBots = nBots or math.min(#idle, math.max(1, math.min(height, math.ceil(height / 8))))
+    nBots = math.min(nBots, #idle, height)
+    mode = "yband"
+  end
+
+  local jobId = "J" .. tostring(nextJobId)
+  nextJobId = nextJobId + 1
+  local pieces = {}
+  if mode == "strip" then
+    local strips = splitStrips(x, z, w, d, nBots)
+    for i, s in ipairs(strips) do
+      pieces[#pieces + 1] = {
+        x1 = s.x1, z1 = s.z1, x2 = s.x2, z2 = s.z2,
+        yStart = yStart, yEnd = yEnd,
+        -- Stagger approach/start so strip bots don't all land on the same Y tick.
+        approachY = yStart - (i - 1),
+        label = ("X[%d..%d] Z[%d..%d] Y[%d->%d]"):format(
+          s.x1, s.x2, s.z1, s.z2, yStart, yEnd),
+      }
+    end
+  else
+    local bands = splitYBands(yStart, yEnd, nBots)
+    local x2, z2 = x + w - 1, z + d - 1
+    for i, b in ipairs(bands) do
+      pieces[#pieces + 1] = {
+        x1 = x, z1 = z, x2 = x2, z2 = z2,
+        yStart = b.yStart, yEnd = b.yEnd,
+        approachY = b.yStart,
+        label = ("XZ full  Y[%d->%d]"):format(b.yStart, b.yEnd),
+      }
+    end
+  end
+
+  print(("Job %s [%s]: %dx%d @ %d,%d  Y%d->%d  %d miners%s"):format(
+    jobId, mode, w, d, x, z, yStart, yEnd, #pieces,
+    opts.name and ("  (" .. opts.name .. ")") or ""))
+
+  local loaders = idleLoaders()
+  for i, piece in ipairs(pieces) do
+    local id = idle[i]
+    local payload = {
+      type = "mine_job",
+      jobId = jobId .. "-" .. i,
+      parentJob = jobId,
+      x1 = piece.x1, z1 = piece.z1, x2 = piece.x2, z2 = piece.z2,
+      yStart = piece.yStart, yEnd = piece.yEnd,
+      approachY = piece.approachY,
+      cruiseY = cruiseY, returnStage = returnStage,
+      mode = mode,
+    }
+    rednet.send(id, payload, NET_PROTOCOL)
+    netbots[id] = netbots[id] or {}
+    netbots[id].assignment = payload.jobId
+    netbots[id].task = mode
+    netbots[id].state = "queued"
+    print(("  -> miner #%d %s  %s"):format(
+      id, netbots[id].name or "?", piece.label))
+    local lid = loaders[i]
+    if lid then
+      local midX = math.floor((piece.x1 + piece.x2) / 2)
+      local midZ = math.floor((piece.z1 + piece.z2) / 2)
+      rednet.send(lid, {
+        type = "loader_assign",
+        jobId = payload.jobId,
+        minerId = id,
+        x = midX, y = piece.approachY or cruiseY, z = midZ,
+        x1 = piece.x1, z1 = piece.z1, x2 = piece.x2, z2 = piece.z2,
+        cruiseY = cruiseY, returnStage = true,
+      }, NET_PROTOCOL)
+      netbots[lid] = netbots[lid] or {}
+      netbots[lid].assignment = payload.jobId
+      netbots[lid].task = "escort"
+      netbots[lid].state = "queued"
+      print(("  -> loader #%d escort"):format(lid))
+    end
+  end
+  if #loaders < #pieces then
+    print(("Note: %d loader(s) for %d piece(s). Chunky Turtle recommended."):format(
+      #loaders, #pieces))
+  end
+
+  table.insert(mineJobs, 1, {
+    id = jobId, x = x, z = z, w = w, d = d,
+    yStart = yStart, yEnd = yEnd, mode = mode,
+    bots = #pieces, loaders = math.min(#loaders, #pieces),
+    source = opts.source or "admin", name = opts.name,
+    at = os.epoch("utc"), status = "dispatched",
+  })
+  while #mineJobs > 12 do mineJobs[#mineJobs] = nil end
+
+  if opts.replyTo then
+    rednet.send(opts.replyTo, {
+      type = "site_job_ack", ok = true, jobId = jobId,
+      bots = #pieces, mode = mode, yStart = yStart, yEnd = yEnd,
+    }, NET_PROTOCOL)
+  end
+  return true, jobId, #pieces
+end
+
+-- flatten <x> <z> <W>x<D> <yEnd> [nBots] [yStart] [mode]
+local function cmdFlatten(rest)
+  local a = {}
+  for w in tostring(rest or ""):gmatch("%S+") do a[#a + 1] = w end
+  local x, z = tonumber(a[1]), tonumber(a[2])
+  local w, d, yEnd, nBots, yStart, mode
+  if a[3] and a[3]:find("[xX]") then
+    w, d = a[3]:match("^(%d+)[xX](%d+)$")
+    w, d = tonumber(w), tonumber(d)
+    yEnd = tonumber(a[4])
+    nBots = tonumber(a[5])
+    yStart = tonumber(a[6])
+    mode = a[7]
+  else
+    w, d, yEnd, nBots = tonumber(a[3]), tonumber(a[4]), tonumber(a[5]), tonumber(a[6])
+    yStart = tonumber(a[7])
+    mode = a[8]
+  end
+  if not (x and z and w and d and yEnd) then
+    print("Usage: flatten <x> <z> <W>x<D> <yEnd> [nBots] [yStart] [yband|strip]")
+    print("Example: flatten 100 200 40x40 -59 8 80 yband")
+    print("  yband = each bot owns a Y band (staggered layers, default)")
+    print("  strip = each bot owns an X strip (full height)")
+    return
+  end
+  local ok, err = dispatchAreaJobs(x, z, w, d, yEnd, nBots, {
+    yStart = yStart, mode = mode or "yband", source = "flatten",
+  })
+  if not ok then print(tostring(err)) end
+end
+
+local function handleSiteJob(id, msg)
+  local x1, z1 = tonumber(msg.x1), tonumber(msg.z1)
+  local x2, z2 = tonumber(msg.x2), tonumber(msg.z2)
+  local yEnd = tonumber(msg.yEnd or msg.y)
+  local yStart = tonumber(msg.yStart or msg.yTop)
+  if not (x1 and z1 and x2 and z2 and yEnd and yStart) then
+    rednet.send(id, { type = "site_job_ack", ok = false, err = "need x1,z1,x2,z2,yStart,yEnd" }, NET_PROTOCOL)
+    return
+  end
+  local minX, maxX = math.min(x1, x2), math.max(x1, x2)
+  local minZ, maxZ = math.min(z1, z2), math.max(z1, z2)
+  local w, d = maxX - minX + 1, maxZ - minZ + 1
+  local ok, errOrId, n = dispatchAreaJobs(minX, minZ, w, d, yEnd, tonumber(msg.nBots), {
+    yStart = yStart,
+    mode = msg.mode or "yband",
+    cruiseY = msg.cruiseY,
+    returnStage = msg.returnStage ~= false,
+    source = "marker",
+    name = msg.name or msg.site,
+    replyTo = id,
+  })
+  if not ok then
+    rednet.send(id, { type = "site_job_ack", ok = false, err = errOrId }, NET_PROTOCOL)
+  end
+end
+
+local function botStats()
+  local nowMs, total, gath, build, mine, load, working = os.epoch("utc"), 0, 0, 0, 0, 0, 0
+  for _, b in pairs(netbots) do
+    if (nowMs - (b.seen or 0)) < 15000 then
+      total = total + 1
+      if b.botType == "gatherer" then gath = gath + 1
+      elseif b.botType == "builder" then build = build + 1
+      elseif b.botType == "miner" then mine = mine + 1
+      elseif b.botType == "loader" then load = load + 1 end
+      if b.state == "moving" or b.state == "working" or b.state == "mining"
+          or b.state == "escorting" or b.state == "queued" then
+        working = working + 1
+      end
+    end
+  end
+  return total, gath, build, mine, load, working
 end
 
 --==============================================================================
@@ -558,21 +910,10 @@ local function handleAdmin(cmd, rest)
   elseif cmd == "scan" then
     cmdScan()
   elseif cmd == "bots" then
+    local total, gath, build, mine, load, working = botStats()
+    print(("Bots active: %d  (build:%d gather:%d mine:%d load:%d busy:%d)"):format(
+      total, build, gath, mine, load, working))
     local nowMs = os.epoch("utc")
-    local total, gath, build, mine, working = 0, 0, 0, 0, 0
-    for _, b in pairs(netbots) do
-      if (nowMs - (b.seen or 0)) < 15000 then
-        total = total + 1
-        if b.botType == "gatherer" then gath = gath + 1
-        elseif b.botType == "builder" then build = build + 1
-        elseif b.botType == "miner" then mine = mine + 1 end
-        if b.state == "moving" or b.state == "working" or b.state == "mining" then
-          working = working + 1
-        end
-      end
-    end
-    print(("Bots active: %d  (build:%d gather:%d mine:%d busy:%d)"):format(
-      total, build, gath, mine, working))
     for id, b in pairs(netbots) do
       local age = math.floor((nowMs - (b.seen or 0)) / 1000)
       local asg = b.assignment or b.task or "-"
@@ -584,6 +925,20 @@ local function handleAdmin(cmd, rest)
     cmdPending()
   elseif cmd == "deploy" then
     cmdDeploy(rest)
+  elseif cmd == "flatten" or cmd == "minejob" or cmd == "mine" then
+    cmdFlatten(rest)
+  elseif cmd == "permit" then
+    cmdPermit(rest)
+  elseif cmd == "unpermit" or cmd == "revoke" then
+    cmdUnpermit(rest)
+  elseif cmd == "permits" then
+    cmdPermits()
+  elseif cmd == "jobs" then
+    if #mineJobs == 0 then print("(no recent flatten jobs)") end
+    for _, j in ipairs(mineJobs) do
+      print(("%s  %dx%d @ %d,%d -> Y%d  bots:%d  %s"):format(
+        j.id, j.w, j.d, j.x, j.z, j.yEnd, j.bots, j.status or "?"))
+    end
   elseif cmd == "bot" or cmd == "locate" then
     local ref, found = rest, nil
     for id, b in pairs(netbots) do
@@ -620,11 +975,15 @@ local function handleAdmin(cmd, rest)
     print("  storage            scan attached storage")
     print("  find <item>        search storage for an item")
     print("  scan               find online computers & master floppy")
-    print("  bots               live roster (builder / gatherer / miner)")
+    print("  bots               live roster (builder/gatherer/miner/loader)")
     print("  bot <name>         location, state, assignment")
     print("  locate <name>      alias of 'bot'")
     print("  pending            bots awaiting deployment")
-    print("  deploy <id> <builder|gatherer|miner> <name> [x y z]")
+    print("  deploy <id> <builder|gatherer|miner|loader> <name> [dep] [stage]")
+    print("  flatten <x> <z> <W>x<D> <yEnd> [nBots] [yStart] [yband|strip]")
+    print("  jobs               recent flatten / marker jobs")
+    print("  permit <id|prefix:>   allow breaking Create/etc (shows on monitor)")
+    print("  unpermit <id|prefix:> | permits")
     print("  rename|hostname <name>  rename this station (updates router roster)")
     print("  setmaster          change master password (master only)")
     print("  who | status       session / station info")
@@ -752,28 +1111,48 @@ local function botLoop()
         }
       elseif msg.type == "worker_deployed" then
         pending[id] = nil
+      elseif msg.type == "mine_job_ack" then
+        local b = netbots[id] or {}
+        b.state = msg.ok and (msg.queued and "queued" or "working") or (b.state or "error")
+        if msg.err then b.task = tostring(msg.err) end
+        if msg.jobId then b.assignment = msg.jobId end
+        if msg.dug ~= nil then b.dug = msg.dug end
+        b.seen = os.epoch("utc")
+        netbots[id] = b
+        if msg.ok and not msg.queued then
+          for _, j in ipairs(mineJobs) do
+            if msg.jobId and tostring(msg.jobId):find("^" .. j.id) then
+              j.status = "active"
+            end
+          end
+        end
+      elseif msg.type == "permit_request" then
+        local key = tostring(msg.key or msg.block or "")
+        if key ~= "" then
+          local dup = false
+          for _, r in ipairs(permitReqs) do
+            if r.key == key then dup = true; break end
+          end
+          if not dup then
+            permitReqs[#permitReqs + 1] = {
+              key = key, from = msg.from or msg.name or ("#" .. id),
+              at = os.epoch("utc"),
+            }
+            while #permitReqs > 24 do table.remove(permitReqs, 1) end
+            print(("Permit request: %s  (from %s) — admin: permit %s"):format(
+              key, tostring(msg.from or id), key))
+          end
+        end
+      elseif msg.type == "permit_sync" and msg.want then
+        rednet.send(id, { type = "permit_sync", permits = permits }, NET_PROTOCOL)
+      elseif msg.type == "site_job" then
+        handleSiteJob(id, msg)
       end
     end
   end
 end
 
 -- Count active bots (seen recently) by type.
-local function botStats()
-  local nowMs, total, gath, build, mine, working = os.epoch("utc"), 0, 0, 0, 0, 0
-  for _, b in pairs(netbots) do
-    if (nowMs - (b.seen or 0)) < 15000 then
-      total = total + 1
-      if b.botType == "gatherer" then gath = gath + 1
-      elseif b.botType == "builder" then build = build + 1
-      elseif b.botType == "miner" then mine = mine + 1 end
-      if b.state == "moving" or b.state == "working" or b.state == "mining" then
-        working = working + 1
-      end
-    end
-  end
-  return total, gath, build, mine, working
-end
-
 -- If a monitor is attached, show the station list (on the master) or a lock screen.
 -- NOTE: never return - parallel.waitForAny stops everything if any task finishes.
 local function drawMonitor(mon)
@@ -794,17 +1173,47 @@ local function drawMonitor(mon)
         age > 45 and colors.gray or colors.white)
       y = y + 1
     end
-    -- Bot network summary (builder / gatherer / miner).
-    local total, gath, build, mine, working = botStats()
+    -- Bot network summary + fleet jobs / Create break permits.
+    local total, gath, build, mine, load, working = botStats()
     y = y + 1
     line(y, "-- BOT NETWORK --", colors.orange); y = y + 1
-    line(y, ("Active:%d  build:%d gather:%d mine:%d busy:%d"):format(
-      total, build, gath, mine, working), colors.lime); y = y + 1
+    line(y, ("Active:%d  build:%d gather:%d mine:%d load:%d busy:%d"):format(
+      total, build, gath, mine, load, working), colors.lime); y = y + 1
     local nowMs2, npend = os.epoch("utc"), 0
     for _, w in pairs(pending) do if (nowMs2 - (w.seen or 0)) < 20000 then npend = npend + 1 end end
     if npend > 0 then
       line(y, ("Awaiting deploy: %d  (admin: pending / deploy)"):format(npend), colors.orange)
       y = y + 1
+    end
+    if #mineJobs > 0 then
+      line(y, "-- FLEET JOBS --", colors.orange); y = y + 1
+      for i = 1, math.min(3, #mineJobs) do
+        if y >= select(2, mon.getSize()) - 4 then break end
+        local j = mineJobs[i]
+        line(y, ("%s %dx%d->Y%d bots:%d %s"):format(
+          j.id, j.w, j.d, j.yEnd, j.bots, j.status or "?"), colors.cyan)
+        y = y + 1
+      end
+    end
+    do
+      local pn = 0
+      for _ in pairs(permits) do pn = pn + 1 end
+      if pn > 0 or #permitReqs > 0 then
+        line(y, "-- BREAK PERMITS --", colors.orange); y = y + 1
+        if pn > 0 then
+          local buf = {}
+          for k in pairs(permits) do buf[#buf + 1] = k end
+          table.sort(buf)
+          line(y, ("OK: %s"):format(table.concat(buf, ", "):sub(1, w - 4)), colors.lime)
+          y = y + 1
+        end
+        for i = 1, math.min(4, #permitReqs) do
+          if y >= select(2, mon.getSize()) - 2 then break end
+          local r = permitReqs[i]
+          line(y, ("REQ %s (%s)"):format(r.key, tostring(r.from or "?")):sub(1, w), colors.red)
+          y = y + 1
+        end
+      end
     end
     line(y, "NAME         TYPE     STATE    ASSIGNMENT", colors.lightGray); y = y + 1
     local h = select(2, mon.getSize())
@@ -815,7 +1224,7 @@ local function drawMonitor(mon)
         line(y, ("%-12s %-8s %-8s %s"):format(
           (b.name or ("#" .. id)):sub(1, 12), (b.botType or "?"):sub(1, 8),
           tostring(b.state or "?"):sub(1, 8), asg),
-          (b.state == "idle" or b.state == "authed") and colors.white or colors.cyan)
+          (b.state == "idle" or b.state == "authed" or b.state == "parked") and colors.white or colors.cyan)
         y = y + 1
       end
     end
@@ -870,6 +1279,8 @@ end
 openModem()
 ensureStationName()
 os.setComputerLabel(station.name)
+loadPermits()
+broadcastPermits()
 
 term.clear(); term.setCursorPos(1, 1)
 print("Titan Data Center - '" .. station.name .. "'")
@@ -877,6 +1288,10 @@ if isLocalMaster() then
   print("This computer holds the MASTER floppy.")
 elseif not discoverMaster(1) then
   print("No master online yet (logins will be denied until one appears).")
+end
+if next(permits) then
+  local n = 0; for _ in pairs(permits) do n = n + 1 end
+  print(("Break permits loaded: %d (broadcast to fleet)"):format(n))
 end
 
 local tasks = { serviceLoop, registerLoop, displayLoop, botLoop, uiLoop, relayLoop }
