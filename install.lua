@@ -1,6 +1,6 @@
 --[[
   install.lua  -  Titan network installer (CC: Tweaked)
-  Titan-Version: 1.1.9
+  Titan-Version: 1.1.11
 
   Downloads the Titan bot-network system onto this device from a running
   `host.lua` on the same rednet network (no pastebin / external web host).
@@ -48,16 +48,14 @@ local ROLES = {
     files = { "lib/titan.lua", "miner.lua", "exclude.txt" } },
   { key = "13", name = "StorageManager (Create storage)",  run = "storage_manager.lua",
     files = { "lib/titan.lua", "storage_manager.lua" } },
-  { key = "14", name = "Train node (Create train mesh)",   run = "train_node.lua",
-    files = { "lib/titan.lua", "train_node.lua" } },
-  { key = "15", name = "Install host (share files to others)", run = "host.lua",
+  { key = "14", name = "Install host (share files to others)", run = "host.lua",
     files = { "lib/titan.lua", "hub.lua", "bot.lua", "poi.lua", "worker.lua", "botserver.lua",
               "datacenter.lua", "console.lua", "admin.lua", "gpshost.lua", "locator.lua", "router.lua",
-              "miner.lua", "storage_manager.lua", "train_node.lua", "exclude.txt", "versions.lua", "install.lua" } },
-  { key = "16", name = "Everything (all files, no auto-run)", run = nil,
+              "miner.lua", "storage_manager.lua", "exclude.txt", "versions.lua", "install.lua" } },
+  { key = "15", name = "Everything (all files, no auto-run)", run = nil,
     files = { "lib/titan.lua", "hub.lua", "bot.lua", "poi.lua", "worker.lua", "botserver.lua",
               "datacenter.lua", "console.lua", "admin.lua", "gpshost.lua", "locator.lua", "router.lua",
-              "miner.lua", "storage_manager.lua", "train_node.lua", "exclude.txt", "versions.lua", "install.lua" } },
+              "miner.lua", "storage_manager.lua", "exclude.txt", "versions.lua", "install.lua" } },
 }
 
 local function openModem()
@@ -134,7 +132,7 @@ local function pickRole()
     while idx <= #ROLES do
       local _, h = term.getSize()
       print("")
-      print("What is this device?  (14=Train node)")
+      print("What is this device?  (13=StorageManager)")
       local budget = math.max(4, (h or 13) - 6)
       local shown = 0
       local start = idx
@@ -233,7 +231,6 @@ local LABELS = {
   ["admin.lua"] = "Admin", ["host.lua"] = "Host", ["gpshost.lua"] = "GPS",
   ["locator.lua"] = "Locator", ["router.lua"] = "Router", ["miner.lua"] = "Miner",
   ["storage_manager.lua"] = "StorageManager",
-  ["train_node.lua"] = "Train",
 }
 local lbl = role.run and LABELS[role.run]
 if lbl and not os.getComputerLabel() then
