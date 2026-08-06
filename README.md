@@ -6,7 +6,7 @@ A wireless dispatch system for Minecraft's **CC: Tweaked** mod:
 - **`bot.lua`** — a turtle that reports status, navigates by GPS, and executes tasks.
 - **`poi.lua`** — a "point of interest" computer that marks a location by coordinates and can summon a bot.
 - **`miner.lua`** — quarry turtle: digs between two corners down to a floor Y, skipping `exclude.txt`.
-- **`offline_miner.lua`** — local quarry (no GPS/network): origin at top-front-left, `box` / `tunnel` / `stair`.
+- **`offline_miner.lua`** — local quarry (no GPS/network): origin at top-front-left, `area` / `box` / `tunnel` / `stair`.
 - **`lib/titan.lua`** — shared library (protocol, messaging, navigation). Copy this onto **every** device.
 
 ```
@@ -412,16 +412,16 @@ No GPS, modem, or Parent Center — just a turtle and two chests. Stand at the
 only and keeps it there), storage chest **behind** (dumps slots 1–15).
 
 ```
-pattern column|layer      default box dig style (saved)
-box 9x5x9                 width × height(down) × depth(forward)
-box 9x5x9 layer           one-shot pattern override
-tunnel 32x3               length × height  (optional width: tunnel 32x3 2)
-stair 3x20 down           width × steps, direction up|down
+area 16x32 40             width × length, 40 layers of 1 Y each (aliases: quarry)
+box 9x5x9                 width × 5 layers down × depth (always 1 Y per layer)
+tunnel 32                 length, player-tall 2 high (optional width: tunnel 32 3)
+stair 3x20 down           width × steps, up|down (player-tall)
+continue | job | clearjob
 home | dump | refuel | stop | status
 ```
 
-**Patterns:** `column` digs each vertical shaft fully before moving on.
-`layer` clears each horizontal slice from the top down, then drops to the next.
+**box / area** always mine **one Y layer at a time** (walk the plane, then drop
+one). They never dig 2 high. **tunnel / stair** stay player-tall (2).
 
 Progress is saved to `offline_miner_job.cfg`. After `stop`, reboot, or a dump
 break: put the turtle back at origin (`0,0,0` facing in) and run `continue`.

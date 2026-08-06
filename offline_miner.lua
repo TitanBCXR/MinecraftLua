@@ -1,6 +1,6 @@
 --[[
   offline_miner.lua  -  Local quarry turtle (no GPS / no network)
-  Titan-Version: 1.0.3
+  Titan-Version: 1.0.7
 
   Place the turtle at the TOP-FRONT-LEFT corner of the dig, facing into the
   mine. That cell is origin 0,0,0:
@@ -13,20 +13,20 @@
     * Fuel chest is on the LEFT  → top up slot 16 with coal only (keeps it there)
     * Storage chest is BEHIND    → dumps slots 1-15 (never slot 16)
 
-  Dig pattern (box):
-    column  — dig each vertical shaft fully, then move to the next (default)
-    layer   — clear each horizontal slice top→bottom, then drop to the next
+  box / area — ALWAYS 1 Y-layer at a time (walk the plane, then drop one).
+               Never digs 2 high; no player headroom on quarry jobs.
 
   Job memory (offline_miner_job.cfg):
     Progress is saved as you dig. After stop / reboot / dump, put the turtle
     back at origin (0,0,0 facing in) and run `continue`.
 
   Commands (sizes as WxH or WxHxD — zeros are just placeholders in the docs):
-    box <W>x<H>x<D> [column|layer]
-    tunnel <L>x<H> [W]       1-wide (or W-wide) tunnel, length forward, height tall
+    area <W>x<L> <stopY>     width × length, dig down stopY layers from origin
+                             (aliases: quarry, flatten)
+    box <W>x<H>x<D>          H = number of 1-high layers down
+    tunnel <L> [W]           player-tall (2 high) corridor; optional width
     stair <W>x<steps> <up|down>
-                             stepped ramp; width across, steps along facing
-    pattern [column|layer]   show / set default box dig pattern
+                             player-tall stepped ramp
     continue | resume        resume saved job from origin
     job | clearjob           show / forget saved job
     home                     return to 0,0,0 facing start
@@ -421,13 +421,17 @@ end
 
 local function jobSummary(j)
   if not j then return "(none)" end
-  if j.type == "box" then
+  if j.type == "area" then
+    return ("area %dx%d stopY=%d %s  step %d/%d  [%s]"):format(
+      j.W or 0, j.L or j.D or 0, j.stopY or j.H or 0, tostring(j.pattern or "column"),
+      tonumber(j.idx) or 1, tonumber(j.total) or 0, tostring(j.status or "?"))
+  elseif j.type == "box" then
     return ("box %dx%dx%d %s  step %d/%d  [%s]"):format(
       j.W or 0, j.H or 0, j.D or 0, tostring(j.pattern or "column"),
       tonumber(j.idx) or 1, tonumber(j.total) or 0, tostring(j.status or "?"))
   elseif j.type == "tunnel" then
-    return ("tunnel %dx%dx%d  step %d/%d  [%s]"):format(
-      j.L or 0, j.H or 0, j.W or 1,
+    return ("tunnel L=%d W=%d (2hi)  step %d/%d  [%s]"):format(
+      j.L or 0, j.W or 1,
       tonumber(j.idx) or 1, tonumber(j.total) or 0, tostring(j.status or "?"))
   elseif j.type == "stair" then
     return ("stair %dx%d %s  step %d/%d  [%s]"):format(
@@ -435,6 +439,17 @@ local function jobSummary(j)
       tonumber(j.idx) or 1, tonumber(j.total) or 0, tostring(j.status or "?"))
   end
   return tostring(j.type)
+end
+
+-- Normalize area jobs onto W/H/D used by the box digger (H = stopY down, D = length).
+local function normalizeAreaJob(j)
+  if not j or j.type ~= "area" then return j end
+  j.L = tonumber(j.L) or tonumber(j.D) or 0
+  j.stopY = tonumber(j.stopY) or tonumber(j.H) or 0
+  j.W = tonumber(j.W) or 0
+  j.H = j.stopY
+  j.D = j.L
+  return j
 end
 
 local function assumeAtOrigin()
@@ -473,6 +488,7 @@ local function manageInventory(resume)
 end
 
 -- Dig H blocks downward from the current cell, then climb back to the top.
+-- Used by box/area only — single-block footprint, no player headroom.
 local function digDownColumn(H)
   for i = 1, H do
     if STOP then return false, "stop" end
@@ -488,22 +504,9 @@ local function digDownColumn(H)
   return true
 end
 
--- Clear H tall space with feet on this floor (dig upward headroom).
-local function clearHeadroom(H)
-  if H <= 1 then return true end
-  for i = 1, H - 1 do
-    if STOP then return false, "stop" end
-    digDir("up")
-    if i < H - 1 then
-      if not moveUp() then return false end
-    end
-  end
-  while pos.y < 0 do
-    if not moveDown() then return false end
-  end
-  while pos.y > 0 do
-    if not moveUp() then return false end
-  end
+-- Clear 2-tall player headroom at the current cell (dig the block above feet).
+local function clearPlayerHeadroom()
+  digDir("up")
   return true
 end
 
@@ -586,9 +589,11 @@ local function finishJob(ok, err)
 end
 
 local function runBoxJob(j)
+  if j.type == "area" then normalizeAreaJob(j) end
   local W, H, D = j.W, j.H, j.D
-  local pattern = j.pattern or "column"
-  local units = (pattern == "layer") and boxLayerUnits(W, H, D) or boxColumnUnits(W, D)
+  -- Quarry jobs are ALWAYS true 1-Y-layer passes (never column / never 2-high).
+  j.pattern = "layer"
+  local units = boxLayerUnits(W, H, D)
   j.total = #units
   j.idx = math.max(1, tonumber(j.idx) or 1)
   j.status = "active"
@@ -597,8 +602,13 @@ local function runBoxJob(j)
   skipped = tonumber(j.skipped) or skipped
   saveJobFile(j)
   jobLabel = jobSummary(j)
-  print(("BOX %dx%dx%d  pattern=%s  resume @ %d/%d"):format(
-    W, H, D, pattern, j.idx, j.total))
+  if j.type == "area" then
+    print(("AREA %dx%d  stopY=%d  (1 layer at a time)  resume @ %d/%d"):format(
+      W, D, H, j.idx, j.total))
+  else
+    print(("BOX %dx%dx%d  (1 layer at a time)  resume @ %d/%d"):format(
+      W, H, D, j.idx, j.total))
+  end
 
   local lastY = -999
   for i = j.idx, #units do
@@ -608,22 +618,22 @@ local function runBoxJob(j)
     saveJobFile(j)
     if not manageInventory(true) then finishJob(false, "inventory/fuel"); return end
 
-    if pattern == "layer" then
-      if lastY ~= -999 and u.y > lastY then
-        -- Ensure we drop onto the new layer from a known cell.
-        if not goTo(0, lastY, 0) then finishJob(false, "layer path"); return end
-        while pos.y < u.y do
-          if not moveDown() then finishJob(false, "layer drop"); return end
-        end
+    -- Drop exactly one Y when the work-list advances to the next layer.
+    if lastY ~= -999 and u.y > lastY then
+      if not goTo(0, lastY, 0) then finishJob(false, "layer path"); return end
+      while pos.y < u.y do
+        if not moveDown() then finishJob(false, "layer drop"); return end
       end
-      lastY = u.y
-      if not goTo(u.x, u.y, u.z) then finishJob(false, "path"); return end
-      digDir("down")
-    else
-      if not goTo(u.x, 0, u.z) then finishJob(false, "path"); return end
-      local ok, err = digDownColumn(H)
-      if not ok then finishJob(false, err or "column"); return end
+      print(("  layer %d / %d"):format(u.y + 1, H))
+    elseif lastY == -999 then
+      print(("  layer %d / %d"):format(u.y + 1, H))
     end
+    lastY = u.y
+
+    -- Excavate ONLY this Y plane (goTo digs 1-high forward). Do NOT digDown —
+    -- that was clearing a second layer under the turtle.
+    if not goTo(u.x, u.y, u.z) then finishJob(false, "path"); return end
+
     j.idx = i + 1
     saveJobFile(j)
   end
@@ -631,7 +641,9 @@ local function runBoxJob(j)
 end
 
 local function runTunnelJob(j)
-  local L, H, W = j.L, j.H, j.W or 1
+  -- Player-tall corridor: dig path + clear the block above (2 high).
+  local L, W = j.L, j.W or 1
+  j.H = 2
   local units = tunnelUnits(L, W)
   j.total = #units
   j.idx = math.max(1, tonumber(j.idx) or 1)
@@ -641,7 +653,7 @@ local function runTunnelJob(j)
   skipped = tonumber(j.skipped) or skipped
   saveJobFile(j)
   jobLabel = jobSummary(j)
-  print(("TUNNEL L=%d H=%d W=%d  resume @ %d/%d"):format(L, H, W, j.idx, j.total))
+  print(("TUNNEL L=%d W=%d (player height 2)  resume @ %d/%d"):format(L, W, j.idx, j.total))
 
   for i = j.idx, #units do
     if STOP then finishJob(false, "stop"); return end
@@ -650,7 +662,7 @@ local function runTunnelJob(j)
     saveJobFile(j)
     if not manageInventory(true) then finishJob(false, "inventory/fuel"); return end
     if not goTo(u.x, 0, u.z) then finishJob(false, "path"); return end
-    if not clearHeadroom(H) then finishJob(false, "headroom"); return end
+    clearPlayerHeadroom()
     j.idx = i + 1
     saveJobFile(j)
   end
@@ -678,7 +690,8 @@ local function runStairJob(j)
     saveJobFile(j)
     if not manageInventory(true) then finishJob(false, "inventory/fuel"); return end
     if not goTo(u.x, u.y, u.z) then finishJob(false, "path"); return end
-    digDir("up")
+    -- Player-tall tread: clear above + the step below.
+    clearPlayerHeadroom()
     digDir("down")
     -- After last cell of a step, step forward/up/down toward next step
     local nextU = units[i + 1]
@@ -686,6 +699,7 @@ local function runStairJob(j)
       if not goTo(0, u.y, u.z) then finishJob(false, "stair edge"); return end
       faceForward()
       if not moveForward() then finishJob(false, "forward"); return end
+      clearPlayerHeadroom()
       if dir == "down" then
         if not moveDown() then finishJob(false, "down"); return end
       else
@@ -716,7 +730,7 @@ local function runSavedJob(j, fromContinue)
   else
     if not goHome() then print("Could not reach origin."); return end
   end
-  if j.type == "box" then
+  if j.type == "box" or j.type == "area" then
     runBoxJob(j)
   elseif j.type == "tunnel" then
     runTunnelJob(j)
@@ -731,30 +745,53 @@ local function digBox(W, H, D, opts)
   opts = opts or {}
   W, H, D = math.floor(W), math.floor(H), math.floor(D)
   if W < 1 or H < 1 or D < 1 then
-    print("Usage: box <W>x<H>x<D> [column|layer]")
+    print("Usage: box <W>x<H>x<D>   (H = layers down, 1 Y at a time)")
     return
   end
-  local pattern = normalizePattern(opts.pattern) or normalizePattern(cfg.pattern) or "column"
   dug, skipped = 0, 0
-  local units = (pattern == "layer") and boxLayerUnits(W, H, D) or boxColumnUnits(W, D)
+  local units = boxLayerUnits(W, H, D)
   local j = {
-    type = "box", W = W, H = H, D = D, pattern = pattern,
+    type = "box", W = W, H = H, D = D, pattern = "layer",
     idx = 1, total = #units, status = "active", dug = 0, skipped = 0,
   }
   runSavedJob(j, false)
 end
 
-local function digTunnel(L, H, W)
-  L, H = math.floor(L), math.floor(H)
+-- Area: width × length footprint, dig stopY one-high layers down from origin.
+-- Example: area 16x32 40   → 16 right, 32 forward, 40 layers of 1 Y each
+local function digArea(W, L, stopY, opts)
+  opts = opts or {}
+  W = math.floor(tonumber(W) or 0)
+  L = math.floor(tonumber(L) or 0)
+  stopY = math.floor(tonumber(stopY) or 0)
+  if W < 1 or L < 1 or stopY < 1 then
+    print("Usage: area <W>x<L> <stopY>")
+    print("  W = width (right), L = length (forward), stopY = layers down (1 Y each)")
+    print("Example: area 16x32 40")
+    return
+  end
+  dug, skipped = 0, 0
+  local units = boxLayerUnits(W, stopY, L)
+  local j = {
+    type = "area", W = W, L = L, stopY = stopY,
+    H = stopY, D = L, pattern = "layer",
+    idx = 1, total = #units, status = "active", dug = 0, skipped = 0,
+  }
+  runSavedJob(j, false)
+end
+
+-- Tunnel is always player-tall (2 high). Usage: tunnel <L> [W]
+local function digTunnel(L, W)
+  L = math.floor(tonumber(L) or 0)
   W = math.floor(tonumber(W) or 1)
-  if L < 1 or H < 1 or W < 1 then
-    print("Usage: tunnel <L>x<H> [W]  (length forward, height, optional width)")
+  if L < 1 or W < 1 then
+    print("Usage: tunnel <L> [W]   (length forward, optional width; player height 2)")
     return
   end
   dug, skipped = 0, 0
   local units = tunnelUnits(L, W)
   local j = {
-    type = "tunnel", L = L, H = H, W = W,
+    type = "tunnel", L = L, H = 2, W = W,
     idx = 1, total = #units, status = "active", dug = 0, skipped = 0,
   }
   runSavedJob(j, false)
@@ -779,7 +816,7 @@ end
 local function continueJob()
   local j = loadJobFile()
   if not j then
-    print("No saved job in " .. JOB_FILE .. ". Start with box / tunnel / stair.")
+    print("No saved job in " .. JOB_FILE .. ". Start with area / box / tunnel / stair.")
     return
   end
   print("Loaded: " .. jobSummary(j))
@@ -793,10 +830,10 @@ local function printHelp()
   print("Offline miner — origin = top-front-left, facing into mine.")
   print("  +X right   +Y down   +Z forward")
   print("")
-  print("  box <W>x<H>x<D> [column|layer]   solid box dig")
-  print("  pattern [column|layer]           default dig pattern")
-  print("  tunnel <L>x<H> [W]               corridor (default W=1)")
-  print("  stair <W>x<steps> <up|down>      staircase")
+  print("  area <W>x<L> <stopY>             width × length, stopY layers (1 Y each)")
+  print("  box <W>x<H>x<D>                  H layers down, 1 Y at a time")
+  print("  tunnel <L> [W]                   player-tall (2 high) corridor")
+  print("  stair <W>x<steps> <up|down>      player-tall staircase")
   print("  continue | resume                resume saved job (from origin)")
   print("  job | clearjob                   show / forget saved job")
   print("  home | dump | refuel | setup | stop | status")
@@ -869,29 +906,50 @@ local function handleCommand(line)
         print("Dig pattern set to: " .. p)
       end
     end
+  elseif cmd == "area" or cmd == "quarry" or cmd == "flatten" then
+    -- area 16x32 40   or   area 16x32 stop 40   or   area 16 32 40
+    local d = parseDims(a, 2)
+    local stopY = nil
+    if d and d[1] and d[2] and d[3] and not tostring(a[2] or ""):find("x") then
+      digArea(d[1], d[2], d[3])
+    elseif d and d[1] and d[2] then
+      for i = 3, #a do
+        local t = tostring(a[i]):lower()
+        if t ~= "stop" and t ~= "to" and t ~= "y" and not normalizePattern(t) then
+          stopY = tonumber(a[i])
+          if stopY then break end
+        end
+      end
+      if not stopY and d[3] then stopY = d[3] end
+      if not stopY then
+        print("Usage: area <W>x<L> <stopY>")
+        print("Example: area 16x32 40   (40 layers of 1 Y each)")
+      else
+        digArea(d[1], d[2], stopY)
+      end
+    else
+      print("Usage: area <W>x<L> <stopY>")
+      print("  W=width  L=length  stopY=how many 1-high layers down")
+      print("Example: area 16x32 40")
+    end
   elseif cmd == "box" then
     local d = parseDims(a, 2)
-    local override
-    for i = 2, #a do
-      local p = normalizePattern(a[i])
-      if p then override = p end
-    end
     if not d or not d[1] or not d[2] or not d[3] then
-      print("Usage: box <W>x<H>x<D> [column|layer]")
+      print("Usage: box <W>x<H>x<D>   (H = 1-high layers down)")
     else
-      digBox(d[1], d[2], d[3], { pattern = override })
+      digBox(d[1], d[2], d[3])
     end
   elseif cmd == "tunnel" then
+    -- tunnel 32          → L=32 W=1
+    -- tunnel 32 3        → L=32 W=3
+    -- tunnel 32x3        → L=32 W=3  (old LxH form: second number is width now)
     local d = parseDims(a, 2)
-    if not d or not d[1] or not d[2] then
-      print("Usage: tunnel <L>x<H> [W]")
+    if not d or not d[1] then
+      print("Usage: tunnel <L> [W]   (player height 2)")
     else
-      if #d >= 3 then
-        digTunnel(d[1], d[2], d[3])
-      else
-        local wExtra = tonumber(a[3])
-        digTunnel(d[1], d[2], wExtra or 1)
-      end
+      local L = d[1]
+      local W = d[2] or tonumber(a[3]) or 1
+      digTunnel(L, W)
     end
   elseif cmd == "stair" then
     local d = parseDims(a, 2)
@@ -953,7 +1011,7 @@ elseif saved and saved.status == "done" then
 end
 
 print("")
-print("Type help. Examples:  box 9x5x9   |   continue")
+print("Type help. Examples:  area 16x32 40   |   continue")
 print("")
 
 while true do
