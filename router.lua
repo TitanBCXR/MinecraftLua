@@ -1,13 +1,15 @@
 --[[
   router.lua  -  Titan network router / repeater (CC: Tweaked)
-  Titan-Version: 1.2.14
+  Titan-Version: 1.2.15
 
   Place one (or several) of these to tie the whole network together over
   wireless and/or wired modems. Roles:
 
     MAIN  - directory, OTA update, re-auth authority, GPS host, repeater.
-            Tracks GitHub versions.lua; `update aoe` pushes fleet OTA and
-            collects `updated` ACKs after devices reboot.
+            Tracks GitHub versions.lua; `update all` pushes fleet OTA to
+            every online device (not just routers), shows ACKs on the
+            monitor (hostname + package from->to), then restores the
+            previous board when every ACK is in.
             Attach up to 3+ monitors for ROSTER / STATS / GPS boards.
             Devices on the same wired cable as MAIN show as WIRED on roster.
     MODEM - repeater (+ optional GPS host) only. Use for coverage; not the
@@ -277,8 +279,13 @@ local ghState = {
   checkedAt = 0,
   lastAlert = nil,    -- last remote.system we alerted about
 }
--- Active AoE update: { version, sentAt, expected = { [id]=name }, acked = { [id]={...} } }
+-- Active fleet update campaign:
+--   version, sentAt, expected = { [id]=name },
+--   acked = { [id]={ name, version, packages={...}, at } },
+--   failed = { [id]={ name, err, at } },
+--   showAcks, restore = previous monitor state
 local updateCampaign = nil
+local UPDATE_CAMPAIGN_TIMEOUT = 180  -- seconds; then restore monitor even if incomplete
 
 local function githubBase()
   local c = loadRouterCfg() or {}
@@ -330,7 +337,15 @@ local function versionCmp(a, b)
   return 1
 end
 
-local function noteDeviceVersion(id, version, name, kind)
+local function copyScreenBoolMap(src)
+  local out = {}
+  for _, role in ipairs(SCREEN_ROLES) do
+    out[role] = src[role] and true or false
+  end
+  return out
+end
+
+local function noteDeviceVersion(id, version, name, kind, packages, isUpdateAck)
   if not id then return end
   local d = seen[id] or {}
   d.version = version or d.version
@@ -340,36 +355,148 @@ local function noteDeviceVersion(id, version, name, kind)
   d.seen = now()
   seen[id] = d
   rosterDirty = true
-  if updateCampaign and version
-     and tostring(version) == tostring(updateCampaign.version) then
+  -- Only explicit `updated` ACKs count toward the campaign (not ordinary hellos).
+  if isUpdateAck and updateCampaign and not updateCampaign.finishedAt then
+    local pkgs = type(packages) == "table" and packages or nil
+    if (not pkgs or #pkgs == 0) and version then
+      local prev = updateCampaign.prevById and updateCampaign.prevById[id]
+      pkgs = { {
+        name = "system", path = "versions.lua",
+        from = tostring(prev or "?"), to = tostring(version),
+      } }
+    end
     updateCampaign.acked[id] = {
-      name = d.hostname, version = version, at = os.epoch("utc"),
+      name = d.hostname, version = version, packages = pkgs or {},
+      at = os.epoch("utc"),
     }
+    updateCampaign.failed[id] = nil
+  end
+end
+
+local function noteUpdateFail(id, name, err)
+  if not updateCampaign or updateCampaign.finishedAt or not id then return end
+  local host = name or (seen[id] and (seen[id].hostname or seen[id].name)) or ("#" .. id)
+  updateCampaign.failed[id] = {
+    name = host, err = tostring(err or "failed"), at = os.epoch("utc"),
+  }
+end
+
+local function campaignCounts()
+  if not updateCampaign then return nil end
+  local exp, ack, fail = 0, 0, 0
+  for _ in pairs(updateCampaign.expected) do exp = exp + 1 end
+  for id in pairs(updateCampaign.expected) do
+    if updateCampaign.acked[id] then ack = ack + 1
+    elseif updateCampaign.failed[id] then fail = fail + 1 end
+  end
+  return exp, ack, fail, updateCampaign
+end
+
+local function campaignStatus()
+  local exp, ack, fail, camp = campaignCounts()
+  if not camp then return nil end
+  return exp, ack + fail, camp
+end
+
+local function campaignResolved()
+  local exp, ack, fail = campaignCounts()
+  if not exp then return true end
+  if exp == 0 then return true end
+  return (ack + fail) >= exp
+end
+
+local function restoreUpdateMonitor()
+  local camp = updateCampaign
+  if not camp or not camp.restore then
+    if camp then camp.showAcks = false end
+    return
+  end
+  local r = camp.restore
+  camp.showAcks = false
+  camp.restore = nil
+  for _, role in ipairs(SCREEN_ROLES) do
+    screenOn[role] = r.on[role] and true or false
+    screenPerm[role] = r.perm[role] and true or false
+  end
+  screenFocus = r.focus or "roster"
+  boardWakeAt = r.wakeAt
+  saverActive = false
+  saverState = {}
+  ensureFocus()
+  -- Do not persist the temporary ACK overlay into router.cfg.
+end
+
+local function beginUpdateMonitor()
+  if not updateCampaign then return end
+  updateCampaign.restore = {
+    focus = screenFocus,
+    on = copyScreenBoolMap(screenOn),
+    perm = copyScreenBoolMap(screenPerm),
+    wakeAt = boardWakeAt,
+  }
+  updateCampaign.showAcks = true
+  saverActive = false
+  saverState = {}
+end
+
+local function finishUpdateCampaign(reason)
+  if not updateCampaign then return end
+  local exp, ack, fail = campaignCounts()
+  print(("[OTA] Campaign done (%s): %d ok, %d fail / %d expected"):format(
+    tostring(reason or "complete"), ack or 0, fail or 0, exp or 0))
+  restoreUpdateMonitor()
+  -- Keep campaign data for `update status` for a bit, but stop overlay.
+  updateCampaign.finishedAt = os.epoch("utc")
+  updateCampaign.showAcks = false
+end
+
+local function maybeFinishUpdateCampaign()
+  if not updateCampaign or updateCampaign.finishedAt then return end
+  if campaignResolved() then
+    -- Hold the final ACK board ~2s so the last hostname paints, then restore.
+    if not updateCampaign.completeAt then
+      updateCampaign.completeAt = os.clock()
+      print("[OTA] All ACKs in — restoring previous monitor board in 2s...")
+    elseif os.clock() >= updateCampaign.completeAt + 2 then
+      finishUpdateCampaign("all acks")
+    end
+  elseif updateCampaign.sentAt then
+    local age = (os.epoch("utc") - updateCampaign.sentAt) / 1000
+    if age >= UPDATE_CAMPAIGN_TIMEOUT then
+      finishUpdateCampaign("timeout")
+    end
   end
 end
 
 local function startUpdateCampaign(targetVersion)
-  local expected = {}
+  local expected, prevById = {}, {}
   for id, d in pairs(seen) do
     if isOnline(d) and id ~= os.getComputerID() then
       expected[id] = d.hostname or d.name or ("#" .. id)
+      prevById[id] = d.version
     end
   end
   updateCampaign = {
     version = targetVersion,
     sentAt = os.epoch("utc"),
     expected = expected,
+    prevById = prevById,
     acked = {},
+    failed = {},
+    showAcks = false,
+    restore = nil,
+    finishedAt = nil,
   }
+  beginUpdateMonitor()
   return expected
 end
 
-local function campaignStatus()
-  if not updateCampaign then return nil end
-  local exp, ack = 0, 0
-  for _ in pairs(updateCampaign.expected) do exp = exp + 1 end
-  for _ in pairs(updateCampaign.acked) do ack = ack + 1 end
-  return exp, ack, updateCampaign
+local function broadcastFleetUpdate(payload)
+  -- Every Titan device that runs networkLoop listens on titan_router.
+  rednet.broadcast(payload, PROTO_ROUTER)
+  -- Also flood titan_net / titan_dc so Parent Center and any net-only listeners hear it.
+  rednet.broadcast(payload, "titan_net")
+  rednet.broadcast(payload, "titan_dc")
 end
 
 local function claimMain()
@@ -808,16 +935,23 @@ local function directoryLoop()
       elseif proto == PROTO_ROUTER and (msg.type == "updated" or msg.type == "update_fail"
           or msg.type == "version_report") then
         local host = msg.hostname or msg.name or ("#" .. id)
-        noteDeviceVersion(id, msg.version, host, msg.kind or classify(msg))
-        if msg.type == "updated" then
-          print(("[OTA] ACK #%d %s -> v%s"):format(id, host, tostring(msg.version or "?")))
-          local exp, ack = campaignStatus()
-          if exp then
-            print(("[OTA] Campaign v%s: %d / %d acked"):format(
-              tostring(updateCampaign.version), ack, exp))
-          end
-        elseif msg.type == "update_fail" then
+        if msg.type == "update_fail" then
+          noteUpdateFail(id, host, msg.err)
           print(("[OTA] FAIL #%d %s: %s"):format(id, host, tostring(msg.err or "?")))
+          maybeFinishUpdateCampaign()
+        elseif msg.type == "updated" then
+          noteDeviceVersion(id, msg.version, host, msg.kind or classify(msg), msg.packages, true)
+          local nPkg = type(msg.packages) == "table" and #msg.packages or 0
+          print(("[OTA] ACK #%d %s -> v%s (%d pkg)"):format(
+            id, host, tostring(msg.version or "?"), nPkg))
+          local exp, done = campaignStatus()
+          if exp then
+            print(("[OTA] Campaign v%s: %d / %d resolved"):format(
+              tostring(updateCampaign.version), done, exp))
+          end
+          maybeFinishUpdateCampaign()
+        else
+          noteDeviceVersion(id, msg.version, host, msg.kind or classify(msg))
         end
 
       elseif proto == PROTO_ROUTER and (msg.type == "hello" or msg.type == "where_main"
@@ -1278,9 +1412,94 @@ local function screensaverFrame(entering)
   st.prevX, st.prevY = st.x, st.y
 end
 
+local function drawUpdateAcks(out)
+  local w, h = out.getSize()
+  clearMon(out)
+  pcall(function() out.setTextScale(0.5) end)
+  local camp = updateCampaign
+  if not camp then
+    monLine(out, w, 1, "== OTA UPDATE ==", colors.yellow)
+    monLine(out, w, 2, "(no active campaign)", colors.gray)
+    return
+  end
+  local exp, ack, fail = campaignCounts()
+  monLine(out, w, 1, ("== OTA UPDATE v%s =="):format(tostring(camp.version or "?")), colors.yellow)
+  monLine(out, w, 2, ("ACKs %d  FAIL %d  / %d expected"):format(ack or 0, fail or 0, exp or 0), colors.lime)
+
+  local ids = {}
+  for id in pairs(camp.expected) do ids[#ids + 1] = id end
+  table.sort(ids)
+  -- Also show main self-ack if recorded under acked but not expected.
+  if camp.acked[os.getComputerID()] then
+    local selfId = os.getComputerID()
+    local has = false
+    for _, id in ipairs(ids) do if id == selfId then has = true; break end end
+    if not has then table.insert(ids, 1, selfId) end
+  end
+
+  local y = 4
+  local function put(txt, c)
+    if y > h - 1 then return false end
+    monLine(out, w, y, txt, c)
+    y = y + 1
+    return true
+  end
+
+  for _, id in ipairs(ids) do
+    if y > h - 1 then
+      put("...", colors.gray)
+      break
+    end
+    local name = camp.expected[id]
+      or (camp.acked[id] and camp.acked[id].name)
+      or (seen[id] and (seen[id].hostname or seen[id].name))
+      or ("#" .. id)
+    local ainfo = camp.acked[id]
+    local finfo = camp.failed[id]
+    if ainfo then
+      if not put(tostring(name), colors.lime) then break end
+      local pkgs = ainfo.packages or {}
+      if #pkgs == 0 then
+        put(("  system - version: ? - %s"):format(tostring(ainfo.version or "?")), colors.white)
+      else
+        for _, p in ipairs(pkgs) do
+          local line = ("%s - version: %s - %s"):format(
+            tostring(p.name or p.path or "?"),
+            tostring(p.from or "?"),
+            tostring(p.to or "?"))
+          if not put("  " .. line, colors.white) then break end
+        end
+      end
+    elseif finfo then
+      if not put(tostring(finfo.name or name), colors.red) then break end
+      put(("  FAIL: %s"):format(tostring(finfo.err or "?"):sub(1, w - 8)), colors.orange)
+    else
+      if not put(tostring(name), colors.lightGray) then break end
+      put("  (waiting for ACK...)", colors.gray)
+    end
+    if y < h - 1 then put("", colors.white) end
+  end
+
+  if #ids == 0 then
+    put("(no online devices expected — main self-updated)", colors.gray)
+  end
+
+  out.setCursorPos(1, h)
+  out.setTextColor(colors.gray)
+  out.write(("[update]%s"):format(
+    camp.finishedAt and " done" or " collecting"):sub(1, w))
+end
+
 drawBoards = function()
   local n = refreshScreens()
   if n == 0 or not displayMon then return end
+
+  -- Fleet OTA overlay takes over the monitor until every ACK is in.
+  if updateCampaign and updateCampaign.showAcks then
+    drawUpdateAcks(displayMon)
+    return
+  end
+
   if not anyLiveBoard() then return end
 
   local role = screenFocus
@@ -1329,7 +1548,19 @@ local function drawLoop()
   while true do
     refreshWiredFlags()
     expireTemporaryBoards()
-    if not anyLiveBoard() then
+    maybeFinishUpdateCampaign()
+    if updateCampaign and updateCampaign.showAcks then
+      if saverActive then
+        saverActive = false
+        saverState = {}
+      end
+      local n = refreshScreens()
+      if n > 0 and displayMon then
+        drawUpdateAcks(displayMon)
+      end
+      if rosterDirty then saveRoster() end
+      sleep(clampMonRate(monRate))
+    elseif not anyLiveBoard() then
       local entering = not saverActive
       saverActive = true
       screensaverFrame(entering)
@@ -1382,7 +1613,7 @@ local function githubWatchLoop()
           print("")
           print(("[GitHub] New Titan v%s available (local %s)."):format(
             tostring(cat.system), tostring(localVer or "?")))
-          print("[GitHub] Run `update aoe` to push fleet OTA from GitHub packages.")
+          print("[GitHub] Run `update all` to push fleet OTA from GitHub packages.")
         end
       elseif err then
         -- Quiet unless first failure after boot.
@@ -1557,22 +1788,23 @@ local function modemLoop()
         }, PROTO_ROUTER)
       end
 
-      elseif msg.type == "update" and id ~= os.getComputerID() then
+    elseif msg.type == "update" and id ~= os.getComputerID() then
       print("")
-      print(("[OTA] AoE update from #%s (v%s) — downloading..."):format(
+      print(("[OTA] Fleet update from #%s (v%s) — downloading..."):format(
         tostring(id), tostring(msg.targetVersion or "?")))
       if titanLib and titanLib.updateSelf then
         local prev = titanLib.systemVersion and titanLib.systemVersion() or nil
-        local ok, err = titanLib.updateSelf()
+        local ok, detail = titanLib.updateSelf()
         if ok then
+          local pkgs = type(detail) == "table" and detail.packages or nil
           if titanLib.markPendingUpdateAck then
-            titanLib.markPendingUpdateAck(prev, msg.targetVersion)
+            titanLib.markPendingUpdateAck(prev, msg.targetVersion, pkgs)
           end
           print("[OTA] Updated. Rebooting (will ACK main)..."); sleep(2); os.reboot()
         else
-          print("[OTA] Failed: " .. tostring(err))
+          print("[OTA] Failed: " .. tostring(detail))
           rednet.send(id, {
-            type = "update_fail", version = prev, err = tostring(err),
+            type = "update_fail", version = prev, err = tostring(detail),
             name = os.getComputerLabel(), hostname = os.getComputerLabel(),
           }, PROTO_ROUTER)
         end
@@ -1846,7 +2078,7 @@ local function handleRouterCommand(a)
         print("name <id|host> <newname>  - force-assign a modem name (reboots it)")
         print("namepool add|remove <name>  - edit the unique-name list")
         print("ping     - re-discover the network")
-        print("update [aoe|status] - fleet OTA from GitHub; track reboot ACKs")
+        print("update all|status - fleet OTA to EVERY online device; ACK board")
         print("reauth   - tell the fleet to re-auth now (no download)")
         print("github [url] - show / set GitHub raw base for versions")
       else
@@ -2258,7 +2490,7 @@ local function handleRouterCommand(a)
           print(("GitHub system: %s"):format(tostring(remote.system or "?")))
           print("Base: " .. ghState.base)
           local cmp = versionCmp(localVer, remote.system)
-          if cmp < 0 then print("Status: GitHub is NEWER — run `update aoe`")
+          if cmp < 0 then print("Status: GitHub is NEWER — run `update all`")
           elseif cmp > 0 then print("Status: local is ahead of GitHub")
           else print("Status: up to date with GitHub") end
           if type(remote.packages) == "table" then
@@ -2308,18 +2540,27 @@ local function handleRouterCommand(a)
       if not isMain() then
         print("OTA update is MAIN-only. Run `main` on this machine, or use the main router.")
       else
-        local sub = (a[2] or "aoe"):lower()
+        local sub = (a[2] or "all"):lower()
         if sub == "status" then
-          local exp, ack, camp = campaignStatus()
+          local exp, done, camp = campaignStatus()
           if not camp then
-            print("No active update campaign. Run `update aoe`.")
+            print("No active update campaign. Run `update all`.")
           else
-            print(("Campaign target v%s  acked %d / %d"):format(
-              tostring(camp.version), ack, exp))
+            local _, ackN, failN = campaignCounts()
+            print(("Campaign target v%s  ok %d  fail %d  / %d%s"):format(
+              tostring(camp.version), ackN or 0, failN or 0, exp or 0,
+              camp.finishedAt and " (finished)" or ""))
             for id, name in pairs(camp.expected) do
               local ainfo = camp.acked[id]
+              local finfo = camp.failed[id]
               if ainfo then
-                print(("  OK  #%-3d %-16s v%s"):format(id, tostring(name):sub(1, 16), tostring(ainfo.version)))
+                print(("  OK  #%-3d %s"):format(id, tostring(name)))
+                for _, p in ipairs(ainfo.packages or {}) do
+                  print(("      %s - version: %s - %s"):format(
+                    tostring(p.name or "?"), tostring(p.from or "?"), tostring(p.to or "?")))
+                end
+              elseif finfo then
+                print(("  FAIL #%-3d %s: %s"):format(id, tostring(name), tostring(finfo.err)))
               else
                 local d = seen[id]
                 print(("  ... #%-3d %-16s have v%s"):format(
@@ -2327,46 +2568,70 @@ local function handleRouterCommand(a)
               end
             end
           end
-        else
-          -- update / update aoe — check GitHub then broadcast fleet OTA
+        elseif sub == "all" or sub == "aoe" or sub == "fleet" or sub == "yes" then
+          -- update all — every online device on the roster (miners, loaders, DC, …)
           print("Checking GitHub versions...")
           local remote, err = fetchGithubVersions()
           local target = remote and remote.system or localSystemVersion()
           if not remote then
             print("GitHub check failed: " .. tostring(err))
-            print("Will still broadcast OTA using local packages / device install sources.")
+            print("Will still broadcast OTA using each device's install source.")
             target = localSystemVersion() or "unknown"
           else
             print(("GitHub Titan v%s  (local %s)"):format(
               tostring(remote.system), tostring(localSystemVersion() or "?")))
           end
-          write(("Push AoE OTA to fleet (target v%s)? Devices download, reboot, ACK. [y/N] "):format(
+          write(("Push OTA to ALL online devices (target v%s)? [y/N] "):format(
             tostring(target)))
           if read():lower() ~= "y" then print("Cancelled."); else
             local expected = startUpdateCampaign(target)
             local nExp = 0
             for _ in pairs(expected) do nExp = nExp + 1 end
             local rname = os.getComputerLabel() or ("Router-" .. os.getComputerID())
-            rednet.broadcast({
+            local payload = {
               type = "update", from = os.getComputerID(), name = rname,
               mainRouterId = os.getComputerID(), hostname = rname,
-              targetVersion = target, aoe = true,
+              targetVersion = target, aoe = true, all = true,
               githubBase = githubBase(),
-            }, PROTO_ROUTER)
-            print(("AoE update broadcast sent (v%s). Expecting up to %d ACK(s)."):format(
-              tostring(target), nExp))
-            print("Devices will reply `updated` after reboot. Watch with `update status`.")
+            }
+            broadcastFleetUpdate(payload)
+            print(("Fleet update broadcast sent (v%s) on router+net+dc."):format(
+              tostring(target)))
+            print(("Expecting %d ACK(s). Monitor shows hostname + package from->to."):format(nExp))
+            print("Watch: `update status`  (monitor returns to previous board when done)")
             -- Update this main router too (no reboot — stay up to collect ACKs).
             if titanLib and titanLib.updateSelf then
               print("Updating main router packages (no reboot)...")
-              local uok, uerr = titanLib.updateSelf()
+              local prevMain = localSystemVersion()
+              local uok, detail = titanLib.updateSelf()
               if uok then
+                local pkgs = type(detail) == "table" and detail.packages or {}
+                if #pkgs == 0 then
+                  pkgs = { {
+                    name = "system", path = "versions.lua",
+                    from = tostring(prevMain or "?"),
+                    to = tostring(localSystemVersion() or target),
+                  } }
+                end
+                updateCampaign.acked[os.getComputerID()] = {
+                  name = rname,
+                  version = localSystemVersion() or target,
+                  packages = pkgs,
+                  at = os.epoch("utc"),
+                }
                 print("Main router packages refreshed to v" .. tostring(localSystemVersion() or target))
+                maybeFinishUpdateCampaign()
               else
-                print("Main self-update failed: " .. tostring(uerr))
+                print("Main self-update failed: " .. tostring(detail))
               end
+            elseif nExp == 0 then
+              maybeFinishUpdateCampaign()
             end
           end
+        else
+          print("Usage: update all | update status")
+          print("  all     push OTA to every online Titan device (not just routers)")
+          print("  status  show ACK progress / package version diffs")
         end
       end
     elseif cmd == "reauth" then

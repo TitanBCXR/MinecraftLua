@@ -1,6 +1,6 @@
 --[[
   titan.lua  -  Shared library for the Titan bot network (CC: Tweaked)
-  Titan-Version: 1.2.12
+  Titan-Version: 1.2.13
 
   Provides:
     * Rednet protocol constants + message type enum
@@ -409,10 +409,59 @@ end
 -- After a successful OTA, leave a flag so the next boot can ACK the main router.
 titan.UPDATED_FLAG = ".titan-updated"
 
-function titan.markPendingUpdateAck(prevVersion, targetVersion)
+-- Snapshot package path -> version for OTA ACK diffs.
+function titan.packageVersionMap(paths)
+  local catalog = titan.loadVersionCatalog()
+  local map = {}
+  if type(paths) ~= "table" then
+    local list = titan.readPackageList()
+    paths = list or titan.scanLocalScripts() or {}
+  end
+  for _, path in ipairs(paths) do
+    if path and path ~= "" then
+      if fs.exists(path) and not fs.isDir(path) then
+        map[path] = titan.packageVersion(path, catalog) or "?"
+      else
+        map[path] = nil
+      end
+    end
+  end
+  return map
+end
+
+-- Build { name, path, from, to } rows for packages whose version changed.
+function titan.diffPackageVersions(before, after)
+  local keys, seen = {}, {}
+  for path in pairs(before or {}) do
+    if not seen[path] then seen[path] = true; keys[#keys + 1] = path end
+  end
+  for path in pairs(after or {}) do
+    if not seen[path] then seen[path] = true; keys[#keys + 1] = path end
+  end
+  table.sort(keys)
+  local changes = {}
+  for _, path in ipairs(keys) do
+    local from = before and before[path] or nil
+    local to = after and after[path] or nil
+    if tostring(from or "") ~= tostring(to or "") then
+      changes[#changes + 1] = {
+        name = titan.packageName(path),
+        path = path,
+        from = from ~= nil and tostring(from) or "—",
+        to = to ~= nil and tostring(to) or "—",
+      }
+    end
+  end
+  return changes
+end
+
+function titan.markPendingUpdateAck(prevVersion, targetVersion, packages)
   local f = fs.open(titan.UPDATED_FLAG, "w")
   f.write(textutils.serialize({
-    prev = prevVersion, target = targetVersion, at = os.epoch("utc"),
+    prev = prevVersion,
+    target = targetVersion,
+    packages = type(packages) == "table" and packages or {},
+    at = os.epoch("utc"),
   }))
   f.close()
 end
@@ -425,15 +474,25 @@ function titan.reportUpdatedIfPending(kind)
   pcall(fs.delete, titan.UPDATED_FLAG)
   local host = titan.hostname(kind)
   local ver = titan.systemVersion()
+  local packages = type(d) == "table" and type(d.packages) == "table" and d.packages or {}
+  -- Fallback row when we only know system versions.
+  if #packages == 0 and type(d) == "table" and (d.prev or d.target or ver) then
+    packages = { {
+      name = "system", path = "versions.lua",
+      from = tostring(d.prev or "—"), to = tostring(ver or d.target or "—"),
+    } }
+  end
   rednet.broadcast({
     type = "updated", kind = kind or lastAnnounceKind,
     name = host, hostname = host,
     version = ver,
     prev = type(d) == "table" and d.prev or nil,
     target = type(d) == "table" and d.target or nil,
+    packages = packages,
     from = os.getComputerID(),
   }, titan.ROUTER_PROTOCOL)
-  print(("[OTA] Reported updated -> v%s"):format(tostring(ver or "?")))
+  print(("[OTA] Reported updated -> v%s (%d package change(s))"):format(
+    tostring(ver or "?"), #packages))
   return true
 end
 
@@ -522,18 +581,19 @@ function titan.registerLoop(kind, period)
         titan.reauth(kind)
       elseif msg.type == "update" then
         print("")
-        print(("[OTA] AoE update from router #%s (target v%s) — downloading..."):format(
+        print(("[OTA] Fleet update from router #%s (target v%s) — downloading..."):format(
           tostring(id), tostring(msg.targetVersion or "?")))
         if msg.mainRouterId then titan.setMainRouterId(msg.mainRouterId) end
         local prev = titan.systemVersion()
-        local uok, err = titan.updateSelf()
+        local uok, detail = titan.updateSelf()
         if uok then
-          titan.markPendingUpdateAck(prev, msg.targetVersion or titan.systemVersion())
+          local pkgs = type(detail) == "table" and detail.packages or nil
+          titan.markPendingUpdateAck(prev, msg.targetVersion or titan.systemVersion(), pkgs)
           print("[OTA] Updated. Rebooting in 2s (will ACK main on boot)..."); os.sleep(2); os.reboot()
         else
-          print("[OTA] Update failed: " .. tostring(err))
+          print("[OTA] Update failed: " .. tostring(detail))
           rednet.send(id, {
-            type = "update_fail", version = prev, err = tostring(err),
+            type = "update_fail", version = prev, err = tostring(detail),
             name = titan.hostname(kind), hostname = titan.hostname(kind),
           }, titan.ROUTER_PROTOCOL)
         end
@@ -1581,6 +1641,7 @@ end
 
 -- Re-download every package listed in the `packages` file from the install source.
 -- opts.onProgress(path, ok, detail) optional. Returns ok, detail.
+-- On success detail includes packages = { {name, path, from, to}, ... }.
 function titan.updateSelf(opts)
   opts = opts or {}
   local m = titan.readManifest()
@@ -1590,6 +1651,8 @@ function titan.updateSelf(opts)
   local paths, perr = otaCollectUpdatePaths()
   if not paths then return false, perr end
 
+  local prevSystem = titan.systemVersion()
+  local before = titan.packageVersionMap(paths)
   local failed, okCount = {}, 0
 
   for _, path in ipairs(paths) do
@@ -1617,7 +1680,21 @@ function titan.updateSelf(opts)
   end
 
   if #failed > 0 then return false, "failed: " .. table.concat(failed, ", ") end
-  return true, { updated = okCount, skipped = 0 }
+
+  local after = titan.packageVersionMap(paths)
+  local packages = titan.diffPackageVersions(before, after)
+  local system = titan.systemVersion()
+  if #packages == 0 and tostring(prevSystem or "") ~= tostring(system or "") then
+    packages = { {
+      name = "system", path = titan.VERSIONS_FILE,
+      from = tostring(prevSystem or "—"), to = tostring(system or "—"),
+    } }
+  end
+  return true, {
+    updated = okCount, skipped = 0,
+    packages = packages,
+    prevSystem = prevSystem, system = system,
+  }
 end
 
 --------------------------------------------------------------------------------

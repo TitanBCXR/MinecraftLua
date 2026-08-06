@@ -163,13 +163,13 @@ out its own role and keeps admin terminals locked until a player logs in.
 
 ## Login flow
 
-1. A locked station only accepts the `password` command.
-2. `password` reads the **interacting player's display name** (via an Advanced Peripherals **Player Detector** next to the computer) and prompts for a password (masked).
+1. A locked station **prompts for the master password immediately** (no need to type `password` / `login` first). Same after `lock` / `logout`.
+2. It reads the **interacting player's display name** (via an Advanced Peripherals **Player Detector** next to the computer) and asks for a password (masked).
 3. The attempt is checked against the master password:
    - if this computer holds the master floppy → checked locally;
    - otherwise it broadcasts to find who holds the floppy and asks that master to verify (the real password never travels the network — only the attempt does, and only a true/false comes back);
    - if **no master is online/found → always "Wrong password"**, even if none exists.
-4. On success the terminal unlocks into admin mode for that player.
+4. On success the terminal unlocks into admin mode for that player. On failure you can retry, or use locked helpers (`initmaster`, `help`).
 
 ## First-time setup (bootstrap the master password)
 
@@ -196,10 +196,10 @@ Tip: to auto-start on boot, create `startup.lua` containing `shell.run("datacent
 
 ## Commands
 
-Locked (bot) mode:
+Locked (bot) mode — password prompt appears on its own; these are fallbacks:
 
 ```
-password        log in with the master password
+password|login  prompt for the master password again
 whoami          show the interacting player
 status          this station's status
 initmaster      first-time master password setup (blank floppy)
@@ -259,7 +259,7 @@ worker turtle never prompts for a password itself:
 
 1. Run `worker.lua` on a fresh turtle. With no config it prints *"awaiting
    deployment"* and just waits, beaconing itself to the network.
-2. Log into a Parent Center terminal (`password`, unlocked by the master floppy).
+2. Log into a Parent Center terminal (password prompt on start / after lock).
 3. Run `pending` to see waiting turtles, then:
 
    ```
@@ -485,29 +485,27 @@ Needs a **pocket computer with a wireless modem** upgrade and `lib/titan.lua`
 (install with the installer → **"Admin tablet"**, or `wget` both files). The
 tablet itself needs no GPS.
 
-**Monitoring is open; every command that controls a bot requires `login`** with
-the master password — verified against the Parent Center's master floppy, just
-like the disk-drive lock. No master online → denied.
+**Starts with a master-password prompt** (same floppy as Parent Center). Empty
+password = monitor-only until you run `login`. Deploy / SSH / fleet control need
+an unlocked session. No master online → denied.
 
 ```
-VIEW  : live            full-screen auto-refreshing dashboard (any key exits)
-        bots            roster: id, name, type, state, pos, fuel
-        pois            points of interest
-        pending         workers awaiting deployment
-        stuck           recent STUCK alerts
-        ping            re-discover everyone
-BOT   : send <bot> <poi>            dispatch to a named POI
-        goto <bot> <x> <y> <z>      dispatch to coordinates
-        return <bot> | refuel <bot> | stop <bot>
-DEPLOY: deploy <bot> <builder|gatherer> <name> [x y z]
-BUILD : scan <bot> <name> <W> <H> <L> | build <bot> <name> [x y z]
-REMOTE: ssh <id|label> [cmd...]     remote shell (also needs master password)
-        login | lock | exit
+VIEW  : live | bots | miners | loaders | markers | pending | stuck | who <id|name>
+NET   : connections | hosts | list [filter]   SSH-capable hosts on the mesh
+        ping
+SSH   : connect <id|name> [cmd...]   (aliases: ssh, c)
+FLEET : dc | center [cmd...]         jump to Parent Center
+        flatten <args...> | jobs     run on Parent Center via SSH
+BOT   : goto | return | park | refuel | stop | mine | continue
+DEPLOY: deploy <id> <miner|loader|builder|gatherer> [auto] [x y z]
+BUILD : scan | build
+        login | lock | hostname | exit
 ```
 
-`<bot>` is a turtle's label or its computer id. Because control is gated by the
-master password, losing the tablet doesn't hand over the network — pull the
-master floppy and every login (including the tablet's) is denied.
+Pocket workflow: `connections` → `connect ParentCenter` (or `dc`) → run hub
+commands; or `connect Miner-12` for a turtle shell. Control is gated by the
+master password — pull the master floppy and every login (including the tablet)
+is denied.
 
 ---
 
@@ -566,7 +564,12 @@ Install it via the installer → **"Network router"** (option **11**). Console:
 `devices`, `forget`, `hostname`, `ping`, `stats`, `gpshost`, `update`, `ssh`,
 `exit`.
 
-**OTA update:** from the main router console, run `update` (confirms first).
+**OTA update:** from the main router console, run `update all` (confirms first).
+That pushes to **every online Titan device** on the roster (miners, loaders,
+Parent Center, admin tablet, modems — not just routers). The monitor switches to
+an ACK board: hostname on top, then each `Package - version: from - to`. When
+every ACK (or fail) is in, the previous board / screensaver returns.
+`update status` prints the same progress in the console.
 Every device that was installed via an installer (and has a `.titan-install`
 manifest) re-downloads its files from the same source (GitHub / pastebin /
 install host) and reboots. Keep `host.lua` running if the fleet was installed

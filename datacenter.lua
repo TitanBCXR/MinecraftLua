@@ -1,6 +1,6 @@
 --[[
   datacenter.lua  -  Titan Data Center (CC: Tweaked)   [ single, self-contained script ]
-  Titan-Version: 1.2.9
+  Titan-Version: 1.2.11
 
   ONE script that every computer/terminal in your data center runs. It works out
   its own role automatically:
@@ -14,16 +14,18 @@
                 in with the master password, after which it becomes an "admin"
                 terminal for that session.
 
-  LOGIN FLOW (exactly what you asked for):
-    1. A locked station only exposes the `password` command.
-    2. `password` reads the *interacting player's display name* (via an Advanced
-       Peripherals Player Detector, if present) and asks for a password.
+  LOGIN FLOW:
+    1. A locked station prompts for the master password immediately (no need to
+       type `password` / `login` first). Same after `lock` / `logout`.
+    2. It reads the interacting player's display name (via an Advanced
+       Peripherals Player Detector, if present).
     3. The password is checked against the MASTER password:
          - if THIS computer holds the master floppy -> check locally,
          - else broadcast to find which computer holds it, and ask that master to
            verify the attempt (the real password never travels the network),
          - if NO master is found/online -> always "Wrong password".
     4. On success the station unlocks into the admin terminal for that player.
+       On failure you can retry, or use locked helpers (`initmaster`, `help`).
 
   NAMING & REGISTRY:
     * Each station is named on first run (saved to `station.cfg`) and registers
@@ -949,14 +951,14 @@ local function handleLocked(cmd, rest)
     printStatus()
   elseif cmd == "help" then
     print("Locked terminal. Commands:")
-    print("  password       log in with the master password")
-    print("  whoami         show the interacting player")
-    print("  status         show this station's status")
-    print("  initmaster     set master password on a blank floppy (first-time only)")
+    print("  password|login  prompt for the master password")
+    print("  whoami          show the interacting player")
+    print("  status          show this station's status")
+    print("  initmaster      set master password on a blank floppy (first-time only)")
   elseif cmd == "" then
-    -- ignore
+    -- ignore (empty returns to the password prompt)
   else
-    print("Locked. Log in first: type 'password'.")
+    print("Locked. Enter the password at the prompt, or: password | initmaster | help")
   end
 end
 
@@ -1336,20 +1338,31 @@ local function displayLoop()
 end
 
 -- The interactive terminal.
+-- Locked: prompt for the master password immediately (no "password" command first).
+-- After a failed attempt, one locked> line for helpers (initmaster / help), then
+-- the password prompt comes back on the next loop.
 local function uiLoop()
   while true do
     term.setBackgroundColor(colors.black)
     if session.mode == "bot" then
       print("")
-      print("[" .. tostring(station.name) .. "] LOCKED. Type 'password' to log in ('help').")
-      write("locked> ")
+      print("[" .. tostring(station.name) .. "] LOCKED")
+      attemptLogin()
+      if session.mode == "bot" then
+        print("Denied. Press Enter to retry, or: initmaster | help | password")
+        write("locked> ")
+        local input = read()
+        local cmd, rest = input:match("^%s*(%S*)%s*(.-)%s*$")
+        cmd = (cmd or ""):lower()
+        if cmd ~= "" then handleLocked(cmd, rest) end
+      end
     else
       write("[" .. tostring(session.user) .. "@" .. tostring(station.name) .. "]$ ")
+      local input = read()
+      local cmd, rest = input:match("^%s*(%S*)%s*(.-)%s*$")
+      cmd = (cmd or ""):lower()
+      handleAdmin(cmd, rest)
     end
-    local input = read()
-    local cmd, rest = input:match("^%s*(%S*)%s*(.-)%s*$")
-    cmd = (cmd or ""):lower()
-    if session.mode == "bot" then handleLocked(cmd, rest) else handleAdmin(cmd, rest) end
   end
 end
 
@@ -1395,7 +1408,7 @@ if next(permits) then
 end
 
 local tasks = { serviceLoop, registerLoop, displayLoop, botLoop, uiLoop, relayLoop }
--- Inbound SSH when lib is present (Parent Center install now ships lib/titan.lua).
+-- Inbound SSH + fleet OTA when lib is present (Parent Center ships lib/titan.lua).
 local dcTitan = nil
 if fs.exists("lib/titan.lua") then
   dcTitan = dofile("lib/titan.lua")
@@ -1427,5 +1440,40 @@ if fs.exists("lib/titan.lua") then
     end)
   end
   tasks[#tasks + 1] = function() dcTitan.sshHostLoop("datacenter") end
+
+  -- Fleet OTA from MAIN (`update all`): listen on titan_router (and ACK after reboot).
+  local otaBusy = false
+  tasks[#tasks + 1] = function()
+    sleep(1)
+    if dcTitan.reportUpdatedIfPending then
+      dcTitan.reportUpdatedIfPending("datacenter")
+    end
+    while true do
+      local id, msg = rednet.receive("titan_router")
+      if type(msg) == "table" and msg.type == "update" and id ~= os.getComputerID()
+          and not otaBusy and dcTitan.updateSelf then
+        otaBusy = true
+        print("")
+        print(("[OTA] Fleet update from router #%s (v%s) — downloading..."):format(
+          tostring(id), tostring(msg.targetVersion or "?")))
+        local prev = dcTitan.systemVersion and dcTitan.systemVersion() or nil
+        local ok, detail = dcTitan.updateSelf()
+        if ok then
+          local pkgs = type(detail) == "table" and detail.packages or nil
+          if dcTitan.markPendingUpdateAck then
+            dcTitan.markPendingUpdateAck(prev, msg.targetVersion, pkgs)
+          end
+          print("[OTA] Updated. Rebooting (will ACK main)..."); sleep(2); os.reboot()
+        else
+          print("[OTA] Failed: " .. tostring(detail))
+          rednet.send(id, {
+            type = "update_fail", version = prev, err = tostring(detail),
+            name = station.name, hostname = station.name, kind = "datacenter",
+          }, "titan_router")
+          otaBusy = false
+        end
+      end
+    end
+  end
 end
 parallel.waitForAny(table.unpack(tasks))
