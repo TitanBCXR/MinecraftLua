@@ -1,6 +1,6 @@
 --[[
   marker.lua  -  Work-site marker computer for Titan fleet mining (CC: Tweaked)
-  Titan-Version: 1.0.1
+  Titan-Version: 1.0.2
 
   Place this computer at (or near) a job site. Define the dig box, how many
   miner bots to request, and `start` — Parent Center assigns idle miners.
@@ -264,9 +264,11 @@ local function requestJob()
   }
   print(("Requesting %s job: %s  bots=%d"):format(
     payload.mode, fmtB(b), payload.nBots))
+  print("Sending site_job to Parent Center over the mesh...")
+  -- One broadcast on titan_net (MAIN/modems relay hops). DC botLoop handles it.
   rednet.broadcast(payload, P)
-  -- Also wait for ack from Parent Center
-  local deadline = os.clock() + 10
+  -- Wait for ack from Parent Center
+  local deadline = os.clock() + 12
   while os.clock() < deadline do
     local id, msg = rednet.receive(P, deadline - os.clock())
     if type(msg) == "table" and (msg.type == MSG.SITE_JOB_ACK or msg.type == "site_job_ack") then
@@ -277,18 +279,21 @@ local function requestJob()
         print(("Parent Center job %s — %d miners (%s) Y %s->%s"):format(
           tostring(msg.jobId), tonumber(msg.bots) or 0, tostring(msg.mode),
           tostring(msg.yStart), tostring(msg.yEnd)))
+        print("Miners + loaders are being dispatched. Check Parent Center `bots` / `jobs`.")
         return true
       else
         state.status = "error"
         state.err = tostring(msg.err or "rejected")
         print("Rejected: " .. state.err)
+        print("Tip: deploy miners (`deploy <id> miner`), keep them idle, check `bots` on Parent Center.")
         return false
       end
     end
   end
   state.status = "error"
-  state.err = "no Parent Center ack (is datacenter online?)"
+  state.err = "no Parent Center ack (is datacenter online on the mesh?)"
   print(state.err)
+  print("Check: Parent Center running, MAIN router up, marker in modem range.")
   return false
 end
 

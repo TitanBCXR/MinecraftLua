@@ -1,6 +1,6 @@
 --[[
   miner.lua  -  Area miner turtle for the Titan network (CC: Tweaked)
-  Titan-Version: 1.2.9
+  Titan-Version: 1.2.10
 
   Digs a rectangular "box":
     * set1 <x> <z> / set2 <x> <z> — opposite corners (X/Z footprint)
@@ -146,14 +146,14 @@ local function yRange()
 end
 
 local function assignmentText()
+  if state.jobId and (state.status == "mining" or state.status == "moving"
+      or state.status == "queued" or state.status == "returning") then
+    return tostring(state.jobId)
+  end
   if state.status == "mining" or state.status == "moving" then
     return state.task or "mining"
   end
-  local topY, floorY = yRange()
-  if cfg.loc1 and cfg.loc2 and topY then
-    return ("box Y%d->%d dug=%d"):format(topY, floorY, state.dug or 0)
-  end
-  return state.task or "unconfigured"
+  return "-"
 end
 
 --------------------------------------------------------------------------------
@@ -1228,9 +1228,8 @@ local function applyDeployment(d)
     return false, "this turtle runs miner.lua — install/run worker.lua for builder/gatherer"
   end
   if t ~= "miner" then return false, "bad type (want miner)" end
-  local name = d.name
-  if not name or name == "" then name = "Miner-" .. os.getComputerID() end
-  print(("Deploying as miner '%s'..."):format(name))
+  local name = titan.uniqueBotName("miner", os.getComputerID())
+  print(("Deploying as miner '%s' (unique name)..."):format(name))
   local ok, err = nav.calibrate(true)
   if not ok then print("Calibrate warning: " .. tostring(err)) end
   local hx, hy, hz = nav.locate(2)
@@ -1266,16 +1265,18 @@ end
 
 local function awaitDeployment()
   setStatus("await", "awaiting deployment")
-  os.setComputerLabel(os.getComputerLabel() or ("miner-" .. os.getComputerID()))
+  local awaitName = "await-" .. os.getComputerID()
+  os.setComputerLabel(awaitName)
   print("Unconfigured miner. Waiting for Parent Center deploy...")
-  print("  deploy <id> miner <name> [depX depY depZ]")
+  print("  deploy <id> miner")
+  print("I will become Miner-" .. os.getComputerID() .. " on deploy.")
   local beacon = os.startTimer(0)
   while true do
     local ev, p1, p2, p3 = os.pullEvent()
     if ev == "timer" and p1 == beacon then
       local x, y, z = nav.locate(1)
       titan.broadcast(MSG.WORKER_AWAIT, {
-        name = os.getComputerLabel(), kind = "miner", x = x, y = y, z = z,
+        name = awaitName, kind = "miner", x = x, y = y, z = z,
       })
       beacon = os.startTimer(3)
     elseif ev == "rednet_message" and p3 == P and type(p2) == "table"
@@ -1293,17 +1294,26 @@ local function awaitDeployment()
 end
 
 local function statusLoop()
+  if cfg.name and not titan.isUniqueBotName(cfg.name, "miner") then
+    cfg.name = titan.uniqueBotName("miner", os.getComputerID())
+    saveCfg()
+    os.setComputerLabel(cfg.name)
+  end
   titan.broadcast(MSG.BOT_REGISTER, {
-    name = cfg.name or os.getComputerLabel(),
+    botName = cfg.name or os.getComputerLabel(),
+    label = cfg.name or os.getComputerLabel(),
     botType = "miner", home = cfg.home or nav.home,
+    state = state.status, status = state.status,
   })
   while true do
     local x, y, z = nav.locate(1)
     local fix = nav.lastFix
     local asg = assignmentText()
     titan.broadcast(MSG.STATUS, {
-      name = cfg.name or os.getComputerLabel(),
+      botName = cfg.name or os.getComputerLabel(),
+      label = cfg.name or os.getComputerLabel(),
       status = state.status,
+      state  = state.status,   -- Parent Center reads `state`
       task   = state.task,
       assignment = asg,
       x = x, y = y, z = z,
@@ -1312,6 +1322,7 @@ local function statusLoop()
       fuel   = turtle.getFuelLevel(),
       dug    = state.dug,
       botType = "miner",
+      jobId = state.jobId,
     })
     sleep(5)
   end
@@ -1378,13 +1389,18 @@ local function receiveLoop()
           titan.send(id, MSG.ACK, { ok = true, task = "stage set" })
         end
       elseif t == MSG.MINE_JOB then
-        if state.status == "mining" or state.status == "moving" then
+        if state.status == "mining" or state.status == "moving"
+            or state.status == "queued" or state.status == "returning" then
           titan.send(id, MSG.MINE_JOB_ACK, { ok = false, err = "busy", jobId = msg.jobId })
         else
           msg.replyTo = id
           pendingJob = msg
-          setStatus("idle", "job queued")
-          titan.send(id, MSG.MINE_JOB_ACK, { ok = true, jobId = msg.jobId, queued = true })
+          state.jobId = msg.jobId or msg.id
+          setStatus("queued", tostring(state.jobId or "job"))
+          titan.send(id, MSG.MINE_JOB_ACK, {
+            ok = true, jobId = state.jobId, queued = true,
+            botType = "miner", state = "queued",
+          })
         end
       elseif t == MSG.PERMIT_SYNC then
         if type(msg.permits) == "table" then
@@ -1404,10 +1420,14 @@ local function receiveLoop()
           ok = ok, err = why, name = cfg.name, botType = "miner",
         })
       elseif t == MSG.PING then
+        local px, py, pz = nav.locate(1)
         titan.send(id, MSG.PONG, {
-          state = state.status, botType = "miner",
+          state = state.status, status = state.status, botType = "miner",
+          botName = cfg.name or os.getComputerLabel(),
           name = cfg.name or os.getComputerLabel(),
           assignment = assignmentText(),
+          x = px, y = py, z = pz, jobId = state.jobId,
+          fuel = turtle.getFuelLevel(),
         })
       end
     end
@@ -1416,16 +1436,23 @@ end
 
 local function jobLoop()
   while true do
-    if pendingJob and state.status ~= "mining" and state.status ~= "moving" then
+    if pendingJob and state.status ~= "mining" and state.status ~= "moving"
+        and state.status ~= "returning" then
       local job = pendingJob
       pendingJob = nil
       runAssignedJob(job)
+      state.jobId = nil
+      if state.status ~= "error" then setStatus("idle", "-") end
     elseif mineRequested and state.status ~= "mining" then
       mineRequested = false
       mineVolume()
+      state.jobId = nil
+      if state.status ~= "error" and state.status ~= "stopped" then setStatus("idle", "-") end
     elseif continueRequested and state.status ~= "mining" then
       continueRequested = false
       continueMine()
+      state.jobId = nil
+      if state.status ~= "error" and state.status ~= "stopped" then setStatus("idle", "-") end
     end
     sleep(0.4)
   end

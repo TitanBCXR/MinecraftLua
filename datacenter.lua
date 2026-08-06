@@ -1,6 +1,6 @@
 --[[
   datacenter.lua  -  Titan Data Center (CC: Tweaked)   [ single, self-contained script ]
-  Titan-Version: 1.2.8
+  Titan-Version: 1.2.9
 
   ONE script that every computer/terminal in your data center runs. It works out
   its own role automatically:
@@ -90,6 +90,7 @@ local permits  = {}                          -- [blockId or prefix] = true | exp
 local permitReqs = {}                        -- pending human-visible permit requests
 local PERMIT_FILE = "break_permits.cfg"
 local nextJobId = 1
+local lastSiteJob = { sig = "", at = 0 }  -- de-dupe marker broadcasts
 
 --==============================================================================
 -- Small helpers
@@ -649,13 +650,24 @@ end
 --------------------------------------------------------------------------------
 -- Fleet flatten / mine jobs
 --------------------------------------------------------------------------------
+local function isIdleState(st)
+  st = tostring(st or ""):lower()
+  -- Miners historically sent `status` while DC read `state` — treat empty as idle
+  -- once the bot is known and freshly seen.
+  return st == "" or st == "nil" or st == "idle" or st == "authed"
+    or st == "online" or st == "-" or st == "parked"
+end
+
 local function idleOfType(botType)
   local nowMs, list = os.epoch("utc"), {}
   for id, b in pairs(netbots) do
     if b.botType == botType and (nowMs - (b.seen or 0)) < 20000 then
-      local st = tostring(b.state or "")
-      if st == "idle" or st == "authed" or st == "online" or st == "-" or st == "parked" then
-        list[#list + 1] = id
+      if isIdleState(b.state) then
+        -- Fleet job ids look like J12-3; keep those busy until they finish.
+        local asg = tostring(b.assignment or "")
+        if not asg:match("^J%d") then
+          list[#list + 1] = id
+        end
       end
     end
   end
@@ -665,6 +677,23 @@ end
 
 local function idleMiners() return idleOfType("miner") end
 local function idleLoaders() return idleOfType("loader") end
+
+local function rosterHint(botType)
+  local nowMs, lines, n = os.epoch("utc"), {}, 0
+  for id, b in pairs(netbots) do
+    if b.botType == botType then
+      n = n + 1
+      local age = math.floor((nowMs - (b.seen or 0)) / 1000)
+      lines[#lines + 1] = ("#%d %s state=%s asg=%s %ds"):format(
+        id, tostring(b.name or "?"), tostring(b.state or "?"),
+        tostring(b.assignment or "-"):sub(1, 12), age)
+    end
+  end
+  if n == 0 then
+    return "none on roster — miners must be deployed and in modem range of the mesh"
+  end
+  return table.concat(lines, " | ")
+end
 
 -- Split XZ box into up to n vertical strips (along X).
 local function splitStrips(x, z, w, d, n)
@@ -714,7 +743,9 @@ local function dispatchAreaJobs(x, z, w, d, yEnd, nBots, opts)
   local returnStage = opts.returnStage ~= false
 
   local idle = idleMiners()
-  if #idle == 0 then return false, "No idle miners online." end
+  if #idle == 0 then
+    return false, "No idle miners online. Roster: " .. rosterHint("miner")
+  end
 
   x, z, w, d, yEnd = math.floor(x), math.floor(z), math.floor(w), math.floor(d), math.floor(yEnd)
   if not yStart then
@@ -794,6 +825,7 @@ local function dispatchAreaJobs(x, z, w, d, yEnd, nBots, opts)
         type = "loader_assign",
         jobId = payload.jobId,
         minerId = id,
+        followGap = 2,   -- stay 2 blocks from miner (don't block digging)
         x = midX, y = piece.approachY or cruiseY, z = midZ,
         x1 = piece.x1, z1 = piece.z1, x2 = piece.x2, z2 = piece.z2,
         cruiseY = cruiseY, returnStage = true,
@@ -1127,15 +1159,22 @@ local function botLoop()
   while true do
     local id, msg = rednet.receive(NET_PROTOCOL)
     if type(msg) == "table" and id then
-      if msg.type == "bot_register" or msg.type == "status" or msg.type == "register" then
+      if msg.type == "bot_register" or msg.type == "status" or msg.type == "register"
+          or msg.type == "pong" then
         local b = netbots[id] or {}
-        b.name = msg.name or msg.hostname or b.name
+        -- Prefer bot's own label fields; titan.broadcast may stamp hostname on `name`.
+        b.name = msg.botName or msg.label or msg.name or msg.hostname or b.name
         b.botType = msg.botType or b.botType
         b.x, b.y, b.z = msg.x or b.x, msg.y or b.y, msg.z or b.z
         b.fuel = msg.fuel ~= nil and msg.fuel or b.fuel
-        b.state = msg.state or b.state
+        -- Miners used `status`; workers use `state`. Accept both.
+        b.state = msg.state or msg.status or b.state
         b.task = msg.task or b.task
-        b.assignment = msg.assignment or msg.task or b.assignment
+        if msg.assignment ~= nil then
+          b.assignment = msg.assignment
+        elseif msg.task and not b.assignment then
+          b.assignment = msg.task
+        end
         if msg.dug ~= nil then b.dug = msg.dug end
         b.seen = os.epoch("utc")
         netbots[id] = b
@@ -1147,6 +1186,11 @@ local function botLoop()
         }
       elseif msg.type == "worker_deployed" then
         pending[id] = nil
+        netbots[id] = netbots[id] or {}
+        netbots[id].name = msg.name or netbots[id].name
+        netbots[id].botType = msg.botType or netbots[id].botType
+        netbots[id].state = "idle"
+        netbots[id].seen = os.epoch("utc")
       elseif msg.type == "mine_job_ack" then
         local b = netbots[id] or {}
         b.state = msg.ok and (msg.queued and "queued" or "working") or (b.state or "error")
@@ -1182,7 +1226,19 @@ local function botLoop()
       elseif msg.type == "permit_sync" and msg.want then
         rednet.send(id, { type = "permit_sync", permits = permits }, NET_PROTOCOL)
       elseif msg.type == "site_job" then
-        handleSiteJob(id, msg)
+        local sig = table.concat({
+          tostring(msg.x1), tostring(msg.z1), tostring(msg.x2), tostring(msg.z2),
+          tostring(msg.yStart), tostring(msg.yEnd), tostring(msg.nBots), tostring(id),
+        }, ",")
+        local now = os.epoch("utc")
+        if lastSiteJob.sig == sig and (now - (lastSiteJob.at or 0)) < 5000 then
+          -- ignore duplicate burst
+        else
+          lastSiteJob.sig, lastSiteJob.at = sig, now
+          print(("Site job from #%d %s — dispatching..."):format(
+            id, tostring(msg.name or "?")))
+          handleSiteJob(id, msg)
+        end
       end
     end
   end

@@ -1,22 +1,15 @@
 --[[
   loader.lua  -  Chunk-escort turtle for the Titan miner fleet (CC: Tweaked)
-  Titan-Version: 1.0.0
+  Titan-Version: 1.0.1
 
-  Keeps work areas loaded while miners dig. Vanilla CC turtles cannot force-load
-  chunks from Lua. Equip Advanced Peripherals "Chunky Turtle" (loads the chunk
-  the turtle is in). This script only moves the escort while a job is active;
-  when idle / parked it returns to the staging sheet and does NOT wander.
+  Follows an assigned miner and keeps its work chunks loaded.
+  Equip Advanced Peripherals "Chunky Turtle" (loads the chunk the turtle is in).
 
-  Flow:
-    * Park at stage (sheet stack with miners)
-    * Parent Center `flatten` assigns loaders with miners
-    * Fly cruise Y (~150) to strip mid, hover / pace the strip
-    * On cancel / job done / `park` — return to stage and idle
+  While escorting: stay ~2 blocks away so the miner is never blocked.
+  When idle / parked: return to stage and do not wander (no chunk load while idle).
 
-  Deploy from Parent Center:
-    deploy <id> loader <name> [stageX stageY stageZ]
-
-  Local: stage here | cruise <y> | park | status
+  Deploy:  deploy <id> loader
+  Parent Center / marker jobs auto-assign loaders with miners.
 ]]
 
 local titan = dofile("lib/titan.lua")
@@ -25,9 +18,11 @@ local MSG   = titan.MSG
 local P     = titan.PROTOCOL
 
 titan.openModem()
-os.setComputerLabel(os.getComputerLabel() or ("Loader-" .. os.getComputerID()))
+os.setComputerLabel(os.getComputerLabel() or ("await-" .. os.getComputerID()))
 
 local CFG = "loader.cfg"
+local FOLLOW_GAP = 2
+
 local cfg = {
   name = nil,
   botType = "loader",
@@ -41,8 +36,10 @@ local state = {
   task = "-",
   jobId = nil,
   stop = false,
+  minerId = nil,
 }
 local pendingEscort = nil
+local minerTrack = nil  -- { x, y, z, state, seen, done }
 
 local function saveCfg()
   local f = fs.open(CFG, "w"); f.write(textutils.serialize(cfg)); f.close()
@@ -82,55 +79,102 @@ local function returnToStage()
   local ok, err = goCruiseTo(dest.x, dest.y, dest.z)
   setStatus(ok and "parked" or "error", ok and "-" or tostring(err))
   state.jobId = nil
+  state.minerId = nil
+  minerTrack = nil
   return ok, err
 end
 
--- Pace the strip slowly so Chunky Turtle keeps nearby chunks warm.
+-- Stand FOLLOW_GAP blocks from the miner on X (prefer +X, flip if needed).
+local function offsetFromMiner(mx, my, mz)
+  local gap = FOLLOW_GAP
+  local lx, ly, lz = gps.locate(1)
+  local tx = mx + gap
+  if lx and math.abs((lx) - (mx + gap)) > math.abs((lx) - (mx - gap)) then
+    -- Prefer the side we're already closer to, so we don't cross through the miner.
+    if math.abs(lx - (mx - gap)) < math.abs(lx - (mx + gap)) then
+      tx = mx - gap
+    end
+  end
+  return tx, my, mz
+end
+
+local function chebyshev(ax, az, bx, bz)
+  return math.max(math.abs(ax - bx), math.abs(az - bz))
+end
+
+local function minerLooksDone(st)
+  st = tostring(st or ""):lower()
+  return st == "idle" or st == "parked" or st == "error" or st == ""
+end
+
+-- Follow minerId at ~2 block gap until they finish / timeout / stop.
 local function escortLoop(job)
   state.stop = false
   state.jobId = job.jobId or job.id
-  setStatus("escorting", tostring(state.jobId or "escort"))
-  local x1 = tonumber(job.x1) or tonumber(job.x)
-  local z1 = tonumber(job.z1) or tonumber(job.z)
-  local x2 = tonumber(job.x2) or x1
-  local z2 = tonumber(job.z2) or z1
-  local y = tonumber(job.y) or tonumber(cfg.cruiseY) or 150
+  state.minerId = tonumber(job.minerId)
+  local gap = tonumber(job.followGap) or FOLLOW_GAP
+  FOLLOW_GAP = math.max(2, math.floor(gap))
   if tonumber(job.cruiseY) then cfg.cruiseY = math.floor(tonumber(job.cruiseY)) end
-  if not (x1 and z1) then
-    setStatus("error", "bad escort coords")
-    return false
-  end
-  x2, z2 = x2 or x1, z2 or z1
-  local midX = math.floor((x1 + x2) / 2)
-  local midZ = math.floor((z1 + z2) / 2)
-  print(("Escort %s -> %d,%d,%d (cruise %d)"):format(
-    tostring(state.jobId), midX, y, midZ, tonumber(cfg.cruiseY) or 150))
-  local ok, err = goCruiseTo(midX, y, midZ)
-  if not ok then
-    setStatus("error", tostring(err))
-    return false
+
+  setStatus("escorting", tostring(state.jobId or "escort"))
+  print(("Escort job %s -> miner #%s (gap %d)"):format(
+    tostring(state.jobId), tostring(state.minerId or "?"), FOLLOW_GAP))
+
+  -- Fly toward the strip first (cruise), then stick to the miner at work Y.
+  local midX = tonumber(job.x) or (tonumber(job.x1) and tonumber(job.x2)
+    and math.floor((job.x1 + job.x2) / 2))
+  local midZ = tonumber(job.z) or (tonumber(job.z1) and tonumber(job.z2)
+    and math.floor((job.z1 + job.z2) / 2))
+  local approachY = tonumber(job.y) or tonumber(cfg.cruiseY) or 150
+  if midX and midZ then
+    goCruiseTo(midX, approachY, midZ)
   end
 
-  -- Stay in area until stop / ~15 min max / miner goes idle (polled lightly).
-  local deadline = os.epoch("utc") + 15 * 60 * 1000
-  local points = {
-    { x = x1, z = z1 },
-    { x = x2, z = z1 },
-    { x = x2, z = z2 },
-    { x = x1, z = z2 },
-    { x = midX, z = midZ },
+  minerTrack = {
+    x = midX, y = approachY, z = midZ,
+    state = "unknown", seen = os.epoch("utc"), done = false,
   }
-  local i = 1
+  local deadline = os.epoch("utc") + 45 * 60 * 1000
+  local idleTicks = 0
+
   while not state.stop and os.epoch("utc") < deadline do
-    local p = points[i]
-    i = (i % #points) + 1
-    setStatus("escorting", ("patrol %d,%d"):format(p.x, p.z))
-    goCruiseTo(p.x, y, p.z)
-    -- Hold ~25s so the chunk stays loaded without constant movement
-    for _ = 1, 25 do
-      if state.stop then break end
-      sleep(1)
+    -- Ask miner for a ping; also STATUS broadcasts update minerTrack in receiveLoop.
+    if state.minerId then
+      titan.send(state.minerId, MSG.PING, { want = "pos" })
     end
+
+    local t = minerTrack
+    if t and t.x and t.y and t.z then
+      local tx, ty, tz = offsetFromMiner(t.x, t.y, t.z)
+      local lx, ly, lz = gps.locate(1)
+      local needMove = true
+      if lx then
+        needMove = chebyshev(lx, lz, t.x, t.z) > FOLLOW_GAP
+          or math.abs((ly or ty) - ty) > 1
+      end
+      if needMove then
+        setStatus("escorting", ("follow #%s @ %d,%d,%d"):format(
+          tostring(state.minerId or "?"), t.x, t.y, t.z))
+        -- No cruise altitude here — stay in the miner's chunk layer.
+        nav.travelTo(tx, ty, tz, { dig = true })
+      else
+        setStatus("escorting", ("hold gap=%d"):format(FOLLOW_GAP))
+      end
+
+      if minerLooksDone(t.state) and (os.epoch("utc") - (t.seen or 0)) < 15000 then
+        idleTicks = idleTicks + 1
+      else
+        idleTicks = 0
+      end
+      -- Miner idle for ~20s after we have tracked them => job finished.
+      if idleTicks >= 10 and t.seen and (os.epoch("utc") - t.seen) < 20000 then
+        print("Miner looks idle — escort complete.")
+        break
+      end
+    else
+      setStatus("escorting", "waiting for miner GPS")
+    end
+    sleep(2)
   end
 
   if job.returnStage ~= false then
@@ -138,6 +182,7 @@ local function escortLoop(job)
   else
     setStatus("idle", "-")
     state.jobId = nil
+    state.minerId = nil
   end
   return true
 end
@@ -147,7 +192,7 @@ local function applyDeployment(d)
   if t ~= "loader" and t ~= "chunk" and t ~= "chunky" then
     return false, "this turtle runs loader.lua (deploy as loader)"
   end
-  cfg.name = tostring(d.name or cfg.name or ("Loader-" .. os.getComputerID()))
+  cfg.name = titan.uniqueBotName("loader", os.getComputerID())
   cfg.botType = "loader"
   if type(d.stage) == "table" and d.stage.x then
     cfg.stage = {
@@ -156,7 +201,6 @@ local function applyDeployment(d)
       z = math.floor(tonumber(d.stage.z)),
     }
   elseif type(d.deposit) == "table" and d.deposit.x then
-    -- Parent Center may send stage in the deposit slots for loaders
     cfg.stage = {
       x = math.floor(tonumber(d.deposit.x)),
       y = math.floor(tonumber(d.deposit.y) or 64),
@@ -171,14 +215,15 @@ end
 
 local function awaitDeployment()
   setStatus("awaiting", "deploy")
+  local awaitName = "await-" .. os.getComputerID()
+  os.setComputerLabel(awaitName)
   print("Loader awaiting Parent Center deploy...")
-  print(("  Computer ID: %d"):format(os.getComputerID()))
+  print(("  deploy %d loader"):format(os.getComputerID()))
   while true do
     local x, y, z = gps.locate(2)
     rednet.broadcast({
       type = MSG.WORKER_AWAIT,
-      name = os.getComputerLabel() or ("Loader-" .. os.getComputerID()),
-      kind = "loader", x = x, y = y, z = z,
+      name = awaitName, kind = "loader", x = x, y = y, z = z,
     }, P)
     local id, msg = rednet.receive(P, 8)
     if type(msg) == "table" and msg.type == MSG.WORKER_DEPLOY then
@@ -197,10 +242,14 @@ local function handleCommand(a)
   if cmd == "" then return true
   elseif cmd == "help" then
     print("stage here | stage <x y z> | cruise [y] | park | stop | status | exit")
-    print("Needs Advanced Peripherals Chunky Turtle to keep chunks loaded.")
+    print("Follows miners at 2-block gap. Needs Chunky Turtle upgrade.")
   elseif cmd == "status" then
-    print(("status=%s task=%s job=%s"):format(state.status, state.task, tostring(state.jobId)))
+    print(("status=%s task=%s job=%s miner=#%s"):format(
+      state.status, state.task, tostring(state.jobId), tostring(state.minerId)))
     print("stage=" .. fmt(cfg.stage) .. "  cruiseY=" .. tostring(cfg.cruiseY))
+    if minerTrack then
+      print(("track: %s state=%s"):format(fmt(minerTrack), tostring(minerTrack.state)))
+    end
   elseif cmd == "stage" then
     if not a[2] or a[2]:lower() == "here" then
       local x, y, z = nav.locatePrecise(3)
@@ -224,7 +273,7 @@ local function handleCommand(a)
     returnToStage()
   elseif cmd == "stop" then
     state.stop = true
-    print("Stop requested — will return to stage after current leg.")
+    print("Stop requested — returning to stage after current leg.")
   elseif cmd == "exit" or cmd == "quit" then
     return "exit"
   else
@@ -238,8 +287,7 @@ local function consoleLoop()
     titan.setSshHandler(function(line)
       local a = {}
       for w in tostring(line or ""):gmatch("%S+") do a[#a + 1] = w end
-      local r = handleCommand(a)
-      return r ~= false
+      return handleCommand(a) ~= false
     end)
   end
   while true do
@@ -256,13 +304,16 @@ local function statusLoop()
     local x, y, z = gps.locate(1)
     rednet.broadcast({
       type = MSG.STATUS,
-      name = cfg.name or os.getComputerLabel(),
+      botName = cfg.name or os.getComputerLabel(),
+      label = cfg.name or os.getComputerLabel(),
       botType = "loader",
       state = state.status,
+      status = state.status,
       task = state.task,
       assignment = assignmentText(),
       x = x, y = y, z = z,
       fuel = turtle.getFuelLevel(),
+      minerId = state.minerId,
     }, P)
     sleep(5)
   end
@@ -281,6 +332,15 @@ local function receiveLoop()
           setStatus("idle", "escort queued")
           titan.send(id, MSG.ACK, { ok = true, task = "escort queued", jobId = msg.jobId })
         end
+      elseif t == MSG.STATUS or t == MSG.PONG then
+        if state.minerId and id == state.minerId then
+          minerTrack = minerTrack or {}
+          minerTrack.x = msg.x or minerTrack.x
+          minerTrack.y = msg.y or minerTrack.y
+          minerTrack.z = msg.z or minerTrack.z
+          minerTrack.state = msg.state or msg.status or minerTrack.state
+          minerTrack.seen = os.epoch("utc")
+        end
       elseif t == MSG.COMMAND then
         local cmd = tostring(msg.cmd or ""):lower()
         if cmd == "park" or cmd == "tostage" or cmd == "return" then
@@ -298,6 +358,8 @@ local function receiveLoop()
           }
           saveCfg()
           titan.send(id, MSG.ACK, { ok = true, task = "stage set" })
+        elseif cmd == "rename" and msg.name then
+          cfg.name = tostring(msg.name); saveCfg(); os.setComputerLabel(cfg.name)
         end
       elseif t == MSG.PERMIT_SYNC and type(msg.permits) == "table" then
         titan.setPermits(msg.permits)
@@ -307,9 +369,11 @@ local function receiveLoop()
           ok = ok, err = why, name = cfg.name, botType = "loader",
         })
       elseif t == MSG.PING then
+        local px, py, pz = gps.locate(1)
         titan.send(id, MSG.PONG, {
-          state = state.status, botType = "loader",
-          name = cfg.name, assignment = assignmentText(),
+          state = state.status, status = state.status, botType = "loader",
+          name = cfg.name, botName = cfg.name, assignment = assignmentText(),
+          x = px, y = py, z = pz,
         })
       end
     end
@@ -333,13 +397,17 @@ loadCfg()
 if not cfg.name then
   parallel.waitForAny(awaitDeployment, function() titan.networkLoop("loader") end)
 end
+if not titan.isUniqueBotName(cfg.name, "loader") then
+  cfg.name = titan.uniqueBotName("loader", os.getComputerID())
+  saveCfg()
+end
 os.setComputerLabel(cfg.name)
 if cfg.stage then cfg.home = cfg.home or cfg.stage; nav.home = cfg.stage end
 pcall(nav.calibrate, true)
 setStatus(cfg.stage and "parked" or "idle", "-")
 print(("Loader '%s' online. stage=%s cruiseY=%d"):format(
   cfg.name, fmt(cfg.stage), tonumber(cfg.cruiseY) or 150))
-print("Tip: Advanced Peripherals Chunky Turtle upgrade required for chunk loading.")
+print("Follows miners at 2-block gap. Chunky Turtle upgrade required for chunk loading.")
 
 parallel.waitForAny(
   consoleLoop, statusLoop, receiveLoop, jobLoop,
