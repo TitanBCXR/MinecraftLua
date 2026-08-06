@@ -1,6 +1,6 @@
 --[[
   github_install.lua  -  Install the Titan system straight from a GitHub repo
-  Titan-Version: 1.1.8
+  Titan-Version: 1.1.9
 
   Point RAW_BASE at your repo's raw content root, then on each Minecraft device:
 
@@ -51,10 +51,12 @@ local ROLES = {
     files = { "lib/titan.lua", "miner.lua", "exclude.txt" } },
   { key = "13", name = "StorageManager (Create storage)",  run = "storage_manager.lua",
     files = { "lib/titan.lua", "storage_manager.lua" } },
-  { key = "14", name = "Everything (all files, no auto-run)", run = nil,
+  { key = "14", name = "Train node (Create train mesh)",   run = "train_node.lua",
+    files = { "lib/titan.lua", "train_node.lua" } },
+  { key = "15", name = "Everything (all files, no auto-run)", run = nil,
     files = { "lib/titan.lua", "hub.lua", "bot.lua", "poi.lua", "worker.lua", "botserver.lua",
               "datacenter.lua", "console.lua", "admin.lua", "gpshost.lua", "locator.lua", "router.lua",
-              "miner.lua", "storage_manager.lua", "exclude.txt", "versions.lua" } },
+              "miner.lua", "storage_manager.lua", "train_node.lua", "exclude.txt", "versions.lua" } },
 }
 
 --==============================================================================
@@ -101,7 +103,7 @@ local function pickRole(title, sourceLine)
       term.clear(); term.setCursorPos(1, 1)
       print(title)
       if sourceLine then print(sourceLine) end
-      print("What is this device?  (13=StorageManager)")
+      print("What is this device?  (14=Train node)")
       print("")
       local budget = math.max(4, (h or 13) - 7)
       local shown = 0
@@ -199,6 +201,7 @@ local LABELS = {
   ["admin.lua"] = "Admin", ["host.lua"] = "Host", ["gpshost.lua"] = "GPS",
   ["locator.lua"] = "Locator", ["router.lua"] = "Router", ["miner.lua"] = "Miner",
   ["storage_manager.lua"] = "StorageManager",
+  ["train_node.lua"] = "Train",
 }
 local lbl = role.run and LABELS[role.run]
 if lbl and not os.getComputerLabel() then
