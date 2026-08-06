@@ -1,6 +1,6 @@
 --[[
   titan.lua  -  Shared library for the Titan bot network (CC: Tweaked)
-  Titan-Version: 1.2.10
+  Titan-Version: 1.2.11
 
   Provides:
     * Rednet protocol constants + message type enum
@@ -146,6 +146,19 @@ function titan.isRestricted(name)
     if name:sub(1, #p) == p then return true end
   end
   return false
+end
+
+-- Monitor redraw interval (seconds). Used by hub / botserver / datacenter /
+-- marker / storage / router. Clamp keeps loops sane on busy servers.
+titan.MONRATE_MIN, titan.MONRATE_MAX = 0.25, 120
+
+function titan.normalizeMonRate(secs, defaultSecs)
+  local d = tonumber(defaultSecs) or 1
+  local n = tonumber(secs)
+  if not n or n ~= n then return d end   -- NaN guard
+  if n < titan.MONRATE_MIN then n = titan.MONRATE_MIN end
+  if n > titan.MONRATE_MAX then n = titan.MONRATE_MAX end
+  return n
 end
 
 -- Decide whether a gatherer should pick up an item, given a gather request.

@@ -1,6 +1,6 @@
 --[[
   botserver.lua  -  "Bots Computer" for the Titan network (CC: Tweaked)
-  Titan-Version: 1.2.3
+  Titan-Version: 1.2.4
 
   Coordination hub for the three bot types:
     * builder  / gatherer  (worker.lua)
@@ -18,6 +18,7 @@
     mine  <bot> | stop <bot>
     order <bot> goto <x> <y> <z>
     assign <bot> <text>   (ops note shown on monitor)
+    monrate [secs]        monitor refresh rate (default 1s)
     help | exit
 ]]
 
@@ -30,6 +31,24 @@ os.setComputerLabel(os.getComputerLabel() or ("Bots-" .. os.getComputerID()))
 
 local BUILD_DIR = "builds"
 if not fs.exists(BUILD_DIR) then fs.makeDir(BUILD_DIR) end
+local CFG = "botserver.cfg"
+local monRate = 1
+
+local function loadServerCfg()
+  if not fs.exists(CFG) then return end
+  local f = fs.open(CFG, "r"); local d = textutils.unserialize(f.readAll()); f.close()
+  if type(d) == "table" and d.monRate then
+    monRate = titan.normalizeMonRate(d.monRate, 1)
+  end
+end
+
+local function saveServerCfg()
+  local f = fs.open(CFG, "w")
+  f.write(textutils.serialize({ monRate = monRate }))
+  f.close()
+end
+
+loadServerCfg()
 
 local BOT_TYPES = { builder = true, gatherer = true, miner = true }
 
@@ -275,13 +294,13 @@ end
 
 local function networkLoop()
   titan.broadcast(MSG.PING, {})
-  local drawT = os.startTimer(1)
+  local drawT = os.startTimer(monRate)
   while true do
     local ev, p1, p2, p3 = os.pullEvent()
     if ev == "rednet_message" and p3 == P and type(p2) == "table" then
       handle(p1, p2)
     elseif ev == "timer" and p1 == drawT then
-      draw(); drawT = os.startTimer(1)
+      draw(); drawT = os.startTimer(monRate)
     elseif ev == "peripheral" or ev == "peripheral_detach" then
       monitor = peripheral.find("monitor")
       if monitor then monitor.setTextScale(0.5) end
@@ -320,7 +339,15 @@ local function handleCommand(a)
     print("mine <bot> | continue <bot> | stop <bot>")
     print("order <bot> goto <x> <y> <z>")
     print("assign <bot> <text> | unassign <bot>")
+    print("monrate [secs]   monitor refresh rate")
     print("exit")
+  elseif cmd == "monrate" or cmd == "mrate" or cmd == "monitorrate" or cmd == "refreshrate" then
+    if a[2] then
+      monRate = titan.normalizeMonRate(a[2], monRate)
+      saveServerCfg()
+    end
+    print(("Monitor refresh: %.2fs  (range %.2f–%ds)"):format(
+      monRate, titan.MONRATE_MIN, titan.MONRATE_MAX))
   elseif cmd == "bots" then
     local n = countByType()
     print(("Active %d  build:%d gather:%d mine:%d busy:%d"):format(

@@ -1,6 +1,6 @@
 --[[
   datacenter.lua  -  Titan Data Center (CC: Tweaked)   [ single, self-contained script ]
-  Titan-Version: 1.2.6
+  Titan-Version: 1.2.7
 
   ONE script that every computer/terminal in your data center runs. It works out
   its own role automatically:
@@ -80,6 +80,7 @@ local MSG = {
 local registry = {}                          -- [id] = { name, seen, master }
 local session  = { mode = "bot", user = nil } -- mode: "bot" (locked) | "admin"
 local station  = { name = nil }
+local monRate  = 2                           -- monitor redraw interval (seconds)
 local BOT_TYPES = { builder = true, gatherer = true, miner = true, loader = true }
 local netbots  = {}                          -- [id] = { name, botType, x,y,z, fuel, state, task, seen, assignment }
 local pending  = {}                          -- [id] = { name, x,y,z, seen, kind } awaiting deployment
@@ -144,10 +145,23 @@ local function loadConfig()
   return data
 end
 
+-- Merge-write so monRate / other prefs survive rename.
 local function saveConfig(cfg)
+  local cur = loadConfig() or {}
+  if type(cfg) == "table" then
+    for k, v in pairs(cfg) do cur[k] = v end
+  end
   local f = fs.open(STATION_CFG, "w")
-  f.write(textutils.serialize(cfg))
+  f.write(textutils.serialize(cur))
   f.close()
+end
+
+local function clampMonRate(secs)
+  local n = tonumber(secs)
+  if not n or n ~= n then return monRate end
+  if n < 0.25 then n = 0.25 end
+  if n > 120 then n = 120 end
+  return n
 end
 
 --==============================================================================
@@ -964,6 +978,12 @@ local function handleAdmin(cmd, rest)
     printStatus()
   elseif cmd == "status" then
     printStatus()
+  elseif cmd == "monrate" or cmd == "mrate" or cmd == "monitorrate" or cmd == "refreshrate" then
+    if rest and rest ~= "" then
+      monRate = clampMonRate(rest:match("%S+"))
+      saveConfig({ monRate = monRate })
+    end
+    print(("Monitor refresh: %.2fs  (range 0.25–120s)"):format(monRate))
   elseif cmd == "lock" or cmd == "logout" then
     session.mode = "bot"; session.user = nil
     print("Locked.")
@@ -984,6 +1004,7 @@ local function handleAdmin(cmd, rest)
     print("  jobs               recent flatten / marker jobs")
     print("  permit <id|prefix:>   allow breaking Create/etc (shows on monitor)")
     print("  unpermit <id|prefix:> | permits")
+    print("  monrate [secs]     monitor refresh rate (default 2s)")
     print("  rename|hostname <name>  rename this station (updates router roster)")
     print("  setmaster          change master password (master only)")
     print("  who | status       session / station info")
@@ -1239,7 +1260,7 @@ local function displayLoop()
   while true do
     local mon = peripheral.find("monitor")
     if mon then drawMonitor(mon) end
-    sleep(2)
+    sleep(monRate)
   end
 end
 
@@ -1266,19 +1287,27 @@ end
 --==============================================================================
 local function ensureStationName()
   local cfg = loadConfig()
-  if cfg and cfg.name then station.name = cfg.name; return end
+  if cfg and cfg.name then
+    station.name = cfg.name
+    if cfg.monRate then monRate = clampMonRate(cfg.monRate) end
+    return
+  end
   term.clear(); term.setCursorPos(1, 1)
   print("== New Data Center Station ==")
   write("Name this station: ")
   local n = read()
   if n == "" then n = "Station-" .. os.getComputerID() end
   station.name = n
-  saveConfig({ name = n })
+  saveConfig({ name = n, monRate = monRate })
 end
 
 openModem()
 ensureStationName()
 os.setComputerLabel(station.name)
+do
+  local cfg = loadConfig()
+  if cfg and cfg.monRate then monRate = clampMonRate(cfg.monRate) end
+end
 loadPermits()
 broadcastPermits()
 

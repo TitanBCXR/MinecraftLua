@@ -1,6 +1,6 @@
 --[[
   marker.lua  -  Work-site marker computer for Titan fleet mining (CC: Tweaked)
-  Titan-Version: 1.0.0
+  Titan-Version: 1.0.1
 
   Place this computer at (or near) a job site. Define the dig box, how many
   miner bots to request, and `start` — Parent Center assigns idle miners.
@@ -25,6 +25,7 @@
     mode yband|strip
     start           request Parent Center dispatch
     gizmo on|off    particle outline (needs command computer)
+    monrate [secs]  monitor refresh rate (default 1s)
 
   Requires: wireless modem, GPS (for `here` / `size`), lib/titan.lua.
   Parent Center must be online for `start`.
@@ -46,6 +47,7 @@ local cfg = {
   cruiseY = 150,
   gizmo = true,
   returnStage = true,
+  monRate = 1,
 }
 
 local state = {
@@ -296,9 +298,9 @@ end
 local function printStatus()
   print("Site: " .. tostring(cfg.name))
   print(fmtB(bounds()))
-  print(("bots=%s  mode=%s  cruiseY=%s  gizmo=%s"):format(
+  print(("bots=%s  mode=%s  cruiseY=%s  gizmo=%s  monrate=%.2fs"):format(
     tostring(cfg.nBots), tostring(cfg.mode), tostring(cfg.cruiseY),
-    cfg.gizmo and "on" or "off"))
+    cfg.gizmo and "on" or "off", tonumber(cfg.monRate) or 1))
   print(("status=%s  lastJob=%s"):format(tostring(state.status), tostring(state.lastJob)))
   if commands then
     print("Command computer: world particle gizmos available.")
@@ -316,7 +318,15 @@ local function handleCommand(a)
     print("JOB  : bots <n> | mode yband|strip | cruise <y>")
     print("      start | stop-status | status")
     print("VIZ  : gizmo on|off | show   (particles need command computer)")
+    print("      monrate [secs]   monitor refresh rate")
     print("      name <label> | hostname [name]")
+  elseif cmd == "monrate" or cmd == "mrate" or cmd == "monitorrate" or cmd == "refreshrate" then
+    if a[2] then
+      cfg.monRate = titan.normalizeMonRate(a[2], cfg.monRate or 1)
+      saveCfg()
+    end
+    print(("Monitor refresh: %.2fs  (range %.2f–%ds)"):format(
+      tonumber(cfg.monRate) or 1, titan.MONRATE_MIN, titan.MONRATE_MAX))
   elseif cmd == "status" then
     printStatus()
   elseif cmd == "name" then
@@ -441,7 +451,7 @@ local function displayLoop()
   while true do
     local mon = peripheral.find("monitor")
     if mon then pcall(drawMonitor, mon) end
-    sleep(1)
+    sleep(titan.normalizeMonRate(cfg.monRate, 1))
   end
 end
 

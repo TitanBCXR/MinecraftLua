@@ -1,6 +1,6 @@
 --[[
   storage_manager.lua  -  Titan Storage Manager (Create + inventories)
-  Titan-Version: 1.0.3
+  Titan-Version: 1.0.4
 
   Watches Create mod storage (Stock Ticker) and/or any attached inventory
   peripherals (Create vaults, chests, barrels, drawers, …).
@@ -18,6 +18,7 @@
     status | stock [filter] | find <item>
     request <item> [count] [address]   (Create Stock Ticker)
     ticker [side]   set/show Stock Ticker direction
+    monrate [secs]  monitor refresh rate (also stock rescan interval)
     sides | invs | refresh | net | hostname [name]
     help | exit
 
@@ -41,7 +42,8 @@ local TICKER_TYPES = {
 
 local cfg = {
   requestAddress = "StorageManager",  -- Create package address for requests
-  refreshSecs = 5,
+  refreshSecs = 5,                    -- legacy alias; prefer monRate
+  monRate = 5,                        -- monitor + stock rescan interval (seconds)
   tickerSide = nil,                   -- front|back|left|right|top|bottom
 }
 
@@ -91,6 +93,9 @@ loadCfg()
 if cfg.tickerSide then
   cfg.tickerSide = SIDE_ALIASES[tostring(cfg.tickerSide):lower()] or cfg.tickerSide
 end
+-- Prefer monRate; migrate older refreshSecs-only configs.
+cfg.monRate = titan.normalizeMonRate(cfg.monRate or cfg.refreshSecs, 5)
+cfg.refreshSecs = cfg.monRate
 
 --------------------------------------------------------------------------------
 -- Peripheral discovery
@@ -470,10 +475,19 @@ local function handleCommand(a)
     print("sides               show what is on each face")
     print("address [name]      default Create package address")
     print("invs                list tickers + inventories")
-    print("refresh             rescan peripherals")
+    print("refresh             rescan peripherals now")
+    print("monrate [secs]      monitor / stock refresh rate")
     print("net                 Titan mesh / Parent Center link")
     print("hostname [name]     get/set label")
     print("exit")
+  elseif cmd == "monrate" or cmd == "mrate" or cmd == "monitorrate" or cmd == "refreshrate" then
+    if a[2] then
+      cfg.monRate = titan.normalizeMonRate(a[2], cfg.monRate or 5)
+      cfg.refreshSecs = cfg.monRate
+      saveCfg()
+    end
+    print(("Monitor refresh: %.2fs  (range %.2f–%ds)"):format(
+      tonumber(cfg.monRate) or 5, titan.MONRATE_MIN, titan.MONRATE_MAX))
   elseif cmd == "status" then
     refresh()
     print(("mode: %s"):format(cache.mode))
@@ -738,7 +752,7 @@ local function refreshLoop()
   while true do
     refresh()
     drawMonitor()
-    sleep(math.max(2, tonumber(cfg.refreshSecs) or 5))
+    sleep(titan.normalizeMonRate(cfg.monRate or cfg.refreshSecs, 5))
   end
 end
 

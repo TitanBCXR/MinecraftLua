@@ -1,6 +1,6 @@
 --[[
   hub.lua  -  Control computer for the Titan bot network (CC: Tweaked)
-  Titan-Version: 1.1.1
+  Titan-Version: 1.1.2
 
   Runs on a normal (or advanced) computer that has:
     * a wireless modem  (to talk to bots & POIs)
@@ -20,6 +20,7 @@
     refuel <bot>             - tell a bot to refuel from its inventory
     stop   <bot>             - cancel a bot's current task
     ping                     - ping everyone
+    monrate [secs]           - monitor refresh rate (default 1s)
     help                     - show this list
     exit                     - quit the hub
 
@@ -30,6 +31,25 @@ local titan = dofile("lib/titan.lua")
 
 titan.openModem()
 os.setComputerLabel(os.getComputerLabel() or ("Hub-" .. os.getComputerID()))
+
+local CFG = "hub.cfg"
+local monRate = 1
+
+local function loadHubCfg()
+  if not fs.exists(CFG) then return end
+  local f = fs.open(CFG, "r"); local d = textutils.unserialize(f.readAll()); f.close()
+  if type(d) == "table" and d.monRate then
+    monRate = titan.normalizeMonRate(d.monRate, 1)
+  end
+end
+
+local function saveHubCfg()
+  local f = fs.open(CFG, "w")
+  f.write(textutils.serialize({ monRate = monRate }))
+  f.close()
+end
+
+loadHubCfg()
 
 -- Optional monitor.
 local monitor = peripheral.find("monitor")
@@ -174,14 +194,14 @@ end
 
 local function networkLoop()
   titan.broadcast(titan.MSG.PING, {})   -- ask everyone to announce themselves
-  local drawTimer = os.startTimer(1)
+  local drawTimer = os.startTimer(monRate)
   while true do
     local event, p1, p2, p3 = os.pullEvent()
     if event == "rednet_message" and p3 == titan.PROTOCOL and type(p2) == "table" then
       handle(p1, p2)
     elseif event == "timer" and p1 == drawTimer then
       draw()
-      drawTimer = os.startTimer(1)
+      drawTimer = os.startTimer(monRate)
     end
   end
 end
@@ -201,7 +221,14 @@ local function handleCommand(args)
     return true
   elseif cmd == "help" then
     print("list | hostname [name] | send <bot> <poi> | goto <bot> <x> <y> <z> |")
-    print("return <bot> | refuel <bot> | stop <bot> | ping | exit")
+    print("return <bot> | refuel <bot> | stop <bot> | ping | monrate [secs] | exit")
+  elseif cmd == "monrate" or cmd == "mrate" or cmd == "monitorrate" or cmd == "refreshrate" then
+    if args[2] then
+      monRate = titan.normalizeMonRate(args[2], monRate)
+      saveHubCfg()
+    end
+    print(("Monitor refresh: %.2fs  (range %.2f–%ds)"):format(
+      monRate, titan.MONRATE_MIN, titan.MONRATE_MAX))
   elseif cmd == "hostname" or cmd == "host" then
     if not args[2] then
       print("hostname: " .. (os.getComputerLabel() or "?"))

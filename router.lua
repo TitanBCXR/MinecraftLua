@@ -1,6 +1,6 @@
 --[[
   router.lua  -  Titan network router / repeater (CC: Tweaked)
-  Titan-Version: 1.2.13
+  Titan-Version: 1.2.14
 
   Place one (or several) of these to tie the whole network together over
   wireless and/or wired modems. Roles:
@@ -94,9 +94,21 @@ local displayMon = nil         -- wrapped primary monitor
 local displayMonName = nil
 local SAVER_TEXT = "TitanSystems"
 local saverIdleSecs = 120      -- temp boards auto-off after this many seconds
+local monRate = 1              -- live board redraw interval (seconds)
 local boardWakeAt = nil        -- os.clock() when a temp board was last woken
 local saverActive = false
 local saverState = {}          -- bounce state for the primary monitor
+
+local function clampMonRate(secs)
+  if titanLib and titanLib.normalizeMonRate then
+    return titanLib.normalizeMonRate(secs, monRate)
+  end
+  local n = tonumber(secs)
+  if not n or n ~= n then return monRate end
+  if n < 0.25 then n = 0.25 end
+  if n > 120 then n = 120 end
+  return n
+end
 
 -- Router config (GPS host coords + role: "main" | "modem").
 local RCFG      = "router.cfg"
@@ -900,6 +912,9 @@ local function loadScreenAssignments()
   if tonumber(c.saverIdleSecs) and tonumber(c.saverIdleSecs) >= 5 then
     saverIdleSecs = math.floor(tonumber(c.saverIdleSecs))
   end
+  if c.monRate ~= nil then
+    monRate = clampMonRate(c.monRate)
+  end
   boardWakeAt = nil
 end
 
@@ -913,6 +928,7 @@ local function saveScreenAssignments()
   patchRouterCfg({
     screens = s, screenOn = on, screenPerm = perm,
     screenFocus = screenFocus, saverIdleSecs = saverIdleSecs,
+    monRate = monRate,
   })
 end
 
@@ -1326,7 +1342,7 @@ local function drawLoop()
       end
       drawBoards()
       if rosterDirty then saveRoster() end
-      sleep(1)
+      sleep(clampMonRate(monRate))
     end
   end
 end
@@ -1821,6 +1837,7 @@ local function handleRouterCommand(a)
         print(("  on = show %ds then saver;  perm = stay on"):format(saverIdleSecs))
         print("view <roster|stats|gps|map>  switch board (temp)")
         print("idle [seconds]  temp-board timeout (default 120)")
+        print("monrate [secs]  live board refresh rate (default 1)")
         print("map on|off|perm|view")
         print("versions - local vs GitHub package versions")
         print("devices  - list remembered systems (ONLINE / OFFLINE)")
@@ -2010,6 +2027,15 @@ local function handleRouterCommand(a)
           saveScreenAssignments()
           print(("Temp-board timeout set to %ds."):format(saverIdleSecs))
         end
+      end
+    elseif cmd == "monrate" or cmd == "mrate" or cmd == "monitorrate" or cmd == "refreshrate" then
+      if not isMain() then print("monrate is MAIN-only.")
+      else
+        if a[2] then
+          monRate = clampMonRate(a[2])
+          saveScreenAssignments()
+        end
+        print(("Monitor refresh: %.2fs  (live boards; screensaver stays smooth)"):format(monRate))
       end
     elseif cmd == "names" then
       if not isMain() then print("Name registry is MAIN-only."); else
