@@ -408,14 +408,20 @@ No GPS, modem, or Parent Center — just a turtle and two chests. Stand at the
 | +Y   | down      |
 | +Z   | forward   |
 
-**First boot** (or `setup`): fuel chest on the **left**, storage chest **behind**.
+**First boot** (or `setup`): fuel chest on the **left** (fills **slot 16** with coal
+only and keeps it there), storage chest **behind** (dumps slots 1–15).
 
 ```
+pattern column|layer      default box dig style (saved)
 box 9x5x9                 width × height(down) × depth(forward)
+box 9x5x9 layer           one-shot pattern override
 tunnel 32x3               length × height  (optional width: tunnel 32x3 2)
 stair 3x20 down           width × steps, direction up|down
 home | dump | refuel | stop | status
 ```
+
+**Patterns:** `column` digs each vertical shaft fully before moving on.
+`layer` clears each horizontal slice from the top down, then drops to the next.
 
 When the inventory fills it returns to `0,0,0`, dumps behind, refuels from the
 left, then resumes. Optional `exclude.txt` is honored if present.
