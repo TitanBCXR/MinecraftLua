@@ -416,9 +416,15 @@ area 16x32 40             width × length, 40 layers of 1 Y each (aliases: quarr
 box 9x5x9                 width × 5 layers down × depth (always 1 Y per layer)
 tunnel 32                 length, player-tall 2 high (optional width: tunnel 32 3)
 stair 3x20 down           width × steps, up|down (player-tall)
+equip [left|right]        mount a pick from inventory (aliases: tool, pick)
 continue | job | clearjob
 home | dump | refuel | stop | status
 ```
+
+Put an enchanted pick in the turtle’s inventory and run `equip` (or reboot /
+`setup`) — the script uses `turtle.equipLeft`/`equipRight` so you don’t have to
+craft the tool onto the turtle. Dump leaves picks in the inventory so they aren’t
+sent to the storage chest.
 
 **box / area** always mine **one Y layer at a time** (walk the plane, then drop
 one). They never dig 2 high. **tunnel / stair** stay player-tall (2).

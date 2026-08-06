@@ -1,6 +1,6 @@
 --[[
   offline_miner.lua  -  Local quarry turtle (no GPS / no network)
-  Titan-Version: 1.0.7
+  Titan-Version: 1.0.8
 
   Place the turtle at the TOP-FRONT-LEFT corner of the dig, facing into the
   mine. That cell is origin 0,0,0:
@@ -12,6 +12,8 @@
   First boot (or `setup`):
     * Fuel chest is on the LEFT  → top up slot 16 with coal only (keeps it there)
     * Storage chest is BEHIND    → dumps slots 1-15 (never slot 16)
+    * If a pickaxe (incl. enchanted) is in the turtle inventory, equip it as a
+      tool upgrade via turtle.equipLeft/Right (crafting often rejects enchantments)
 
   box / area — ALWAYS 1 Y-layer at a time (walk the plane, then drop one).
                Never digs 2 high; no player headroom on quarry jobs.
@@ -27,6 +29,7 @@
     tunnel <L> [W]           player-tall (2 high) corridor; optional width
     stair <W>x<steps> <up|down>
                              player-tall stepped ramp
+    equip | tool | pick      equip best pickaxe from inventory (left/right)
     continue | resume        resume saved job from origin
     job | clearjob           show / forget saved job
     home                     return to 0,0,0 facing start
@@ -290,7 +293,164 @@ local function suckFuelFromLeft()
   return turtle.getFuelLevel()
 end
 
+--------------------------------------------------------------------------------
+-- Tool equip (inventory → turtle upgrade slot)
+-- Crafting an enchanted pick onto a turtle often fails; equipLeft/Right keeps NBT
+-- when the pack/datapack allows enchanted turtle tools.
+--------------------------------------------------------------------------------
+local function toolKind(name)
+  name = tostring(name or ""):lower()
+  if name:find("pickaxe", 1, true) then return "pickaxe" end
+  if name:find("sword", 1, true) then return "sword" end
+  if name:find("shovel", 1, true) then return "shovel" end
+  if name:find("_hoe", 1, true) or name:sub(-4) == "_hoe" then return "hoe" end
+  -- Check axe after pickaxe (pickaxe contains "axe").
+  if name:find("_axe", 1, true) or name:sub(-4) == "_axe" then return "axe" end
+  return nil
+end
+
+local function itemDetail(slot)
+  local ok, d = pcall(turtle.getItemDetail, slot, true)
+  if ok and type(d) == "table" then return d end
+  return turtle.getItemDetail(slot)
+end
+
+local function enchantCount(detail)
+  local e = detail and detail.enchantments
+  if type(e) ~= "table" then return 0 end
+  return #e
+end
+
+local function scoreTool(detail)
+  if type(detail) ~= "table" or not detail.name then return -1 end
+  local kind = toolKind(detail.name)
+  if not kind then return -1 end
+  local s = 0
+  if kind == "pickaxe" then s = s + 100
+  elseif kind == "shovel" then s = s + 40
+  elseif kind == "axe" then s = s + 30
+  else s = s + 10 end
+  local n = detail.name:lower()
+  if n:find("netherite", 1, true) then s = s + 30
+  elseif n:find("diamond", 1, true) then s = s + 20
+  elseif n:find("iron", 1, true) then s = s + 10 end
+  s = s + enchantCount(detail) * 15
+  return s
+end
+
+local function isToolItem(detail)
+  return scoreTool(detail) >= 0
+end
+
+local function getEquipped(side)
+  local fn = (side == "left") and turtle.getEquippedLeft or turtle.getEquippedRight
+  if type(fn) ~= "function" then return nil end
+  local ok, d = pcall(fn)
+  if ok and type(d) == "table" then return d end
+  return nil
+end
+
+local function sideLooksLikeModem(side)
+  local t = peripheral.getType(side)
+  if t == "modem" or t == "wired_modem" or t == "wireless_modem" then return true end
+  local d = getEquipped(side)
+  if d and tostring(d.name or ""):find("modem", 1, true) then return true end
+  return false
+end
+
+local function sideLooksLikeDigTool(side)
+  local d = getEquipped(side)
+  if not d then return false end
+  return toolKind(d.name) ~= nil
+end
+
+local function describeTool(detail)
+  if not detail or not detail.name then return "(none)" end
+  local short = tostring(detail.name):gsub("^[^:]+:", "")
+  local n = enchantCount(detail)
+  if n > 0 then
+    return ("%s (+%d enchant)"):format(short, n)
+  end
+  return short
+end
+
+local function findBestToolInInventory()
+  local bestSlot, bestScore, bestDetail = nil, -1, nil
+  for s = 1, 16 do
+    if turtle.getItemCount(s) > 0 then
+      local d = itemDetail(s)
+      local sc = scoreTool(d)
+      if sc > bestScore then
+        bestScore, bestSlot, bestDetail = sc, s, d
+      end
+    end
+  end
+  return bestSlot, bestDetail
+end
+
+-- Equip best pick/tool from inventory onto left or right upgrade slot.
+-- sideArg: "left" | "right" | nil (auto)
+-- quiet: if true, stay silent when nothing to equip (boot path)
+local function equipToolFromInventory(sideArg, quiet)
+  local bestSlot, bestDetail = findBestToolInInventory()
+  if not bestSlot then
+    if not quiet then
+      print("No pickaxe/tool in inventory to equip.")
+      print("Put a diamond/netherite pick (enchanted OK) in any slot, then: equip")
+    end
+    return false, "none"
+  end
+
+  local prefer = tostring(sideArg or ""):lower()
+  local order = {}
+  if prefer == "left" or prefer == "l" then
+    order = { "left", "right" }
+  elseif prefer == "right" or prefer == "r" then
+    order = { "right", "left" }
+  else
+    -- Prefer replacing an existing dig tool; else avoid modem side; else left.
+    if sideLooksLikeDigTool("left") then
+      order = { "left", "right" }
+    elseif sideLooksLikeDigTool("right") then
+      order = { "right", "left" }
+    elseif sideLooksLikeModem("left") and not sideLooksLikeModem("right") then
+      order = { "right", "left" }
+    elseif sideLooksLikeModem("right") and not sideLooksLikeModem("left") then
+      order = { "left", "right" }
+    else
+      order = { "left", "right" }
+    end
+  end
+
+  print(("Equipping %s from slot %d..."):format(describeTool(bestDetail), bestSlot))
+  turtle.select(bestSlot)
+  local lastErr = nil
+  for _, side in ipairs(order) do
+    local ok, err
+    if side == "left" then
+      ok, err = turtle.equipLeft()
+    else
+      ok, err = turtle.equipRight()
+    end
+    if ok then
+      local now = getEquipped(side)
+      print(("Equipped on %s: %s"):format(side, describeTool(now or bestDetail)))
+      return true, side
+    end
+    lastErr = err or "failed"
+    print(("  %s: %s"):format(side, tostring(lastErr)))
+  end
+
+  print("Could not equip tool. " .. tostring(lastErr))
+  if enchantCount(bestDetail) > 0 then
+    print("Enchanted tools need CC: Tweaked to allow them (datapack /")
+    print("allowEnchantments). Unenchanted diamond picks always work.")
+  end
+  return false, lastErr
+end
+
 -- Dump mined goods to the chest behind. Never drops slot 16 (coal stays).
+-- Also keeps pickaxes/tools in inventory so dump does not eat an unequipped pick.
 local function dumpToStorage()
   consolidateFuelToSlot16()
   faceBack()
@@ -302,7 +462,12 @@ local function dumpToStorage()
         turtle.transferTo(FUEL_SLOT)
       end
       if turtle.getItemCount(s) > 0 then
-        turtle.drop()
+        local d = itemDetail(s)
+        if isToolItem(d) then
+          -- Leave tools for `equip` / boot auto-equip.
+        else
+          turtle.drop()
+        end
       end
     end
   end
@@ -313,6 +478,7 @@ end
 local function setupChests()
   print("Setup: fuel chest LEFT → slot 16 only; storage BEHIND → dump 1-15.")
   print("Facing into the mine at top-front-left (origin 0,0,0)...")
+  equipToolFromInventory(nil, true)
   dumpToStorage()
   local fuel = suckFuelFromLeft()
   cfg.setupDone = true
@@ -834,11 +1000,13 @@ local function printHelp()
   print("  box <W>x<H>x<D>                  H layers down, 1 Y at a time")
   print("  tunnel <L> [W]                   player-tall (2 high) corridor")
   print("  stair <W>x<steps> <up|down>      player-tall staircase")
+  print("  equip [left|right]               equip pick from inventory (aliases: tool, pick)")
   print("  continue | resume                resume saved job (from origin)")
   print("  job | clearjob                   show / forget saved job")
   print("  home | dump | refuel | setup | stop | status")
   print("")
   print("Jobs save to " .. JOB_FILE .. ". After stop/reboot: origin + continue.")
+  print("Enchanted pick: put it in inventory, then `equip` (not craft onto turtle).")
 end
 
 local function printStatus()
@@ -870,6 +1038,8 @@ local function handleCommand(line)
     print("Stop requested — job will be saved for `continue`.")
   elseif cmd == "setup" then
     setupChests()
+  elseif cmd == "equip" or cmd == "tool" or cmd == "pick" or cmd == "pickaxe" then
+    equipToolFromInventory(a[2])
   elseif cmd == "dump" then
     goHome()
     dumpToStorage()
@@ -996,6 +1166,8 @@ if not cfg.setupDone then
   setupChests()
 else
   print("Setup already done (fuel left, storage behind). Type `setup` to redo.")
+  -- If a pick is sitting in inventory (e.g. enchanted), mount it before digging.
+  equipToolFromInventory(nil, true)
   suckFuelFromLeft()
   print("Fuel: " .. tostring(turtle.getFuelLevel()))
 end
