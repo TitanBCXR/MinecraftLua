@@ -1,6 +1,6 @@
 --[[
   admin.lua  -  Titan admin console for a POCKET computer ("Live" tablet)
-  Titan-Version: 1.2.1
+  Titan-Version: 1.2.2
 
   Pocket remote for the whole fleet. Keep it on you; it joins the mesh like
   every other Titan device (MAIN router + modem hops).
@@ -14,9 +14,8 @@
     flatten ...                  — run flatten on Parent Center via SSH
     live                         — full-screen roster
 
-  Starts with a master-password prompt (same floppy as Parent Center). Empty
-  password = monitor-only until you run `login`. Deploy / SSH / fleet control
-  need an unlocked session.
+  Boots with a master-password prompt (before background loops). Deploy / SSH /
+  fleet control need an unlocked session.
 
   Requires: POCKET + wireless modem, lib/titan.lua, mesh in range.
   Run:  admin
@@ -128,7 +127,7 @@ local function listenerLoop()
 end
 
 --------------------------------------------------------------------------------
--- Auth
+-- Auth — password prompt runs BEFORE parallel background loops
 --------------------------------------------------------------------------------
 local function tryUnlock(promptLabel)
   if unlocked then return true end
@@ -144,34 +143,32 @@ local function tryUnlock(promptLabel)
   return false
 end
 
--- Boot / lock screen: ask for the password immediately (no `login` command first).
--- Empty password keeps monitor-only mode; wrong password retries once more then stays locked.
+-- Blocking boot / lock prompt. Keeps asking until the password is accepted.
 local function promptUnlockAtStart()
   if unlocked then return end
   if titan.sshIsAuthed and titan.sshIsAuthed() then
     unlocked = true
     return
   end
-  print("Master password required (Parent Center floppy).")
-  print("Empty = monitor-only for now.")
-  write("Master password: ")
-  local pw = read("*")
-  if pw == nil or pw == "" then
-    print("Monitor-only. Type 'login' when you want to unlock.")
-    return
-  end
-  if titan.checkPassword(pw) then
-    unlocked = true
-    print("Unlocked.")
-  else
-    print("Wrong password (need Parent Center master online).")
-    write("Retry (empty = monitor-only): ")
-    local pw2 = read("*")
-    if pw2 and pw2 ~= "" and titan.checkPassword(pw2) then
-      unlocked = true
-      print("Unlocked.")
-    else
-      print("Monitor-only. Type 'login' to try again.")
+  term.setBackgroundColor(colors.black)
+  term.clear()
+  term.setCursorPos(1, 1)
+  if term.setTextColor then term.setTextColor(colors.white) end
+  print("== Titan Admin (" .. (os.getComputerLabel() or ("#" .. os.getComputerID())) .. ") ==")
+  print("Master password required.")
+  print("(Parent Center with the master floppy must be online.)")
+  print("")
+  while not unlocked do
+    write("Master password: ")
+    local pw = read("*")
+    if pw and pw ~= "" then
+      if titan.checkPassword(pw) then
+        unlocked = true
+        print("")
+        print("Unlocked.")
+      else
+        print("Wrong password, or no master online. Try again.")
+      end
     end
   end
 end
@@ -208,13 +205,11 @@ local function listConnections(filter)
     return blob:find(filter, 1, true) ~= nil
   end
 
-  -- Merge ssh peers into systems table
   for _, p in ipairs(peers) do
     touchSystem(p.id, p.name, p.kind)
   end
 
   print("ID    NAME              KIND         AGE")
-  -- Prefer live ssh peers first
   local shown = {}
   for _, p in ipairs(peers) do
     if match(p) then
@@ -224,7 +219,6 @@ local function listConnections(filter)
         p.id, tostring(p.name or "?"):sub(1, 16), tostring(p.kind or "?"):sub(1, 12)))
     end
   end
-  -- Also show recently heard fleet members not in ssh list (offline for SSH)
   for id, b in pairs(bots) do
     if not shown[id] and ago(b.seen) < 60 then
       local row = { id = id, name = b.name, kind = b.botType or b.kind or "bot" }
@@ -496,7 +490,6 @@ local function handleCommand(a)
       print(("Parent Center -> #%d %s"):format(id, (row and row.name) or "?"))
       a[2] = tostring(id)
       if a[3] then
-        -- dc bots  => connect id bots
         local parts = { "connect", tostring(id) }
         for i = 3, #a do parts[#parts + 1] = a[i] end
         return doConnect(parts)
@@ -593,7 +586,6 @@ local function handleCommand(a)
     if btype == "chunk" or btype == "chunky" then btype = "loader" end
     local okType = btype == "builder" or btype == "gatherer"
       or btype == "miner" or btype == "loader"
-    -- Name optional — unique Type-<id>
     local coordAt = 4
     if a[4] and tonumber(a[4]) then coordAt = 4
     elseif a[4] and (a[4]:lower() == "auto" or not tonumber(a[4])) then
@@ -661,11 +653,10 @@ end
 local function consoleLoop()
   term.clear(); term.setCursorPos(1, 1)
   print("== Titan Admin (" .. (os.getComputerLabel() or ("#" .. os.getComputerID())) .. ") ==")
-  print("Pocket remote. Type 'help'.")
+  print("Unlocked. Type 'help'.")
   print("Quick:  connections   |   connect <name>   |   dc   |   miners")
-  promptUnlockAtStart()
   while true do
-    write((unlocked and "admin> ") or "titan> ")
+    write("admin> ")
     local a = {}
     for w in tostring(read()):gmatch("%S+") do a[#a + 1] = w end
     local r = handleCommand(a)
@@ -690,8 +681,10 @@ titan.setSshHandler(function(line)
   return true
 end)
 
-print("Titan admin tablet online.")
--- Network must be up before the password check (talks to Parent Center master).
+-- Password FIRST (blocking), before any parallel loops touch the terminal.
+promptUnlockAtStart()
+
+print("Starting network...")
 parallel.waitForAny(
   listenerLoop,
   function() titan.networkLoop("admin") end,

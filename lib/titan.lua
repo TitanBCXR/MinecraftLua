@@ -1,6 +1,6 @@
 --[[
   titan.lua  -  Shared library for the Titan bot network (CC: Tweaked)
-  Titan-Version: 1.2.13
+  Titan-Version: 1.2.14
 
   Provides:
     * Rednet protocol constants + message type enum
@@ -607,32 +607,30 @@ end
 -- main router is out of range, nearby workers/miners keep the network linked.
 function titan.relayLoop()
   local REPEAT = rednet.CHANNEL_REPEAT
-  local relayed = {}   -- [nMessageID] = timerId
+  local relayed = {}   -- [nMessageID] = expireClock
   -- Ensure the repeat channel is open (in case openModem ran before an upgrade).
   for _, side in ipairs(titan.modemSides()) do
     pcall(peripheral.call, side, "open", REPEAT)
   end
+  -- Only pull modem_message so keyboard/read() in parallel consoles is never starved.
   while true do
-    local event, p1, p2, p3, p4 = os.pullEvent()
-    if event == "modem_message" then
-      local side, channel, replyChannel, message = p1, p2, p3, p4
-      if channel == REPEAT and type(message) == "table"
-         and message.nMessageID and message.nRecipient then
-        if not relayed[message.nMessageID] then
-          relayed[message.nMessageID] = os.startTimer(30)
-          local sides = titan.modemSides()
-          if #sides == 0 then sides = { side } end
-          for _, m in ipairs(sides) do
-            peripheral.call(m, "transmit", REPEAT, replyChannel, message)
-            if message.nRecipient ~= REPEAT then
-              peripheral.call(m, "transmit", message.nRecipient, replyChannel, message)
-            end
+    local _, side, channel, replyChannel, message = os.pullEvent("modem_message")
+    if channel == REPEAT and type(message) == "table"
+       and message.nMessageID and message.nRecipient then
+      local now = os.clock()
+      for mid, exp in pairs(relayed) do
+        if exp <= now then relayed[mid] = nil end
+      end
+      if not relayed[message.nMessageID] then
+        relayed[message.nMessageID] = now + 30
+        local sides = titan.modemSides()
+        if #sides == 0 then sides = { side } end
+        for _, m in ipairs(sides) do
+          peripheral.call(m, "transmit", REPEAT, replyChannel, message)
+          if message.nRecipient ~= REPEAT then
+            peripheral.call(m, "transmit", message.nRecipient, replyChannel, message)
           end
         end
-      end
-    elseif event == "timer" then
-      for mid, timer in pairs(relayed) do
-        if timer == p1 then relayed[mid] = nil; break end
       end
     end
   end

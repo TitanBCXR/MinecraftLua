@@ -1,6 +1,6 @@
 --[[
   datacenter.lua  -  Titan Data Center (CC: Tweaked)   [ single, self-contained script ]
-  Titan-Version: 1.2.11
+  Titan-Version: 1.2.12
 
   ONE script that every computer/terminal in your data center runs. It works out
   its own role automatically:
@@ -116,13 +116,17 @@ end
 -- Mesh repeater (same hop protocol as router.lua / CraftOS `repeat`).
 local function relayLoop()
   local REPEAT, relayed = rednet.CHANNEL_REPEAT, {}
+  -- modem_message only — do not starve the password/read() console.
   while true do
-    local event, p1, p2, p3, p4 = os.pullEvent()
-    if event == "modem_message" then
-      local side, channel, replyChannel, message = p1, p2, p3, p4
-      if channel == REPEAT and type(message) == "table"
-         and message.nMessageID and message.nRecipient and not relayed[message.nMessageID] then
-        relayed[message.nMessageID] = os.startTimer(30)
+    local _, side, channel, replyChannel, message = os.pullEvent("modem_message")
+    if channel == REPEAT and type(message) == "table"
+       and message.nMessageID and message.nRecipient then
+      local t = os.clock()
+      for mid, exp in pairs(relayed) do
+        if exp <= t then relayed[mid] = nil end
+      end
+      if not relayed[message.nMessageID] then
+        relayed[message.nMessageID] = t + 30
         for _, s in ipairs(redstone.getSides()) do
           if peripheral.getType(s) == "modem" and rednet.isOpen(s) then
             peripheral.call(s, "transmit", REPEAT, replyChannel, message)
@@ -131,10 +135,6 @@ local function relayLoop()
             end
           end
         end
-      end
-    elseif event == "timer" then
-      for mid, timer in pairs(relayed) do
-        if timer == p1 then relayed[mid] = nil; break end
       end
     end
   end
@@ -302,16 +302,18 @@ local function attemptLogin()
   end
   write("Master password: ")
   local pw = read("*")
+  if not pw or pw == "" then
+    return false
+  end
   if validatePassword(pw) then
     session.mode = "admin"
     session.user = player
     print("")
     print("Access granted. Welcome, " .. player .. ".")
-    sleep(1)
-  else
-    print("Wrong password.")
-    sleep(1.2)
+    return true
   end
+  print("Wrong password.")
+  return false
 end
 
 -- First-time bootstrap of a master floppy (allowed while locked, only if unset).
@@ -951,14 +953,15 @@ local function handleLocked(cmd, rest)
     printStatus()
   elseif cmd == "help" then
     print("Locked terminal. Commands:")
-    print("  password|login  prompt for the master password")
+    print("  (boot already prompts for the password)")
+    print("  password|login  prompt again")
     print("  whoami          show the interacting player")
     print("  status          show this station's status")
     print("  initmaster      set master password on a blank floppy (first-time only)")
   elseif cmd == "" then
     -- ignore (empty returns to the password prompt)
   else
-    print("Locked. Enter the password at the prompt, or: password | initmaster | help")
+    print("Locked. Password prompt is automatic — or: initmaster | help")
   end
 end
 
@@ -1338,23 +1341,40 @@ local function displayLoop()
 end
 
 -- The interactive terminal.
--- Locked: prompt for the master password immediately (no "password" command first).
--- After a failed attempt, one locked> line for helpers (initmaster / help), then
--- the password prompt comes back on the next loop.
+-- Boots straight into Master password: (no need to type login/password first).
+-- serviceLoop runs in parallel so remote master auth works during the prompt.
 local function uiLoop()
+  local failStreak = 0
   while true do
     term.setBackgroundColor(colors.black)
     if session.mode == "bot" then
+      term.clear()
+      term.setCursorPos(1, 1)
+      print("== " .. tostring(station.name) .. " ==")
+      print("LOCKED — enter the master password.")
+      if isLocalMaster() then
+        print("(This computer holds the master floppy.)")
+      elseif not discoverMaster(1) then
+        print("(No master online yet — insert master.pw floppy or wait.)")
+      end
       print("")
-      print("[" .. tostring(station.name) .. "] LOCKED")
-      attemptLogin()
+      local ok = attemptLogin()
       if session.mode == "bot" then
-        print("Denied. Press Enter to retry, or: initmaster | help | password")
-        write("locked> ")
-        local input = read()
-        local cmd, rest = input:match("^%s*(%S*)%s*(.-)%s*$")
-        cmd = (cmd or ""):lower()
-        if cmd ~= "" then handleLocked(cmd, rest) end
+        failStreak = failStreak + 1
+        -- After repeated fails, allow initmaster/help without forcing another password line.
+        if failStreak >= 2 then
+          print("")
+          print("Still locked. Enter = retry password, or: initmaster | help")
+          write("locked> ")
+          local input = read() or ""
+          local cmd, rest = input:match("^%s*(%S*)%s*(.-)%s*$")
+          cmd = (cmd or ""):lower()
+          if cmd ~= "" then handleLocked(cmd, rest) end
+        elseif not ok then
+          sleep(0.4)
+        end
+      else
+        failStreak = 0
       end
     else
       write("[" .. tostring(session.user) .. "@" .. tostring(station.name) .. "]$ ")

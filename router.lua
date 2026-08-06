@@ -1,6 +1,6 @@
 --[[
   router.lua  -  Titan network router / repeater (CC: Tweaked)
-  Titan-Version: 1.2.15
+  Titan-Version: 1.2.16
 
   Place one (or several) of these to tie the whole network together over
   wireless and/or wired modems. Roles:
@@ -285,6 +285,8 @@ local ghState = {
 --   failed = { [id]={ name, err, at } },
 --   showAcks, restore = previous monitor state
 local updateCampaign = nil
+local otaOverlay = false           -- hard flag: monitor shows ACK board
+local paintUpdateAcks             -- forward decl; assigned with drawUpdateAcks
 local UPDATE_CAMPAIGN_TIMEOUT = 180  -- seconds; then restore monitor even if incomplete
 
 local function githubBase()
@@ -401,19 +403,22 @@ end
 local function campaignResolved()
   local exp, ack, fail = campaignCounts()
   if not exp then return true end
-  if exp == 0 then return true end
+  if exp == 0 then
+    -- Nobody else online: wait until MAIN records its own self-update ACK.
+    local selfId = os.getComputerID()
+    return updateCampaign.acked[selfId] ~= nil or updateCampaign.failed[selfId] ~= nil
+  end
   return (ack + fail) >= exp
 end
 
 local function restoreUpdateMonitor()
   local camp = updateCampaign
-  if not camp or not camp.restore then
-    if camp then camp.showAcks = false end
-    return
-  end
-  local r = camp.restore
+  otaOverlay = false
+  if not camp then return end
   camp.showAcks = false
+  local r = camp.restore
   camp.restore = nil
+  if not r then return end
   for _, role in ipairs(SCREEN_ROLES) do
     screenOn[role] = r.on[role] and true or false
     screenPerm[role] = r.perm[role] and true or false
@@ -435,8 +440,15 @@ local function beginUpdateMonitor()
     wakeAt = boardWakeAt,
   }
   updateCampaign.showAcks = true
+  otaOverlay = true
   saverActive = false
   saverState = {}
+  print("[OTA] Monitor switched to ACK board (hostname + package from->to).")
+  -- Paint immediately so the board changes even while updateSelf is running.
+  if paintUpdateAcks then
+    local ok, err = pcall(paintUpdateAcks)
+    if not ok then print("[OTA] ACK board paint error: " .. tostring(err)) end
+  end
 end
 
 local function finishUpdateCampaign(reason)
@@ -448,6 +460,7 @@ local function finishUpdateCampaign(reason)
   -- Keep campaign data for `update status` for a bit, but stop overlay.
   updateCampaign.finishedAt = os.epoch("utc")
   updateCampaign.showAcks = false
+  otaOverlay = false
 end
 
 local function maybeFinishUpdateCampaign()
@@ -776,26 +789,25 @@ end
 -- Bridges wireless <-> wired by re-transmitting on every open modem.
 --------------------------------------------------------------------------------
 local function repeaterLoop()
+  -- modem_message only (clock-based de-dup) so console read() is never starved.
   while true do
-    local event, p1, p2, p3, p4 = os.pullEvent()
-    if event == "modem_message" then
-      local _, channel, replyChannel, message = p1, p2, p3, p4
-      if channel == REPEAT and type(message) == "table"
-         and message.nMessageID and message.nRecipient then
-        if not relayed[message.nMessageID] then
-          relayed[message.nMessageID] = os.startTimer(30)
-          relayStats.relayed = relayStats.relayed + 1
-          for _, m in ipairs(modems) do
-            peripheral.call(m, "transmit", REPEAT, replyChannel, message)
-            if message.nRecipient ~= REPEAT then
-              peripheral.call(m, "transmit", message.nRecipient, replyChannel, message)
-            end
+    local _, _, channel, replyChannel, message = os.pullEvent("modem_message")
+    if channel == REPEAT and type(message) == "table"
+       and message.nMessageID and message.nRecipient then
+      local t = os.clock()
+      for mid, exp in pairs(relayed) do
+        if type(exp) == "number" and exp <= t then relayed[mid] = nil end
+      end
+      local prev = relayed[message.nMessageID]
+      if not (type(prev) == "number" and prev > t) then
+        relayed[message.nMessageID] = t + 30
+        relayStats.relayed = relayStats.relayed + 1
+        for _, m in ipairs(modems) do
+          peripheral.call(m, "transmit", REPEAT, replyChannel, message)
+          if message.nRecipient ~= REPEAT then
+            peripheral.call(m, "transmit", message.nRecipient, replyChannel, message)
           end
         end
-      end
-    elseif event == "timer" then
-      for mid, timer in pairs(relayed) do
-        if timer == p1 then relayed[mid] = nil; break end
       end
     end
   end
@@ -1484,21 +1496,35 @@ local function drawUpdateAcks(out)
     put("(no online devices expected — main self-updated)", colors.gray)
   end
 
+  local footer = "[update] " .. (camp.finishedAt and "done" or "collecting")
   out.setCursorPos(1, h)
   out.setTextColor(colors.gray)
-  out.write(("[update]%s"):format(
-    camp.finishedAt and " done" or " collecting"):sub(1, w))
+  out.write(footer:sub(1, w))
+end
+
+paintUpdateAcks = function()
+  refreshScreens()
+  local mon = displayMon
+  if not mon then
+    -- Still try the first attached monitor even if board focus is off.
+    local names = listMonitorNames()
+    if #names == 0 then return false, "no monitor" end
+    mon = wrapScreen(names[1])
+    displayMon, displayMonName = mon, names[1]
+  end
+  if not mon then return false, "no monitor" end
+  drawUpdateAcks(mon)
+  return true
 end
 
 drawBoards = function()
-  local n = refreshScreens()
-  if n == 0 or not displayMon then return end
-
-  -- Fleet OTA overlay takes over the monitor until every ACK is in.
-  if updateCampaign and updateCampaign.showAcks then
-    drawUpdateAcks(displayMon)
+  if otaOverlay or (updateCampaign and updateCampaign.showAcks) then
+    paintUpdateAcks()
     return
   end
+
+  local n = refreshScreens()
+  if n == 0 or not displayMon then return end
 
   if not anyLiveBoard() then return end
 
@@ -1547,16 +1573,21 @@ local function drawLoop()
   loadScreenAssignments()
   while true do
     refreshWiredFlags()
-    expireTemporaryBoards()
+    if not otaOverlay then
+      expireTemporaryBoards()
+    end
     maybeFinishUpdateCampaign()
-    if updateCampaign and updateCampaign.showAcks then
+    if otaOverlay or (updateCampaign and updateCampaign.showAcks) then
       if saverActive then
         saverActive = false
         saverState = {}
       end
-      local n = refreshScreens()
-      if n > 0 and displayMon then
-        drawUpdateAcks(displayMon)
+      local ok, err = pcall(paintUpdateAcks)
+      if not ok then
+        -- Keep trying; print once in a while via console if needed.
+        if type(err) == "string" then
+          -- swallow spam; beginUpdateMonitor already reports first failure
+        end
       end
       if rosterDirty then saveRoster() end
       sleep(clampMonRate(monRate))

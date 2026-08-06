@@ -6,6 +6,7 @@ A wireless dispatch system for Minecraft's **CC: Tweaked** mod:
 - **`bot.lua`** — a turtle that reports status, navigates by GPS, and executes tasks.
 - **`poi.lua`** — a "point of interest" computer that marks a location by coordinates and can summon a bot.
 - **`miner.lua`** — quarry turtle: digs between two corners down to a floor Y, skipping `exclude.txt`.
+- **`offline_miner.lua`** — local quarry (no GPS/network): origin at top-front-left, `box` / `tunnel` / `stair`.
 - **`lib/titan.lua`** — shared library (protocol, messaging, navigation). Copy this onto **every** device.
 
 ```
@@ -104,6 +105,7 @@ Each device needs:
 | Hub computer      | `hub.lua`, `lib/titan.lua`                 |
 | Each turtle (bot) | `bot.lua`, `lib/titan.lua`                 |
 | Miner turtle      | `miner.lua`, `lib/titan.lua`, `exclude.txt` |
+| Offline miner     | `offline_miner.lua`, `exclude.txt` (optional) |
 | Each POI computer | `poi.lua`, `lib/titan.lua`                 |
 
 (The **Install host** runs `host.lua` and serves everything else over rednet;
@@ -394,6 +396,34 @@ the two corner Y values down to `floorY`. When the inventory fills it returns to
 
 ---
 
+# Offline miner (`offline_miner.lua`)
+
+No GPS, modem, or Parent Center — just a turtle and two chests. Stand at the
+**top-front-left** corner of the dig, facing into the mine. That pose is origin
+`0,0,0`:
+
+| Axis | Direction |
+|------|-----------|
+| +X   | right     |
+| +Y   | down      |
+| +Z   | forward   |
+
+**First boot** (or `setup`): fuel chest on the **left**, storage chest **behind**.
+
+```
+box 9x5x9                 width × height(down) × depth(forward)
+tunnel 32x3               length × height  (optional width: tunnel 32x3 2)
+stair 3x20 down           width × steps, direction up|down
+home | dump | refuel | stop | status
+```
+
+When the inventory fills it returns to `0,0,0`, dumps behind, refuels from the
+left, then resumes. Optional `exclude.txt` is honored if present.
+
+Install via the installer → **"Offline miner"**.
+
+---
+
 ## Notes & limitations
 
 - Navigation digs through obstacles by default and moves axis-by-axis (up → X → Z → down). It's simple, not a full pathfinder; keep routes reasonably clear or pre-tunnel long corridors.
@@ -485,9 +515,9 @@ Needs a **pocket computer with a wireless modem** upgrade and `lib/titan.lua`
 (install with the installer → **"Admin tablet"**, or `wget` both files). The
 tablet itself needs no GPS.
 
-**Starts with a master-password prompt** (same floppy as Parent Center). Empty
-password = monitor-only until you run `login`. Deploy / SSH / fleet control need
-an unlocked session. No master online → denied.
+**Boots with a master-password prompt** (before network loops start — same floppy
+as Parent Center). Keeps asking until accepted. Deploy / SSH / fleet control need
+an unlocked session. No master online → denied until the floppy is up.
 
 ```
 VIEW  : live | bots | miners | loaders | markers | pending | stuck | who <id|name>

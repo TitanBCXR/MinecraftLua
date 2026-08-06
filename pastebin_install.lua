@@ -1,6 +1,6 @@
 --[[
   pastebin_install.lua  -  Pastebin bootstrap installer for the Titan system
-  Titan-Version: 1.1.13
+  Titan-Version: 1.1.14
 
   Pulls the Titan files straight from Pastebin (no in-game host needed). Upload
   each file to pastebin.com once, paste its CODE into the table below, then
@@ -33,6 +33,7 @@ local CODES = {
   ["locator.lua"]   = "",
   ["router.lua"]    = "",
   ["miner.lua"]     = "",
+  ["offline_miner.lua"] = "",
   ["loader.lua"]    = "",
   ["marker.lua"]    = "",
   ["storage_manager.lua"] = "",
@@ -68,16 +69,19 @@ local ROLES = {
     files = { "lib/titan.lua", "router.lua" } },
   { key = "12", name = "Miner (area quarry turtle)",       run = "miner.lua",
     files = { "lib/titan.lua", "miner.lua", "exclude.txt" } },
-  { key = "13", name = "StorageManager (Create storage)", run = "storage_manager.lua",
+  { key = "13", name = "Offline miner (no GPS/network)",  run = "offline_miner.lua",
+    files = { "offline_miner.lua", "exclude.txt" } },
+  { key = "14", name = "StorageManager (Create storage)", run = "storage_manager.lua",
     files = { "lib/titan.lua", "storage_manager.lua" } },
-  { key = "14", name = "Loader (chunk escort / Chunky Turtle)", run = "loader.lua",
+  { key = "15", name = "Loader (chunk escort / Chunky Turtle)", run = "loader.lua",
     files = { "lib/titan.lua", "loader.lua" } },
-  { key = "15", name = "Site marker (area + fleet job request)", run = "marker.lua",
+  { key = "16", name = "Site marker (area + fleet job request)", run = "marker.lua",
     files = { "lib/titan.lua", "marker.lua" } },
-  { key = "16", name = "Everything (all files, no auto-run)", run = nil,
+  { key = "17", name = "Everything (all files, no auto-run)", run = nil,
     files = { "lib/titan.lua", "hub.lua", "bot.lua", "poi.lua", "worker.lua", "botserver.lua",
               "datacenter.lua", "console.lua", "admin.lua", "gpshost.lua", "locator.lua", "router.lua",
-              "miner.lua", "loader.lua", "marker.lua", "storage_manager.lua", "exclude.txt", "versions.lua" } },
+              "miner.lua", "offline_miner.lua", "loader.lua", "marker.lua", "storage_manager.lua",
+              "exclude.txt", "versions.lua" } },
 }
 
 --==============================================================================
@@ -219,6 +223,7 @@ local LABELS = {
   ["worker.lua"] = "Worker", ["console.lua"] = "Console",
   ["admin.lua"] = "Admin", ["host.lua"] = "Host", ["gpshost.lua"] = "GPS",
   ["locator.lua"] = "Locator", ["router.lua"] = "Router", ["miner.lua"] = "Miner",
+  ["offline_miner.lua"] = "OfflineMiner",
   ["loader.lua"] = "Loader", ["marker.lua"] = "SiteMarker",
   ["storage_manager.lua"] = "StorageManager",
 }
