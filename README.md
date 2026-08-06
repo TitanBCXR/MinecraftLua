@@ -423,8 +423,12 @@ home | dump | refuel | stop | status
 **Patterns:** `column` digs each vertical shaft fully before moving on.
 `layer` clears each horizontal slice from the top down, then drops to the next.
 
+Progress is saved to `offline_miner_job.cfg`. After `stop`, reboot, or a dump
+break: put the turtle back at origin (`0,0,0` facing in) and run `continue`.
+`job` shows the saved task; `clearjob` forgets it.
+
 When the inventory fills it returns to `0,0,0`, dumps behind, refuels from the
-left, then resumes. Optional `exclude.txt` is honored if present.
+left, then resumes in-session. Optional `exclude.txt` is honored if present.
 
 Install via the installer → **"Offline miner"**.
 

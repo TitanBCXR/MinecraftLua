@@ -1,6 +1,6 @@
 --[[
   offline_miner.lua  -  Local quarry turtle (no GPS / no network)
-  Titan-Version: 1.0.2
+  Titan-Version: 1.0.3
 
   Place the turtle at the TOP-FRONT-LEFT corner of the dig, facing into the
   mine. That cell is origin 0,0,0:
@@ -17,12 +17,18 @@
     column  — dig each vertical shaft fully, then move to the next (default)
     layer   — clear each horizontal slice top→bottom, then drop to the next
 
+  Job memory (offline_miner_job.cfg):
+    Progress is saved as you dig. After stop / reboot / dump, put the turtle
+    back at origin (0,0,0 facing in) and run `continue`.
+
   Commands (sizes as WxH or WxHxD — zeros are just placeholders in the docs):
     box <W>x<H>x<D> [column|layer]
     tunnel <L>x<H> [W]       1-wide (or W-wide) tunnel, length forward, height tall
     stair <W>x<steps> <up|down>
                              stepped ramp; width across, steps along facing
     pattern [column|layer]   show / set default box dig pattern
+    continue | resume        resume saved job from origin
+    job | clearjob           show / forget saved job
     home                     return to 0,0,0 facing start
     dump | refuel | setup | stop | status | help
 
@@ -32,6 +38,7 @@
 ]]
 
 local CFG = "offline_miner.cfg"
+local JOB_FILE = "offline_miner_job.cfg"
 local EXCLUDE = "exclude.txt"
 local FUEL_SLOT = 16
 local MIN_FUEL = 200
@@ -42,7 +49,8 @@ local pos = { x = 0, y = 0, z = 0 }
 local facing = 0   -- 0=+Z forward, 1=+X right, 2=-Z back, 3=-X left
 local dug = 0
 local skipped = 0
-local job = "-"
+local jobLabel = "-"
+local activeJob = nil   -- in-memory copy of JOB_FILE while running
 
 local exclude = {}
 local cfg = {
@@ -383,8 +391,60 @@ local function goTo(tx, ty, tz)
   return true
 end
 
+--------------------------------------------------------------------------------
+-- Job memory (offline_miner_job.cfg)
+--------------------------------------------------------------------------------
+local function loadJobFile()
+  if not fs.exists(JOB_FILE) then return nil end
+  local f = fs.open(JOB_FILE, "r")
+  local d = textutils.unserialize(f.readAll())
+  f.close()
+  if type(d) == "table" and d.type then return d end
+  return nil
+end
+
+local function saveJobFile(j)
+  if not j then return end
+  j.dug = dug
+  j.skipped = skipped
+  j.updated = os.epoch("utc")
+  local f = fs.open(JOB_FILE, "w")
+  f.write(textutils.serialize(j))
+  f.close()
+  activeJob = j
+end
+
+local function clearJobFile()
+  if fs.exists(JOB_FILE) then pcall(fs.delete, JOB_FILE) end
+  activeJob = nil
+end
+
+local function jobSummary(j)
+  if not j then return "(none)" end
+  if j.type == "box" then
+    return ("box %dx%dx%d %s  step %d/%d  [%s]"):format(
+      j.W or 0, j.H or 0, j.D or 0, tostring(j.pattern or "column"),
+      tonumber(j.idx) or 1, tonumber(j.total) or 0, tostring(j.status or "?"))
+  elseif j.type == "tunnel" then
+    return ("tunnel %dx%dx%d  step %d/%d  [%s]"):format(
+      j.L or 0, j.H or 0, j.W or 1,
+      tonumber(j.idx) or 1, tonumber(j.total) or 0, tostring(j.status or "?"))
+  elseif j.type == "stair" then
+    return ("stair %dx%d %s  step %d/%d  [%s]"):format(
+      j.W or 0, j.steps or 0, tostring(j.dir or "?"),
+      tonumber(j.idx) or 1, tonumber(j.total) or 0, tostring(j.status or "?"))
+  end
+  return tostring(j.type)
+end
+
+local function assumeAtOrigin()
+  pos.x, pos.y, pos.z = 0, 0, 0
+  facing = 0
+  faceForward()
+end
+
 local function goHome()
-  job = "home"
+  jobLabel = "home"
   local ok, err = goTo(0, 0, 0)
   faceForward()
   return ok, err
@@ -393,6 +453,10 @@ end
 local function manageInventory(resume)
   if not inventoryFull() and ensureFuel() then return true end
   print("Inventory/fuel break — returning to origin...")
+  if activeJob then
+    activeJob.status = "paused"
+    saveJobFile(activeJob)
+  end
   local rx, ry, rz = pos.x, pos.y, pos.z
   if not goHome() then return false, "home" end
   dumpToStorage()
@@ -400,6 +464,10 @@ local function manageInventory(resume)
   if resume then
     print(("Resuming @ %d,%d,%d"):format(rx, ry, rz))
     if not goTo(rx, ry, rz) then return false, "resume" end
+    if activeJob then
+      activeJob.status = "active"
+      saveJobFile(activeJob)
+    end
   end
   return true
 end
@@ -407,8 +475,8 @@ end
 -- Dig H blocks downward from the current cell, then climb back to the top.
 local function digDownColumn(H)
   for i = 1, H do
-    if STOP then return false end
-    if not manageInventory(true) then return false end
+    if STOP then return false, "stop" end
+    if not manageInventory(true) then return false, "inventory" end
     digDir("down")
     if i < H then
       if not moveDown() then return false, "down" end
@@ -424,7 +492,7 @@ end
 local function clearHeadroom(H)
   if H <= 1 then return true end
   for i = 1, H - 1 do
-    if STOP then return false end
+    if STOP then return false, "stop" end
     digDir("up")
     if i < H - 1 then
       if not moveUp() then return false end
@@ -440,53 +508,225 @@ local function clearHeadroom(H)
 end
 
 --------------------------------------------------------------------------------
--- Jobs
+-- Work-unit lists (for continue / idx progress)
 --------------------------------------------------------------------------------
--- Column pattern: at each (x,z), dig the full vertical shaft, then next cell.
-local function digBoxColumn(W, H, D)
+local function boxColumnUnits(W, D)
+  local units = {}
   for z = 0, D - 1 do
-    if STOP then break end
-    local xStart, xEnd, xStep = 0, W - 1, 1
-    if z % 2 == 1 then xStart, xEnd, xStep = W - 1, 0, -1 end
-    for x = xStart, xEnd, xStep do
-      if STOP then break end
-      if not manageInventory(true) then return false, "inventory/fuel" end
-      if not goTo(x, 0, z) then return false, "path blocked" end
-      local ok, err = digDownColumn(H)
-      if not ok then return false, err or "column" end
+    if z % 2 == 0 then
+      for x = 0, W - 1 do units[#units + 1] = { x = x, z = z } end
+    else
+      for x = W - 1, 0, -1 do units[#units + 1] = { x = x, z = z } end
     end
   end
-  return true
+  return units
 end
 
--- Layer pattern: clear each horizontal slice from the top down, then drop one.
-local function digBoxLayer(W, H, D)
+local function boxLayerUnits(W, H, D)
+  local units = {}
   for y = 0, H - 1 do
-    if STOP then break end
-    print(("  layer %d / %d"):format(y + 1, H))
     for z = 0, D - 1 do
-      if STOP then break end
-      -- Alternate snake per layer and per row for shorter walks.
-      local xStart, xEnd, xStep = 0, W - 1, 1
-      if (z + y) % 2 == 1 then xStart, xEnd, xStep = W - 1, 0, -1 end
-      for x = xStart, xEnd, xStep do
-        if STOP then break end
-        if not manageInventory(true) then return false, "inventory/fuel" end
-        if not goTo(x, y, z) then return false, "path blocked" end
-        digDir("down")
+      if (z + y) % 2 == 0 then
+        for x = 0, W - 1 do units[#units + 1] = { x = x, y = y, z = z } end
+      else
+        for x = W - 1, 0, -1 do units[#units + 1] = { x = x, y = y, z = z } end
       end
     end
-    if y < H - 1 and not STOP then
-      -- Drop onto the next layer (prefer returning toward x=0,z=0 first).
-      if not goTo(0, y, 0) then return false, "layer drop path" end
-      if not moveDown() then return false, "layer drop" end
-    end
   end
-  return true
+  return units
 end
 
--- Box WxHxD: width (+X), height (+Y down), depth (+Z forward)
--- opts.pattern overrides cfg.pattern for this run.
+local function tunnelUnits(L, W)
+  local units = {}
+  for z = 0, L - 1 do
+    if z % 2 == 0 or W == 1 then
+      for x = 0, W - 1 do units[#units + 1] = { x = x, z = z } end
+    else
+      for x = W - 1, 0, -1 do units[#units + 1] = { x = x, z = z } end
+    end
+  end
+  return units
+end
+
+local function stairUnits(W, steps, dir)
+  local units = {}
+  for s = 0, steps - 1 do
+    local y = (dir == "down") and s or -s
+    for x = 0, W - 1 do
+      units[#units + 1] = { x = x, y = y, z = s, step = s }
+    end
+  end
+  return units
+end
+
+--------------------------------------------------------------------------------
+-- Jobs
+--------------------------------------------------------------------------------
+local function finishJob(ok, err)
+  if activeJob then
+    if ok then
+      activeJob.status = "done"
+      activeJob.idx = (activeJob.total or 0) + 1
+      saveJobFile(activeJob)
+      print("Job finished (kept in " .. JOB_FILE .. " — `clearjob` to forget).")
+    else
+      activeJob.status = "paused"
+      saveJobFile(activeJob)
+      print("Job paused: " .. tostring(err or "stop"))
+      print("Put turtle at origin 0,0,0 facing in, then: continue")
+    end
+  end
+  goHome()
+  dumpToStorage()
+  suckFuelFromLeft()
+  jobLabel = "idle"
+  if ok then
+    print(("Done. dug=%d skipped=%d fuel=%s"):format(dug, skipped, tostring(turtle.getFuelLevel())))
+  end
+end
+
+local function runBoxJob(j)
+  local W, H, D = j.W, j.H, j.D
+  local pattern = j.pattern or "column"
+  local units = (pattern == "layer") and boxLayerUnits(W, H, D) or boxColumnUnits(W, D)
+  j.total = #units
+  j.idx = math.max(1, tonumber(j.idx) or 1)
+  j.status = "active"
+  activeJob = j
+  dug = tonumber(j.dug) or dug
+  skipped = tonumber(j.skipped) or skipped
+  saveJobFile(j)
+  jobLabel = jobSummary(j)
+  print(("BOX %dx%dx%d  pattern=%s  resume @ %d/%d"):format(
+    W, H, D, pattern, j.idx, j.total))
+
+  local lastY = -999
+  for i = j.idx, #units do
+    if STOP then finishJob(false, "stop"); return end
+    local u = units[i]
+    j.idx = i
+    saveJobFile(j)
+    if not manageInventory(true) then finishJob(false, "inventory/fuel"); return end
+
+    if pattern == "layer" then
+      if lastY ~= -999 and u.y > lastY then
+        -- Ensure we drop onto the new layer from a known cell.
+        if not goTo(0, lastY, 0) then finishJob(false, "layer path"); return end
+        while pos.y < u.y do
+          if not moveDown() then finishJob(false, "layer drop"); return end
+        end
+      end
+      lastY = u.y
+      if not goTo(u.x, u.y, u.z) then finishJob(false, "path"); return end
+      digDir("down")
+    else
+      if not goTo(u.x, 0, u.z) then finishJob(false, "path"); return end
+      local ok, err = digDownColumn(H)
+      if not ok then finishJob(false, err or "column"); return end
+    end
+    j.idx = i + 1
+    saveJobFile(j)
+  end
+  finishJob(true)
+end
+
+local function runTunnelJob(j)
+  local L, H, W = j.L, j.H, j.W or 1
+  local units = tunnelUnits(L, W)
+  j.total = #units
+  j.idx = math.max(1, tonumber(j.idx) or 1)
+  j.status = "active"
+  activeJob = j
+  dug = tonumber(j.dug) or dug
+  skipped = tonumber(j.skipped) or skipped
+  saveJobFile(j)
+  jobLabel = jobSummary(j)
+  print(("TUNNEL L=%d H=%d W=%d  resume @ %d/%d"):format(L, H, W, j.idx, j.total))
+
+  for i = j.idx, #units do
+    if STOP then finishJob(false, "stop"); return end
+    local u = units[i]
+    j.idx = i
+    saveJobFile(j)
+    if not manageInventory(true) then finishJob(false, "inventory/fuel"); return end
+    if not goTo(u.x, 0, u.z) then finishJob(false, "path"); return end
+    if not clearHeadroom(H) then finishJob(false, "headroom"); return end
+    j.idx = i + 1
+    saveJobFile(j)
+  end
+  finishJob(true)
+end
+
+local function runStairJob(j)
+  local W, steps, dir = j.W, j.steps, j.dir
+  local units = stairUnits(W, steps, dir)
+  j.total = #units
+  j.idx = math.max(1, tonumber(j.idx) or 1)
+  j.status = "active"
+  activeJob = j
+  dug = tonumber(j.dug) or dug
+  skipped = tonumber(j.skipped) or skipped
+  saveJobFile(j)
+  jobLabel = jobSummary(j)
+  print(("STAIR W=%d steps=%d dir=%s  resume @ %d/%d"):format(
+    W, steps, dir, j.idx, j.total))
+
+  for i = j.idx, #units do
+    if STOP then finishJob(false, "stop"); return end
+    local u = units[i]
+    j.idx = i
+    saveJobFile(j)
+    if not manageInventory(true) then finishJob(false, "inventory/fuel"); return end
+    if not goTo(u.x, u.y, u.z) then finishJob(false, "path"); return end
+    digDir("up")
+    digDir("down")
+    -- After last cell of a step, step forward/up/down toward next step
+    local nextU = units[i + 1]
+    if nextU and nextU.step ~= u.step then
+      if not goTo(0, u.y, u.z) then finishJob(false, "stair edge"); return end
+      faceForward()
+      if not moveForward() then finishJob(false, "forward"); return end
+      if dir == "down" then
+        if not moveDown() then finishJob(false, "down"); return end
+      else
+        if not moveUp() then finishJob(false, "up"); return end
+      end
+    end
+    j.idx = i + 1
+    saveJobFile(j)
+  end
+  finishJob(true)
+end
+
+local function runSavedJob(j, fromContinue)
+  if not j or not j.type then
+    print("No saved job.")
+    return
+  end
+  if j.status == "done" then
+    print("Saved job already finished. `clearjob` to forget, or start a new dig.")
+    print("  " .. jobSummary(j))
+    return
+  end
+  STOP = false
+  if fromContinue then
+    print("Continue: assuming turtle is at origin 0,0,0 facing into the mine.")
+    assumeAtOrigin()
+    suckFuelFromLeft()
+  else
+    if not goHome() then print("Could not reach origin."); return end
+  end
+  if j.type == "box" then
+    runBoxJob(j)
+  elseif j.type == "tunnel" then
+    runTunnelJob(j)
+  elseif j.type == "stair" then
+    runStairJob(j)
+  else
+    print("Unknown job type: " .. tostring(j.type))
+  end
+end
+
 local function digBox(W, H, D, opts)
   opts = opts or {}
   W, H, D = math.floor(W), math.floor(H), math.floor(D)
@@ -495,35 +735,15 @@ local function digBox(W, H, D, opts)
     return
   end
   local pattern = normalizePattern(opts.pattern) or normalizePattern(cfg.pattern) or "column"
-  STOP = false
   dug, skipped = 0, 0
-  job = ("box %dx%dx%d %s"):format(W, H, D, pattern)
-  print(("BOX %dx%dx%d  pattern=%s  (right / down / forward)"):format(W, H, D, pattern))
-  if not goHome() then print("Could not reach origin."); return end
-
-  local ok, err
-  if pattern == "layer" then
-    ok, err = digBoxLayer(W, H, D)
-  else
-    ok, err = digBoxColumn(W, H, D)
-  end
-  if not ok then
-    print("Abort: " .. tostring(err or "?"))
-    goHome()
-    dumpToStorage()
-    suckFuelFromLeft()
-    job = "idle"
-    return
-  end
-
-  goHome()
-  dumpToStorage()
-  suckFuelFromLeft()
-  job = "idle"
-  print(("Done. dug=%d skipped=%d fuel=%s"):format(dug, skipped, tostring(turtle.getFuelLevel())))
+  local units = (pattern == "layer") and boxLayerUnits(W, H, D) or boxColumnUnits(W, D)
+  local j = {
+    type = "box", W = W, H = H, D = D, pattern = pattern,
+    idx = 1, total = #units, status = "active", dug = 0, skipped = 0,
+  }
+  runSavedJob(j, false)
 end
 
--- Tunnel LxH [W]: length forward, height tall, optional width (default 1)
 local function digTunnel(L, H, W)
   L, H = math.floor(L), math.floor(H)
   W = math.floor(tonumber(W) or 1)
@@ -531,32 +751,15 @@ local function digTunnel(L, H, W)
     print("Usage: tunnel <L>x<H> [W]  (length forward, height, optional width)")
     return
   end
-  STOP = false
   dug, skipped = 0, 0
-  job = ("tunnel %dx%dx%d"):format(L, H, W)
-  print(("TUNNEL length=%d height=%d width=%d"):format(L, H, W))
-  if not goHome() then print("Could not reach origin."); return end
-
-  for z = 0, L - 1 do
-    if STOP then break end
-    local xStart, xEnd, xStep = 0, W - 1, 1
-    if z % 2 == 1 and W > 1 then xStart, xEnd, xStep = W - 1, 0, -1 end
-    for x = xStart, xEnd, xStep do
-      if STOP then break end
-      if not manageInventory(true) then print("Abort: inventory/fuel."); return end
-      if not goTo(x, 0, z) then print("Abort: path."); return end
-      if not clearHeadroom(H) then print("Abort: headroom."); goHome(); return end
-    end
-  end
-
-  goHome()
-  dumpToStorage()
-  suckFuelFromLeft()
-  job = "idle"
-  print(("Done. dug=%d skipped=%d fuel=%s"):format(dug, skipped, tostring(turtle.getFuelLevel())))
+  local units = tunnelUnits(L, W)
+  local j = {
+    type = "tunnel", L = L, H = H, W = W,
+    idx = 1, total = #units, status = "active", dug = 0, skipped = 0,
+  }
+  runSavedJob(j, false)
 end
 
--- Stair WxSteps up|down — each step: clear W-wide x 2-high tread, then forward + up/down
 local function digStair(W, steps, dir)
   W, steps = math.floor(W), math.floor(steps)
   dir = tostring(dir or "down"):lower()
@@ -564,40 +767,23 @@ local function digStair(W, steps, dir)
     print("Usage: stair <W>x<steps> <up|down>")
     return
   end
-  STOP = false
   dug, skipped = 0, 0
-  job = ("stair %dx%d %s"):format(W, steps, dir)
-  print(("STAIR width=%d steps=%d dir=%s"):format(W, steps, dir))
-  if not goHome() then print("Could not reach origin."); return end
+  local units = stairUnits(W, steps, dir)
+  local j = {
+    type = "stair", W = W, steps = steps, dir = dir,
+    idx = 1, total = #units, status = "active", dug = 0, skipped = 0,
+  }
+  runSavedJob(j, false)
+end
 
-  for s = 0, steps - 1 do
-    if STOP then break end
-    if not manageInventory(true) then print("Abort: inventory/fuel."); return end
-    local y = (dir == "down") and s or -s
-    local z = s
-    for x = 0, W - 1 do
-      if STOP then break end
-      if not goTo(x, y, z) then print("Abort: path."); goHome(); return end
-      digDir("up")
-      digDir("down")
-    end
-    if s < steps - 1 then
-      if not goTo(0, y, z) then print("Abort."); return end
-      faceForward()
-      if not moveForward() then print("Abort: forward."); return end
-      if dir == "down" then
-        if not moveDown() then print("Abort: down."); return end
-      else
-        if not moveUp() then print("Abort: up."); return end
-      end
-    end
+local function continueJob()
+  local j = loadJobFile()
+  if not j then
+    print("No saved job in " .. JOB_FILE .. ". Start with box / tunnel / stair.")
+    return
   end
-
-  goHome()
-  dumpToStorage()
-  suckFuelFromLeft()
-  job = "idle"
-  print(("Done. dug=%d skipped=%d fuel=%s"):format(dug, skipped, tostring(turtle.getFuelLevel())))
+  print("Loaded: " .. jobSummary(j))
+  runSavedJob(j, true)
 end
 
 --------------------------------------------------------------------------------
@@ -609,19 +795,26 @@ local function printHelp()
   print("")
   print("  box <W>x<H>x<D> [column|layer]   solid box dig")
   print("  pattern [column|layer]           default dig pattern")
-  print("    column = full shafts, then next cell")
-  print("    layer  = each slice top→bottom, then drop")
   print("  tunnel <L>x<H> [W]               corridor (default W=1)")
   print("  stair <W>x<steps> <up|down>      staircase")
+  print("  continue | resume                resume saved job (from origin)")
+  print("  job | clearjob                   show / forget saved job")
   print("  home | dump | refuel | setup | stop | status")
   print("")
-  print("First boot auto-runs setup: fuel LEFT → slot 16, storage BEHIND.")
+  print("Jobs save to " .. JOB_FILE .. ". After stop/reboot: origin + continue.")
 end
 
 local function printStatus()
-  print(("pos=%d,%d,%d face=%d job=%s"):format(pos.x, pos.y, pos.z, facing, job))
-  print(("dug=%d skipped=%d fuel=%s"):format(dug, skipped, tostring(turtle.getFuelLevel())))
+  print(("pos=%d,%d,%d face=%d"):format(pos.x, pos.y, pos.z, facing))
+  print(("label=%s  dug=%d skipped=%d fuel=%s"):format(
+    jobLabel, dug, skipped, tostring(turtle.getFuelLevel())))
   print(("setup=%s  pattern=%s"):format(tostring(cfg.setupDone), tostring(cfg.pattern or "column")))
+  local j = activeJob or loadJobFile()
+  if j then
+    print("saved: " .. jobSummary(j))
+  else
+    print("saved: (none)")
+  end
 end
 
 local function handleCommand(line)
@@ -637,7 +830,7 @@ local function handleCommand(line)
     printStatus()
   elseif cmd == "stop" then
     STOP = true
-    print("Stop requested.")
+    print("Stop requested — job will be saved for `continue`.")
   elseif cmd == "setup" then
     setupChests()
   elseif cmd == "dump" then
@@ -651,6 +844,15 @@ local function handleCommand(line)
   elseif cmd == "home" then
     goHome()
     print("Home.")
+  elseif cmd == "job" then
+    local j = activeJob or loadJobFile()
+    if not j then print("No saved job.")
+    else print(jobSummary(j)) end
+  elseif cmd == "clearjob" or cmd == "forgetjob" then
+    clearJobFile()
+    print("Cleared saved job.")
+  elseif cmd == "continue" or cmd == "resume" then
+    continueJob()
   elseif cmd == "pattern" or cmd == "mode" then
     if not a[2] then
       print("Dig pattern: " .. tostring(cfg.pattern or "column"))
@@ -684,14 +886,9 @@ local function handleCommand(line)
     if not d or not d[1] or not d[2] then
       print("Usage: tunnel <L>x<H> [W]")
     else
-      local W = d[3] or tonumber(a[#a])
-      if W and #d == 2 and tonumber(a[3]) and not tostring(a[2]):find("x") then
-        -- tunnel 20 3 2 style already in d
-      end
       if #d >= 3 then
         digTunnel(d[1], d[2], d[3])
       else
-        -- optional trailing W as separate token: tunnel 20x3 2
         local wExtra = tonumber(a[3])
         digTunnel(d[1], d[2], wExtra or 1)
       end
@@ -741,16 +938,22 @@ if not cfg.setupDone then
   setupChests()
 else
   print("Setup already done (fuel left, storage behind). Type `setup` to redo.")
-  -- Still top up fuel on boot
   suckFuelFromLeft()
   print("Fuel: " .. tostring(turtle.getFuelLevel()))
 end
 
+local saved = loadJobFile()
+if saved and saved.status ~= "done" then
+  print("")
+  print("Saved job: " .. jobSummary(saved))
+  print("Place at origin facing in, then: continue")
+elseif saved and saved.status == "done" then
+  print("")
+  print("Last job finished. `clearjob` to forget, or start a new dig.")
+end
+
 print("")
-print("Type help. Examples:")
-print("  box 9x5x9")
-print("  tunnel 32x3")
-print("  stair 3x20 down")
+print("Type help. Examples:  box 9x5x9   |   continue")
 print("")
 
 while true do
