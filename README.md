@@ -504,6 +504,10 @@ area 16x32 40             # dig; reports to admin whenever a modem is present
 Y-band claims (max **half** / **third** of height) need the site board. Progress
 % shows on the site monitor and admin (`live quarry` / Quarry app / `quarry`).
 
+If a turtle has **no local** `offline_miner_job.cfg`, `continue` / `mine` / `join`
+pull the stored job list from the site board (`quarry_jobs/<id>_…`) and resume
+from that.
+
 Put an enchanted pick in the turtle’s inventory and run `equip` (or reboot /
 `setup`) — the script uses `turtle.equipLeft`/`equipRight` so you don’t have to
 craft the tool onto the turtle. Dump leaves picks in the inventory so they aren’t

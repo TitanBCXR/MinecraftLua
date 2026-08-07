@@ -1,6 +1,6 @@
 --[[
   offline_site.lua  -  Quarry site board for multi-turtle offline miners
-  Titan-Version: 1.0.2
+  Titan-Version: 1.0.3
 
   Place this computer to the LEFT of the storage chest (storage sits behind
   the turtles' origin). Attach a modem (wired to the turtles is fine, or
@@ -12,6 +12,7 @@
     * Hands out non-overlapping Y bands (max 1/2 or 1/3 of height)
     * Collects BPC so every turtle knows safe travel distance
     * Stores each turtle's offline_miner_job.cfg under quarry_jobs/
+    * Hands that job back if a turtle rejoins with no local job file
     * Relays a quarry_site snapshot to the admin tablet
 
   Commands:
@@ -77,6 +78,38 @@ local function persistTurtleJob(id, job)
   if not f then return end
   f.write(textutils.serialize(job))
   f.close()
+end
+
+local function loadStoredJob(id)
+  local t = turtles[id]
+  if t and type(t.job) == "table" and t.job.type and t.job.status ~= "done" then
+    return t.job
+  end
+  local path = turtleJobPath(id)
+  if not fs.exists(path) then return nil end
+  local f = fs.open(path, "r")
+  if not f then return nil end
+  local d = textutils.unserialize(f.readAll())
+  f.close()
+  if type(d) == "table" and d.type and d.status ~= "done" then
+    if t then t.job = d; turtles[id] = t end
+    return d
+  end
+  return nil
+end
+
+local function jobReplyFor(id)
+  local job = loadStoredJob(id)
+  local t = turtles[id] or {}
+  return {
+    type = "quarry_job_reply",
+    ok = job ~= nil,
+    job = job,
+    jobFile = job and turtleJobPath(id) or nil,
+    y0 = t.y0, y1 = t.y1,
+    W = cfg.W, L = cfg.L, H = cfg.H,
+    maxTravel = maxTravel(), minBpc = minBpc(),
+  }
 end
 
 local function loadCfg()
@@ -383,6 +416,7 @@ local function handleMsg(id, msg)
         id, tostring(msg.name or "?"), tostring(msg.bpc or "?")))
     end
     if shouldWelcome then
+      local stored = loadStoredJob(id)
       rednet.send(id, {
         type = "quarry_welcome",
         siteId = os.getComputerID(),
@@ -391,14 +425,29 @@ local function handleMsg(id, msg)
         fraction = fractionLabel(),
         maxClaim = maxClaimLayers(),
         maxTravel = maxTravel(), minBpc = minBpc(),
+        job = stored,
+        y0 = row.y0, y1 = row.y1,
+        hasJob = stored ~= nil,
       }, PROTO)
       row.welcomedAt = now()
+      if stored then
+        print(("[job] #%d can resume %s"):format(id, jobSummaryShort(stored)))
+      end
     end
     if t ~= "quarry_turtle" then broadcastStatus() end
   elseif t == "quarry_claim_req" then
     local reply = assignClaim(id, msg)
     rednet.send(id, reply, PROTO)
     broadcastStatus()
+  elseif t == "quarry_job_req" then
+    touchTurtle(id, msg)
+    local reply = jobReplyFor(id)
+    rednet.send(id, reply, PROTO)
+    if reply.ok then
+      print(("[job] #%d requested → %s"):format(id, jobSummaryShort(reply.job)))
+    else
+      print(("[job] #%d requested — none stored"):format(id))
+    end
   elseif t == "quarry_progress" or t == "quarry_job" then
     touchTurtle(id, msg)
     if t == "quarry_job" and type(msg.job) == "table" then

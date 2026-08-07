@@ -1,6 +1,6 @@
 --[[
   offline_miner.lua  -  Local quarry turtle (optional site board)
-  Titan-Version: 1.1.3
+  Titan-Version: 1.1.4
 
   Place the turtle at the TOP-FRONT-LEFT corner of the dig, facing into the
   mine. That cell is origin 0,0,0:
@@ -662,6 +662,25 @@ end
 
 -- Forward decl: site sync uses this after save/clear.
 local siteSendJob
+local fetchJobFromSite
+
+-- Adopt a job table from the site board (or elsewhere) as local JOB_FILE.
+local function adoptJob(j, source)
+  if type(j) ~= "table" or not j.type then return nil end
+  if j.status == "done" then return nil end
+  dug = tonumber(j.dug) or dug or 0
+  skipped = tonumber(j.skipped) or skipped or 0
+  j.updated = os.epoch("utc")
+  local f = fs.open(JOB_FILE, "w")
+  f.write(textutils.serialize(j))
+  f.close()
+  activeJob = j
+  print(("Adopted job from %s: %s"):format(
+    tostring(source or "site"),
+    (j.y0 and ("Y%d-%d step %d/%d"):format(j.y0, j.y1 or j.y0, tonumber(j.idx) or 1, tonumber(j.total) or 0))
+      or (tostring(j.type) .. " step " .. tostring(j.idx or 1) .. "/" .. tostring(j.total or 0))))
+  return j
+end
 
 local function saveJobFile(j)
   if not j then return end
@@ -1058,9 +1077,12 @@ local function joinSite(timeout, quiet)
   end
   local joinMsg = sitePayload({})
   joinMsg.type = "quarry_join"
+  -- Ask site to include our stored job if we have none locally.
+  joinMsg.wantJob = loadJobFile() == nil
   rednet.broadcast(joinMsg, PROTO_QUARRY)
   local deadline = os.clock() + timeout
   local found = false
+  local welcomed = nil
   while os.clock() < deadline do
     local id, msg = rednet.receive(PROTO_QUARRY, math.max(0.05, deadline - os.clock()))
     if id and type(msg) == "table" and msg.type == "quarry_welcome" then
@@ -1078,6 +1100,7 @@ local function joinSite(timeout, quiet)
           tostring(msg.maxTravel or "?")))
       end
       found = true
+      welcomed = msg
       break
     end
   end
@@ -1088,6 +1111,8 @@ local function joinSite(timeout, quiet)
       print("No site board — OK. Broadcasting mine data for the admin tablet.")
       print("Use `area WxL H` to dig. Multi Y-band claims need offline_site.")
     end
+  elseif welcomed and type(welcomed.job) == "table" and not loadJobFile() then
+    adoptJob(welcomed.job, "site welcome")
   end
   -- Report once while modem is still equipped.
   local base = sitePayload({ _siteType = found and "quarry_join" or "quarry_progress" })
@@ -1098,6 +1123,48 @@ local function joinSite(timeout, quiet)
   rednet.broadcast(bcast, "titan_net")
   if digging then restorePickAfterComms() end
   return found
+end
+
+-- Pull offline_miner_job.cfg from the site board when we have none locally.
+fetchJobFromSite = function(timeout, quiet)
+  timeout = tonumber(timeout) or 5
+  quiet = quiet == true
+  local localJob = loadJobFile()
+  if localJob then return localJob end
+  if not ensureModemForComms(quiet) then return nil end
+  if not siteId then joinSite(math.min(timeout, 4), true) end
+  if not siteId then
+    if not quiet then print("No site board to fetch a job from.") end
+    if digging then restorePickAfterComms() end
+    return nil
+  end
+  -- Welcome may already have delivered a job during joinSite.
+  localJob = loadJobFile()
+  if localJob then
+    if digging then restorePickAfterComms() end
+    return localJob
+  end
+  local req = sitePayload({})
+  req.type = "quarry_job_req"
+  req.wantJob = true
+  rednet.send(siteId, req, PROTO_QUARRY)
+  local deadline = os.clock() + timeout
+  while os.clock() < deadline do
+    local id, msg = rednet.receive(PROTO_QUARRY, math.max(0.05, deadline - os.clock()))
+    if id == siteId and type(msg) == "table" and msg.type == "quarry_job_reply" then
+      if digging then restorePickAfterComms() end
+      if msg.ok and type(msg.job) == "table" then
+        if msg.maxTravel then maxTravel = tonumber(msg.maxTravel) or maxTravel end
+        if msg.y0 ~= nil then siteInfo = siteInfo or {}; siteInfo.y0 = msg.y0; siteInfo.y1 = msg.y1 end
+        return adoptJob(msg.job, "site board")
+      end
+      if not quiet then print("Site board has no job stored for this turtle.") end
+      return nil
+    end
+  end
+  if digging then restorePickAfterComms() end
+  if not quiet then print("Timed out waiting for job from site board.") end
+  return nil
 end
 
 local function claimBand()
@@ -1480,20 +1547,49 @@ end
 local function continueJob()
   local j = loadJobFile()
   if not j then
-    print("No saved job in " .. JOB_FILE .. ". Start with area / box / tunnel / stair.")
+    print("No local " .. JOB_FILE .. " — asking site board...")
+    j = fetchJobFromSite(6, false)
+  end
+  if not j then
+    print("No saved job locally or on site. Start with area / box / mine.")
     return
   end
-  if j.site and not siteId then
-    joinSite(4)
+  if (j.site or j.y0 ~= nil) and not siteId then
+    joinSite(4, true)
   end
   print("Loaded: " .. jobSummary(j))
   runSavedJob(j, true)
 end
 
 local function digSiteMine()
+  -- Prefer resuming a job the site is holding for us.
+  if not loadJobFile() then
+    local remote = fetchJobFromSite(5, true)
+    if remote then
+      print("Resuming job list from site board.")
+      runSavedJob(remote, true)
+      return
+    end
+  else
+    local j = loadJobFile()
+    if j and j.status ~= "done" and (j.site or j.y0 ~= nil) then
+      print("Continuing local site job.")
+      if not siteId then joinSite(3, true) end
+      runSavedJob(j, true)
+      return
+    end
+  end
+
   local claim = claimBand()
   if not claim then
     print("Tip: start with `area <W>x<L> <stopY>` — progress still goes to the admin tablet.")
+    return
+  end
+  -- Resume claim may already have a stored job with progress.
+  local stored = fetchJobFromSite(3, true)
+  if stored and stored.y0 == claim.y0 and stored.y1 == claim.y1 then
+    print("Resuming claimed band from site job list.")
+    runSavedJob(stored, true)
     return
   end
   local W = math.floor(tonumber(claim.W) or 0)
@@ -1532,13 +1628,13 @@ local function printHelp()
   print("  mine                             claim a Y band (needs site board)")
   print("  site                             show site / BPC / mine broadcast")
   print("  equip [left|right]               equip pick from inventory (aliases: tool, pick)")
-  print("  continue | resume                resume saved job (from origin)")
+  print("  continue | resume                resume saved job (local or from site)")
   print("  job | clearjob                   show / forget saved job")
   print("  home | dump | refuel | setup | stop | status")
   print("")
   print("Slot 15 = wireless modem (swaps over diamond pickaxe for site/admin).")
   print("Loader upgrades are never replaced. Slot 16 = coal.")
-  print("Site board optional: stores job.cfg + Y-band claims.")
+  print("No local job? `continue` / `mine` pull the job list from the site board.")
   print("Jobs save to " .. JOB_FILE .. " while running / paused.")
   print("Finished digs clear that file automatically. After stop: origin + continue.")
   print("Enchanted pick: put it in inventory, then `equip` (not craft onto turtle).")
@@ -1718,14 +1814,8 @@ end
 
 local saved = loadJobFile()
 if saved and saved.status == "done" then
-  clearJobFile()
+  clearJobFile({ keepSite = true })
   saved = nil
-end
-if saved then
-  print("")
-  print("Saved job: " .. jobSummary(saved))
-  print("Place at origin facing in, then: continue")
-  print("Or `clearjob` to forget it.")
 end
 
 if cfg.siteId then
@@ -1736,10 +1826,23 @@ if hasModem then
   print("Modem slot " .. MODEM_SLOT .. ": swaps over diamond pickaxe for site/admin.")
   print("Optional site board: `join` / `mine` for shared Y bands.")
   joinSite(2, true)
+  if not saved then
+    saved = loadJobFile()  -- may have been adopted from site welcome
+  end
   -- Idle with modem listening; pickaxe re-equipped when a dig starts.
   ensureModemForComms(true)
 else
   print("No modem in slot " .. MODEM_SLOT .. " — dig works; no site/admin link.")
+end
+
+if saved then
+  print("")
+  print("Saved job: " .. jobSummary(saved))
+  print("Place at origin facing in, then: continue")
+  print("Or `clearjob` to forget it.")
+elseif hasModem then
+  print("")
+  print("No local job — `continue` or `mine` will ask the site board.")
 end
 
 print("")
