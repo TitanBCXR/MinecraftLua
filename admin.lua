@@ -1,6 +1,6 @@
 --[[
   admin.lua  -  Titan admin console for a POCKET computer ("Live" tablet)
-  Titan-Version: 1.4.3
+  Titan-Version: 1.4.4
 
   Pocket remote for the whole fleet. Keep it on you; it joins the mesh like
   every other Titan device (MAIN router + modem hops).
@@ -81,8 +81,9 @@ local systems  = {}   -- [id] = { name, kind, seen } from SSH pongs / hellos
 local pois     = {}
 local pending  = {}
 local stuck    = {}
-local quarrySnap = nil   -- last quarry_site broadcast from offline_site
+local quarrySnap = nil   -- last quarry_site from offline_site (preferred)
 local quarrySnapAt = 0
+local quarryTurtles = {} -- [id] = turtle mine reports when no site board
 
 local function now() return os.epoch("utc") end
 local function ago(ts) return math.floor((now() - (ts or 0)) / 1000) end
@@ -166,6 +167,41 @@ local function handle(id, msg)
     quarrySnap = msg
     quarrySnapAt = now()
     touchSystem(id, msg.name or ("Quarry-" .. id), "quarry_site")
+  elseif t == "quarry_turtle" or t == "quarry_progress" or t == "quarry_join"
+      or t == "quarry_job" or t == "quarry_done" then
+    -- Direct turtle mine data (works without a site board).
+    local q = quarryTurtles[id] or {}
+    q.name = msg.name or msg.hostname or q.name or ("Turtle-" .. id)
+    q.seen = now()
+    q.bpc = tonumber(msg.bpc) or q.bpc
+    q.fuel = msg.fuel
+    q.dug = tonumber(msg.dug) or q.dug
+    q.idx = tonumber(msg.idx) or q.idx
+    q.total = tonumber(msg.total) or q.total
+    q.status = msg.status or q.status
+    q.y0 = tonumber(msg.y0) or q.y0
+    q.y1 = tonumber(msg.y1) or q.y1
+    q.W = tonumber(msg.W) or q.W
+    q.L = tonumber(msg.L) or q.L
+    q.H = tonumber(msg.H) or q.H
+    if type(msg.job) == "table" then
+      q.job = msg.job
+      q.W = q.W or tonumber(msg.job.W)
+      q.L = q.L or tonumber(msg.job.L) or tonumber(msg.job.D)
+      q.H = q.H or tonumber(msg.job.stopY) or tonumber(msg.job.H)
+      if msg.job.y1 ~= nil then
+        q.H = math.max(q.H or 0, (tonumber(msg.job.y1) or 0) + 1)
+      end
+      q.idx = tonumber(msg.job.idx) or q.idx
+      q.total = tonumber(msg.job.total) or q.total
+      q.y0 = tonumber(msg.job.y0) or q.y0
+      q.y1 = tonumber(msg.job.y1) or q.y1
+    end
+    if msg.finished or msg.status == "done" or t == "quarry_done" then
+      q.status = "done"
+    end
+    quarryTurtles[id] = q
+    touchSystem(id, q.name, "offline_miner")
   end
 end
 
@@ -177,31 +213,85 @@ local function listenerLoop()
   end
 end
 
--- offline_site primary protocol (also mirrored on titan_net → handle())
+local function synthesizeQuarryFromTurtles()
+  local ONLINE = 45
+  local W, L, H = 0, 0, 0
+  local list = {}
+  local minBpc = nil
+  local online = 0
+  local doneCells, totalCells = 0, 0
+  for id, t in pairs(quarryTurtles) do
+    local age = ago(t.seen)
+    if age < ONLINE * 3 then
+      W = math.max(W, tonumber(t.W) or 0)
+      L = math.max(L, tonumber(t.L) or 0)
+      H = math.max(H, tonumber(t.H) or 0)
+      if age < ONLINE then
+        online = online + 1
+        local b = tonumber(t.bpc)
+        if b and b > 0 and (not minBpc or b < minBpc) then minBpc = b end
+      end
+      local tot = tonumber(t.total) or 0
+      local idx = math.max(0, (tonumber(t.idx) or 1) - 1)
+      if tot > 0 then
+        doneCells = doneCells + math.min(tot, idx)
+        totalCells = totalCells + tot
+      end
+      list[#list + 1] = {
+        id = id, name = t.name, y0 = t.y0, y1 = t.y1,
+        dug = t.dug, idx = t.idx, total = t.total, bpc = t.bpc,
+        fuel = t.fuel, status = t.status, age = age,
+        job = t.job,
+      }
+    end
+  end
+  table.sort(list, function(a, b) return (a.id or 0) < (b.id or 0) end)
+  if #list == 0 then return nil end
+  if totalCells < 1 then
+    local plane = math.max(1, W * L)
+    totalCells = math.max(1, plane * math.max(1, H))
+  end
+  local pct = math.floor(math.min(100, (doneCells / math.max(1, totalCells)) * 100) + 0.5)
+  return {
+    type = "quarry_site",
+    source = "turtles",
+    siteId = nil,
+    name = "Turtles (no site board)",
+    W = W, L = L, H = H,
+    fraction = "-",
+    maxClaim = 0,
+    pct = pct, done = doneCells, total = totalCells,
+    minBpc = minBpc or 48,
+    maxTravel = math.max(16, math.floor((minBpc or 48) * 32 * 0.4)),
+    online = online,
+    turtles = list,
+  }
+end
+
+local function effectiveQuarrySnap()
+  if quarrySnap and ago(quarrySnapAt) < 45 then
+    return quarrySnap
+  end
+  return synthesizeQuarryFromTurtles()
+end
+
+-- offline_site + direct turtle mine broadcasts
 local function quarryListenerLoop()
   while true do
     local id, msg = rednet.receive(PROTO_QUARRY, 2)
-    if id and type(msg) == "table" and msg.type == "quarry_site" then
-      quarrySnap = msg
-      quarrySnapAt = now()
-      touchSystem(id, msg.name or ("Quarry-" .. id), "quarry_site")
+    if id and type(msg) == "table" and msg.type then
+      handle(id, msg)
     end
   end
 end
 
 local function requestQuarryStatus(timeout)
   timeout = tonumber(timeout) or 3
+  -- Broadcast; quarryListenerLoop / titan handle() collect replies.
   rednet.broadcast({ type = "quarry_status_req", from = os.getComputerID() }, PROTO_QUARRY)
-  local deadline = os.clock() + timeout
-  while os.clock() < deadline do
-    local id, msg = rednet.receive(PROTO_QUARRY, math.max(0.05, deadline - os.clock()))
-    if id and type(msg) == "table" and msg.type == "quarry_site" then
-      quarrySnap = msg
-      quarrySnapAt = now()
-      return msg
-    end
-  end
-  return quarrySnap
+  rednet.broadcast({ type = "quarry_turtle_req", from = os.getComputerID() }, PROTO_QUARRY)
+  sleep(timeout)
+  return effectiveQuarrySnap()
 end
 
 --------------------------------------------------------------------------------
@@ -927,10 +1017,15 @@ end
 
 local function drawQuarryBoard(L)
   local out = L.out
-  local snap = quarrySnap
-  local age = snap and ago(quarrySnapAt) or nil
+  local snap = effectiveQuarrySnap()
+  local age = nil
+  if snap and snap.source == "site_board" and quarrySnapAt > 0 then
+    age = ago(quarrySnapAt)
+  elseif snap and snap.turtles and snap.turtles[1] then
+    age = snap.turtles[1].age
+  end
   guiFill(out, 1, 1, L.w, L.h, colors.black, colors.white)
-  local title = "QUARRY SITE"
+  local title = (snap and snap.source == "turtles") and "QUARRY (turtles)" or "QUARRY SITE"
   if L.color then
     guiFill(out, 1, 1, L.w, 1, colors.cyan, colors.black)
     guiText(out, 1 + L.pad, 1, " " .. title, colors.black, colors.cyan)
@@ -938,9 +1033,10 @@ local function drawQuarryBoard(L)
     guiText(out, 1, 1, title, colors.yellow, colors.black)
   end
   if not snap then
-    guiText(out, 1 + L.pad, 3, "Waiting for offline_site...", colors.lightGray, colors.black)
-    guiText(out, 1 + L.pad, 4, "Site PC left of storage; turtles: join → mine", colors.gray, colors.black)
-    guiText(out, 1 + L.pad, 6, "Press r to request status", colors.gray, colors.black)
+    guiText(out, 1 + L.pad, 3, "Waiting for offline miners...", colors.lightGray, colors.black)
+    guiText(out, 1 + L.pad, 4, "Turtle modem: area dig broadcasts progress", colors.gray, colors.black)
+    guiText(out, 1 + L.pad, 5, "Optional site board stores jobs + Y claims", colors.gray, colors.black)
+    guiText(out, 1 + L.pad, 7, "Press r to request status", colors.gray, colors.black)
     return
   end
   local name = tostring(snap.name or ("#" .. tostring(snap.siteId or "?")))
@@ -1530,14 +1626,15 @@ local function handleCommand(a)
 
   elseif cmd == "quarry" or cmd == "quarrysite" or cmd == "offlinesite" then
     if titan.sshIsAuthed and titan.sshIsAuthed() then
-      local s = quarrySnap or requestQuarryStatus(2)
+      local s = requestQuarryStatus(2) or effectiveQuarrySnap()
       if not s then
-        print("No quarry site online (offline_site broadcasting?).")
+        print("No offline miners reporting (modem + area dig, or offline_site).")
       else
-        print(("Quarry #%s  %dx%d × %dY  %d%%  online=%s"):format(
-          tostring(s.siteId or "?"),
+        print(("Quarry %s  %dx%d × %dY  %d%%  online=%s  [%s]"):format(
+          tostring(s.siteId or "turtles"),
           tonumber(s.W) or 0, tonumber(s.L) or 0, tonumber(s.H) or 0,
-          tonumber(s.pct) or 0, tostring(s.online or 0)))
+          tonumber(s.pct) or 0, tostring(s.online or 0),
+          tostring(s.source or "?")))
         print(("minBPC=%s  maxTravel=%s  claim=%s"):format(
           tostring(s.minBpc or "?"), tostring(s.maxTravel or "?"),
           tostring(s.fraction or "?")))

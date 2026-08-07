@@ -477,31 +477,32 @@ continue | job | clearjob
 home | dump | refuel | stop | status
 ```
 
-### Multi-turtle quarry (same footprint, different Y bands)
+### Progress to the admin tablet (site board optional)
 
-Place a computer with a modem to the **left of the storage chest**, install
-**Offline quarry site board**, and define the shared volume:
+Give mining turtles a **wireless modem in slot 15**. For site/admin talk the
+turtle briefly equips that modem **in place of its diamond pickaxe** (never a
+loader upgrade), then puts the pickaxe back before digging. Any `area` / `box` /
+`mine` job can broadcast progress **with or without** a site PC.
+
+**Without a site board:** run `area 16x32 40` — the tablet aggregates turtle
+reports into a progress view.
+
+**With a site board** (left of the storage chest): it auto-learns W×L×H from
+those reports (or lock with `setup`), stores each `offline_miner_job.cfg` under
+`quarry_jobs/`, hands out Y bands, and relays a combined snapshot to the tablet.
 
 ```
-setup 16x32 60 half       # W×L footprint, 60 layers down; claim ≤ half of H
-# or: setup 16x32 60 third
+# optional site board
+setup 16x32 60 half       # lock footprint (or skip — auto from turtles)
+auto                      # unlock auto-learn again
+# turtles
+join                      # link to site if present
+mine                      # claim a Y band (needs site)
+area 16x32 40             # dig; reports to admin whenever a modem is present
 ```
 
-On each mining turtle (modem required for this mode):
-
-```
-join                      # find site, report BPC
-mine                      # claim a free Y band and dig only that band
-site                      # show site / BPC / maxTravel
-```
-
-The site hands out non-overlapping Y bands (max **half** or **third** of total
-height), tracks each turtle’s progress + **BPC** (blocks per coal), and publishes
-a safe **maxTravel** so turtles dump before they outrun fuel. Each turtle also
-sends its `offline_miner_job.cfg` to the site (saved under
-`quarry_jobs/<id>_offline_miner_job.cfg`; site command `jobs`). Progress % and
-online turtles show on the site monitor/terminal and on the admin tablet
-(`live quarry`, menu **Quarry progress**, or `quarry`).
+Y-band claims (max **half** / **third** of height) need the site board. Progress
+% shows on the site monitor and admin (`live quarry` / Quarry app / `quarry`).
 
 Put an enchanted pick in the turtle’s inventory and run `equip` (or reboot /
 `setup`) — the script uses `turtle.equipLeft`/`equipRight` so you don’t have to

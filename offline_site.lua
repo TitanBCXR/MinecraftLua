@@ -1,26 +1,27 @@
 --[[
   offline_site.lua  -  Quarry site board for multi-turtle offline miners
-  Titan-Version: 1.0.1
+  Titan-Version: 1.0.2
 
   Place this computer to the LEFT of the storage chest (storage sits behind
   the turtles' origin). Attach a modem (wired to the turtles is fine, or
   wireless in range).
 
-  Job:
-    * Define one shared footprint: width × length × total Y layers down
-    * Hand out non-overlapping Y bands to turtles (max 1/2 or 1/3 of height)
-    * Collect BPC (blocks-per-coal) so every turtle knows safe travel distance
-    * Store each turtle's offline_miner_job.cfg under quarry_jobs/
-    * Show % complete on an attached monitor (or the terminal)
-    * Announce to the admin tablet over the Titan mesh
+  OPTIONAL — turtles can dig and report straight to the admin tablet with no
+  site board. When this board IS present it:
+    * Auto-sets W×L×H from turtle mine/job data (or `setup` to lock manually)
+    * Hands out non-overlapping Y bands (max 1/2 or 1/3 of height)
+    * Collects BPC so every turtle knows safe travel distance
+    * Stores each turtle's offline_miner_job.cfg under quarry_jobs/
+    * Relays a quarry_site snapshot to the admin tablet
 
   Commands:
-    setup <W>x<L> <H> [half|third]   define / redefine the quarry
+    setup <W>x<L> <H> [half|third]   lock footprint manually
+    auto                             unlock auto-learn from turtles
     fraction half|third              max Y band size per turtle
     status | turtles | jobs | clear
     help | exit
 
-  Turtle side: offline_miner → `join` then `mine` (or `area` with site online).
+  Turtle side: offline_miner with modem (area …); `join`/`mine` for Y bands.
 
   Run:  offline_site
 ]]
@@ -38,8 +39,9 @@ if fs.exists("lib/titan.lua") then
 end
 
 local cfg = {
-  W = 16, L = 32, H = 40,
-  fraction = 0.5,   -- half of height per claim (use 1/3 via `fraction third`)
+  W = 0, L = 0, H = 0,   -- 0 = waiting to learn from turtles
+  fraction = 0.5,        -- half of height per claim (use 1/3 via `fraction third`)
+  manual = false,        -- true after `setup` (still expands if turtles report larger)
   label = nil,
 }
 
@@ -89,12 +91,46 @@ local function loadCfg()
   if cfg.fraction ~= (1 / 3) and cfg.fraction ~= (1 / 2) then
     if cfg.fraction < 0.4 then cfg.fraction = 1 / 3 else cfg.fraction = 0.5 end
   end
+  cfg.manual = cfg.manual == true
+  cfg.W = tonumber(cfg.W) or 0
+  cfg.L = tonumber(cfg.L) or 0
+  cfg.H = tonumber(cfg.H) or 0
 end
 
 local function saveCfg()
   local f = fs.open(CFG, "w")
   f.write(textutils.serialize(cfg))
   f.close()
+end
+
+-- Grow (or initially set) footprint from a turtle's mine/job report.
+local function learnSiteFromMsg(msg)
+  if type(msg) ~= "table" then return false end
+  local j = msg.job
+  local W = tonumber(msg.W)
+  local L = tonumber(msg.L)
+  local H = tonumber(msg.H)
+  if j then
+    W = W or tonumber(j.W)
+    L = L or tonumber(j.L) or tonumber(j.D)
+    H = H or tonumber(j.stopY) or tonumber(j.H)
+    if j.y1 ~= nil then
+      H = math.max(H or 0, (tonumber(j.y1) or 0) + 1)
+    end
+  end
+  W = math.floor(tonumber(W) or 0)
+  L = math.floor(tonumber(L) or 0)
+  H = math.floor(tonumber(H) or 0)
+  if W < 1 or L < 1 or H < 1 then return false end
+  local nW = math.max(tonumber(cfg.W) or 0, W)
+  local nL = math.max(tonumber(cfg.L) or 0, L)
+  local nH = math.max(tonumber(cfg.H) or 0, H)
+  if nW == cfg.W and nL == cfg.L and nH == cfg.H then return false end
+  cfg.W, cfg.L, cfg.H = nW, nL, nH
+  saveCfg()
+  local how = cfg.manual and "expand" or "auto"
+  print(("[%s] site %dx%d × %dY from turtle mine data"):format(how, nW, nL, nH))
+  return true
 end
 
 local function openModem()
@@ -226,9 +262,11 @@ local function snapshot()
   table.sort(list, function(a, b) return (a.id or 0) < (b.id or 0) end)
   return {
     type = "quarry_site",
+    source = "site_board",
     siteId = os.getComputerID(),
     name = os.getComputerLabel() or ("Quarry-" .. os.getComputerID()),
     W = cfg.W, L = cfg.L, H = cfg.H,
+    manual = cfg.manual == true,
     fraction = fractionLabel(),
     maxClaim = maxClaimLayers(),
     pct = pct, done = done, total = total,
@@ -262,6 +300,8 @@ local function touchTurtle(id, msg)
   if msg.moves ~= nil then t.moves = tonumber(msg.moves) or t.moves end
   if msg.coal ~= nil then t.coal = tonumber(msg.coal) or t.coal end
   if msg.status then t.status = msg.status end
+  if msg.y0 ~= nil then t.y0 = tonumber(msg.y0) or t.y0 end
+  if msg.y1 ~= nil then t.y1 = tonumber(msg.y1) or t.y1 end
   if msg.clearJob or msg.job == false then
     t.job = nil
     persistTurtleJob(id, nil)
@@ -275,12 +315,19 @@ local function touchTurtle(id, msg)
     if msg.job.status and not msg.status then t.status = msg.job.status end
     persistTurtleJob(id, msg.job)
   end
+  learnSiteFromMsg(msg)
   turtles[id] = t
   return t
 end
 
 local function assignClaim(id, msg)
   local t = touchTurtle(id, msg or {})
+  if (tonumber(cfg.H) or 0) < 1 or (tonumber(cfg.W) or 0) < 1 then
+    return {
+      type = "quarry_claim", ok = false,
+      err = "site size unknown — start a turtle with area WxL H first (auto-learn)",
+    }
+  end
   if t.y0 and t.y1 and t.status ~= "done" then
     return {
       type = "quarry_claim",
@@ -324,20 +371,30 @@ end
 local function handleMsg(id, msg)
   if type(msg) ~= "table" or not msg.type then return end
   local t = tostring(msg.type)
-  if t == "quarry_hello" or t == "quarry_join" then
+  if t == "quarry_hello" or t == "quarry_join" or t == "quarry_turtle" then
+    local first = turtles[id] == nil
     touchTurtle(id, msg)
-    print(("[+] #%d %s joined  bpc=%s"):format(
-      id, tostring(msg.name or "?"), tostring(msg.bpc or "?")))
-    rednet.send(id, {
-      type = "quarry_welcome",
-      siteId = os.getComputerID(),
-      name = os.getComputerLabel(),
-      W = cfg.W, L = cfg.L, H = cfg.H,
-      fraction = fractionLabel(),
-      maxClaim = maxClaimLayers(),
-      maxTravel = maxTravel(), minBpc = minBpc(),
-    }, PROTO)
-    broadcastStatus()
+    local row = turtles[id]
+    local shouldWelcome = (t ~= "quarry_turtle")
+        or first
+        or ago(row.welcomedAt or 0) > 60
+    if t ~= "quarry_turtle" or first then
+      print(("[+] #%d %s  bpc=%s"):format(
+        id, tostring(msg.name or "?"), tostring(msg.bpc or "?")))
+    end
+    if shouldWelcome then
+      rednet.send(id, {
+        type = "quarry_welcome",
+        siteId = os.getComputerID(),
+        name = os.getComputerLabel(),
+        W = cfg.W, L = cfg.L, H = cfg.H,
+        fraction = fractionLabel(),
+        maxClaim = maxClaimLayers(),
+        maxTravel = maxTravel(), minBpc = minBpc(),
+      }, PROTO)
+      row.welcomedAt = now()
+    end
+    if t ~= "quarry_turtle" then broadcastStatus() end
   elseif t == "quarry_claim_req" then
     local reply = assignClaim(id, msg)
     rednet.send(id, reply, PROTO)
@@ -356,8 +413,9 @@ local function handleMsg(id, msg)
   elseif t == "quarry_done" then
     markDone(id, msg)
     broadcastStatus()
-  elseif t == "quarry_status_req" then
+  elseif t == "quarry_status_req" or t == "quarry_turtle_req" then
     rednet.send(id, snapshot(), PROTO)
+    rednet.broadcast(snapshot(), PROTO)
   end
 end
 
@@ -456,14 +514,15 @@ end
 -- Console
 --------------------------------------------------------------------------------
 local function printHelp()
-  print("Quarry site board — place LEFT of the storage chest.")
-  print("  setup <W>x<L> <H> [half|third]   shared dig volume")
+  print("Quarry site board — place LEFT of the storage chest (optional).")
+  print("  setup <W>x<L> <H> [half|third]   lock shared dig volume")
+  print("  auto                             learn size from turtle mine data")
   print("  fraction half|third              max Y band per turtle")
   print("  status | turtles | jobs | clear | broadcast")
   print("  help | exit")
   print("")
-  print("Turtles: offline_miner → join → mine")
-  print("Job files saved under " .. JOB_DIR .. "/<id>_offline_miner_job.cfg")
+  print("Auto-learns W×L×H when turtles run area/box (or join).")
+  print("Job files: " .. JOB_DIR .. "/<id>_offline_miner_job.cfg")
 end
 
 local function handleCommand(line)
@@ -524,6 +583,10 @@ local function handleCommand(line)
     end
     print("Cleared turtle claims / completed bands / quarry_jobs (footprint kept).")
     broadcastStatus()
+  elseif cmd == "auto" then
+    cfg.manual = false
+    saveCfg()
+    print("Auto-learn ON — footprint grows from turtle mine data.")
   elseif cmd == "broadcast" or cmd == "push" then
     broadcastStatus()
     print("Status broadcast.")
@@ -564,12 +627,15 @@ local function handleCommand(line)
     if not W or not L or not H then
       print("Usage: setup <W>x<L> <H> [half|third]")
       print("Example: setup 16x32 60 half")
+      print("Or skip setup — turtles' area commands set the site automatically.")
     else
       cfg.W, cfg.L, cfg.H = W, L, H
+      cfg.manual = true
       turtles, completedBands = {}, {}
       saveCfg()
-      print(("Site set: %dx%d × %dY  claim=%s (max %d layers)"):format(
+      print(("Site locked: %dx%d × %dY  claim=%s (max %d layers)"):format(
         W, L, H, fractionLabel(), maxClaimLayers()))
+      print("(`auto` to unlock learning from turtles again)")
       broadcastStatus()
     end
   elseif cmd == "exit" or cmd == "quit" then
@@ -594,8 +660,14 @@ saveCfg()
 
 term.clear(); term.setCursorPos(1, 1)
 print("== Quarry Site Board ==")
-print(("Footprint %dx%d × %dY  claim=%s"):format(cfg.W, cfg.L, cfg.H, fractionLabel()))
-print("Place LEFT of the storage chest. Turtles: join → mine")
+if (cfg.W or 0) < 1 then
+  print("Footprint: waiting for turtle mine data (or `setup WxL H`)")
+else
+  print(("Footprint %dx%d × %dY  claim=%s  %s"):format(
+    cfg.W, cfg.L, cfg.H, fractionLabel(),
+    cfg.manual and "manual" or "auto"))
+end
+print("Place LEFT of storage. Relays jobs/progress to admin tablet.")
 print("Type help.")
 print("")
 

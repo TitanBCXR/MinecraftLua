@@ -1,6 +1,6 @@
 --[[
   offline_miner.lua  -  Local quarry turtle (optional site board)
-  Titan-Version: 1.1.1
+  Titan-Version: 1.1.3
 
   Place the turtle at the TOP-FRONT-LEFT corner of the dig, facing into the
   mine. That cell is origin 0,0,0:
@@ -11,7 +11,9 @@
 
   First boot (or `setup`):
     * Fuel chest is on the LEFT  → top up slot 16 with coal only (keeps it there)
-    * Storage chest is BEHIND    → dumps slots 1-15 (never slot 16)
+    * Storage chest is BEHIND    → dumps slots 1-14 (never 15 modem / 16 fuel)
+    * Slot 15 = wireless modem (swapped with the diamond pickaxe for site/admin
+      comms; never replaces a loader / non-pickaxe upgrade)
     * Site computer (optional) LEFT of the storage chest — multi-turtle Y claims
     * If a pickaxe (incl. enchanted) is in the turtle inventory, equip it as a
       tool upgrade via turtle.equipLeft/Right (crafting often rejects enchantments)
@@ -19,10 +21,12 @@
   box / area — ALWAYS 1 Y-layer at a time (walk the plane, then drop one).
                Never digs 2 high; no player headroom on quarry jobs.
 
-  Multi-turtle (modem + offline_site.lua):
-    join                     find site board, report BPC
-    mine                     claim a Y band (½ or ⅓ of height) and dig it
-    site                     show last site / claim info
+  Modem (slot 15):
+    For site/admin talk, equips the modem in place of the diamond pickaxe, then
+    puts the pickaxe back before digging. Loader upgrades are never touched.
+    join                     find site board (optional)
+    mine                     claim a Y band when a site is online
+    site                     show site / BPC / broadcast status
 
   Job memory (offline_miner_job.cfg):
     Progress is saved as you dig. After stop / reboot / dump, put the turtle
@@ -38,12 +42,11 @@
     equip | tool | pick      equip best pickaxe from inventory (left/right)
     continue | resume        resume saved job from origin
     job | clearjob           show / forget saved job
-    home                     return to 0,0,0 facing start
-    dump | refuel | setup | stop | status | help
+    home | dump | refuel | setup | stop | status | help
 
   Optional: exclude.txt (same format as the network miner) — never break those.
 
-  Solo mode needs no modem. Multi-turtle needs a modem + offline_site.
+  Solo: no modem needed. Admin progress: modem. Multi Y-band: modem + offline_site.
   Run:  offline_miner
 ]]
 
@@ -51,9 +54,12 @@ local CFG = "offline_miner.cfg"
 local JOB_FILE = "offline_miner_job.cfg"
 local EXCLUDE = "exclude.txt"
 local FUEL_SLOT = 16
+local MODEM_SLOT = 15   -- wireless modem; swapped with diamond pickaxe for comms
 local MIN_FUEL = 200
 local STOP = false
 local PROTO_QUARRY = "titan_quarry"
+local digging = false
+local modemSwapSide = nil  -- "left"|"right" while modem is equipped over the pick
 
 -- Relative pose from boot origin. +Y is DOWN.
 local pos = { x = 0, y = 0, z = 0 }
@@ -290,7 +296,7 @@ end
 
 local function inventoryFull()
   for s = 1, 16 do
-    if s ~= FUEL_SLOT and turtle.getItemCount(s) == 0 then
+    if s ~= FUEL_SLOT and s ~= MODEM_SLOT and turtle.getItemCount(s) == 0 then
       return false
     end
   end
@@ -377,11 +383,22 @@ local function getEquipped(side)
   return nil
 end
 
+local function isModemItem(detail)
+  if type(detail) ~= "table" or not detail.name then return false end
+  return tostring(detail.name):lower():find("modem", 1, true) ~= nil
+end
+
+local function isDiamondPickaxe(detail)
+  if type(detail) ~= "table" or not detail.name then return false end
+  local n = tostring(detail.name):lower()
+  return n:find("pickaxe", 1, true) ~= nil and n:find("diamond", 1, true) ~= nil
+end
+
 local function sideLooksLikeModem(side)
   local t = peripheral.getType(side)
   if t == "modem" or t == "wired_modem" or t == "wireless_modem" then return true end
   local d = getEquipped(side)
-  if d and tostring(d.name or ""):find("modem", 1, true) then return true end
+  if d and isModemItem(d) then return true end
   return false
 end
 
@@ -389,6 +406,50 @@ local function sideLooksLikeDigTool(side)
   local d = getEquipped(side)
   if not d then return false end
   return toolKind(d.name) ~= nil
+end
+
+-- Prefer diamond pickaxe side; never treat a non-pickaxe upgrade (e.g. loader) as swappable.
+local function findPickaxeSide()
+  for _, side in ipairs({ "left", "right" }) do
+    local d = getEquipped(side)
+    if d and isDiamondPickaxe(d) then return side, d end
+  end
+  for _, side in ipairs({ "left", "right" }) do
+    local d = getEquipped(side)
+    if d and toolKind(d.name) == "pickaxe" then return side, d end
+  end
+  return nil
+end
+
+local function findModemInInventory()
+  if isModemItem(itemDetail(MODEM_SLOT)) then return MODEM_SLOT end
+  for s = 1, 16 do
+    if s ~= FUEL_SLOT and isModemItem(itemDetail(s)) then return s end
+  end
+  return nil
+end
+
+local function moveModemToSlot15()
+  local slot = findModemInInventory()
+  if not slot then return false end
+  if slot == MODEM_SLOT then return true end
+  if turtle.getItemCount(MODEM_SLOT) > 0 and not isModemItem(itemDetail(MODEM_SLOT)) then
+    -- Keep pickaxe/tools; don't overwrite a tool parked in 15.
+    if isToolItem(itemDetail(MODEM_SLOT)) then return false end
+  end
+  turtle.select(slot)
+  if turtle.getItemCount(MODEM_SLOT) > 0 then
+    -- Swap into an empty slot if needed
+    for s = 1, 14 do
+      if turtle.getItemCount(s) == 0 then
+        turtle.select(MODEM_SLOT)
+        turtle.transferTo(s)
+        break
+      end
+    end
+  end
+  turtle.select(slot)
+  return turtle.transferTo(MODEM_SLOT) or isModemItem(itemDetail(MODEM_SLOT))
 end
 
 local function describeTool(detail)
@@ -476,12 +537,12 @@ local function equipToolFromInventory(sideArg, quiet)
   return false, lastErr
 end
 
--- Dump mined goods to the chest behind. Never drops slot 16 (coal stays).
+-- Dump mined goods to the chest behind. Never drops slot 16 (coal) or 15 (modem).
 -- Also keeps pickaxes/tools in inventory so dump does not eat an unequipped pick.
 local function dumpToStorage()
   consolidateFuelToSlot16()
   faceBack()
-  for s = 1, 15 do
+  for s = 1, 14 do
     if turtle.getItemCount(s) > 0 then
       turtle.select(s)
       -- If somehow still fuel, try slot 16 again instead of storing it.
@@ -490,8 +551,8 @@ local function dumpToStorage()
       end
       if turtle.getItemCount(s) > 0 then
         local d = itemDetail(s)
-        if isToolItem(d) then
-          -- Leave tools for `equip` / boot auto-equip.
+        if isToolItem(d) or isModemItem(d) then
+          -- Leave tools / modem for equip / comms.
         else
           turtle.drop()
         end
@@ -503,7 +564,7 @@ local function dumpToStorage()
 end
 
 local function setupChests()
-  print("Setup: fuel chest LEFT → slot 16 only; storage BEHIND → dump 1-15.")
+  print("Setup: fuel LEFT → slot 16; modem in slot 15; storage BEHIND → dump 1-14.")
   print("Optional: site computer LEFT of the storage chest (offline_site).")
   print("Facing into the mine at top-front-left (origin 0,0,0)...")
   equipToolFromInventory(nil, true)
@@ -511,8 +572,8 @@ local function setupChests()
   local fuel = suckFuelFromLeft()
   cfg.setupDone = true
   saveCfg()
-  print(("Setup done. Tank=%s  coal in slot 16=%d"):format(
-    tostring(fuel), turtle.getItemCount(FUEL_SLOT)))
+  print(("Setup done. Tank=%s  coal in slot 16=%d  modem slot 15=%d"):format(
+    tostring(fuel), turtle.getItemCount(FUEL_SLOT), turtle.getItemCount(MODEM_SLOT)))
   print("Origin locked at current pose (0,0,0 forward).")
 end
 
@@ -816,16 +877,98 @@ local function openModem()
   return any
 end
 
+-- Put wireless modem on the diamond-pickaxe upgrade side (never a loader).
+local function ensureModemForComms(quiet)
+  if openModem() then
+    if sideLooksLikeModem("left") then modemSwapSide = modemSwapSide or "left" end
+    if sideLooksLikeModem("right") then modemSwapSide = modemSwapSide or "right" end
+    return true
+  end
+  if not moveModemToSlot15() and not isModemItem(itemDetail(MODEM_SLOT)) then
+    if not quiet then
+      print("No wireless modem. Put one in slot " .. MODEM_SLOT .. " for site/admin.")
+    end
+    return false
+  end
+  local function sideIsLoaderLike(side)
+    local d = getEquipped(side)
+    if not d or not d.name then return false end
+    if isModemItem(d) then return false end
+    if toolKind(d.name) == "pickaxe" then return false end
+    -- Anything else equipped (chunk loader, etc.) is protected.
+    return true
+  end
+  local side = findPickaxeSide()
+  if not side then
+    -- Empty upgrade slot only — never equip over a loader / non-pickaxe.
+    if not sideLooksLikeModem("left") and not sideIsLoaderLike("left")
+        and not sideLooksLikeDigTool("left") then
+      side = "left"
+    elseif not sideLooksLikeModem("right") and not sideIsLoaderLike("right")
+        and not sideLooksLikeDigTool("right") then
+      side = "right"
+    else
+      if not quiet then
+        print("No diamond pickaxe side to swap — won't replace a loader upgrade.")
+      end
+      return false
+    end
+  end
+  turtle.select(MODEM_SLOT)
+  local ok
+  if side == "left" then ok = turtle.equipLeft() else ok = turtle.equipRight() end
+  if not ok then
+    if not quiet then print("Could not equip modem on " .. side) end
+    return false
+  end
+  modemSwapSide = side
+  if not openModem() then
+    if not quiet then print("Modem equipped but rednet failed to open.") end
+    return false
+  end
+  return true
+end
+
+-- Swap modem back off; diamond pickaxe returns from slot 15 to the upgrade slot.
+local function restorePickAfterComms()
+  if not modemSwapSide then return end
+  local side = modemSwapSide
+  -- After modem equip, slot 15 should hold the pickaxe we swapped out.
+  if turtle.getItemCount(MODEM_SLOT) > 0 then
+    turtle.select(MODEM_SLOT)
+    if side == "left" then turtle.equipLeft() else turtle.equipRight() end
+  end
+  modemSwapSide = nil
+  -- If pickaxe landed elsewhere, try normal equip.
+  if not findPickaxeSide() then
+    equipToolFromInventory(side, true)
+  end
+end
+
+local function footprintFromJob(j)
+  if type(j) ~= "table" then return nil end
+  local W = math.floor(tonumber(j.W) or 0)
+  local L = math.floor(tonumber(j.L) or tonumber(j.D) or 0)
+  local H = math.floor(tonumber(j.stopY) or tonumber(j.H) or 0)
+  if j.y1 ~= nil then
+    H = math.max(H, math.floor(tonumber(j.y1) or 0) + 1)
+  end
+  if W < 1 or L < 1 or H < 1 then return nil end
+  return W, L, H
+end
+
 local function sitePayload(extra)
   local msg = {
     name = os.getComputerLabel(),
     hostname = os.getComputerLabel(),
+    turtleId = os.getComputerID(),
     bpc = currentBpc(),
     fuel = turtle.getFuelLevel(),
     dug = dug,
     moves = moves,
     coal = coalBurned,
     status = (activeJob and activeJob.status) or "idle",
+    hasSite = siteId ~= nil,
   }
   local j = activeJob or loadJobFile()
   if j then
@@ -835,45 +978,89 @@ local function sitePayload(extra)
     msg.total = j.total
     msg.y0 = j.y0 or msg.y0
     msg.y1 = j.y1 or msg.y1
+    local W, L, H = footprintFromJob(j)
+    if W then msg.W, msg.L, msg.H = W, L, H end
   elseif siteInfo then
     msg.y0 = siteInfo.y0
     msg.y1 = siteInfo.y1
+    msg.W = siteInfo.W
+    msg.L = siteInfo.L
+    msg.H = siteInfo.H
   end
   if type(extra) == "table" then
-    for k, v in pairs(extra) do msg[k] = v end
+    for k, v in pairs(extra) do
+      if k ~= "type" and k ~= "_siteType" then msg[k] = v end
+    end
   end
   return msg
 end
 
-local function siteSend(msgType, extra)
-  if not siteId then return false end
-  local msg = sitePayload(extra)
-  msg.type = msgType
-  rednet.send(siteId, msg, PROTO_QUARRY)
+-- Broadcast mine data for admin (always). Also unicast to site board when joined.
+-- Swaps slot-15 modem over the diamond pickaxe, then restores the pickaxe.
+local function publishMine(extra)
+  if not ensureModemForComms(true) then return false end
+  extra = extra or {}
+  local base = sitePayload(extra)
+  local bcast = {}
+  for k, v in pairs(base) do bcast[k] = v end
+  bcast.type = "quarry_turtle"
+  rednet.broadcast(bcast, PROTO_QUARRY)
+  rednet.broadcast(bcast, "titan_net")
+  if siteId then
+    local uni = {}
+    for k, v in pairs(base) do uni[k] = v end
+    uni.type = extra._siteType or "quarry_progress"
+    rednet.send(siteId, uni, PROTO_QUARRY)
+  end
+  -- Keep modem up while idle (listening); put pickaxe back while digging.
+  if digging then restorePickAfterComms() end
   return true
 end
 
-local function siteReportProgress(extra)
-  return siteSend("quarry_progress", extra)
-end
-
--- Push offline_miner_job.cfg contents to the site board (or clear it).
-siteSendJob = function(j, clearing)
-  if not siteId then return false end
-  if clearing or not j then
-    return siteSend("quarry_job", { clearJob = true, job = false, status = "idle" })
+local function siteSend(msgType, extra)
+  if not siteId then
+    -- No board — still publish so admin tablet can see us.
+    return publishMine(extra)
   end
-  return siteSend("quarry_job", { job = j, jobFile = JOB_FILE, status = j.status or "active" })
+  extra = extra or {}
+  extra._siteType = msgType
+  return publishMine(extra)
 end
 
-local function joinSite(timeout)
+local function siteReportProgress(extra)
+  extra = extra or {}
+  extra._siteType = "quarry_progress"
+  return publishMine(extra)
+end
+
+-- Push offline_miner_job.cfg to site (if any) and broadcast for admin.
+siteSendJob = function(j, clearing)
+  if clearing or not j then
+    return publishMine({
+      _siteType = "quarry_job",
+      clearJob = true, job = false, status = "idle",
+    })
+  end
+  return publishMine({
+    _siteType = "quarry_job",
+    job = j, jobFile = JOB_FILE, status = j.status or "active",
+  })
+end
+
+local function joinSite(timeout, quiet)
   timeout = tonumber(timeout) or 6
-  if not openModem() then
-    print("No modem — solo mode only (area/box still work).")
+  quiet = quiet == true
+  if not ensureModemForComms(quiet) then
+    if not quiet then
+      print("No modem in slot " .. MODEM_SLOT .. " — solo dig only (no site/admin link).")
+    end
     return false
   end
-  rednet.broadcast(sitePayload({ type = "quarry_join" }), PROTO_QUARRY)
+  local joinMsg = sitePayload({})
+  joinMsg.type = "quarry_join"
+  rednet.broadcast(joinMsg, PROTO_QUARRY)
   local deadline = os.clock() + timeout
+  local found = false
   while os.clock() < deadline do
     local id, msg = rednet.receive(PROTO_QUARRY, math.max(0.05, deadline - os.clock()))
     if id and type(msg) == "table" and msg.type == "quarry_welcome" then
@@ -882,54 +1069,115 @@ local function joinSite(timeout)
       maxTravel = tonumber(msg.maxTravel) or maxTravel
       cfg.siteId = id
       saveCfg()
-      print(("Joined site #%d  %dx%d × %dY  claim=%s  minBPC=%s  maxTravel=%s"):format(
-        id,
-        tonumber(msg.W) or 0, tonumber(msg.L) or 0, tonumber(msg.H) or 0,
-        tostring(msg.fraction or "?"),
-        tostring(msg.minBpc or "?"),
-        tostring(msg.maxTravel or "?")))
-      return true
+      if not quiet then
+        print(("Joined site #%d  %dx%d × %dY  claim=%s  minBPC=%s  maxTravel=%s"):format(
+          id,
+          tonumber(msg.W) or 0, tonumber(msg.L) or 0, tonumber(msg.H) or 0,
+          tostring(msg.fraction or "?"),
+          tostring(msg.minBpc or "?"),
+          tostring(msg.maxTravel or "?")))
+      end
+      found = true
+      break
     end
   end
-  print("No site board answered. Run offline_site on the computer LEFT of storage.")
-  return false
+  if not found then
+    siteId, cfg.siteId = nil, nil
+    saveCfg()
+    if not quiet then
+      print("No site board — OK. Broadcasting mine data for the admin tablet.")
+      print("Use `area WxL H` to dig. Multi Y-band claims need offline_site.")
+    end
+  end
+  -- Report once while modem is still equipped.
+  local base = sitePayload({ _siteType = found and "quarry_join" or "quarry_progress" })
+  local bcast = {}
+  for k, v in pairs(base) do bcast[k] = v end
+  bcast.type = "quarry_turtle"
+  rednet.broadcast(bcast, PROTO_QUARRY)
+  rednet.broadcast(bcast, "titan_net")
+  if digging then restorePickAfterComms() end
+  return found
 end
 
 local function claimBand()
   if not siteId then
     if not joinSite() then return nil end
   end
-  rednet.send(siteId, sitePayload({ type = "quarry_claim_req" }), PROTO_QUARRY)
+  if not ensureModemForComms() then return nil end
+  local req = sitePayload({})
+  req.type = "quarry_claim_req"
+  rednet.send(siteId, req, PROTO_QUARRY)
   local deadline = os.clock() + 8
+  local claim = nil
   while os.clock() < deadline do
     local id, msg = rednet.receive(PROTO_QUARRY, math.max(0.05, deadline - os.clock()))
     if id == siteId and type(msg) == "table" and msg.type == "quarry_claim" then
       if not msg.ok then
         print("Claim failed: " .. tostring(msg.err or "unknown"))
+        if digging then restorePickAfterComms() end
         return nil
       end
       maxTravel = tonumber(msg.maxTravel) or maxTravel
       siteInfo = msg
       print(("Claimed Y %d..%d  (%d layers)  maxTravel=%s"):format(
         msg.y0, msg.y1, (msg.y1 - msg.y0 + 1), tostring(maxTravel or "?")))
-      return msg
+      claim = msg
+      break
     end
   end
-  print("Claim timed out.")
-  return nil
+  if digging then restorePickAfterComms() end
+  if not claim then print("Claim timed out.") end
+  return claim
 end
 
 local function printSiteInfo()
   if not siteId and cfg.siteId then siteId = cfg.siteId end
   print(("siteId=%s  bpc=%.1f  moves=%d coal=%d  maxTravel=%s"):format(
-    tostring(siteId or "-"), currentBpc(), moves, coalBurned, tostring(maxTravel or "-")))
+    tostring(siteId or "(none — admin via broadcast)"),
+    currentBpc(), moves, coalBurned, tostring(maxTravel or "-")))
+  local j = activeJob or loadJobFile()
+  local W, L, H = footprintFromJob(j)
+  if W then
+    print(("mine data: %dx%d × %dY (from job)"):format(W, L, H))
+  end
   if siteInfo then
-    print(("last: %dx%d × %dY  Y=%s..%s  fraction=%s"):format(
+    print(("site: %dx%d × %dY  Y=%s..%s  fraction=%s"):format(
       tonumber(siteInfo.W) or 0, tonumber(siteInfo.L) or 0, tonumber(siteInfo.H) or 0,
       tostring(siteInfo.y0 or "?"), tostring(siteInfo.y1 or "?"),
       tostring(siteInfo.fraction or "?")))
-  else
-    print("No site info yet — run `join`.")
+  end
+end
+
+-- Answer admin/site polls while idle (modem stays equipped). Quiet while digging
+-- so we never yank the pickaxe out from under a dig step.
+local function mineNetLoop()
+  local last = 0
+  while true do
+    if digging then
+      sleep(1)
+    else
+      ensureModemForComms(true)
+      local id, msg = rednet.receive(PROTO_QUARRY, 2)
+      if id and type(msg) == "table" then
+        local t = tostring(msg.type or "")
+        if t == "quarry_turtle_req" or t == "quarry_status_req" then
+          publishMine()
+        elseif t == "quarry_welcome" and not siteId then
+          siteId = id
+          siteInfo = msg
+          maxTravel = tonumber(msg.maxTravel) or maxTravel
+          cfg.siteId = id
+          saveCfg()
+          print(("\n[site] Linked to #%d"):format(id))
+          publishMine({ _siteType = "quarry_join" })
+        end
+      end
+      if (os.clock() - last) >= 12 then
+        if activeJob or loadJobFile() then publishMine() end
+        last = os.clock()
+      end
+    end
   end
 end
 
@@ -960,16 +1208,20 @@ local function finishJob(ok, err)
       print("(Or `clearjob` to forget this dig.)")
     end
   end
-  if wasSite then
-    if ok then
-      siteSend("quarry_done", {
-        status = "done", finished = true, y0 = y0, y1 = y1,
-        job = lastJob, jobFile = JOB_FILE,
-      })
-    else
-      siteReportProgress({ status = "paused", job = activeJob or lastJob, jobFile = JOB_FILE })
-    end
+  digging = false
+  if ok then
+    publishMine({
+      _siteType = "quarry_done",
+      status = "done", finished = true, y0 = y0, y1 = y1,
+      job = lastJob, jobFile = JOB_FILE,
+    })
+  else
+    publishMine({
+      _siteType = "quarry_progress",
+      status = "paused", job = activeJob or lastJob, jobFile = JOB_FILE,
+    })
   end
+  restorePickAfterComms()
   goHome()
   dumpToStorage()
   suckFuelFromLeft()
@@ -1037,8 +1289,8 @@ local function runBoxJob(j)
 
     j.idx = i + 1
     saveJobFile(j)
-    if j.site and (i % 10 == 0) then
-      -- Includes full offline_miner_job.cfg table in the payload.
+    if i % 10 == 0 then
+      -- Includes full offline_miner_job.cfg for admin / optional site board.
       siteReportProgress({ status = "mining", job = j, jobFile = JOB_FILE })
     end
   end
@@ -1135,6 +1387,12 @@ local function runSavedJob(j, fromContinue)
   else
     if not goHome() then print("Could not reach origin."); return end
   end
+  -- Soft-join site if present; publish footprint, then dig with pickaxe equipped.
+  if not siteId then joinSite(2, true) end
+  publishMine({ _siteType = "quarry_job", job = j, status = "active" })
+  restorePickAfterComms()
+  equipToolFromInventory(nil, true)
+  digging = true
   if j.type == "box" or j.type == "area" then
     runBoxJob(j)
   elseif j.type == "tunnel" then
@@ -1144,6 +1402,7 @@ local function runSavedJob(j, fromContinue)
   else
     print("Unknown job type: " .. tostring(j.type))
   end
+  digging = false
 end
 
 local function digBox(W, H, D, opts)
@@ -1233,7 +1492,10 @@ end
 
 local function digSiteMine()
   local claim = claimBand()
-  if not claim then return end
+  if not claim then
+    print("Tip: start with `area <W>x<L> <stopY>` — progress still goes to the admin tablet.")
+    return
+  end
   local W = math.floor(tonumber(claim.W) or 0)
   local L = math.floor(tonumber(claim.L) or 0)
   local y0 = tonumber(claim.y0)
@@ -1266,15 +1528,17 @@ local function printHelp()
   print("  box <W>x<H>x<D>                  H layers down, 1 Y at a time")
   print("  tunnel <L> [W]                   player-tall (2 high) corridor")
   print("  stair <W>x<steps> <up|down>      player-tall staircase")
-  print("  join                             find quarry site board (modem)")
-  print("  mine                             claim a Y band from site and dig it")
-  print("  site                             show site / BPC / maxTravel")
+  print("  join                             find optional site board (modem)")
+  print("  mine                             claim a Y band (needs site board)")
+  print("  site                             show site / BPC / mine broadcast")
   print("  equip [left|right]               equip pick from inventory (aliases: tool, pick)")
   print("  continue | resume                resume saved job (from origin)")
   print("  job | clearjob                   show / forget saved job")
   print("  home | dump | refuel | setup | stop | status")
   print("")
-  print("Multi-turtle: site computer LEFT of storage → offline_site → join → mine")
+  print("Slot 15 = wireless modem (swaps over diamond pickaxe for site/admin).")
+  print("Loader upgrades are never replaced. Slot 16 = coal.")
+  print("Site board optional: stores job.cfg + Y-band claims.")
   print("Jobs save to " .. JOB_FILE .. " while running / paused.")
   print("Finished digs clear that file automatically. After stop: origin + continue.")
   print("Enchanted pick: put it in inventory, then `equip` (not craft onto turtle).")
@@ -1467,19 +1731,34 @@ end
 if cfg.siteId then
   siteId = cfg.siteId
 end
-if openModem() then
-  print("Modem present — multi-turtle: `join` then `mine` (needs offline_site).")
+local hasModem = ensureModemForComms(true) or openModem() or findModemInInventory() ~= nil
+if hasModem then
+  print("Modem slot " .. MODEM_SLOT .. ": swaps over diamond pickaxe for site/admin.")
+  print("Optional site board: `join` / `mine` for shared Y bands.")
+  joinSite(2, true)
+  -- Idle with modem listening; pickaxe re-equipped when a dig starts.
+  ensureModemForComms(true)
+else
+  print("No modem in slot " .. MODEM_SLOT .. " — dig works; no site/admin link.")
 end
 
 print("")
-print("Type help. Examples:  area 16x32 40   |   join / mine   |   continue")
+print("Type help. Examples:  area 16x32 40   |   continue")
 print("")
 
-while true do
-  write("mine> ")
-  local line = read()
-  local r = handleCommand(line)
-  if r == "exit" then break end
+local function consoleLoop()
+  while true do
+    write("mine> ")
+    local line = read()
+    local r = handleCommand(line)
+    if r == "exit" then return end
+  end
+end
+
+if hasModem then
+  parallel.waitForAny(consoleLoop, mineNetLoop)
+else
+  consoleLoop()
 end
 
 print("Offline miner stopped.")
