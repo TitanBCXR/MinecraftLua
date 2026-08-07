@@ -1,6 +1,6 @@
 --[[
   offline_miner.lua  -  Local quarry turtle (optional site board)
-  Titan-Version: 1.2.0
+  Titan-Version: 1.2.1
 
   Place the turtle at the TOP-FRONT-LEFT corner of the dig, facing into the
   mine. That cell is origin 0,0,0:
@@ -1043,8 +1043,41 @@ local function sitePayload(extra)
   return msg
 end
 
+local applyingAssign = false
+
+-- Path to the top of a Y band (0, y0, 0). Pickaxe must be equipped for digs.
+local function moveIntoBand(y0, y1)
+  y0 = math.floor(tonumber(y0) or 0)
+  y1 = math.floor(tonumber(y1) or y0)
+  if y1 < y0 then y0, y1 = y1, y0 end
+  if digging then
+    print(("Y band %d..%d saved — finish/stop current dig, then I'll move in."):format(y0, y1))
+    return false
+  end
+  restorePickAfterComms()
+  equipToolFromInventory(nil, true)
+  if not ensureFuel() then
+    print("Need fuel to move into Y band.")
+    return false
+  end
+  local prev = activeJob
+  -- Clamp downward travel to this band's floor while pathing in.
+  activeJob = { y0 = y0, y1 = y1, stopY = y1 + 1, H = y1 + 1 }
+  print(("Moving into Y band %d..%d (path to 0,%d,0)..."):format(y0, y1, y0))
+  local ok, err = goTo(0, y0, 0)
+  activeJob = prev
+  faceForward()
+  if not ok then
+    print("Could not reach band Y=" .. y0 .. ": " .. tostring(err))
+    return false
+  end
+  print(("In position at Y=%d (band %d..%d). `mine` to dig."):format(pos.y, y0, y1))
+  return true
+end
+
 -- Apply admin-tablet Y band; ack back to the tablet (and broadcast).
 local function applyQuarryAssign(msg, fromId)
+  if applyingAssign then return false end
   if type(msg) ~= "table" then return false end
   local tid = tonumber(msg.turtleId)
   if tid and tid ~= os.getComputerID() then return false end
@@ -1053,6 +1086,12 @@ local function applyQuarryAssign(msg, fromId)
   if y0 == nil or y1 == nil then return false end
   y0, y1 = math.floor(y0), math.floor(y1)
   if y1 < y0 then y0, y1 = y1, y0 end
+
+  -- Same band and already sitting on it — just ack.
+  local alreadyThere = adminAssign
+      and tonumber(adminAssign.y0) == y0 and tonumber(adminAssign.y1) == y1
+      and pos.y == y0 and pos.x == 0 and pos.z == 0
+
   adminAssign = {
     y0 = y0, y1 = y1,
     assignId = msg.assignId,
@@ -1088,6 +1127,12 @@ local function applyQuarryAssign(msg, fromId)
     end
   end
 
+  applyingAssign = true
+  local moved = false
+  if not digging and not alreadyThere then
+    moved = moveIntoBand(y0, y1)
+  end
+
   local ack = {
     type = "quarry_assign_ack",
     ok = true,
@@ -1096,14 +1141,18 @@ local function applyQuarryAssign(msg, fromId)
     y0 = y0, y1 = y1,
     assignId = msg.assignId,
     digging = digging == true,
-    status = digging and "mining" or "assigned",
+    atBand = (pos.y == y0),
+    posY = pos.y,
+    status = digging and "mining" or (moved or alreadyThere) and "at_band" or "assigned",
   }
   if fromId then rednet.send(fromId, ack, PROTO_QUARRY) end
   local adminId = tonumber(msg.from)
   if adminId and adminId ~= fromId then rednet.send(adminId, ack, PROTO_QUARRY) end
   rednet.broadcast(ack, PROTO_QUARRY)
   print(("\n[admin] Y assign %d..%d — acked%s"):format(
-    y0, y1, digging and " (applies on next mine/band)" or ""))
+    y0, y1,
+    digging and " (move after current dig)" or (moved and " — moved in") or ""))
+  applyingAssign = false
   return true
 end
 
@@ -1608,13 +1657,34 @@ local function runSavedJob(j, fromContinue)
     return
   end
   STOP = false
-  if fromContinue then
+  restorePickAfterComms()
+  equipToolFromInventory(nil, true)
+
+  local bandY0 = (j.y0 ~= nil) and math.floor(tonumber(j.y0) or 0) or nil
+  if bandY0 ~= nil then
+    -- Y-band jobs: go to the top of the band (do not yank back to surface first).
+    if fromContinue then
+      print("Continue: assuming turtle is at origin 0,0,0 facing into the mine.")
+      assumeAtOrigin()
+      suckFuelFromLeft()
+    elseif pos.y < 1 then
+      suckFuelFromLeft()
+    end
+    activeJob = j
+    print(("Moving into Y band %d..%d ..."):format(bandY0, tonumber(j.y1) or bandY0))
+    if not goTo(0, bandY0, 0) then
+      print("Could not reach band Y=" .. bandY0)
+      activeJob = nil
+      return
+    end
+  elseif fromContinue then
     print("Continue: assuming turtle is at origin 0,0,0 facing into the mine.")
     assumeAtOrigin()
     suckFuelFromLeft()
   else
     if not goHome() then print("Could not reach origin."); return end
   end
+
   -- Soft-join site if present; publish footprint, then dig with pickaxe equipped.
   if not siteId then joinSite(2, true) end
   publishMine({ _siteType = "quarry_job", job = j, status = "active" })
