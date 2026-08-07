@@ -1,13 +1,14 @@
 --[[
   admin.lua  -  Titan admin console for a POCKET computer ("Live" tablet)
-  Titan-Version: 1.4.2
+  Titan-Version: 1.4.3
 
   Pocket remote for the whole fleet. Keep it on you; it joins the mesh like
   every other Titan device (MAIN router + modem hops).
 
   Two modes (saved in admin.cfg):
-    simple   — numbered menus anyone can use (default)
+    simple   — phone-style home screen with app tiles (default)
     advanced — command-line / SSH power-user console
+              `help` is paginated (10 commands per page)
 
   Switch anytime:  mode simple | mode advanced
 
@@ -204,50 +205,25 @@ local function requestQuarryStatus(timeout)
 end
 
 --------------------------------------------------------------------------------
--- Auth — password prompt runs BEFORE parallel background loops
+-- Auth — login GUI is defined after the shared GUI helpers below
 --------------------------------------------------------------------------------
+local promptUnlockAtStart  -- assigned later (login screen)
+local showLoginScreen      -- assigned later
+
 local function tryUnlock(promptLabel)
   if unlocked then return true end
   if titan.sshIsAuthed and titan.sshIsAuthed() then
     unlocked = true
     return true
   end
+  if showLoginScreen then
+    return showLoginScreen({ title = promptLabel or "Unlock", once = true })
+  end
   if titan.login(promptLabel or "Master password") then
     unlocked = true
-    print("Unlocked.")
     return true
   end
   return false
-end
-
--- Blocking boot / lock prompt. Keeps asking until the password is accepted.
-local function promptUnlockAtStart()
-  if unlocked then return end
-  if titan.sshIsAuthed and titan.sshIsAuthed() then
-    unlocked = true
-    return
-  end
-  term.setBackgroundColor(colors.black)
-  term.clear()
-  term.setCursorPos(1, 1)
-  if term.setTextColor then term.setTextColor(colors.white) end
-  print("== Titan Admin (" .. (os.getComputerLabel() or ("#" .. os.getComputerID())) .. ") ==")
-  print("Master password required.")
-  print("(Parent Center with the master floppy must be online.)")
-  print("")
-  while not unlocked do
-    write("Master password: ")
-    local pw = read("*")
-    if pw and pw ~= "" then
-      if titan.checkPassword(pw) then
-        unlocked = true
-        print("")
-        print("Unlocked.")
-      else
-        print("Wrong password, or no master online. Try again.")
-      end
-    end
-  end
 end
 
 local function requireAuth()
@@ -256,7 +232,6 @@ local function requireAuth()
     unlocked = true
     return true
   end
-  print("Admin action - master password required.")
   if tryUnlock("Master password") then return true end
   print("Denied (need the Parent Center master online + correct password).")
   return false
@@ -403,6 +378,118 @@ local function guiText(out, x, y, txt, fg, bg)
   if out.setTextColor then out.setTextColor(fg or colors.white) end
   out.setCursorPos(x, y)
   out.write(txt:sub(1, math.max(0, w - x + 1)))
+end
+
+--------------------------------------------------------------------------------
+-- Login screen GUI
+--------------------------------------------------------------------------------
+showLoginScreen = function(opts)
+  opts = opts or {}
+  if unlocked then return true end
+  if titan.sshIsAuthed and titan.sshIsAuthed() then
+    unlocked = true
+    return true
+  end
+
+  local errMsg = nil
+  local once = opts.once == true
+
+  while not unlocked do
+    local w, h = term.getSize()
+    local color = termIsColor()
+    local out = term
+    local bg = colors.black
+    local accent = color and colors.cyan or colors.white
+    local panel = color and colors.gray or colors.black
+    local btnBg = color and colors.lime or colors.white
+    local btnFg = colors.black
+
+    if out.setBackgroundColor then out.setBackgroundColor(bg) end
+    out.clear()
+
+    -- Header band
+    local headerH = math.min(4, math.max(2, math.floor(h * 0.22)))
+    guiFill(out, 1, 1, w, headerH, accent, btnFg)
+    guiText(out, 2, 1, " TITAN", btnFg, accent)
+    if headerH >= 2 then
+      guiText(out, 2, 2, " Admin Tablet", btnFg, accent)
+    end
+    if headerH >= 3 then
+      guiText(out, 2, 3, " " .. (opts.title or "Sign in"), color and colors.black or btnFg, accent)
+    end
+
+    local y = headerH + 2
+    local label = os.getComputerLabel() or ("#" .. os.getComputerID())
+    guiText(out, 2, y, "Device  " .. label:sub(1, w - 10), colors.lightGray, bg)
+    y = y + 2
+
+    guiText(out, 2, y, "Master password", colors.white, bg)
+    y = y + 1
+
+    -- Password field
+    local fieldX, fieldW = 2, math.max(10, w - 2)
+    local fieldY = y
+    guiFill(out, fieldX, fieldY, fieldW, 1, panel, colors.white)
+    guiText(out, fieldX, fieldY, " ", colors.white, panel)
+
+    y = fieldY + 2
+    if errMsg then
+      guiText(out, 2, y, errMsg:sub(1, w - 2), colors.red, bg)
+      y = y + 1
+    end
+
+    -- Unlock button
+    local btnLabel = "  Unlock  "
+    local btnY = math.min(h - 3, y + 1)
+    local btnX = math.max(2, math.floor((w - #btnLabel) / 2) + 1)
+    guiFill(out, btnX, btnY, #btnLabel, 1, btnBg, btnFg)
+    guiText(out, btnX, btnY, btnLabel, btnFg, btnBg)
+
+    guiText(out, 2, h - 1, "Parent Center + master floppy online", colors.gray, bg)
+    guiText(out, 2, h, "Type password, then Enter", colors.gray, bg)
+
+    -- Read password in the field
+    if out.setBackgroundColor then out.setBackgroundColor(panel) end
+    if out.setTextColor then out.setTextColor(colors.white) end
+    out.setCursorPos(fieldX, fieldY)
+    local pw = read("*")
+    if pw and pw ~= "" then
+      if titan.checkPassword(pw) then
+        unlocked = true
+        if out.setBackgroundColor then out.setBackgroundColor(bg) end
+        out.clear()
+        guiFill(out, 1, 1, w, h, color and colors.green or bg, colors.white)
+        guiText(out, 2, math.floor(h / 2), "Unlocked", colors.white, color and colors.green or bg)
+        sleep(0.45)
+        if out.setBackgroundColor then out.setBackgroundColor(bg) end
+        out.clear()
+        out.setCursorPos(1, 1)
+        return true
+      end
+      errMsg = "Wrong password or no master online"
+      if once then
+        if out.setBackgroundColor then out.setBackgroundColor(bg) end
+        out.clear()
+        out.setCursorPos(1, 1)
+        return false
+      end
+    elseif once then
+      if out.setBackgroundColor then out.setBackgroundColor(bg) end
+      out.clear()
+      out.setCursorPos(1, 1)
+      return false
+    end
+  end
+  return unlocked
+end
+
+promptUnlockAtStart = function()
+  if unlocked then return end
+  if titan.sshIsAuthed and titan.sshIsAuthed() then
+    unlocked = true
+    return
+  end
+  showLoginScreen({ title = "Sign in", once = false })
 end
 
 local function guiBar(L, y, title, subtitle, accent)
@@ -1303,31 +1390,108 @@ end
 --------------------------------------------------------------------------------
 -- Commands
 --------------------------------------------------------------------------------
+local HELP_PER_PAGE = 10
+local HELP_ENTRIES = {
+  { "live [board]", "MAIN boards (local/global/stats/gps/bots/quarry)" },
+  { "quarry", "Offline quarry site progress %" },
+  { "bots", "All known turtles" },
+  { "miners", "Miner turtles only" },
+  { "loaders", "Loader turtles only" },
+  { "markers", "Site markers" },
+  { "pending", "Turtles waiting to deploy" },
+  { "stuck", "Recent stuck reports" },
+  { "connections", "SSH-reachable hosts" },
+  { "list [filter]", "Filter connections" },
+  { "ping", "Ping the mesh" },
+  { "who <id|name>", "Lookup a device" },
+  { "link", "Show network topology" },
+  { "link auto", "Auto peer routers / attach modems" },
+  { "link <a> <b>", "Peer or attach by role" },
+  { "connect <id>", "SSH shell (alias: ssh)" },
+  { "goto <id> x y z", "Send turtle to coords" },
+  { "return|park <id>", "Send turtle home / park" },
+  { "refuel <id>", "Ask turtle to refuel" },
+  { "stop <id>", "Stop turtle job" },
+  { "mine|continue <id>", "Start / resume mining" },
+  { "deploy <id> <role>", "Deploy miner|loader|builder|gatherer" },
+  { "dc | center", "Jump to Parent Center" },
+  { "flatten ...", "Run flatten on Parent Center" },
+  { "jobs", "Parent Center job list" },
+  { "scan | build", "Builder scan / build" },
+  { "mode simple", "Phone home UI" },
+  { "mode advanced", "Command console" },
+  { "hostname [name]", "Show / set label" },
+  { "login | lock", "Unlock session / lock tablet" },
+  { "help [page]", "This list (10 per page)" },
+  { "exit", "Quit admin" },
+}
+
+local function printHelpPage(page, pages)
+  pages = pages or math.max(1, math.ceil(#HELP_ENTRIES / HELP_PER_PAGE))
+  page = math.max(1, math.min(pages, tonumber(page) or 1))
+  local i0 = (page - 1) * HELP_PER_PAGE + 1
+  local i1 = math.min(#HELP_ENTRIES, i0 + HELP_PER_PAGE - 1)
+  print(("Commands  page %d/%d  (%d–%d of %d)"):format(
+    page, pages, i0, i1, #HELP_ENTRIES))
+  print(string.rep("-", 36))
+  for i = i0, i1 do
+    local e = HELP_ENTRIES[i]
+    local n = i - i0 + 1
+    print((" %2d  %-20s %s"):format(n, e[1], e[2]))
+  end
+  return page, pages
+end
+
+local function showHelpPages(startPage)
+  local pages = math.max(1, math.ceil(#HELP_ENTRIES / HELP_PER_PAGE))
+  local page = math.max(1, math.min(pages, tonumber(startPage) or 1))
+  -- SSH / non-interactive: one page then return
+  if titan.sshIsAuthed and titan.sshIsAuthed() then
+    printHelpPage(page, pages)
+    if pages > 1 then
+      print(("More: help <1-%d>"):format(pages))
+    end
+    return
+  end
+  while true do
+    term.clear(); term.setCursorPos(1, 1)
+    if term.setTextColor then term.setTextColor(colors.white) end
+    printHelpPage(page, pages)
+    print("")
+    print("Pick page 1-" .. pages .. "  |  n next  |  p prev  |  Enter back")
+    write("help> ")
+    local line = tostring(read() or ""):lower()
+    if line == "" or line == "q" or line == "back" or line == "exit" then
+      break
+    elseif line == "n" or line == "next" or line == "+" or line == "d" then
+      page = (page % pages) + 1
+    elseif line == "p" or line == "prev" or line == "-" or line == "a" then
+      page = page - 1
+      if page < 1 then page = pages end
+    else
+      local n = tonumber(line)
+      if n and n >= 1 and n <= pages then
+        page = n
+      else
+        print("Unknown. Enter a page number, n/p, or Enter.")
+        sleep(0.7)
+      end
+    end
+  end
+end
+
 local function handleCommand(a)
   local cmd = (a[1] or ""):lower()
 
   if cmd == "" then
     return true
-  elseif cmd == "help" then
-    if cfg.mode == "simple" then
-      print("Simple mode: use the numbered menu.")
-      print("  mode advanced   — switch to command-line console")
-      print("  mode simple     — back to menus")
+  elseif cmd == "help" or cmd == "cmds" or cmd == "?" then
+    if cfg.mode == "simple" and not (titan.sshIsAuthed and titan.sshIsAuthed()) then
+      print("Simple mode: open apps on the home screen.")
+      print("  mode advanced   — command console (paginated help)")
+      print("  mode simple     — phone home")
     else
-      print("VIEW  : live [local|global|stats|gps|bots|quarry]")
-      print("        quarry               offline quarry % / turtles")
-      print("        bots | miners | loaders | markers | pending | stuck")
-      print("NET   : connections | hosts | list [filter] | ping | who")
-      print("        link | link <a> <b> | link auto | link peer|modem ...")
-      print("SSH   : connect <id|name> [cmd...]   (alias: ssh)")
-      print("BOT   : goto | return | park | refuel | stop | mine | continue")
-      print("DEPLOY: deploy <id> <miner|loader|builder|gatherer> [auto] [x y z]")
-      print("FLEET : dc | center          jump to Parent Center")
-      print("        flatten <args...>    run flatten on Parent Center")
-      print("        jobs                 Parent Center job list")
-      print("BUILD : scan | build")
-      print("MODE  : mode simple | mode advanced")
-      print("login | lock | hostname | exit")
+      showHelpPages(a[2])
     end
 
   elseif cmd == "mode" or cmd == "ui" then
@@ -1626,7 +1790,7 @@ local function handleCommand(a)
 end
 
 --------------------------------------------------------------------------------
--- Simple mode helpers (numbered menus)
+-- Simple mode helpers (phone home + wizards)
 --------------------------------------------------------------------------------
 local function pauseSimple(msg)
   if msg then print(msg) end
@@ -1844,35 +2008,6 @@ local function simpleLiveMenu()
   end
 end
 
-local function drawSimpleMenu()
-  term.clear(); term.setCursorPos(1, 1)
-  if term.setTextColor then term.setTextColor(colors.white) end
-  print("== Titan Admin — SIMPLE ==")
-  print(os.getComputerLabel() or ("#" .. os.getComputerID()))
-  local ui = termIsColor() and "advanced color UI" or "mono UI"
-  print("(" .. ui .. ")")
-  print("")
-  print("  1) Network stats (live boards)")
-  print("  2) Miners")
-  print("  3) Loaders")
-  print("  4) Sites / markers")
-  print("  5) Waiting for deploy")
-  print("  6) Deploy a turtle (wizard)")
-  print("  7) Start a flatten job (wizard)")
-  print("  8) Connect to a device")
-  print("  9) Parent Center")
-  print(" 10) Network link (routers + modems)")
-  print(" 11) Park a turtle")
-  print(" 12) Stop a turtle")
-  print(" 13) Continue mining")
-  print(" 14) Live boards (pick view)")
-  print(" 15) Quarry progress (%)")
-  print(" 16) Advanced mode (commands)")
-  print(" 17) Lock tablet")
-  print("  0) Exit")
-  print("")
-end
-
 local function simpleLinkMenu()
   if not requireAuth() then pauseSimple(); return end
   print("Network link")
@@ -1899,64 +2034,210 @@ local function simpleLinkMenu()
   end
 end
 
-local function simpleMenuLoop()
-  while cfg.mode == "simple" do
-    drawSimpleMenu()
-    local n = askNumber("Choose: ")
-    if n == 0 then
-      return "exit"
-    elseif n == 1 then
-      simpleStatusBoard()
-    elseif n == 2 then
-      printBots("miner"); pauseSimple()
-    elseif n == 3 then
-      printBots("loader"); pauseSimple()
-    elseif n == 4 then
-      printBots("marker"); pauseSimple()
-    elseif n == 5 then
-      handleCommand({ "pending" }); pauseSimple()
-    elseif n == 6 then
-      simpleDeployWizard()
-    elseif n == 7 then
-      simpleFlattenWizard()
-    elseif n == 8 then
-      simpleConnectMenu()
-    elseif n == 9 then
-      handleCommand({ "dc" })
-    elseif n == 10 then
-      simpleLinkMenu()
-    elseif n == 11 then
-      simpleBotAction("park", nil)
-    elseif n == 12 then
-      simpleBotAction("stop", nil)
-    elseif n == 13 then
-      simpleBotAction("continue", "miner")
-    elseif n == 14 then
-      if titan.sshIsAuthed and titan.sshIsAuthed() then
-        print("Live view is local-only.")
-        pauseSimple()
-      else
-        simpleLiveMenu()
-      end
-    elseif n == 15 then
-      if titan.sshIsAuthed and titan.sshIsAuthed() then
-        handleCommand({ "quarry" }); pauseSimple()
-      else
-        liveView("quarry")
-      end
-    elseif n == 16 then
-      cfg.mode = "advanced"
-      saveAdminCfg()
-      print("Switching to ADVANCED mode...")
-      sleep(0.4)
-      return "switch_advanced"
-    elseif n == 17 then
-      unlocked = false
-      print("Locked.")
-      promptUnlockAtStart()
+-- Phone-style app catalog (id → action). Colors used when term.isColor().
+local PHONE_APPS = {
+  { id = "stats",    name = "Stats",    sub = "network",  bg = colors.blue },
+  { id = "miners",   name = "Miners",   sub = "turtles",  bg = colors.brown },
+  { id = "loaders",  name = "Loaders",  sub = "escorts",  bg = colors.orange },
+  { id = "sites",    name = "Sites",    sub = "markers",  bg = colors.purple },
+  { id = "pending",  name = "Pending",  sub = "deploy",   bg = colors.red },
+  { id = "deploy",   name = "Deploy",   sub = "wizard",   bg = colors.magenta },
+  { id = "flatten",  name = "Flatten",  sub = "wizard",   bg = colors.green },
+  { id = "connect",  name = "Connect",  sub = "SSH",      bg = colors.cyan },
+  { id = "center",   name = "Center",   sub = "parent",   bg = colors.lightBlue },
+  { id = "link",     name = "Link",     sub = "mesh",     bg = colors.white },
+  { id = "park",     name = "Park",     sub = "turtle",   bg = colors.gray },
+  { id = "stop",     name = "Stop",     sub = "turtle",   bg = colors.red },
+  { id = "continue", name = "Resume",   sub = "mining",   bg = colors.lime },
+  { id = "boards",   name = "Boards",   sub = "live",     bg = colors.yellow },
+  { id = "quarry",   name = "Quarry",   sub = "offline",  bg = colors.green },
+  { id = "advanced", name = "Terminal", sub = "commands", bg = colors.lightGray },
+  { id = "lock",     name = "Lock",     sub = "screen",   bg = colors.black },
+}
+
+local PHONE_PAGE = 10  -- apps per home page
+
+local function runPhoneApp(id)
+  if id == "stats" then
+    simpleStatusBoard()
+  elseif id == "miners" then
+    printBots("miner"); pauseSimple()
+  elseif id == "loaders" then
+    printBots("loader"); pauseSimple()
+  elseif id == "sites" then
+    printBots("marker"); pauseSimple()
+  elseif id == "pending" then
+    handleCommand({ "pending" }); pauseSimple()
+  elseif id == "deploy" then
+    simpleDeployWizard()
+  elseif id == "flatten" then
+    simpleFlattenWizard()
+  elseif id == "connect" then
+    simpleConnectMenu()
+  elseif id == "center" then
+    handleCommand({ "dc" })
+  elseif id == "link" then
+    simpleLinkMenu()
+  elseif id == "park" then
+    simpleBotAction("park", nil)
+  elseif id == "stop" then
+    simpleBotAction("stop", nil)
+  elseif id == "continue" then
+    simpleBotAction("continue", "miner")
+  elseif id == "boards" then
+    if titan.sshIsAuthed and titan.sshIsAuthed() then
+      print("Live view is local-only.")
+      pauseSimple()
     else
-      print("Invalid choice.")
-      sleep(0.6)
+      simpleLiveMenu()
+    end
+  elseif id == "quarry" then
+    if titan.sshIsAuthed and titan.sshIsAuthed() then
+      handleCommand({ "quarry" }); pauseSimple()
+    else
+      liveView("quarry")
+    end
+  elseif id == "advanced" then
+    cfg.mode = "advanced"
+    saveAdminCfg()
+    return "switch_advanced"
+  elseif id == "lock" then
+    unlocked = false
+    promptUnlockAtStart()
+  end
+  return nil
+end
+
+local function drawPhoneHome(page, pages, tiles)
+  local w, h = term.getSize()
+  local color = termIsColor()
+  local out = term
+  local bg = colors.black
+  if out.setBackgroundColor then out.setBackgroundColor(bg) end
+  out.clear()
+
+  -- Status bar
+  local barBg = color and colors.gray or colors.black
+  local barFg = colors.white
+  guiFill(out, 1, 1, w, 1, barBg, barFg)
+  local title = "Titan"
+  local clock = textutils.formatTime(os.time(), true)
+  guiText(out, 2, 1, title, barFg, barBg)
+  guiText(out, math.max(2, w - #clock), 1, clock, colors.lightGray, barBg)
+
+  local label = os.getComputerLabel() or ("#" .. os.getComputerID())
+  guiText(out, 2, 2, label:sub(1, w - 2), colors.lightGray, bg)
+
+  -- App grid (2 columns)
+  local cols = (w >= 30) and 3 or 2
+  local gap = 1
+  local tileW = math.floor((w - 2 - gap * (cols - 1)) / cols)
+  local tileH = 3
+  local startY = 4
+  local maxRows = math.max(1, math.floor((h - 6) / (tileH + 0)))
+  -- Force layout to fit PAGE apps: prefer 5 rows x 2 cols
+  if cols == 2 then maxRows = math.min(maxRows, 5) end
+
+  tiles = tiles or {}
+  for i, app in ipairs(tiles) do
+    local idx = i - 1
+    local col = (idx % cols)
+    local row = math.floor(idx / cols)
+    local x = 2 + col * (tileW + gap)
+    local y = startY + row * tileH
+    if y + tileH - 1 >= h - 2 then break end
+    local abg = color and (app.bg or colors.blue) or colors.gray
+    local afg = colors.white
+    if abg == colors.yellow or abg == colors.lime or abg == colors.white then
+      afg = colors.black
+    end
+    if abg == colors.black then
+      abg = color and colors.gray or colors.black
+    end
+    guiFill(out, x, y, tileW, tileH - 1, abg, afg)
+    local num = tostring(i % 10)
+    if i == 10 then num = "0" end
+    guiText(out, x + 1, y, num .. " " .. tostring(app.name):sub(1, tileW - 3), afg, abg)
+    if tileH >= 3 then
+      guiText(out, x + 1, y + 1, tostring(app.sub or ""):sub(1, tileW - 2),
+        color and colors.lightGray or afg, abg)
+    end
+    app._x, app._y, app._w, app._h = x, y, tileW, tileH - 1
+  end
+
+  -- Page dots + dock
+  local dockY = h
+  local pageTxt = ("<%d/%d>"):format(page, pages)
+  guiFill(out, 1, dockY, w, 1, barBg, barFg)
+  guiText(out, 2, dockY, pageTxt, colors.lightGray, barBg)
+  local dock = "< > page  E exit"
+  guiText(out, math.max(2, w - #dock), dockY, dock, colors.white, barBg)
+end
+
+local function phoneHitApp(tiles, x, y)
+  for i, app in ipairs(tiles) do
+    if app._x and x >= app._x and x < app._x + app._w
+        and y >= app._y and y < app._y + app._h then
+      return app, i
+    end
+  end
+  return nil
+end
+
+local function simpleMenuLoop()
+  local page = 1
+  while cfg.mode == "simple" do
+    local pages = math.max(1, math.ceil(#PHONE_APPS / PHONE_PAGE))
+    if page > pages then page = pages end
+    if page < 1 then page = 1 end
+    local i0 = (page - 1) * PHONE_PAGE + 1
+    local tiles = {}
+    for i = i0, math.min(#PHONE_APPS, i0 + PHONE_PAGE - 1) do
+      tiles[#tiles + 1] = PHONE_APPS[i]
+    end
+    drawPhoneHome(page, pages, tiles)
+
+    local ev, p1, p2, p3 = os.pullEvent()
+    if ev == "char" then
+      local ch = tostring(p1 or ""):lower()
+      if ch == "e" or ch == "q" then
+        return "exit"
+      elseif ch == "n" or ch == "d" then
+        page = (page % pages) + 1
+      elseif ch == "p" or ch == "a" then
+        page = page - 1
+        if page < 1 then page = pages end
+      elseif ch >= "1" and ch <= "9" then
+        local n = tonumber(ch)
+        if tiles[n] then
+          local r = runPhoneApp(tiles[n].id)
+          if r then return r end
+        end
+      elseif ch == "0" then
+        if tiles[10] then
+          local r = runPhoneApp(tiles[10].id)
+          if r then return r end
+        end
+      end
+    elseif ev == "key" then
+      local K = keys
+      if p1 == K.right or p1 == K.pagedown then
+        page = (page % pages) + 1
+      elseif p1 == K.left or p1 == K.pageup then
+        page = page - 1
+        if page < 1 then page = pages end
+      elseif p1 == K.q then
+        return "exit"
+      end
+    elseif ev == "mouse_click" then
+      local x, y = p2, p3
+      local app = phoneHitApp(tiles, x, y)
+      if app then
+        local r = runPhoneApp(app.id)
+        if r then return r end
+      end
+    elseif ev == "terminate" then
+      return "exit"
     end
   end
   return "switch_advanced"
@@ -1966,7 +2247,7 @@ local function advancedConsoleLoop()
   term.clear(); term.setCursorPos(1, 1)
   print("== Titan Admin — ADVANCED ==")
   print(os.getComputerLabel() or ("#" .. os.getComputerID()))
-  print("Command console. Type 'help'.  mode simple  for menus.")
+  print("Type help  (10 cmds/page, pick a page).  mode simple  for phone UI.")
   print("Quick:  live  |  quarry  |  connections  |  connect <name>  |  dc")
   while cfg.mode == "advanced" do
     write("admin> ")
@@ -2017,19 +2298,37 @@ end)
 -- Password FIRST (blocking), before any parallel loops touch the terminal.
 promptUnlockAtStart()
 
--- Optional first-run mode pick
+-- Optional first-run mode pick (friendly chooser)
 if not fs.exists(CFG_FILE) then
-  print("")
-  print("Choose tablet UI:")
-  print("  1) Simple menus  (recommended)")
-  print("  2) Advanced commands")
-  write("Pick [1]: ")
+  local w, h = term.getSize()
+  local color = termIsColor()
+  local out = term
+  if out.setBackgroundColor then out.setBackgroundColor(colors.black) end
+  out.clear()
+  local accent = color and colors.cyan or colors.white
+  guiFill(out, 1, 1, w, 2, accent, colors.black)
+  guiText(out, 2, 1, " Choose your UI", colors.black, accent)
+  guiText(out, 2, 4, "1  Phone home   (apps — recommended)", colors.white, colors.black)
+  guiText(out, 2, 5, "   Tap tiles, swipe pages", colors.lightGray, colors.black)
+  guiText(out, 2, 7, "2  Terminal     (commands + help pages)", colors.white, colors.black)
+  guiText(out, 2, 8, "   Power users / SSH", colors.lightGray, colors.black)
+  guiText(out, 2, h, "Pick 1 or 2  [default 1]", colors.gray, colors.black)
+  write("")
+  term.setCursorPos(2, h - 1)
   local pick = tonumber(read())
   cfg.mode = (pick == 2) and "advanced" or "simple"
   saveAdminCfg()
 end
 
-print("Starting network (" .. cfg.mode .. " UI)...")
+do
+  local w, h = term.getSize()
+  if term.setBackgroundColor then term.setBackgroundColor(colors.black) end
+  term.clear()
+  guiText(term, 2, math.max(1, math.floor(h / 2)),
+    "Starting " .. cfg.mode .. "…", colors.lightGray, colors.black)
+  sleep(0.35)
+end
+
 parallel.waitForAny(
   listenerLoop,
   quarryListenerLoop,

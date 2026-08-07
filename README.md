@@ -614,42 +614,37 @@ Needs a **pocket computer with a wireless modem** upgrade and `lib/titan.lua`
 (install with the installer → **"Admin tablet"**, or `wget` both files). The
 tablet itself needs no GPS.
 
-**Boots with a master-password prompt** (before network loops start — same floppy
-as Parent Center). Keeps asking until accepted. Deploy / SSH / fleet control need
-an unlocked session. No master online → denied until the floppy is up.
+**Boots with a login screen GUI** (before network loops start — same floppy as
+Parent Center). Type the master password in the field and press Enter. Deploy /
+SSH / fleet control need an unlocked session. No master online → denied until
+the floppy is up. **Lock** returns you to the login screen.
 
 ### Two UIs (same program)
 
 | Mode | Who it’s for | How to enter |
 |------|----------------|--------------|
-| **Simple** (default) | Anyone — numbered menus, wizards | Boot choice / `mode simple` |
-| **Advanced** | Terminal users — full command line | Boot choice / `mode advanced` |
+| **Simple** (default) | Anyone — phone home with app tiles | Boot choice / `mode simple` |
+| **Advanced** | Terminal users — command line | Boot choice / `mode advanced` |
 
-Simple menus cover **network stats / live boards**, deploy wizard, flatten
-wizard, connect, **network link**, park/stop, Parent Center jump. Advanced keeps
-the full command set:
+**Simple (phone home):** colored app tiles (Stats, Miners, Deploy, Quarry, …).
+Tap a tile or press `1`–`0`. Left/right (or `a`/`d`) flips pages (10 apps each).
+`E` exits. Wizards and live boards open from the matching app.
+
+**Advanced:** type commands as before. `help` is **paginated** — 10 commands per
+page; enter a page number, or `n`/`p` for next/prev. Over SSH, `help 2` prints
+one page.
 
 ```
-VIEW  : live [local|global|stats|gps|bots]
-        bots | miners | loaders | markers | pending | stuck | who <id|name>
-NET   : connections | hosts | list [filter]   SSH-capable hosts on the mesh
-        link | link <a> <b> | link auto | link peer|modem ...
-        ping
-SSH   : connect <id|name> [cmd...]   (aliases: ssh, c)
-FLEET : dc | center [cmd...]         jump to Parent Center
-        flatten <args...> | jobs     run on Parent Center via SSH
-BOT   : goto | return | park | refuel | stop | mine | continue
-DEPLOY: deploy <id> <miner|loader|builder|gatherer> [auto] [x y z]
-BUILD : scan | build
-MODE  : mode simple | mode advanced
-        login | lock | hostname | exit
+help [page]              paginated command list (10 / page)
+live [board] | quarry | bots | miners | loaders | markers | pending
+connections | link | link auto | connect <id|name>
+deploy | flatten | dc | park | stop | continue | mode simple|advanced
 ```
 
-**Live boards** pull the same local / global / stats / GPS views as the MAIN
-router monitor (`board_req`). An **advanced (color) pocket** gets the pretty GUI
-(header bars, status chips, alternating rows); a normal pocket stays mono.
-Layout adapts to the tablet size. Keys: `1`–`5` select board, `←`/`→` cycle,
-`r` refresh, `q` quit.
+**Live boards** pull the same local / global / stats / GPS / bots / quarry views
+as the MAIN router monitor (`board_req`). An **advanced (color) pocket** gets the
+pretty GUI; a normal pocket stays mono. Keys: `1`–`6` select board, `←`/`→`
+cycle, `r` refresh, `q` quit.
 
 **`link`** builds the ender-router backbone and attaches local RF modems. Prefer
 `link auto` once hubs have GPS, or `link 5 12` to peer two routers / attach a
