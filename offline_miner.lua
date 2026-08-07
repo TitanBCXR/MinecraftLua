@@ -1,6 +1,6 @@
 --[[
   offline_miner.lua  -  Local quarry turtle (optional site board)
-  Titan-Version: 1.2.2
+  Titan-Version: 1.2.4
 
   Place the turtle at the TOP-FRONT-LEFT corner of the dig, facing into the
   mine. That cell is origin 0,0,0:
@@ -12,18 +12,17 @@
   First boot (or `setup`):
     * Fuel chest is on the LEFT  → top up slot 16 with coal only (keeps it there)
     * Storage chest is BEHIND    → dumps slots 1-14 (never 15 modem / 16 fuel)
-    * Slot 15 = wireless modem (swapped with the diamond pickaxe for site/admin
-      comms; never replaces a loader / non-pickaxe upgrade)
+    * Slot 15 = wireless modem
+    * Pickaxe on turtle upgrade slot 2 (RIGHT) — modem only swaps with that side
+      (left upgrade / chunk loader is never touched)
     * Site computer (optional) LEFT of the storage chest — multi-turtle Y claims
-    * If a pickaxe (incl. enchanted) is in the turtle inventory, equip it as a
-      tool upgrade via turtle.equipLeft/Right (crafting often rejects enchantments)
 
   box / area — ALWAYS 1 Y-layer at a time (walk the plane, then drop one).
                Never digs 2 high; no player headroom on quarry jobs.
 
   Modem (slot 15):
-    For site/admin talk, equips the modem in place of the diamond pickaxe, then
-    puts the pickaxe back before digging. Loader upgrades are never touched.
+    Swaps only with RIGHT upgrade (slot 2 pickaxe) for site/admin check-ins:
+    every depot dump, and at the end of each dig line (before next row / layer).
     join                     find site board (optional)
     mine                     claim a Y band when a site is online
     site                     show site / BPC / broadcast status
@@ -54,12 +53,13 @@ local CFG = "offline_miner.cfg"
 local JOB_FILE = "offline_miner_job.cfg"
 local EXCLUDE = "exclude.txt"
 local FUEL_SLOT = 16
-local MODEM_SLOT = 15   -- wireless modem; swapped with diamond pickaxe for comms
+local MODEM_SLOT = 15   -- wireless modem; swapped only with RIGHT pickaxe
+local PICK_SIDE = "right"  -- turtle upgrade slot 2 — never touch left (loaders)
 local MIN_FUEL = 200
 local STOP = false
 local PROTO_QUARRY = "titan_quarry"
 local digging = false
-local modemSwapSide = nil  -- "left"|"right" while modem is equipped over the pick
+local modemSwapSide = nil  -- only "right" while modem is over the pick
 
 -- Relative pose from boot origin. +Y is DOWN.
 local pos = { x = 0, y = 0, z = 0 }
@@ -513,6 +513,10 @@ local function equipToolFromInventory(sideArg, quiet)
     end
   end
 
+  -- Offline miners keep the pick on RIGHT (slot 2) so modem swaps never hit left.
+  if not sideArg or sideArg == "" then
+    order = { PICK_SIDE, (PICK_SIDE == "right") and "left" or "right" }
+  end
   print(("Equipping %s from slot %d..."):format(describeTool(bestDetail), bestSlot))
   turtle.select(bestSlot)
   local lastErr = nil
@@ -788,6 +792,9 @@ local function goHome()
   return ok, err
 end
 
+-- Forward decl — filled after publishMine / siteReportProgress exist.
+local checkIn
+
 -- Dump only when inventory is full (or truly out of fuel). No distance/travel
 -- timeout — deep Y bands stay down until slots fill.
 local function manageInventory(resume)
@@ -807,6 +814,10 @@ local function manageInventory(resume)
   if not goHome() then return false, "home" end
   dumpToStorage()
   suckFuelFromLeft()
+  -- Check in at every depot so admin/site see progress + can deliver Y assigns.
+  if checkIn then
+    checkIn("depot", { status = "depot", resumeAt = { x = rx, y = ry, z = rz } })
+  end
   if resume then
     print(("Resuming @ %d,%d,%d"):format(rx, ry, rz))
     if not goTo(rx, ry, rz) then return false, "resume" end
@@ -925,11 +936,124 @@ local function openModem()
   return any
 end
 
--- Put wireless modem on the diamond-pickaxe upgrade side (never a loader).
+local function rightDetail()
+  return getEquipped(PICK_SIDE)
+end
+
+local function rightHasPickaxe()
+  local d = rightDetail()
+  return d ~= nil and toolKind(d.name) == "pickaxe"
+end
+
+local function rightHasModem()
+  return sideLooksLikeModem(PICK_SIDE)
+end
+
+local function findPickaxeInventorySlot()
+  -- Prefer slot 15 (modem/pick swap parking), then any other slot.
+  local order = { MODEM_SLOT }
+  for s = 1, 16 do
+    if s ~= MODEM_SLOT and s ~= FUEL_SLOT then order[#order + 1] = s end
+  end
+  local best, bestScore = nil, -1
+  for _, s in ipairs(order) do
+    if turtle.getItemCount(s) > 0 then
+      local d = itemDetail(s)
+      if d and toolKind(d.name) == "pickaxe" then
+        local sc = scoreTool(d)
+        if sc > bestScore then bestScore, best = sc, s end
+      end
+    end
+  end
+  return best
+end
+
+local function parkModemInSlot15()
+  -- After equipping pick, modem may sit in whatever slot we selected — move to 15.
+  if isModemItem(itemDetail(MODEM_SLOT)) then return true end
+  for s = 1, 16 do
+    if s ~= FUEL_SLOT and isModemItem(itemDetail(s)) then
+      if s == MODEM_SLOT then return true end
+      if turtle.getItemCount(MODEM_SLOT) > 0 and not isModemItem(itemDetail(MODEM_SLOT)) then
+        for e = 1, 14 do
+          if turtle.getItemCount(e) == 0 then
+            turtle.select(MODEM_SLOT)
+            turtle.transferTo(e)
+            break
+          end
+        end
+      end
+      turtle.select(s)
+      if turtle.transferTo(MODEM_SLOT) or isModemItem(itemDetail(MODEM_SLOT)) then
+        return true
+      end
+    end
+  end
+  return isModemItem(itemDetail(MODEM_SLOT))
+end
+
+-- Guarantee dig tool on RIGHT (slot 2) before mining. Detects modem-still-equipped.
+local function ensurePickReady(quiet)
+  if rightHasPickaxe() then
+    modemSwapSide = nil
+    parkModemInSlot15()
+    return true
+  end
+
+  -- Modem still on right after a check-in — swap it off for a pickaxe.
+  if rightHasModem() then
+    local pickSlot = findPickaxeInventorySlot()
+    if pickSlot then
+      turtle.select(pickSlot)
+      if turtle.equipRight() and rightHasPickaxe() then
+        parkModemInSlot15()
+        modemSwapSide = nil
+        return true
+      end
+    end
+    -- Slot 15 empty or has pick: try equip from 15 anyway.
+    if turtle.getItemCount(MODEM_SLOT) > 0 then
+      turtle.select(MODEM_SLOT)
+      if turtle.equipRight() and rightHasPickaxe() then
+        parkModemInSlot15()
+        modemSwapSide = nil
+        return true
+      end
+    end
+  end
+
+  -- Right empty / wrong item: equip best pick from inventory onto right only.
+  local pickSlot = findPickaxeInventorySlot()
+  if pickSlot then
+    turtle.select(pickSlot)
+    if turtle.equipRight() and rightHasPickaxe() then
+      parkModemInSlot15()
+      modemSwapSide = nil
+      return true
+    end
+  end
+
+  if equipToolFromInventory(PICK_SIDE, true) and rightHasPickaxe() then
+    parkModemInSlot15()
+    modemSwapSide = nil
+    return true
+  end
+
+  if not quiet then
+    print("Need a pickaxe on RIGHT (slot 2) to dig. Modem may still be equipped.")
+  end
+  return false
+end
+
+-- Put wireless modem on RIGHT upgrade only (slot 2 / pickaxe). Never touch left.
 local function ensureModemForComms(quiet)
-  if openModem() then
-    if sideLooksLikeModem("left") then modemSwapSide = modemSwapSide or "left" end
-    if sideLooksLikeModem("right") then modemSwapSide = modemSwapSide or "right" end
+  -- Already talking and modem is on right — mark swap so we restore the pick.
+  if rightHasModem() and openModem() then
+    modemSwapSide = PICK_SIDE
+    return true
+  end
+  -- Modem on another side (or already open): talk without touching right pick.
+  if openModem() and not rightHasModem() and rightHasPickaxe() then
     return true
   end
   if not moveModemToSlot15() and not isModemItem(itemDetail(MODEM_SLOT)) then
@@ -938,38 +1062,21 @@ local function ensureModemForComms(quiet)
     end
     return false
   end
-  local function sideIsLoaderLike(side)
-    local d = getEquipped(side)
-    if not d or not d.name then return false end
-    if isModemItem(d) then return false end
-    if toolKind(d.name) == "pickaxe" then return false end
-    -- Anything else equipped (chunk loader, etc.) is protected.
-    return true
-  end
-  local side = findPickaxeSide()
-  if not side then
-    -- Empty upgrade slot only — never equip over a loader / non-pickaxe.
-    if not sideLooksLikeModem("left") and not sideIsLoaderLike("left")
-        and not sideLooksLikeDigTool("left") then
-      side = "left"
-    elseif not sideLooksLikeModem("right") and not sideIsLoaderLike("right")
-        and not sideLooksLikeDigTool("right") then
-      side = "right"
-    else
-      if not quiet then
-        print("No diamond pickaxe side to swap — won't replace a loader upgrade.")
-      end
-      return false
+  local d = rightDetail()
+  if d and not isModemItem(d) and toolKind(d.name) ~= "pickaxe" then
+    if not quiet then
+      print("Right upgrade (slot 2) must be the pickaxe — won't swap a loader/other.")
     end
-  end
-  turtle.select(MODEM_SLOT)
-  local ok
-  if side == "left" then ok = turtle.equipLeft() else ok = turtle.equipRight() end
-  if not ok then
-    if not quiet then print("Could not equip modem on " .. side) end
     return false
   end
-  modemSwapSide = side
+  -- Empty right or pickaxe: swap modem on.
+  turtle.select(MODEM_SLOT)
+  local ok = turtle.equipRight()
+  if not ok then
+    if not quiet then print("Could not equip modem on right (slot 2)") end
+    return false
+  end
+  modemSwapSide = PICK_SIDE
   if not openModem() then
     if not quiet then print("Modem equipped but rednet failed to open.") end
     return false
@@ -977,20 +1084,11 @@ local function ensureModemForComms(quiet)
   return true
 end
 
--- Swap modem back off; diamond pickaxe returns from slot 15 to the upgrade slot.
+-- Always try to put the pickaxe back on RIGHT after comms (robust detection).
 local function restorePickAfterComms()
-  if not modemSwapSide then return end
-  local side = modemSwapSide
-  -- After modem equip, slot 15 should hold the pickaxe we swapped out.
-  if turtle.getItemCount(MODEM_SLOT) > 0 then
-    turtle.select(MODEM_SLOT)
-    if side == "left" then turtle.equipLeft() else turtle.equipRight() end
-  end
+  local ok = ensurePickReady(true)
   modemSwapSide = nil
-  -- If pickaxe landed elsewhere, try normal equip.
-  if not findPickaxeSide() then
-    equipToolFromInventory(side, true)
-  end
+  return ok
 end
 
 local function footprintFromJob(j)
@@ -1231,7 +1329,7 @@ local function pollAssignReplies(timeout)
 end
 
 -- Broadcast mine data for admin (always). Also unicast to site board when joined.
--- Swaps slot-15 modem over the diamond pickaxe, then restores the pickaxe.
+-- Swaps slot-15 modem over RIGHT pickaxe only, then restores the pickaxe.
 local function publishMine(extra)
   if not ensureModemForComms(true) then return false end
   extra = extra or {}
@@ -1240,6 +1338,7 @@ local function publishMine(extra)
     base.y0 = adminAssign.y0
     base.y1 = adminAssign.y1
   end
+  base.posX, base.posY, base.posZ = pos.x, pos.y, pos.z
   local bcast = {}
   for k, v in pairs(base) do bcast[k] = v end
   bcast.type = "quarry_turtle"
@@ -1251,10 +1350,17 @@ local function publishMine(extra)
     uni.type = extra._siteType or "quarry_progress"
     rednet.send(siteId, uni, PROTO_QUARRY)
   end
-  -- Listen briefly for tablet Y assign + ack it.
-  pollAssignReplies(0.8)
-  -- Keep modem up while idle (listening); put pickaxe back while digging.
-  if digging then restorePickAfterComms() end
+  -- Listen briefly for tablet Y assign + ack it (shorter while digging).
+  local listen = tonumber(extra.listen) or (digging and 0.35 or 0.75)
+  pollAssignReplies(listen)
+  -- While mining, ALWAYS re-equip pick on right before the next dig step.
+  if digging then
+    if not restorePickAfterComms() then
+      print("WARN: pickaxe not on right after check-in — retrying...")
+      sleep(0.05)
+      ensurePickReady(false)
+    end
+  end
   return true
 end
 
@@ -1272,6 +1378,23 @@ local function siteReportProgress(extra)
   extra = extra or {}
   extra._siteType = "quarry_progress"
   return publishMine(extra)
+end
+
+-- Named check-in helper (depot / end of dig line / layer).
+checkIn = function(reason, extra)
+  extra = extra or {}
+  extra.checkIn = reason or "ping"
+  extra._siteType = extra._siteType or "quarry_progress"
+  extra.status = extra.status or (activeJob and activeJob.status) or "mining"
+  if activeJob then extra.job = activeJob; extra.jobFile = JOB_FILE end
+  print(("[check-in] %s @ %d,%d,%d"):format(
+    tostring(reason), pos.x, pos.y, pos.z))
+  local ok = publishMine(extra)
+  -- Belt-and-suspenders: verify pick before returning to the dig line.
+  if digging and not ensurePickReady(true) then
+    print("Pickaxe missing after check-in — cannot dig until RIGHT has a pick.")
+  end
+  return ok
 end
 
 -- Push offline_miner_job.cfg to site (if any) and broadcast for admin.
@@ -1587,11 +1710,13 @@ local function runBoxJob(j)
   end
 
   local lastY = -999
+  local lastZ = nil
   local layerCount = (j.y0 ~= nil and j.y1 ~= nil) and (j.y1 - j.y0 + 1) or H
   local floor = digFloorY(j)
   for i = j.idx, #units do
     if STOP then finishJob(false, "stop"); return end
     local u = units[i]
+    local nextU = units[i + 1]
     if floor ~= nil and u.y > floor then
       print(("Abort: work unit Y=%d past claim floor Y=%d"):format(u.y, floor))
       finishJob(false, "past-band")
@@ -1613,6 +1738,13 @@ local function runBoxJob(j)
       print(("  layer Y=%d  (%d layers in band)"):format(u.y, layerCount))
     end
     lastY = u.y
+    lastZ = u.z
+
+    -- Never path/dig with the modem still equipped on slot 2.
+    if not ensurePickReady(true) then
+      finishJob(false, "no-pickaxe")
+      return
+    end
 
     -- Excavate ONLY this Y plane (goTo digs 1-high forward). Do NOT digDown —
     -- that was clearing a second layer under the turtle.
@@ -1620,9 +1752,16 @@ local function runBoxJob(j)
 
     j.idx = i + 1
     saveJobFile(j)
-    if i % 10 == 0 then
-      -- Includes full offline_miner_job.cfg for admin / optional site board.
-      siteReportProgress({ status = "mining", job = j, jobFile = JOB_FILE })
+
+    -- End of this dig line (next cell is another row or layer, or done).
+    if not nextU or nextU.z ~= u.z or nextU.y ~= u.y then
+      checkIn((nextU and nextU.y ~= u.y) and "layer" or "line", {
+        status = "mining", job = j, jobFile = JOB_FILE,
+      })
+      if not ensurePickReady(true) then
+        finishJob(false, "no-pickaxe")
+        return
+      end
     end
   end
   finishJob(true)
@@ -2234,8 +2373,8 @@ if cfg.siteId then
 end
 local hasModem = ensureModemForComms(true) or openModem() or findModemInInventory() ~= nil
 if hasModem then
-  print("Modem slot " .. MODEM_SLOT .. ": swaps over diamond pickaxe for site/admin.")
-  print("Optional site board: `join` / `mine` for shared Y bands.")
+  print("Modem slot " .. MODEM_SLOT .. ": swaps RIGHT pick (slot 2) only — left untouched.")
+  print("Check-in: every depot + end of each dig line. Optional site: join / mine.")
   joinSite(2, true)
   if not saved then
     saved = loadJobFile()  -- may have been adopted from site welcome
