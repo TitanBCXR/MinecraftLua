@@ -413,20 +413,37 @@ One board computer (installer → **"Perimeter manager"**), ideally with a monit
 ```
 here                 set territory origin (stand at center)
 assign all           auto-map sensors to N/NE/E/SE/S/SW/W/NW from GPS
+rename <id|gate> Main Gate
 set <id|all> range 50
 set <id> side ne
+update | forceupdate OTA this board + every perimeter sensor
 sensors | status | log
+newlog | logs        rotate / list disk event logs
 ```
 
 Shows who’s inside, entry sector, timestamps, and a rolling ENTER/EXIT log.
+Events are appended under `perimeter_logs/` and reloaded on boot (latest file).
+Logs over **5 MB** are deleted automatically; `newlog` starts a fresh file and
+removes the previous one.
+
+Sensors **self-name** from direction vs `here` (`North Gate`, `Southeast Gate`, …).
+Override any one with `rename <id|gate> <label>` (custom names survive `assign`).
+
+**Mesh:** sensors out of direct range still reach the manager through the **MAIN
+router** (and modem extenders). Alerts are hopped to the board; `sensors`
+refreshes the gate list from the router roster.
+
+**`update` / `forceupdate`:** refreshes the manager, pushes OTA to every known
+perimeter sensor over rednet, then **SSH**es any that don’t ACK (master password)
+and runs `update -y` on them.
 
 ### Perimeter sensor (`perimeter_sensor.lua`)
 
 Install on each gate (installer → **"Perimeter sensor"**):
 
 - Computer + wireless modem + Player Detector + GPS coverage
-- Default **range 50**; side auto-assigned by the manager from position vs `here`
-- Manual: `side ne`, `range 50`, `auto` (re-request assign)
+- Default **range 50**; side + name from GPS vs manager origin
+- Manual: `side ne`, `range 50`, `name My Gate`, `autoname`, `auto`
 
 Manager can push `side` / `range` / `name` remotely. Overlapping gates use a
 grace timer so walking between detectors doesn’t false-exit.
@@ -580,12 +597,15 @@ an unlocked session. No master online → denied until the floppy is up.
 | **Simple** (default) | Anyone — numbered menus, wizards | Boot choice / `mode simple` |
 | **Advanced** | Terminal users — full command line | Boot choice / `mode advanced` |
 
-Simple menus cover status, deploy wizard, flatten wizard, connect, park/stop,
-Parent Center jump, and live roster. Advanced keeps the full command set:
+Simple menus cover **network stats / live boards**, deploy wizard, flatten
+wizard, connect, **network link**, park/stop, Parent Center jump. Advanced keeps
+the full command set:
 
 ```
-VIEW  : live | bots | miners | loaders | markers | pending | stuck | who <id|name>
+VIEW  : live [local|global|stats|gps|bots]
+        bots | miners | loaders | markers | pending | stuck | who <id|name>
 NET   : connections | hosts | list [filter]   SSH-capable hosts on the mesh
+        link | link <a> <b> | link auto | link peer|modem ...
         ping
 SSH   : connect <id|name> [cmd...]   (aliases: ssh, c)
 FLEET : dc | center [cmd...]         jump to Parent Center
@@ -596,6 +616,16 @@ BUILD : scan | build
 MODE  : mode simple | mode advanced
         login | lock | hostname | exit
 ```
+
+**Live boards** pull the same local / global / stats / GPS views as the MAIN
+router monitor (`board_req`). An **advanced (color) pocket** gets the pretty GUI
+(header bars, status chips, alternating rows); a normal pocket stays mono.
+Layout adapts to the tablet size. Keys: `1`–`5` select board, `←`/`→` cycle,
+`r` refresh, `q` quit.
+
+**`link`** builds the ender-router backbone and attaches local RF modems. Prefer
+`link auto` once hubs have GPS, or `link 5 12` to peer two routers / attach a
+modem to a hub. Simple menu item **10** opens the same tools.
 
 Pocket workflow: Simple menu **8** (connect) / **9** (Parent Center), or Advanced
 `connections` → `connect ParentCenter` (or `dc`). Control is gated by the
@@ -634,45 +664,62 @@ walking, it infers your facing from movement and adds a relative cue
 
 # Network router (`router.lua`)
 
-Ties the whole network together over wireless. Run one (or several) on a
-computer with a wireless (ideally **ender**) modem. It does three things:
+Ties the whole network together over wireless. Three roles:
 
-- **Repeater:** re-transmits rednet traffic — **both broadcasts and directed
-  messages** (bot commands, worker deploys, auth checks) — so devices out of
-  direct modem range still reach each other. Chain several **extender** routers
-  (`role=modem`) every ~50–60 blocks like cell towers so pockets/admin can reach
-  MAIN from far sites. Normal wireless modems are ~64 blocks; gaps larger than
-  that break the hop chain. **Rednet hops ≠ GPS** — place 4+ GPS-capable routers
-  (or `gpshost.lua`) near distant areas too, or use ender modems / a wired
-  backbone. Duplicate messages are de-duplicated so they never loop. (Same
-  mechanism as CraftOS's built-in `repeat`, but with a roster + dashboard.)
-- **Directory + status board:** listens to every Titan protocol and remembers
-  every system that has registered (hostnames persist in `router_roster.cfg`
-  across reboots). Attach a **monitor** to the main router for a live board:
-  each system shows as **ONLINE** (green) or **OFFLINE** (red), sorted with
-  online hosts first. Console `devices` lists the same; `forget <id|host>`
-  drops a remembered entry.
-- **GPS host:** routers double as GPS hosts. On first run each router asks for
-  its coordinates (or auto-detects if a constellation already exists) and then
-  answers `gps.locate` requests. Place **4+ routers, spread out**, and they *are*
-  your GPS constellation as well as the network backbone — no separate GPS
-  computers needed. Coords are saved to `router.cfg`; re-set them any time with
-  the `gpshost <x> <y> <z>` console command.
+| Role | Modem | Job |
+|------|--------|-----|
+| **MAIN** | Ender | Directory, OTA, re-auth; long-haul hub |
+| **ROUTER** | Ender | Backbone satellite; peers with MAIN/other routers |
+| **MODEM** | Normal RF | Local cell coverage (~64 blocks); homes to a hub |
 
-Install it via the installer → **"Network router"** (option **11**). Console:
-`devices`, `forget`, `hostname`, `ping`, `stats`, `gpshost`, `update`, `ssh`,
-`exit`.
+```
+[MAIN ender] <-----ender-----> [ROUTER ender] <-----ender-----> [ROUTER …]
+     |                              |
+ [modem RF]  [modem RF]        [modem RF]     ← local area coverage
+```
 
-**OTA update:** from the main router console, run `update all` (confirms first).
-That pushes to **every online Titan device** on the roster (miners, loaders,
-Parent Center, admin tablet, modems — not just routers). The monitor switches to
-an ACK board: hostname on top, then each `Package - version: from - to`. When
-every ACK (or fail) is in, the previous board / screensaver returns.
-`update status` prints the same progress in the console.
-Every device that was installed via an installer (and has a `.titan-install`
-manifest) re-downloads its files from the same source (GitHub / pastebin /
-install host) and reboots. Keep `host.lua` running if the fleet was installed
-that way.
+Use the **admin tablet** `link` command (or `link` on each node) to peer routers
+and attach modems:
+
+```
+link                 show topology
+link <idA> <idB>     smart link (router↔router or modem→router)
+link peer 5 12       force backbone peer
+link modem 20 5      attach modem #20 to hub #5
+link auto            peer all routers; each modem → nearest hub (GPS)
+```
+
+- **Repeater:** re-transmits rednet traffic so devices out of direct range still
+  reach each other. Local **MODEMS** fill a site; **ROUTER/MAIN** ender links
+  span the map. **Rednet hops ≠ GPS** — place 4+ GPS-capable hubs (or
+  `gpshost.lua`) near distant areas too.
+- **Directory + status boards (MAIN):** two roster views on the monitor —
+  **local** (`view local` / `screen roster`) for this hub’s modems and computers,
+  and **global** (`view global`) for backbone peers and remote mesh cells.
+  Also `devices` / `forget` in the console. **Advanced (color) monitors** get a
+  denser GUI (header bars, status chips, alternating rows); plain monitors stay
+  mono. Layout and text scale auto-adjust from the screen size (`tiny` → `large`).
+- **GPS host:** each hub can host GPS (`gpshost <x> <y> <z>`).
+
+Install via installer → **"Network router"**.
+
+**OTA update** (MAIN router only):
+
+| Command | Target |
+|---------|--------|
+| `update` / `forceupdate` | Online **modems** only (mesh extenders) |
+| `update all` / `update fleet` | **Every** online Titan device |
+| `update status` | ACK progress |
+
+Both force paths refresh MAIN, push OTA over rednet, wait for ACKs, then **SSH**
+into stragglers (`update -y`, master password). Modem updates are **unicast** so
+miners/workers/admin are not touched. `update all` still **broadcasts** to the
+whole fleet. The monitor switches to an ACK board (hostname + package from→to)
+and restores when done.
+
+Every device with a `.titan-install` manifest re-downloads from its install
+source (GitHub / pastebin / host) and reboots. Keep `host.lua` running if the
+fleet was installed that way.
 
 **Auto-registration + mesh relay:** every networked program (bot, worker/builder/
 gatherer, miner/excavator, hub, POI, Bots Computer, data center, admin tablet,

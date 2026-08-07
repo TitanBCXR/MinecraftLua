@@ -1,20 +1,24 @@
 --[[
   router.lua  -  Titan network router / repeater (CC: Tweaked)
-  Titan-Version: 1.2.16
+  Titan-Version: 1.3.3
 
   Place one (or several) of these to tie the whole network together over
   wireless and/or wired modems. Roles:
 
-    MAIN  - directory, OTA update, re-auth authority, GPS host, repeater.
-            Tracks GitHub versions.lua; `update all` pushes fleet OTA to
-            every online device (not just routers), shows ACKs on the
-            monitor (hostname + package from->to), then restores the
-            previous board when every ACK is in.
-            Attach up to 3+ monitors for ROSTER / STATS / GPS boards.
-            Devices on the same wired cable as MAIN show as WIRED on roster.
-    MODEM - repeater (+ optional GPS host) only. Use for coverage; not the
-            network authority. Main assigns each a unique name from a pool;
-            the modem sets it and reboots once. Set with `modem` / `main`.
+    MAIN   - directory, OTA, re-auth authority, GPS, ender backbone hub.
+             Prefer an **ender modem** here. Peers with other ROUTER nodes
+             over long range; local MODEMS attach as RF cells.
+    ROUTER - ender backbone satellite (no OTA authority). Long-haul peer to
+             MAIN / other routers. Hosts local weak-modem cells around a site.
+    MODEM  - short-range RF repeater for one area. Links to a home MAIN/ROUTER.
+             Main can still auto-name these from the name pool.
+
+    Topology (admin tablet: `link`):
+      [MAIN ender] <---ender---> [ROUTER ender] <---ender---> [ROUTER …]
+           |                          |
+        [modem RF]                 [modem RF]   ← local coverage
+
+    `update` force-updates modems; `update all` hits the whole fleet.
 
     1. REPEATER - re-transmits rednet traffic (same idea as `repeat`) so devices
        out of direct range still reach each other. Both roles do this.
@@ -86,11 +90,13 @@ local ONLINE_SECS = 45   -- heard within this window => ONLINE on the board
 --   `screen <role> on`   → show that board for saverIdleSecs (default 120), then saver.
 --   `screen <role> perm` → show that board permanently.
 --   Only one board is live at a time (switching replaces the previous).
-local SCREEN_ROLES = { "roster", "stats", "gps", "map" }
-local screens = { roster = nil, stats = nil, gps = nil, map = nil }
-local screenNames = { roster = nil, stats = nil, gps = nil, map = nil }
-local screenOn   = { roster = false, stats = false, gps = false, map = false }
-local screenPerm = { roster = false, stats = false, gps = false, map = false }
+-- roster = LOCAL cell (this hub's modems + nearby computers)
+-- global = GLOBAL mesh (backbone peers + remote cells / devices)
+local SCREEN_ROLES = { "roster", "global", "stats", "gps", "map" }
+local screens = { roster = nil, global = nil, stats = nil, gps = nil, map = nil }
+local screenNames = { roster = nil, global = nil, stats = nil, gps = nil, map = nil }
+local screenOn   = { roster = false, global = false, stats = false, gps = false, map = false }
+local screenPerm = { roster = false, global = false, stats = false, gps = false, map = false }
 local screenFocus = "roster"   -- the one live board (when any is on)
 local displayMon = nil         -- wrapped primary monitor
 local displayMonName = nil
@@ -112,7 +118,7 @@ local function clampMonRate(secs)
   return n
 end
 
--- Router config (GPS host coords + role: "main" | "modem").
+-- Router config (GPS host coords + role: "main" | "router" | "modem").
 local RCFG      = "router.cfg"
 local ROSTER    = "router_roster.cfg"
 local gpsCoords = nil
@@ -132,6 +138,334 @@ local function patchRouterCfg(patch)
   return c
 end
 local function isMain() return routerRole == "main" end
+local function isModemRole() return routerRole == "modem" end
+local function isBackbone() return routerRole == "main" or routerRole == "router" end
+local function roleKind()
+  if routerRole == "main" then return "router" end
+  if routerRole == "router" then return "router" end
+  return "modem"
+end
+
+--------------------------------------------------------------------------------
+-- Network links: ender backbone peers + local modem cells
+-- Persisted in router.cfg.netLinks
+--------------------------------------------------------------------------------
+local netPeers = {}       -- [id] = { name, kind, seen }
+local netCells = {}       -- [modemId] = { name, seen }  (backbone only)
+local homeRouterId = nil  -- modem -> home MAIN/ROUTER id
+
+local function loadNetLinks()
+  local c = loadRouterCfg() or {}
+  local nl = type(c.netLinks) == "table" and c.netLinks or {}
+  netPeers, netCells = {}, {}
+  if type(nl.peers) == "table" then
+    for id, info in pairs(nl.peers) do
+      local nid = tonumber(id)
+      if nid then
+        if type(info) == "table" then
+          netPeers[nid] = { name = info.name, kind = info.kind or "router", seen = info.seen or 0 }
+        else
+          netPeers[nid] = { name = tostring(info), kind = "router", seen = 0 }
+        end
+      end
+    end
+  end
+  if type(nl.cells) == "table" then
+    for id, info in pairs(nl.cells) do
+      local nid = tonumber(id)
+      if nid then
+        if type(info) == "table" then
+          netCells[nid] = { name = info.name, seen = info.seen or 0 }
+        else
+          netCells[nid] = { name = tostring(info), seen = 0 }
+        end
+      end
+    end
+  end
+  homeRouterId = tonumber(nl.homeRouter) or tonumber(c.homeRouter)
+end
+
+local function saveNetLinks()
+  local peers, cells = {}, {}
+  for id, p in pairs(netPeers) do
+    peers[id] = { name = p.name, kind = p.kind, seen = p.seen }
+  end
+  for id, c in pairs(netCells) do
+    cells[id] = { name = c.name, seen = c.seen }
+  end
+  patchRouterCfg({
+    netLinks = {
+      peers = peers,
+      cells = cells,
+      homeRouter = homeRouterId,
+    },
+    homeRouter = homeRouterId,
+  })
+end
+
+local function addNetPeer(id, name, kind)
+  id = tonumber(id)
+  if not id or id == os.getComputerID() then return false, "bad id" end
+  netPeers[id] = {
+    name = name or (netPeers[id] and netPeers[id].name) or ("#" .. id),
+    kind = kind or "router",
+    seen = os.epoch("utc"),
+  }
+  saveNetLinks()
+  return true
+end
+
+local function removeNetPeer(id)
+  id = tonumber(id)
+  if not id or not netPeers[id] then return false, "not linked" end
+  netPeers[id] = nil
+  saveNetLinks()
+  return true
+end
+
+local function setHomeRouter(id, name)
+  id = tonumber(id)
+  if not id then return false, "bad id" end
+  homeRouterId = id
+  saveNetLinks()
+  -- Also keep mainRouterId for legacy hop paths when home is MAIN.
+  if not isBackbone() then
+    patchRouterCfg({ homeRouter = id, mainRouterId = id })
+  end
+  return true
+end
+
+local function addNetCell(id, name)
+  id = tonumber(id)
+  if not id or id == os.getComputerID() then return false, "bad id" end
+  netCells[id] = {
+    name = name or (netCells[id] and netCells[id].name) or ("#" .. id),
+    seen = os.epoch("utc"),
+  }
+  saveNetLinks()
+  return true
+end
+
+local function removeNetCell(id)
+  id = tonumber(id)
+  if not id or not netCells[id] then return false, "not a cell" end
+  netCells[id] = nil
+  saveNetLinks()
+  return true
+end
+
+local function netLinkSnapshot()
+  local peers, cells = {}, {}
+  for id, p in pairs(netPeers) do
+    peers[#peers + 1] = { id = id, name = p.name, kind = p.kind or "router" }
+  end
+  for id, c in pairs(netCells) do
+    cells[#cells + 1] = { id = id, name = c.name, kind = "modem" }
+  end
+  table.sort(peers, function(a, b) return a.id < b.id end)
+  table.sort(cells, function(a, b) return a.id < b.id end)
+  local x, y, z = nil, nil, nil
+  if gpsCoords then x, y, z = gpsCoords.x, gpsCoords.y, gpsCoords.z end
+  return {
+    type = "net_topo",
+    id = os.getComputerID(),
+    name = os.getComputerLabel() or ("#" .. os.getComputerID()),
+    role = routerRole,
+    kind = roleKind(),
+    homeRouter = homeRouterId,
+    peers = peers,
+    cells = cells,
+    x = x, y = y, z = z,
+  }
+end
+
+local function printNetLinks()
+  local snap = netLinkSnapshot()
+  print(("== Network links  #%d [%s] %s =="):format(
+    snap.id, tostring(snap.role):upper(), tostring(snap.name)))
+  if snap.x then
+    print(("GPS %d,%d,%d"):format(snap.x, snap.y or 0, snap.z))
+  end
+  if isModemRole() then
+    print("Home router: " .. tostring(homeRouterId or "(none — run: link home <id>)"))
+  end
+  if isBackbone() then
+    print(("Backbone peers (%d):"):format(#snap.peers))
+    if #snap.peers == 0 then print("  (none — link routers with ender modems)") end
+    for _, p in ipairs(snap.peers) do
+      print(("  #%d  %s"):format(p.id, tostring(p.name)))
+    end
+    print(("Local modem cells (%d):"):format(#snap.cells))
+    if #snap.cells == 0 then print("  (none — link modems: link modem <id>)") end
+    for _, c in ipairs(snap.cells) do
+      print(("  #%d  %s"):format(c.id, tostring(c.name)))
+    end
+  end
+end
+
+local function broadcastNetHello()
+  local snap = netLinkSnapshot()
+  snap.type = "net_link_hello"
+  rednet.broadcast(snap, PROTO_ROUTER)
+  for id in pairs(netPeers) do
+    rednet.send(id, snap, PROTO_ROUTER)
+  end
+  if homeRouterId then
+    rednet.send(homeRouterId, snap, PROTO_ROUTER)
+  end
+end
+
+-- Deliver a payload toward dest via backbone peers / local cells.
+local function netHopDeliver(dest, payload, ttl)
+  dest = tonumber(dest)
+  ttl = (tonumber(ttl) or 6) - 1
+  if not dest or ttl < 0 or type(payload) ~= "table" then return false end
+  if dest == os.getComputerID() then
+    rednet.send(dest, payload, PROTO_ROUTER)
+    return true
+  end
+  -- Direct try (ender backbone or local RF).
+  rednet.send(dest, payload, PROTO_ROUTER)
+  if payload._netProto == "titan_net" or payload.type and tostring(payload.type):sub(1, 10) == "perimeter_" then
+    rednet.send(dest, payload, "titan_net")
+  end
+  -- Local cell modem
+  if netCells[dest] then
+    return true
+  end
+  -- Ask peers to continue the hop.
+  local hop = {
+    type = "net_hop",
+    dest = dest,
+    payload = payload,
+    ttl = ttl,
+    via = os.getComputerID(),
+    from = os.getComputerID(),
+  }
+  for id in pairs(netPeers) do
+    if id ~= dest then rednet.send(id, hop, PROTO_ROUTER) end
+  end
+  return true
+end
+
+-- Filled after roster helpers exist; used by board_req for admin tablets.
+local buildBoardSnap
+
+local function handleNetControl(id, msg)
+  if type(msg) ~= "table" or not msg.type then return false end
+  local t = msg.type
+  if t == "net_topo_req" then
+    rednet.send(id, netLinkSnapshot(), PROTO_ROUTER)
+    return true
+  elseif t == "board_req" then
+    -- Admin / pocket tablets pull the same boards MAIN paints on monitors.
+    if isMain() and buildBoardSnap then
+      rednet.send(id, buildBoardSnap(), PROTO_ROUTER)
+    elseif isBackbone() and buildBoardSnap then
+      -- Non-MAIN hubs still answer with whatever local topology they know.
+      rednet.send(id, buildBoardSnap(), PROTO_ROUTER)
+    end
+    return true
+  elseif t == "net_link_hello" then
+    if msg.role == "main" or msg.role == "router" or msg.kind == "router" then
+      if netPeers[id] or isBackbone() then
+        netPeers[id] = netPeers[id] or { name = msg.name, kind = "router", seen = 0 }
+        netPeers[id].name = msg.name or netPeers[id].name
+        netPeers[id].seen = os.epoch("utc")
+        if msg.role == "main" and not isMain() then
+          patchRouterCfg({ mainRouterId = id })
+        end
+      end
+    elseif msg.role == "modem" or msg.kind == "modem" then
+      if isBackbone() and (netCells[id] or tonumber(msg.homeRouter) == os.getComputerID()) then
+        addNetCell(id, msg.name)
+      end
+    end
+    return true
+  elseif t == "net_link" then
+    local action = tostring(msg.action or ""):lower()
+    local withId = tonumber(msg.with) or tonumber(msg.peer) or tonumber(msg.home) or tonumber(msg.modem)
+    local ok, err = false, "unknown action"
+    if action == "peer" or action == "router" then
+      ok, err = addNetPeer(withId, msg.withName or msg.name, "router")
+      if ok then
+        -- Reciprocate so the other side also stores us.
+        rednet.send(withId, {
+          type = "net_link", action = "peer_ack",
+          with = os.getComputerID(),
+          withName = os.getComputerLabel(),
+          name = os.getComputerLabel(),
+          role = routerRole,
+        }, PROTO_ROUTER)
+        broadcastNetHello()
+      end
+    elseif action == "peer_ack" then
+      ok, err = addNetPeer(withId or id, msg.withName or msg.name, "router")
+    elseif action == "home" or action == "modem_home" then
+      if isModemRole() then
+        ok, err = setHomeRouter(withId, msg.withName)
+        if ok then
+          rednet.send(withId, {
+            type = "net_link", action = "cell",
+            with = os.getComputerID(),
+            withName = os.getComputerLabel(),
+            name = os.getComputerLabel(),
+          }, PROTO_ROUTER)
+          broadcastNetHello()
+        end
+      else
+        ok, err = false, "home is for modem role only"
+      end
+    elseif action == "cell" or action == "modem" then
+      if isBackbone() then
+        ok, err = addNetCell(withId or id, msg.withName or msg.name)
+        if ok and withId then
+          rednet.send(withId, {
+            type = "net_link", action = "home",
+            with = os.getComputerID(),
+            withName = os.getComputerLabel(),
+          }, PROTO_ROUTER)
+        end
+      else
+        ok, err = false, "cells are for MAIN/ROUTER only"
+      end
+    elseif action == "unpeer" or action == "unlink" then
+      ok, err = removeNetPeer(withId)
+    elseif action == "unhome" then
+      homeRouterId = nil
+      saveNetLinks()
+      ok = true
+    elseif action == "uncell" then
+      ok, err = removeNetCell(withId)
+    else
+      ok, err = false, "action: peer|home|cell|unpeer|uncell"
+    end
+    rednet.send(id, {
+      type = "net_link_ack", ok = ok, err = err,
+      action = action, with = withId,
+      topo = netLinkSnapshot(),
+    }, PROTO_ROUTER)
+    return true
+  elseif t == "net_hop" then
+    local dest = tonumber(msg.dest)
+    local payload = msg.payload
+    if dest and type(payload) == "table" then
+      if dest == os.getComputerID() then
+        -- Deliver locally by re-injecting as normal router traffic when possible.
+        rednet.send(dest, payload, PROTO_ROUTER)
+      elseif netCells[dest] or netPeers[dest] then
+        rednet.send(dest, payload, PROTO_ROUTER)
+        rednet.send(dest, payload, "titan_net")
+      else
+        netHopDeliver(dest, payload, msg.ttl)
+      end
+    end
+    return true
+  end
+  return false
+end
+
+loadNetLinks()
 
 -- Time helpers (must be above noteDeviceVersion / startUpdateCampaign).
 local function now() return os.epoch("utc") end
@@ -481,16 +815,20 @@ local function maybeFinishUpdateCampaign()
   end
 end
 
-local function startUpdateCampaign(targetVersion)
+-- filterFn(id, d) optional — return true to include in the campaign.
+local function startUpdateCampaign(targetVersion, filterFn, scope)
   local expected, prevById = {}, {}
   for id, d in pairs(seen) do
     if isOnline(d) and id ~= os.getComputerID() then
-      expected[id] = d.hostname or d.name or ("#" .. id)
-      prevById[id] = d.version
+      if not filterFn or filterFn(id, d) then
+        expected[id] = d.hostname or d.name or ("#" .. id)
+        prevById[id] = d.version
+      end
     end
   end
   updateCampaign = {
     version = targetVersion,
+    scope = scope or "all",
     sentAt = os.epoch("utc"),
     expected = expected,
     prevById = prevById,
@@ -510,6 +848,235 @@ local function broadcastFleetUpdate(payload)
   -- Also flood titan_net / titan_dc so Parent Center and any net-only listeners hear it.
   rednet.broadcast(payload, "titan_net")
   rednet.broadcast(payload, "titan_dc")
+end
+
+local function isModemKind(kind)
+  kind = tostring(kind or ""):lower()
+  return kind == "modem"
+end
+
+local function collectUpdateTargets(scope)
+  local ids, byId = {}, {}
+  local function add(id, label, kind)
+    id = tonumber(id)
+    if not id or id == os.getComputerID() or byId[id] then return end
+    if scope == "modems" and not isModemKind(kind) then return end
+    byId[id] = true
+    ids[#ids + 1] = {
+      id = id,
+      label = label or ("#" .. id),
+      kind = kind or "device",
+    }
+  end
+  for id, d in pairs(seen) do
+    if isOnline(d) then
+      add(id, d.hostname or d.name, d.kind)
+    end
+  end
+  -- Pick up mesh modems that hello'd over SSH but aren't in roster yet.
+  if titanLib and titanLib.sshListPeers then
+    local peers = titanLib.sshListPeers(2)
+    for _, p in ipairs(peers) do
+      local kind = p.kind or "device"
+      if scope ~= "modems" or isModemKind(kind) then
+        add(p.id, p.name or p.hostname, kind)
+      end
+    end
+  end
+  table.sort(ids, function(a, b) return a.id < b.id end)
+  return ids
+end
+
+local function unicastUpdate(targets, payload)
+  for _, t in ipairs(targets) do
+    rednet.send(t.id, payload, PROTO_ROUTER)
+    rednet.send(t.id, payload, "titan_net")
+  end
+end
+
+local function sshForceUpdateDevice(targetId, password)
+  if not titanLib or not titanLib.sshOpenRouted then
+    return false, "ssh not available"
+  end
+  local hopId, token, info = titanLib.sshOpenRouted(targetId, password)
+  if not token then return false, tostring(info) end
+  local res = titanLib.sshExec(hopId, token, "update -y")
+  titanLib.sshClose(hopId, token)
+  if not res then return false, "no reply" end
+  if res.ok then return true, res.out or "ok" end
+  return false, res.out or "ssh update failed"
+end
+
+-- scope: "modems" (default force) or "all"
+local function runForceUpdate(scope, opts)
+  opts = opts or {}
+  local skipConfirm = opts.yes == true
+  scope = (scope == "all" or scope == "fleet") and "all" or "modems"
+
+  print("Checking GitHub versions...")
+  local remote, err = fetchGithubVersions()
+  local target = remote and remote.system or localSystemVersion()
+  if not remote then
+    print("GitHub check failed: " .. tostring(err))
+    print("Will still push OTA using each device's install source.")
+    target = localSystemVersion() or "unknown"
+  else
+    print(("GitHub Titan v%s  (local %s)"):format(
+      tostring(remote.system), tostring(localSystemVersion() or "?")))
+  end
+
+  local targets = collectUpdateTargets(scope)
+  local label = (scope == "modems") and "MODEMS (mesh extenders)" or "ALL online devices"
+  print(("Force-update scope: %s"):format(label))
+  print(("Targets: %d"):format(#targets))
+  for _, t in ipairs(targets) do
+    print(("  #%d  %-8s  %s"):format(t.id, tostring(t.kind), tostring(t.label)))
+  end
+
+  if not skipConfirm then
+    write(("Push OTA to %s (target v%s)? [y/N] "):format(label, tostring(target)))
+    if (read() or ""):lower() ~= "y" then
+      print("Cancelled.")
+      return
+    end
+  end
+
+  local filterFn = nil
+  if scope == "modems" then
+    filterFn = function(_, d) return isModemKind(d.kind) end
+  end
+  local expected = startUpdateCampaign(target, filterFn, scope)
+  -- Ensure campaign expected matches collected targets (incl. SSH-discovered).
+  for _, t in ipairs(targets) do
+    if not expected[t.id] then
+      expected[t.id] = t.label
+      updateCampaign.expected[t.id] = t.label
+      updateCampaign.prevById[t.id] = seen[t.id] and seen[t.id].version
+    end
+  end
+
+  local nExp = 0
+  for _ in pairs(updateCampaign.expected) do nExp = nExp + 1 end
+  local rname = os.getComputerLabel() or ("Router-" .. os.getComputerID())
+  local payload = {
+    type = "update", from = os.getComputerID(), name = rname,
+    mainRouterId = os.getComputerID(), hostname = rname,
+    targetVersion = target,
+    aoe = (scope == "all"),
+    all = (scope == "all"),
+    modemsOnly = (scope == "modems"),
+    githubBase = githubBase(),
+  }
+
+  if scope == "all" then
+    broadcastFleetUpdate(payload)
+    print(("Fleet update BROADCAST sent (v%s) on router+net+dc."):format(tostring(target)))
+  else
+    -- Unicast only — do not wake miners/workers/admin/etc.
+    unicastUpdate(targets, payload)
+    print(("Modem update UNICAST sent (v%s) to %d device(s)."):format(
+      tostring(target), #targets))
+  end
+  print(("Expecting %d ACK(s). Monitor shows hostname + package from->to."):format(nExp))
+  print("Watch: `update status`")
+
+  -- Update MAIN itself (stay up to collect ACKs / run SSH).
+  if titanLib and titanLib.updateSelf then
+    print("Updating main router packages (no reboot)...")
+    local prevMain = localSystemVersion()
+    local uok, detail = titanLib.updateSelf()
+    if uok then
+      local pkgs = type(detail) == "table" and detail.packages or {}
+      if #pkgs == 0 then
+        pkgs = { {
+          name = "system", path = "versions.lua",
+          from = tostring(prevMain or "?"),
+          to = tostring(localSystemVersion() or target),
+        } }
+      end
+      updateCampaign.acked[os.getComputerID()] = {
+        name = rname,
+        version = localSystemVersion() or target,
+        packages = pkgs,
+        at = os.epoch("utc"),
+      }
+      print("Main router packages refreshed to v" .. tostring(localSystemVersion() or target))
+      maybeFinishUpdateCampaign()
+    else
+      print("Main self-update failed: " .. tostring(detail))
+    end
+  elseif nExp == 0 then
+    maybeFinishUpdateCampaign()
+  end
+
+  if #targets == 0 then
+    print("No targets online for this scope.")
+    return
+  end
+
+  -- Wait briefly for rednet ACKs, then SSH anyone still pending.
+  local waitSec = (scope == "all") and 20 or 12
+  print(("Waiting %ds for ACKs before SSH fallback..."):format(waitSec))
+  local deadline = os.clock() + waitSec
+  while os.clock() < deadline do
+    local pending = 0
+    for id in pairs(updateCampaign.expected) do
+      if not updateCampaign.acked[id] and not updateCampaign.failed[id] then
+        pending = pending + 1
+      end
+    end
+    if pending == 0 then break end
+    sleep(0.5)
+  end
+
+  local needSsh = {}
+  for _, t in ipairs(targets) do
+    if not updateCampaign.acked[t.id] and not updateCampaign.failed[t.id] then
+      needSsh[#needSsh + 1] = t
+    end
+  end
+
+  if #needSsh > 0 then
+    print(("SSH force-update for %d device(s) that didn't ACK..."):format(#needSsh))
+    write("Master password (Parent Center): ")
+    local password = read("*")
+    if not password or password == "" then
+      print("No password — skipping SSH fallback. Campaign stays open for late ACKs.")
+    else
+      for _, t in ipairs(needSsh) do
+        print(("ssh #%d (%s)..."):format(t.id, tostring(t.label)))
+        local ok, detail = sshForceUpdateDevice(t.id, password)
+        if not ok then
+          print(("  #%d SSH failed (%s) — retry in 3s..."):format(t.id, tostring(detail)))
+          sleep(3)
+          ok, detail = sshForceUpdateDevice(t.id, password)
+        end
+        if ok then
+          local prev = updateCampaign.prevById and updateCampaign.prevById[t.id]
+          updateCampaign.acked[t.id] = {
+            name = t.label,
+            version = target,
+            packages = { {
+              name = "system", path = "versions.lua",
+              from = tostring(prev or "?"), to = tostring(target),
+            } },
+            at = os.epoch("utc"),
+            via = "ssh",
+          }
+          updateCampaign.failed[t.id] = nil
+          print(("  #%d SSH ok"):format(t.id))
+          if detail and detail ~= "" then print("  " .. tostring(detail):sub(1, 120)) end
+        else
+          noteUpdateFail(t.id, t.label, detail)
+          print(("  #%d SSH failed: %s"):format(t.id, tostring(detail)))
+        end
+      end
+      maybeFinishUpdateCampaign()
+    end
+  else
+    print("All targets ACK'd over rednet (or failed explicitly).")
+    maybeFinishUpdateCampaign()
+  end
 end
 
 local function claimMain()
@@ -652,16 +1219,34 @@ local function clearRosterIfModem()
   end
 end
 
--- MODEM routers only persist a slim cfg: role + route to MAIN (+ optional
--- GPS / assigned hostname). Strip MAIN-only keys (roster, name pool, screens…).
+-- MODEM nodes only persist a slim cfg: role + routes + links (+ optional GPS/name).
+-- ROUTER backbone keeps fuller cfg (peers/cells) but not MAIN roster/screens.
 local function sanitizeModemCfg(opts)
   opts = opts or {}
   if isMain() then return nil end
   local c = loadRouterCfg() or {}
+  if routerRole == "router" then
+    -- Keep backbone link state; drop MAIN-only board keys if present.
+    local keep = {
+      role = "router",
+      gps = c.gps,
+      gpsHost = c.gpsHost,
+      netLinks = c.netLinks,
+      homeRouter = c.homeRouter,
+      mainRouterId = c.mainRouterId,
+      assignedName = c.assignedName,
+      manualHostname = c.manualHostname,
+    }
+    saveRouterCfg(keep)
+    return keep
+  end
   local slim = { role = "modem" }
   if not opts.clearMain then
     local mid = tonumber(opts.mainRouterId) or tonumber(c.mainRouterId)
     if mid then slim.mainRouterId = mid end
+    local home = tonumber(opts.homeRouter) or tonumber(c.homeRouter)
+      or (c.netLinks and tonumber(c.netLinks.homeRouter))
+    if home then slim.homeRouter = home end
   end
   if not opts.clearName then
     if type(c.assignedName) == "string" and c.assignedName ~= "" then
@@ -671,6 +1256,7 @@ local function sanitizeModemCfg(opts)
   end
   if c.gps then slim.gps = c.gps end
   if c.gpsHost == false then slim.gpsHost = false end
+  if type(c.netLinks) == "table" then slim.netLinks = c.netLinks end
   saveRouterCfg(slim)
   return slim
 end
@@ -780,8 +1366,104 @@ local function classify(msg)
   elseif t == "worker_await" then return "worker?"
   elseif t == "pong" or t == "master_here" then return "computer"
   elseif t == "hello" then return msg.kind or "device"
+  elseif t == "perimeter_hello" then
+    if msg.kind == "manager" or msg.kind == "perimeter_manager" then
+      return "perimeter_manager"
+    end
+    return "perimeter_sensor"
+  elseif type(msg.kind) == "string" and msg.kind:find("perimeter", 1, true) then
+    return msg.kind
   end
   return nil
+end
+
+local function isPerimeterTraffic(msg)
+  if type(msg) ~= "table" or type(msg.type) ~= "string" then return false end
+  local t = msg.type
+  if t == "perimeter_fwd" or t == "perimeter_roster_req" or t == "perimeter_roster" then
+    return false
+  end
+  return t:sub(1, 10) == "perimeter_"
+end
+
+local function listOnlineKind(kind)
+  local out = {}
+  for id, d in pairs(seen) do
+    if isOnline(d) and tostring(d.kind or "") == kind then
+      out[#out + 1] = {
+        id = id,
+        name = d.hostname or d.name or ("#" .. id),
+        x = d.x, y = d.y, z = d.z,
+      }
+    end
+  end
+  table.sort(out, function(a, b) return a.id < b.id end)
+  return out
+end
+
+-- Dedup recent perimeter forwards (origin|type|eventTs|player).
+local perimeterFwdSeen = {}
+local function perimeterFwdKey(originId, msg)
+  return table.concat({
+    tostring(originId or "?"),
+    tostring(msg.type or "?"),
+    tostring(msg.eventTs or msg.ts or msg.time or ""),
+    tostring(msg.player or ""),
+  }, "|")
+end
+
+-- Forward sensor perimeter_* traffic to online perimeter managers (mesh bridge).
+local function forwardPerimeterToManagers(originId, msg)
+  if not isPerimeterTraffic(msg) then return 0 end
+  local t = msg.type
+  if t == "perimeter_config" or t == "perimeter_update" then return 0 end
+  local key = perimeterFwdKey(originId, msg)
+  local now = os.clock()
+  if perimeterFwdSeen[key] and perimeterFwdSeen[key] > now then return 0 end
+  perimeterFwdSeen[key] = now + 15
+  if math.random(1, 20) == 1 then
+    for k, exp in pairs(perimeterFwdSeen) do
+      if exp <= now then perimeterFwdSeen[k] = nil end
+    end
+  end
+
+  local managers = listOnlineKind("perimeter_manager")
+  if #managers == 0 then return 0 end
+
+  local fwd = {}
+  for k, v in pairs(msg) do fwd[k] = v end
+  fwd.hop = true
+  fwd.originId = tonumber(msg.originId) or tonumber(msg.sensorId) or originId
+  fwd.via = os.getComputerID()
+  fwd.sensorId = fwd.originId
+
+  local n = 0
+  for _, m in ipairs(managers) do
+    if m.id ~= originId and m.id ~= fwd.originId then
+      rednet.send(m.id, fwd, "titan_net")
+      rednet.send(m.id, {
+        type = "perimeter_fwd",
+        dest = m.id,
+        originId = fwd.originId,
+        payload = fwd,
+        from = os.getComputerID(),
+      }, PROTO_ROUTER)
+      n = n + 1
+    end
+  end
+  return n
+end
+
+local function deliverPerimeterFwd(msg)
+  local dest = tonumber(msg.dest)
+  local payload = msg.payload
+  if not dest or type(payload) ~= "table" then return false end
+  payload.hop = true
+  payload.originId = tonumber(msg.originId) or tonumber(payload.originId)
+    or tonumber(payload.sensorId) or payload.from
+  payload.via = os.getComputerID()
+  rednet.send(dest, payload, "titan_net")
+  return true
 end
 
 --------------------------------------------------------------------------------
@@ -898,6 +1580,20 @@ local function rosterTouch(id, msg, kind, doAssign)
     local cur = tostring(msg.hostname or msg.name or "")
     assignReboot = isNew or (cur:lower() ~= name:lower())
   end
+  local via = tonumber(msg.via) or (prev and prev.via)
+  local viaModem = tonumber(msg.viaModem) or (prev and prev.viaModem)
+  local home = tonumber(msg.homeRouter) or (prev and prev.homeRouter)
+  local scope = msg.scope or (prev and prev.scope)
+  local remote = msg.remote or (prev and prev.remote)
+  if msg.remote or scope == "global" then
+    scope, remote = "global", true
+  elseif netCells[id] or home == os.getComputerID()
+      or (viaModem and netCells[viaModem]) or isWiredFresh(id) then
+    scope, remote = "local", nil
+  elseif netPeers[id] or (via and netPeers[via])
+      or (home and home ~= os.getComputerID()) then
+    scope, remote = "global", true
+  end
   seen[id] = {
     name = host, hostname = host,
     kind = kind or (prev and prev.kind) or "device",
@@ -905,6 +1601,9 @@ local function rosterTouch(id, msg, kind, doAssign)
     version = msg.version or (prev and prev.version),
     -- Only MAIN's wired probe/pong marks a direct cable link (not RF relays).
     wired = isWiredFresh(id) or nil,
+    via = via, viaModem = viaModem, homeRouter = home,
+    scope = scope, remote = remote,
+    hub = msg.hub or msg.viaName or (prev and prev.hub),
   }
   rosterDirty = true
   if not prev then
@@ -920,16 +1619,74 @@ local function rosterTouch(id, msg, kind, doAssign)
   return assignHostname, assignReboot
 end
 
+-- Fold a remote hub's topology into the GLOBAL roster (MAIN only).
+local function ingestRemoteTopology(id, msg)
+  if not isMain() or type(msg) ~= "table" then return end
+  if id == os.getComputerID() then return end
+  local role = tostring(msg.role or msg.kind or "")
+  if role == "main" or role == "router" or msg.kind == "router" then
+    rosterTouch(id, {
+      hostname = msg.name, name = msg.name, kind = "router",
+      x = msg.x, y = msg.y, z = msg.z,
+      scope = "global", remote = true, role = msg.role,
+    }, "router", false)
+    for _, cell in ipairs(msg.cells or {}) do
+      local cid = tonumber(cell.id)
+      if cid then
+        rosterTouch(cid, {
+          hostname = cell.name, name = cell.name, kind = "modem",
+          homeRouter = id, via = id, scope = "global", remote = true,
+          hub = msg.name,
+        }, "modem", false)
+      end
+    end
+    for _, peer in ipairs(msg.peers or {}) do
+      local pid = tonumber(peer.id)
+      if pid and pid ~= os.getComputerID() then
+        rosterTouch(pid, {
+          hostname = peer.name, name = peer.name, kind = "router",
+          scope = "global", remote = true, via = id,
+        }, "router", false)
+      end
+    end
+  elseif role == "modem" or msg.kind == "modem" then
+    local home = tonumber(msg.homeRouter)
+    if home == os.getComputerID() or netCells[id] then
+      rosterTouch(id, {
+        hostname = msg.name, name = msg.name, kind = "modem",
+        homeRouter = os.getComputerID(), scope = "local",
+        x = msg.x, y = msg.y, z = msg.z,
+      }, "modem", false)
+    elseif home then
+      rosterTouch(id, {
+        hostname = msg.name, name = msg.name, kind = "modem",
+        homeRouter = home, scope = "global", remote = true,
+        x = msg.x, y = msg.y, z = msg.z,
+      }, "modem", false)
+    end
+  end
+end
+
 local function directoryLoop()
   rednet.broadcast({ type = "ping" }, "titan_net")
   rednet.broadcast({ type = "ping" }, "titan_dc")
   claimMain()
   broadcastFleetMap()
+  broadcastNetHello()
+  local nextLinkHello = os.clock() + 25
   while true do
-    local id, msg, proto = rednet.receive()
+    if os.clock() >= nextLinkHello then
+      broadcastNetHello()
+      nextLinkHello = os.clock() + 25
+    end
+    local id, msg, proto = rednet.receive(nil, math.max(0.2, nextLinkHello - os.clock()))
     if type(msg) == "table" and id then
+      if proto == PROTO_ROUTER and handleNetControl(id, msg) then
+        if msg.type == "net_link_hello" or msg.type == "net_topo" then
+          ingestRemoteTopology(id, msg)
+        end
       -- Hopped modem hello: peer modem forwarded a device that can't hear main.
-      if proto == PROTO_ROUTER and msg.type == "hop_hello" and tonumber(msg.from) then
+      elseif proto == PROTO_ROUTER and msg.type == "hop_hello" and tonumber(msg.from) then
         local src = tonumber(msg.from)
         local hello = type(msg.hello) == "table" and msg.hello or msg
         hello.kind = hello.kind or "modem"
@@ -991,7 +1748,62 @@ local function directoryLoop()
           broadcastFleetMap()
         end
 
+      elseif proto == PROTO_ROUTER and (msg.type == "perimeter_roster_req"
+          or msg.type == "perimeter_fwd") then
+        if msg.type == "perimeter_roster_req" then
+          -- Seed roster from announce kind when requester identifies itself.
+          if msg.kind then rosterTouch(id, msg, msg.kind, false) end
+          local sensors = listOnlineKind("perimeter_sensor")
+          local managers = listOnlineKind("perimeter_manager")
+          rednet.send(id, {
+            type = "perimeter_roster",
+            from = os.getComputerID(),
+            sensors = sensors,
+            managers = managers,
+          }, PROTO_ROUTER)
+          -- Optional: flood a config/update to every known sensor via mesh.
+          if type(msg.floodConfig) == "table" then
+            for _, s in ipairs(sensors) do
+              deliverPerimeterFwd({
+                dest = s.id,
+                originId = id,
+                payload = msg.floodConfig,
+              })
+            end
+          end
+        else
+          -- Explicit hop: deliver payload to dest (sensor or manager).
+          deliverPerimeterFwd(msg)
+        end
+
       else
+        -- Perimeter alerts: bridge over the mesh to territory managers.
+        if isPerimeterTraffic(msg) then
+          local origin = tonumber(msg.originId) or tonumber(msg.sensorId) or id
+          if msg.kind == "sensor" or msg.sensorId or tostring(msg.type or ""):find("perimeter_", 1, true) then
+            local pk = "perimeter_sensor"
+            if msg.kind == "manager" or msg.kind == "perimeter_manager" then
+              pk = "perimeter_manager"
+            end
+            rosterTouch(origin, {
+              kind = pk, hostname = msg.gate or msg.name or msg.hostname,
+              x = msg.x, y = msg.y, z = msg.z,
+            }, pk, false)
+          end
+          forwardPerimeterToManagers(origin, msg)
+          -- Also fan-out to backbone peers (other ender routers).
+          for peerId in pairs(netPeers) do
+            if peerId ~= id and peerId ~= origin then
+              local hop = {}
+              for k, v in pairs(msg) do hop[k] = v end
+              hop.hop = true
+              hop.originId = origin
+              hop.via = os.getComputerID()
+              rednet.send(peerId, hop, "titan_net")
+              rednet.send(peerId, hop, PROTO_ROUTER)
+            end
+          end
+        end
         -- Other protocols: remember presence only (no modem naming).
         local kind = classify(msg)
         if kind then rosterTouch(id, msg, kind, false) end
@@ -1001,17 +1813,171 @@ local function directoryLoop()
 end
 
 --------------------------------------------------------------------------------
--- Single-monitor dashboards (main): ROSTER / STATS / GPS / MAP
+-- Single-monitor dashboards (MAIN):
+--   roster/local — this hub's modems + nearby computers
+--   global       — backbone peers + remote mesh
+--   stats / gps / map
 --
 -- One physical monitor. Screensaver by default; wake one board at a time.
 -- Toggle:  screen <role> on|off|perm
 -- Focus:   view <role>
 --------------------------------------------------------------------------------
+local function normalizeScreenRole(role)
+  role = tostring(role or ""):lower()
+  if role == "local" or role == "cell" or role == "lan" then return "roster" end
+  if role == "mesh" or role == "remote" or role == "wan" then return "global" end
+  return role
+end
+
 local function isScreenRole(role)
+  role = normalizeScreenRole(role)
   for _, r in ipairs(SCREEN_ROLES) do
     if r == role then return true end
   end
   return false
+end
+
+-- Local = this hub's RF/wired cell. Global = backbone peers + remote mesh.
+local function isLocalDevice(id, d)
+  if not d then return false end
+  if id == os.getComputerID() then return true end
+  if d.scope == "local" then return true end
+  if d.scope == "global" or d.remote then return false end
+  if d.wired or isWiredFresh(id) then return true end
+  if netCells[id] then return true end
+  if tonumber(d.homeRouter) == os.getComputerID() then return true end
+  local viaM = tonumber(d.viaModem)
+  if viaM and netCells[viaM] then return true end
+  local via = tonumber(d.via)
+  if via and netPeers[via] then return false end
+  -- Backbone peer hubs are global, not local.
+  if netPeers[id] then return false end
+  local k = tostring(d.kind or ""):lower()
+  if k == "router" and id ~= os.getComputerID() then return false end
+  -- Direct / unmarked online devices count as local to this hub.
+  return true
+end
+
+local function isGlobalDevice(id, d)
+  if not d then return false end
+  if id == os.getComputerID() then return true end -- show self on global too as hub
+  if d.scope == "global" or d.remote then return true end
+  if netPeers[id] then return true end
+  local k = tostring(d.kind or ""):lower()
+  if k == "router" then return true end
+  if tonumber(d.homeRouter) and tonumber(d.homeRouter) ~= os.getComputerID() then return true end
+  local via = tonumber(d.via)
+  if via and netPeers[via] then return true end
+  local viaM = tonumber(d.viaModem)
+  if viaM and not netCells[viaM] and viaM ~= os.getComputerID() then return true end
+  return not isLocalDevice(id, d)
+end
+
+local function sortedIdsScoped(scope)
+  local ids = {}
+  for id, d in pairs(seen) do
+    if scope == "local" then
+      if isLocalDevice(id, d) then ids[#ids + 1] = id end
+    elseif scope == "global" then
+      if isGlobalDevice(id, d) then ids[#ids + 1] = id end
+    else
+      ids[#ids + 1] = id
+    end
+  end
+  table.sort(ids, function(a, b)
+    local da, db = seen[a], seen[b]
+    local function rank(d, id)
+      local st = statusOf(d, id)
+      if st == "ONLINE" or st == "WIRED" then return 0 end
+      if st == "UNKNOWN" then return 1 end
+      return 2
+    end
+    local ra, rb = rank(da, a), rank(db, b)
+    if ra ~= rb then return ra < rb end
+    local ha = tostring(da.hostname or da.name or ""):lower()
+    local hb = tostring(db.hostname or db.name or ""):lower()
+    if ha ~= hb then return ha < hb end
+    return a < b
+  end)
+  return ids
+end
+
+local function countScoped(scope)
+  local on, off, unk = 0, 0, 0
+  for _, id in ipairs(sortedIdsScoped(scope)) do
+    local st = statusOf(seen[id], id)
+    if st == "ONLINE" or st == "WIRED" then on = on + 1
+    elseif st == "UNKNOWN" then unk = unk + 1
+    else off = off + 1 end
+  end
+  return on, off, unk
+end
+
+-- Snapshot for admin tablets (pretty boards over rednet).
+buildBoardSnap = function()
+  local function rows(scope)
+    local out = {}
+    for _, id in ipairs(sortedIdsScoped(scope)) do
+      local d = seen[id]
+      if d then
+        local st = statusOf(d, id)
+        out[#out + 1] = {
+          id = id,
+          hostname = d.hostname or d.name or ("#" .. id),
+          kind = d.kind or "device",
+          status = st,
+          seen = d.seen or 0,
+          hub = d.hub,
+          homeRouter = d.homeRouter,
+          remote = d.remote and true or nil,
+        }
+      end
+    end
+    return out
+  end
+  local on, off, unk = countOnlineOffline()
+  local lon, loff, lunk = countScoped("local")
+  local gon, goff, gunk = countScoped("global")
+  local kinds = {}
+  local remembered = 0
+  for _, d in pairs(seen) do
+    remembered = remembered + 1
+    local k = d.kind or "device"
+    kinds[k] = (kinds[k] or 0) + 1
+  end
+  local nPeers, nCells = 0, 0
+  for _ in pairs(netPeers) do nPeers = nPeers + 1 end
+  for _ in pairs(netCells) do nCells = nCells + 1 end
+  local nRf = wirelessModems and #wirelessModems or 0
+  local nWire = wiredModems and #wiredModems or 0
+  local nModems = modems and #modems or (nRf + nWire)
+  return {
+    type = "board_snap",
+    role = routerRole,
+    id = os.getComputerID(),
+    name = os.getComputerLabel() or ("Router-" .. os.getComputerID()),
+    localRows = rows("local"),
+    globalRows = rows("global"),
+    localCounts = { on = lon, off = loff, unk = lunk },
+    globalCounts = { on = gon, off = goff, unk = gunk },
+    peers = nPeers,
+    cells = nCells,
+    stats = {
+      role = routerRole,
+      hostname = os.getComputerLabel() or ("Router-" .. os.getComputerID()),
+      uptimeSec = math.floor((os.epoch("utc") - BOOT_EPOCH) / 1000),
+      modems = nModems, rf = nRf, wire = nWire,
+      relayed = (relayStats and tonumber(relayStats.relayed)) or 0,
+      online = on, offline = off, unknown = unk,
+      wired = countWiredOnline(),
+      remembered = remembered,
+      kinds = kinds,
+      peers = nPeers, cells = nCells,
+    },
+    gps = gpsCoords and {
+      hosting = true, x = gpsCoords.x, y = gpsCoords.y, z = gpsCoords.z,
+    } or { hosting = false },
+  }
 end
 
 local function listMonitorNames()
@@ -1027,8 +1993,119 @@ local function wrapScreen(name)
   if not name or not peripheral.isPresent(name) then return nil end
   if peripheral.getType(name) ~= "monitor" then return nil end
   local m = peripheral.wrap(name)
-  if m then pcall(function() m.setTextScale(0.5) end) end
   return m
+end
+
+--------------------------------------------------------------------------------
+-- Monitor GUI: advanced (color) chrome + auto layout by screen size
+--------------------------------------------------------------------------------
+local function monIsColor(out)
+  local ok, c = pcall(function() return out.isColor and out.isColor() end)
+  return ok and c == true
+end
+
+-- Pick text scale from monitor size so huge walls stay readable and
+-- small monitors stay dense. Returns scale, w, h, color after applying.
+local function monApplyScale(out)
+  if not out then return 0.5, 0, 0, false end
+  local color = monIsColor(out)
+  -- Probe at 0.5 (max character density), then bump scale on huge walls.
+  pcall(function() out.setTextScale(0.5) end)
+  local w, h = out.getSize()
+  local scale = 0.5
+  if w >= 90 and h >= 36 then
+    scale = 1 -- ~6x4+ advanced wall: prefer readable cells
+  end
+  pcall(function() out.setTextScale(scale) end)
+  w, h = out.getSize()
+  return scale, w, h, color
+end
+
+local function monLayout(out)
+  local scale, w, h, color = monApplyScale(out)
+  local tier
+  if w < 20 or h < 8 then tier = "tiny"
+  elseif w < 30 or h < 12 then tier = "small"
+  elseif w < 50 or h < 18 then tier = "medium"
+  else tier = "large" end
+  return {
+    out = out, w = w, h = h, scale = scale, color = color, tier = tier,
+    -- Layout slots (leave last row for footer).
+    headerH = (tier == "tiny") and 1 or ((tier == "small") and 2 or 3),
+    footerH = 1,
+    pad = (tier == "large" and color) and 1 or 0,
+  }
+end
+
+local function guiFill(out, x, y, w, h, bg, fg)
+  if not out then return end
+  bg = bg or colors.black
+  fg = fg or colors.white
+  for row = y, y + h - 1 do
+    out.setCursorPos(x, row)
+    if out.setBackgroundColor then out.setBackgroundColor(bg) end
+    if out.setTextColor then out.setTextColor(fg) end
+    out.write(string.rep(" ", w))
+  end
+end
+
+local function guiText(out, x, y, txt, fg, bg)
+  if not out or y < 1 then return end
+  local w = select(1, out.getSize())
+  if x > w then return end
+  txt = tostring(txt or "")
+  if out.setBackgroundColor then out.setBackgroundColor(bg or colors.black) end
+  if out.setTextColor then out.setTextColor(fg or colors.white) end
+  out.setCursorPos(x, y)
+  out.write(txt:sub(1, math.max(0, w - x + 1)))
+end
+
+local function guiBar(L, y, title, subtitle, accent)
+  local out, w = L.out, L.w
+  accent = accent or colors.cyan
+  if L.color then
+    guiFill(out, 1, y, w, 1, accent, colors.black)
+    guiText(out, 2, y, title, colors.black, accent)
+    if subtitle and L.tier ~= "tiny" and #title + #subtitle + 4 < w then
+      guiText(out, math.max(1, w - #subtitle), y, subtitle, colors.gray, accent)
+    end
+  else
+    guiText(out, 1, y, title, colors.white, colors.black)
+    if subtitle and L.tier ~= "tiny" then
+      guiText(out, math.max(1, w - #subtitle + 1), y, subtitle, colors.lightGray, colors.black)
+    end
+  end
+end
+
+local function guiChip(out, x, y, label, fg, bg, colorOk)
+  label = " " .. tostring(label) .. " "
+  if colorOk then
+    guiText(out, x, y, label, fg or colors.white, bg or colors.gray)
+  else
+    guiText(out, x, y, "[" .. tostring(label):match("^%s*(.-)%s*$") .. "]", fg or colors.white, colors.black)
+  end
+  return x + #label + (colorOk and 1 or 0)
+end
+
+local function guiFooter(L, role)
+  local out, w, h = L.out, L.w, L.h
+  local left = ""
+  if boardWakeAt and not screenPerm[role] then
+    left = (" %ds"):format(math.max(0, math.floor(boardWakeAt + saverIdleSecs - os.clock())))
+  elseif screenPerm[role] then
+    left = " PERM"
+  end
+  local tag = (role == "roster") and "local" or tostring(role)
+  local right = L.color and " ADV" or " MONO"
+  right = right .. (" %dx%d"):format(w, h)
+  local line = (" %s%s"):format(tag, left)
+  if L.color then
+    guiFill(out, 1, h, w, 1, colors.gray, colors.white)
+    guiText(out, 1, h, line, colors.white, colors.gray)
+    guiText(out, math.max(1, w - #right + 1), h, right, colors.lightGray, colors.gray)
+  else
+    guiText(out, 1, h, (line .. right):sub(1, w), colors.gray, colors.black)
+  end
 end
 
 local function loadScreenAssignments()
@@ -1117,6 +2194,7 @@ local function expireTemporaryBoards()
 end
 
 local function wakeBoard(role, permanent)
+  role = normalizeScreenRole(role)
   if not isScreenRole(role) then return false end
   -- Single-screen: exclusive — only this board is live.
   for _, r in ipairs(SCREEN_ROLES) do
@@ -1174,12 +2252,14 @@ end
 
 local function monLine(out, w, y, txt, c)
   out.setCursorPos(1, y)
+  if out.setBackgroundColor then out.setBackgroundColor(colors.black) end
   out.setTextColor(c or colors.white)
   out.write(tostring(txt):sub(1, w))
 end
 
 local function clearMon(out)
-  out.setBackgroundColor(colors.black)
+  if out.setBackgroundColor then out.setBackgroundColor(colors.black) end
+  if out.setTextColor then out.setTextColor(colors.white) end
   out.clear()
 end
 
@@ -1202,75 +2282,169 @@ local function uptimeStr()
   return ("%ds"):format(s)
 end
 
-local function drawStatusHeader(out, w, y, on, off, unk)
-  -- Color-coded counts: green ONLINE, red OFFLINE, yellow UNKNOWN.
-  out.setCursorPos(1, y)
-  local function writePart(txt, c)
-    out.setTextColor(c)
-    out.write(txt)
+local function drawStatusChips(L, y, on, off, unk)
+  local out, w = L.out, L.w
+  if L.tier == "tiny" then
+    guiText(out, 1, y, ("ON:%d OFF:%d ?:%d"):format(on, off, unk), colors.white, colors.black)
+    return
   end
-  writePart("ONLINE:" .. tostring(on), colors.lime)
-  writePart("  ", colors.white)
-  writePart("OFFLINE:" .. tostring(off), colors.red)
-  writePart("  ", colors.white)
-  writePart("UNKNOWN:" .. tostring(unk), colors.yellow)
-  -- Clear remainder of the line.
-  local cx = out.getCursorPos()
-  if cx <= w then
-    out.setTextColor(colors.white)
-    out.write(string.rep(" ", w - cx + 1))
+  local x = 1
+  if L.color then
+    guiFill(out, 1, y, w, 1, colors.black, colors.white)
+    x = guiChip(out, x, y, "ON " .. on, colors.black, colors.lime, true)
+    x = guiChip(out, x, y, "OFF " .. off, colors.white, colors.red, true)
+    guiChip(out, x, y, "? " .. unk, colors.black, colors.yellow, true)
+  else
+    guiText(out, 1, y,
+      ("ONLINE:%d  OFFLINE:%d  UNKNOWN:%d"):format(on, off, unk),
+      colors.white, colors.black)
+  end
+end
+
+local function drawRosterScoped(out, scope, y0, y1)
+  local L = monLayout(out)
+  local w, h = L.w, L.h
+  y0 = y0 or 1
+  y1 = y1 or (h - L.footerH)
+  local on, off, unk = countScoped(scope)
+  local title = (scope == "global") and "GLOBAL MESH" or "LOCAL NETWORK"
+  local accent = (scope == "global") and (colors.orange or colors.yellow) or (colors.cyan or colors.lightBlue)
+
+  local y = y0
+  guiBar(L, y, title, L.color and (L.tier ~= "tiny" and "ADV" or nil) or "MONO", accent)
+  y = y + 1
+
+  if y <= y1 then
+    drawStatusChips(L, y, on, off, unk)
+    y = y + 1
+  end
+
+  if L.headerH >= 3 and y <= y1 then
+    local nPeers, nCells = 0, 0
+    for _ in pairs(netPeers) do nPeers = nPeers + 1 end
+    for _ in pairs(netCells) do nCells = nCells + 1 end
+    local meta
+    if scope == "global" then
+      meta = ("backbone %d  cells %d"):format(nPeers, nCells)
+    else
+      meta = ("cells %d  peers %d"):format(nCells, nPeers)
+    end
+    if L.color then
+      guiFill(out, 1, y, w, 1, colors.gray, colors.white)
+      guiText(out, 2, y, meta, colors.white, colors.gray)
+    else
+      guiText(out, 1, y, meta, colors.lightGray, colors.black)
+    end
+    y = y + 1
+  end
+
+  -- Column plan by width.
+  local showKind = w >= 28
+  local showAge = w >= 36
+  local idW = (w < 22) and 3 or 4
+  local stW = (L.tier == "tiny") and 3 or 8
+  if y <= y1 then
+    local hdr
+    if L.tier == "tiny" then
+      hdr = "ID ST HOST"
+    elseif not showKind then
+      hdr = ("%-" .. idW .. "s %-8s HOST"):format("ID", "STATUS")
+    elseif not showAge then
+      hdr = ("%-" .. idW .. "s %-8s %-6s HOST"):format("ID", "STATUS", "KIND")
+    else
+      hdr = ("%-" .. idW .. "s %-8s %-8s HOST"):format("ID", "STATUS", "KIND")
+    end
+    local hbg = L.color and colors.lightGray or colors.black
+    local hfg = L.color and colors.black or colors.lightGray
+    if L.color then guiFill(out, 1, y, w, 1, hbg, hfg) end
+    guiText(out, 1 + L.pad, y, hdr, hfg, hbg)
+    y = y + 1
+  end
+
+  local listStart = y
+  local ids = sortedIdsScoped(scope)
+  for _, id in ipairs(ids) do
+    if y > y1 then break end
+    local d = seen[id]
+    local host = d.hostname or d.name or "?"
+    if scope == "global" and d.hub then
+      host = host .. " @" .. tostring(d.hub):sub(1, 8)
+    elseif scope == "global" and d.homeRouter and d.homeRouter ~= os.getComputerID() then
+      host = host .. " →#" .. tostring(d.homeRouter)
+    end
+    local status, statusColor = statusOf(d, id)
+    local stShort = status
+    if L.tier == "tiny" then
+      if status == "ONLINE" then stShort = "ON"
+      elseif status == "OFFLINE" then stShort = "OFF"
+      elseif status == "WIRED" then stShort = "WR"
+      else stShort = "?" end
+    end
+    local age = d.seen and d.seen > 0 and (ago(d.seen) .. "s") or "-"
+    local kind = (d.kind or "?"):sub(1, showKind and (w >= 40 and 8 or 6) or 0)
+    local bg = colors.black
+    if L.color and ((y - listStart) % 2 == 1) then bg = colors.gray end
+
+    if L.color then guiFill(out, 1, y, w, 1, bg, colors.white) end
+
+    local x = 1 + L.pad
+    guiText(out, x, y, ("%-" .. idW .. "d"):format(id), colors.white, bg)
+    x = x + idW + 1
+
+    if L.color and L.tier ~= "tiny" then
+      local chip = ("%-" .. math.min(stW, 8) .. "s"):format(stShort)
+      local chipBg = statusColor
+      local chipFg = colors.black
+      if status == "OFFLINE" then chipFg = colors.white end
+      if status == "UNKNOWN" then chipFg = colors.black end
+      guiText(out, x, y, chip, chipFg, chipBg)
+      x = x + #chip + 1
+    else
+      guiText(out, x, y, ("%-" .. stW .. "s"):format(stShort), statusColor, bg)
+      x = x + stW + 1
+    end
+
+    local kindCol = colors.white
+    if status == "WIRED" then kindCol = colors.cyan
+    elseif d.remote or scope == "global" then kindCol = colors.orange or colors.yellow
+    end
+    if showKind and #kind > 0 then
+      local kw = (w >= 40) and 8 or 6
+      guiText(out, x, y, ("%-" .. kw .. "s"):format(kind), kindCol, bg)
+      x = x + kw + 1
+    end
+
+    local ageStr = showAge and tostring(age) or ""
+    local room = w - x - (showAge and (#ageStr + 1) or 0) - L.pad
+    if room < 1 then room = math.max(0, w - x) end
+    guiText(out, x, y, host:sub(1, room), colors.white, bg)
+    if showAge and #ageStr > 0 then
+      guiText(out, w - #ageStr + 1 - L.pad, y, ageStr, colors.lightGray, bg)
+    end
+    y = y + 1
+  end
+
+  if y == listStart and y <= y1 then
+    local empty = (scope == "global")
+      and "(no remote hubs — link peer <id>)"
+      or "(no local devices — link modem <id>)"
+    guiText(out, 1 + L.pad, y, empty, colors.gray, colors.black)
   end
 end
 
 local function drawRoster(out, y0, y1)
-  local w, h = out.getSize()
-  y0 = y0 or 1
-  y1 = y1 or h
-  local on, off, unk = countOnlineOffline()
-  monLine(out, w, y0, "== ROSTER ==", colors.white)
-  if y0 + 1 <= y1 then
-    drawStatusHeader(out, w, y0 + 1, on, off, unk)
-  end
-  if y0 + 2 <= y1 then
-    monLine(out, w, y0 + 2, "ID   STATUS   KIND     HOSTNAME", colors.lightGray)
-  end
-  local y = y0 + 3
-  for _, id in ipairs(sortedIds()) do
-    if y > y1 then break end
-    local d = seen[id]
-    local host = d.hostname or d.name or "?"
-    local status, statusColor = statusOf(d, id)
-    local age = d.seen and d.seen > 0 and (ago(d.seen) .. "s") or "-"
-    -- ID + STATUS (colored) + KIND + HOSTNAME
-    out.setCursorPos(1, y)
-    out.setTextColor(colors.white)
-    out.write(("%-4d "):format(id))
-    out.setTextColor(statusColor)
-    out.write(("%-8s "):format(status))
-    out.setTextColor(status == "WIRED" and colors.cyan or colors.white)
-    local rest = ("%-8s %s"):format((d.kind or "?"):sub(1, 8), host)
-    local used = 4 + 1 + 8 + 1
-    local room = w - used - 6
-    if room < 8 then room = math.max(0, w - used) end
-    out.write(rest:sub(1, room))
-    local ageStr = tostring(age)
-    local rowLen = used + math.min(#rest, room)
-    if w >= rowLen + #ageStr + 1 then
-      out.setCursorPos(w - #ageStr + 1, y)
-      out.setTextColor(colors.gray)
-      out.write(ageStr)
-    end
-    y = y + 1
-  end
-  if y == y0 + 3 and y <= y1 then
-    monLine(out, w, y, "(no systems registered yet)", colors.gray)
-  end
+  drawRosterScoped(out, "local", y0, y1)
+end
+
+local function drawGlobal(out, y0, y1)
+  drawRosterScoped(out, "global", y0, y1)
 end
 
 local function drawStats(out, y0, y1)
-  local w, h = out.getSize()
+  local L = monLayout(out)
+  local w, h = L.w, L.h
   y0 = y0 or 1
-  y1 = y1 or h
+  y1 = y1 or (h - L.footerH)
   local on, off, unk = countOnlineOffline()
   local remembered = 0
   for _ in pairs(seen) do remembered = remembered + 1 end
@@ -1279,77 +2453,142 @@ local function drawStats(out, y0, y1)
   local nWire = wiredModems and #wiredModems or 0
   local nModems = modems and #modems or (nRf + nWire)
   local nRelayed = (relayStats and tonumber(relayStats.relayed)) or 0
-  monLine(out, w, y0, "== STATS ==", colors.white)
-  local rows = {}
-  local function addRow(txt, col)
-    rows[#rows + 1] = { txt, col }
+
+  local y = y0
+  guiBar(L, y, "STATS", ("#%d"):format(os.getComputerID()), cyan)
+  y = y + 1
+
+  if y <= y1 then
+    drawStatusChips(L, y, on, off, unk)
+    y = y + 1
   end
-  addRow(string.format("Router #%d  [%s]", os.getComputerID(), tostring(routerRole or "?"):upper()), colors.white)
-  addRow(string.format("Hostname: %s", tostring(os.getComputerLabel() or "?")), colors.lightGray)
-  addRow(string.format("Uptime: %s", uptimeStr()), colors.white)
-  addRow(string.format("Modems: %d  (rf:%d wire:%d)", nModems, nRf, nWire), colors.white)
-  addRow(string.format("Relayed: %d", nRelayed), cyan)
-  addRow(string.format("Online: %d", on), colors.lime)
-  addRow(string.format("Wired: %d", countWiredOnline()), cyan)
-  addRow(string.format("Offline: %d", off), colors.red)
-  addRow(string.format("Unknown: %d", unk), colors.yellow)
-  addRow(string.format("Remembered: %d", remembered), colors.white)
-  local y = y0 + 1
-  for _, r in ipairs(rows) do
-    if y > y1 then return end
-    monLine(out, w, y, r[1], r[2]); y = y + 1
+
+  local cards = {
+    { "ROLE", tostring(routerRole or "?"):upper(), colors.white },
+    { "HOST", tostring(os.getComputerLabel() or "?"):sub(1, 16), colors.lightGray },
+    { "UP", uptimeStr(), colors.white },
+    { "MODEMS", ("%d rf:%d wire:%d"):format(nModems, nRf, nWire), colors.white },
+    { "RELAY", tostring(nRelayed), cyan },
+    { "WIRED", tostring(countWiredOnline()), cyan },
+    { "MEM", tostring(remembered), colors.white },
+  }
+
+  if L.color and L.tier ~= "tiny" and w >= 30 then
+    -- Two-column key/value cards on advanced monitors.
+    local colW = math.floor((w - 2) / 2)
+    local i = 1
+    while i <= #cards and y <= y1 do
+      local a, b = cards[i], cards[i + 1]
+      guiFill(out, 1, y, w, 1, colors.gray, colors.white)
+      local left = (" %s %s"):format(a[1], a[2])
+      guiText(out, 1, y, left:sub(1, colW), a[3], colors.gray)
+      if b then
+        local right = (" %s %s"):format(b[1], b[2])
+        guiText(out, colW + 2, y, right:sub(1, colW), b[3], colors.gray)
+        i = i + 2
+      else
+        i = i + 1
+      end
+      y = y + 1
+    end
+  else
+    for _, c in ipairs(cards) do
+      if y > y1 then break end
+      local line = ("%s: %s"):format(c[1], c[2])
+      if L.tier == "tiny" then line = ("%s %s"):format(c[1], c[2]) end
+      guiText(out, 1 + L.pad, y, line, c[3], colors.black)
+      y = y + 1
+    end
   end
-  if y <= y1 then monLine(out, w, y, "By kind:", colors.lightGray); y = y + 1 end
+
+  if y <= y1 then
+    if L.color then
+      guiFill(out, 1, y, w, 1, colors.lightGray, colors.black)
+      guiText(out, 2, y, "BY KIND", colors.black, colors.lightGray)
+    else
+      guiText(out, 1, y, "By kind:", colors.lightGray, colors.black)
+    end
+    y = y + 1
+  end
+
   local kinds = kindCounts()
   local keys = {}
   for k in pairs(kinds) do keys[#keys + 1] = k end
   table.sort(keys)
   for _, k in ipairs(keys) do
     if y > y1 then break end
-    monLine(out, w, y, string.format("  %-10s %d", k, kinds[k]), colors.white)
+    local n = kinds[k]
+    if L.color and w >= 24 then
+      local barW = math.max(1, math.min(w - 14, n))
+      guiText(out, 1 + L.pad, y, ("%-10s %3d "):format(k:sub(1, 10), n), colors.white, colors.black)
+      guiText(out, 16 + L.pad, y, string.rep(" ", barW), colors.black, cyan)
+    else
+      guiText(out, 1 + L.pad, y, ("%-10s %d"):format(k, n), colors.white, colors.black)
+    end
     y = y + 1
   end
   if #keys == 0 and y <= y1 then
-    monLine(out, w, y, "  (none)", colors.gray)
+    guiText(out, 1 + L.pad, y, "(none)", colors.gray, colors.black)
   end
 end
 
 local function drawGps(out, y0, y1)
-  local w, h = out.getSize()
+  local L = monLayout(out)
+  local w, h = L.w, L.h
   y0 = y0 or 1
-  y1 = y1 or h
-  monLine(out, w, y0, "== GPS ==", colors.yellow)
-  local y = y0 + 1
-  local function put(txt, c)
+  y1 = y1 or (h - L.footerH)
+  local y = y0
+  guiBar(L, y, "GPS", gpsCoords and "HOSTING" or "IDLE", colors.yellow)
+  y = y + 1
+
+  local function put(txt, c, bg)
     if y > y1 then return end
-    monLine(out, w, y, txt, c); y = y + 1
+    if L.color and bg then guiFill(out, 1, y, w, 1, bg, c or colors.white) end
+    guiText(out, 1 + L.pad, y, txt, c or colors.white, bg or colors.black)
+    y = y + 1
   end
+
   if gpsCoords then
-    put("Hosting: YES", colors.lime)
-    put(("X: %d"):format(gpsCoords.x), colors.white)
-    put(("Y: %d"):format(gpsCoords.y), colors.white)
-    put(("Z: %d"):format(gpsCoords.z), colors.white)
-    put(("Pos: %d, %d, %d"):format(gpsCoords.x, gpsCoords.y, gpsCoords.z), colors.cyan)
+    if L.color then
+      put(" HOSTING ", colors.black, colors.lime)
+      local box = ("  X %-6d  Y %-6d  Z %-6d"):format(gpsCoords.x, gpsCoords.y, gpsCoords.z)
+      if L.tier == "tiny" then
+        put(("%d,%d,%d"):format(gpsCoords.x, gpsCoords.y, gpsCoords.z), colors.white, colors.gray)
+      else
+        put(box, colors.white, colors.gray)
+        put(("  %d, %d, %d"):format(gpsCoords.x, gpsCoords.y, gpsCoords.z), colors.cyan, colors.black)
+      end
+    else
+      put("Hosting: YES", colors.lime)
+      put(("X: %d"):format(gpsCoords.x), colors.white)
+      put(("Y: %d"):format(gpsCoords.y), colors.white)
+      put(("Z: %d"):format(gpsCoords.z), colors.white)
+    end
   else
-    put("Hosting: NO", colors.red)
+    put(L.color and " NOT HOSTING " or "Hosting: NO",
+      L.color and colors.white or colors.red,
+      L.color and colors.red or colors.black)
     put("Use: gpshost <x> <y> <z>", colors.lightGray)
   end
-  put("", colors.white)
-  put("Live locate:", colors.lightGray)
-  -- Keep this snappy so the GPS board paints every second (no multi-sample stall).
+
+  if y <= y1 and L.tier ~= "tiny" then put("", colors.white) end
+  put("Live locate", colors.lightGray, L.color and colors.gray or nil)
   local lx, ly, lz = gps.locate(0.3)
   if lx then
     lx = math.floor(lx + 0.5); ly = math.floor(ly + 0.5); lz = math.floor(lz + 0.5)
     put(("  %d, %d, %d"):format(lx, ly, lz), colors.lime)
   else
-    put("  (no fix - need 4 hosts)", colors.orange)
+    put("  (no fix — need 4 hosts)", colors.orange or colors.yellow)
   end
-  put("", colors.white)
-  put("Constellation: place 4+", colors.gray)
-  put("routers with gpshost set.", colors.gray)
+  if L.tier ~= "tiny" then
+    put("", colors.white)
+    put("Constellation: place 4+ routers", colors.gray)
+    put("with gpshost set.", colors.gray)
+  end
 end
 
 local function setScreenOn(role, on)
+  role = normalizeScreenRole(role)
   if not isScreenRole(role) then return false end
   if on then
     return wakeBoard(role, false)
@@ -1365,6 +2604,7 @@ local function setScreenOn(role, on)
 end
 
 local function setScreenFocus(role)
+  role = normalizeScreenRole(role)
   if not isScreenRole(role) then return false end
   return wakeBoard(role, false)
 end
@@ -1425,23 +2665,32 @@ local function screensaverFrame(entering)
 end
 
 local function drawUpdateAcks(out)
-  local w, h = out.getSize()
   clearMon(out)
-  pcall(function() out.setTextScale(0.5) end)
+  local L = monLayout(out)
+  local w, h = L.w, L.h
   local camp = updateCampaign
   if not camp then
-    monLine(out, w, 1, "== OTA UPDATE ==", colors.yellow)
-    monLine(out, w, 2, "(no active campaign)", colors.gray)
+    guiBar(L, 1, "OTA UPDATE", nil, colors.yellow)
+    guiText(out, 1 + L.pad, 2, "(no active campaign)", colors.gray, colors.black)
+    guiFooter(L, "update")
     return
   end
   local exp, ack, fail = campaignCounts()
-  monLine(out, w, 1, ("== OTA UPDATE v%s =="):format(tostring(camp.version or "?")), colors.yellow)
-  monLine(out, w, 2, ("ACKs %d  FAIL %d  / %d expected"):format(ack or 0, fail or 0, exp or 0), colors.lime)
+  guiBar(L, 1, ("OTA v%s"):format(tostring(camp.version or "?")), nil, colors.yellow)
+  local y = 2
+  if L.color then
+    local x = 1
+    x = guiChip(out, x, y, "ACK " .. tostring(ack or 0), colors.black, colors.lime, true)
+    x = guiChip(out, x, y, "FAIL " .. tostring(fail or 0), colors.white, colors.red, true)
+    guiChip(out, x, y, "EXP " .. tostring(exp or 0), colors.black, colors.lightGray, true)
+  else
+    guiText(out, 1, y, ("ACKs %d  FAIL %d  / %d expected"):format(ack or 0, fail or 0, exp or 0), colors.lime, colors.black)
+  end
+  y = 3
 
   local ids = {}
   for id in pairs(camp.expected) do ids[#ids + 1] = id end
   table.sort(ids)
-  -- Also show main self-ack if recorded under acked but not expected.
   if camp.acked[os.getComputerID()] then
     local selfId = os.getComputerID()
     local has = false
@@ -1449,10 +2698,10 @@ local function drawUpdateAcks(out)
     if not has then table.insert(ids, 1, selfId) end
   end
 
-  local y = 4
-  local function put(txt, c)
+  local function put(txt, c, bg)
     if y > h - 1 then return false end
-    monLine(out, w, y, txt, c)
+    if L.color and bg then guiFill(out, 1, y, w, 1, bg, c or colors.white) end
+    guiText(out, 1 + L.pad, y, txt, c or colors.white, bg or colors.black)
     y = y + 1
     return true
   end
@@ -1469,7 +2718,7 @@ local function drawUpdateAcks(out)
     local ainfo = camp.acked[id]
     local finfo = camp.failed[id]
     if ainfo then
-      if not put(tostring(name), colors.lime) then break end
+      if not put(tostring(name), L.color and colors.black or colors.lime, L.color and colors.lime or nil) then break end
       local pkgs = ainfo.packages or {}
       if #pkgs == 0 then
         put(("  system - version: ? - %s"):format(tostring(ainfo.version or "?")), colors.white)
@@ -1483,23 +2732,24 @@ local function drawUpdateAcks(out)
         end
       end
     elseif finfo then
-      if not put(tostring(finfo.name or name), colors.red) then break end
-      put(("  FAIL: %s"):format(tostring(finfo.err or "?"):sub(1, w - 8)), colors.orange)
+      if not put(tostring(finfo.name or name), L.color and colors.white or colors.red, L.color and colors.red or nil) then break end
+      put(("  FAIL: %s"):format(tostring(finfo.err or "?"):sub(1, w - 8)), colors.orange or colors.yellow)
     else
-      if not put(tostring(name), colors.lightGray) then break end
+      if not put(tostring(name), colors.lightGray, L.color and colors.gray or nil) then break end
       put("  (waiting for ACK...)", colors.gray)
     end
-    if y < h - 1 then put("", colors.white) end
+    if y < h - 1 and L.tier ~= "tiny" then put("", colors.white) end
   end
 
   if #ids == 0 then
     put("(no online devices expected — main self-updated)", colors.gray)
   end
 
-  local footer = "[update] " .. (camp.finishedAt and "done" or "collecting")
-  out.setCursorPos(1, h)
-  out.setTextColor(colors.gray)
-  out.write(footer:sub(1, w))
+  local footer = camp.finishedAt and "done" or "collecting"
+  guiFooter({ out = out, w = w, h = h, color = L.color, tier = L.tier }, "update")
+  if L.color then
+    guiText(out, math.max(1, w - #footer - 12), h, footer, colors.white, colors.gray)
+  end
 end
 
 paintUpdateAcks = function()
@@ -1537,35 +2787,28 @@ drawBoards = function()
 
   local mon = displayMon
   clearMon(mon)
-  -- Ensure text scale after clear (some monitors reset quirks).
-  pcall(function() mon.setTextScale(0.5) end)
+  local L = monLayout(mon)
+  local contentBottom = math.max(1, L.h - L.footerH)
 
   if role == "stats" then
-    drawStats(mon)
+    drawStats(mon, 1, contentBottom)
   elseif role == "gps" then
-    drawGps(mon)
+    drawGps(mon, 1, contentBottom)
   elseif role == "map" then
     if drawMapBoard then drawMapBoard(mon) else
-      monLine(mon, select(1, mon.getSize()), 1, "== MAP ==", colors.yellow)
-      monLine(mon, select(1, mon.getSize()), 2, "(map unavailable)", colors.gray)
+      guiBar(L, 1, "MAP", nil, colors.yellow)
+      guiText(mon, 1, 2, "(map unavailable)", colors.gray, colors.black)
     end
+  elseif role == "global" then
+    drawGlobal(mon, 1, contentBottom)
   else
-    drawRoster(mon)
+    -- roster / local
+    drawRoster(mon, 1, contentBottom)
   end
 
-  -- Footer: which board + temp countdown.
-  local w, h = mon.getSize()
-  if h >= 2 then
-    local left = ""
-    if boardWakeAt and not screenPerm[role] then
-      local sec = math.max(0, math.floor(boardWakeAt + saverIdleSecs - os.clock()))
-      left = ("  %ds"):format(sec)
-    elseif screenPerm[role] then
-      left = "  PERM"
-    end
-    mon.setCursorPos(1, h)
-    mon.setTextColor(colors.gray)
-    mon.write((("[%s]%s"):format(role, left)):sub(1, w))
+  -- Map board has its own chrome; other boards share the adaptive footer.
+  if L.h >= 2 and role ~= "map" then
+    guiFooter(L, role)
   end
 end
 
@@ -1644,7 +2887,7 @@ local function githubWatchLoop()
           print("")
           print(("[GitHub] New Titan v%s available (local %s)."):format(
             tostring(cat.system), tostring(localVer or "?")))
-          print("[GitHub] Run `update all` to push fleet OTA from GitHub packages.")
+          print("[GitHub] Run `update` (modems) or `update all` (whole fleet).")
         end
       elseif err then
         -- Quiet unless first failure after boot.
@@ -1726,27 +2969,44 @@ local function modemLoop()
     applyAssignedName(msg.assignHostname, needReboot)
   end
 
+  local function hubId()
+    return homeRouterId or mainId
+  end
+
   local function announce()
     local x, y, z = ownPos()
     local name = assignedName or os.getComputerLabel()
-      or ("Modem-pending-" .. os.getComputerID())
+      or ((routerRole == "router") and ("Router-" .. os.getComputerID())
+          or ("Modem-pending-" .. os.getComputerID()))
+    local kind = roleKind()
     local msg = {
-      type = "hello", kind = "modem", name = name, hostname = name,
-      autoName = not manualName,
-      needName = (not manualName) and (assignedName == nil),
+      type = "hello", kind = kind, name = name, hostname = name,
+      role = routerRole,
+      autoName = (routerRole == "modem") and (not manualName) or false,
+      needName = (routerRole == "modem") and (not manualName) and (assignedName == nil),
+      homeRouter = homeRouterId,
     }
     if x then msg.x, msg.y, msg.z = x, y, z end
-    -- Prefer directed hello to main when known; also broadcast for mesh/repeat.
-    if mainId then
-      rednet.send(mainId, msg, PROTO_ROUTER)
+    -- Prefer home router (local hub), then MAIN, then broadcast.
+    local hub = hubId()
+    if hub then rednet.send(hub, msg, PROTO_ROUTER) end
+    if mainId and mainId ~= hub then rednet.send(mainId, msg, PROTO_ROUTER) end
+    for peerId in pairs(netPeers) do
+      rednet.send(peerId, msg, PROTO_ROUTER)
     end
     rednet.broadcast(msg, PROTO_ROUTER)
-    -- If main is stale/unknown, ask peers to hop us a path.
+    broadcastNetHello()
     if not mainId or (os.clock() - mainSeenAt) > MAIN_STALE then
       rednet.broadcast({
         type = "hop_find_main", from = os.getComputerID(),
         name = name, hostname = name,
       }, PROTO_ROUTER)
+      if hub then
+        rednet.send(hub, {
+          type = "hop_find_main", from = os.getComputerID(),
+          name = name, hostname = name,
+        }, PROTO_ROUTER)
+      end
     end
   end
 
@@ -1756,12 +3016,23 @@ local function modemLoop()
       type = "hop_find_main", from = os.getComputerID(),
       name = os.getComputerLabel(),
     }, PROTO_ROUTER)
+    local hub = hubId()
+    if hub then
+      rednet.send(hub, { type = "where_main", name = os.getComputerLabel() }, PROTO_ROUTER)
+    end
   end
 
-  if not manualName and not assignedName then
+  if routerRole == "modem" and not manualName and not assignedName then
     print("[name] Waiting for main router to assign a unique name...")
   end
-  print("[hop] Mesh relay on — will hop to MAIN when out of direct range.")
+  if routerRole == "router" then
+    print("[backbone] ROUTER mode — ender peer to MAIN/other routers; host local modems.")
+  else
+    print("[hop] MODEM cell — links to home router, then backbone.")
+  end
+  if homeRouterId then
+    print("[link] Home router #" .. tostring(homeRouterId))
+  end
   findMain()
   announce()
   local nextAnn = os.clock() + 20
@@ -1770,6 +3041,8 @@ local function modemLoop()
     local id, msg = rednet.receive(PROTO_ROUTER, math.max(0.2, nextAnn - os.clock()))
     if type(msg) ~= "table" or not id then
       -- ignore
+    elseif handleNetControl(id, msg) then
+      -- topology / link / hop
     elseif msg.type == "main_claim" or msg.type == "main_here" then
       rememberMain(id, msg)
       handleAssign(msg)
@@ -1789,7 +3062,8 @@ local function modemLoop()
       end
 
     elseif msg.type == "where_main" or msg.type == "hop_find_main" then
-      -- Peer looking for main: if we know it, answer + forward their query.
+      -- Peer looking for main: answer + forward via hub/peers.
+      local hub = hubId()
       if mainId and mainInfo and id ~= mainId then
         local reply = {
           type = "main_here",
@@ -1806,17 +3080,39 @@ local function modemLoop()
           type = "where_main", from = id, via = os.getComputerID(),
           name = msg.name or msg.hostname,
         }, PROTO_ROUTER)
+        for peerId in pairs(netPeers) do
+          if peerId ~= id then
+            rednet.send(peerId, {
+              type = "where_main", from = id, via = os.getComputerID(),
+              name = msg.name or msg.hostname,
+            }, PROTO_ROUTER)
+          end
+        end
+      elseif hub and id ~= hub then
+        rednet.send(hub, msg, PROTO_ROUTER)
       elseif mainId and id ~= mainId then
         rednet.send(mainId, msg, PROTO_ROUTER)
       end
 
-    elseif msg.type == "hello" and (msg.kind == "modem" or msg.autoName) then
-      -- Peer modem hello: if we can reach main and they might not, hop it.
-      if mainId and id ~= mainId and id ~= os.getComputerID() then
+    elseif msg.type == "hello" and (msg.kind == "modem" or msg.kind == "router" or msg.autoName) then
+      -- Hop toward home hub / MAIN / backbone peers.
+      local hub = hubId()
+      if hub and id ~= hub and id ~= os.getComputerID() then
+        rednet.send(hub, {
+          type = "hop_hello", from = id, via = os.getComputerID(),
+          hello = msg,
+        }, PROTO_ROUTER)
+      end
+      if mainId and mainId ~= hub and id ~= mainId then
         rednet.send(mainId, {
           type = "hop_hello", from = id, via = os.getComputerID(),
           hello = msg,
         }, PROTO_ROUTER)
+      end
+      if isBackbone() and (msg.kind == "modem" or msg.role == "modem") then
+        if tonumber(msg.homeRouter) == os.getComputerID() or netCells[id] then
+          addNetCell(id, msg.name or msg.hostname)
+        end
       end
 
     elseif msg.type == "update" and id ~= os.getComputerID() then
@@ -2022,6 +3318,7 @@ end
 
 drawMapBoard = function(mon)
   if not mon then return end
+  monApplyScale(mon)
   local w, h = mon.getSize()
   local nodes = fleetMapNodes()
   local ox, oz = mapOrigin(nodes)
@@ -2086,9 +3383,15 @@ local function handleRouterCommand(a)
   if cmd == "" then
     return true
   elseif cmd == "help" then
-      print("role     - show main / modem role")
-      print("main     - make THIS the main router (directory + OTA authority)")
-      print("modem    - demote to modem-only repeater (reboot)")
+      print("role     - show main / router / modem role")
+      print("main     - make THIS the MAIN hub (directory + OTA)")
+      print("router   - ender backbone satellite (long-haul peer)")
+      print("modem    - local RF cell repeater (short range)")
+      print("link                 show backbone peers + modem cells")
+      print("link peer <id>       peer this node to another ROUTER/MAIN")
+      print("link home <id>       MODEM: set home MAIN/ROUTER")
+      print("link modem <id>      MAIN/ROUTER: attach a modem cell")
+      print("link unpeer|uncell|unhome <id>")
       print("hostname [name|auto] - set name (modems: auto = accept main assign)")
       print("stats    - relay counts (+ roster if main)")
       print("gpshost [x y z] - show / set this router's GPS host coords")
@@ -2098,7 +3401,9 @@ local function handleRouterCommand(a)
         print("screens  - monitor status (single screen)")
         print("screen <role> on|off|perm   one board at a time")
         print(("  on = show %ds then saver;  perm = stay on"):format(saverIdleSecs))
-        print("view <roster|stats|gps|map>  switch board (temp)")
+        print("view <roster|global|stats|gps|map>")
+        print("  roster/local = this hub's modems+computers")
+        print("  global       = backbone peers + remote mesh")
         print("idle [seconds]  temp-board timeout (default 120)")
         print("monrate [secs]  live board refresh rate (default 1)")
         print("map on|off|perm|view")
@@ -2109,42 +3414,138 @@ local function handleRouterCommand(a)
         print("name <id|host> <newname>  - force-assign a modem name (reboots it)")
         print("namepool add|remove <name>  - edit the unique-name list")
         print("ping     - re-discover the network")
-        print("update all|status - fleet OTA to EVERY online device; ACK board")
+        print("update [modems]|status - OTA online MODEMS only (+ SSH fallback)")
+        print("update all|fleet       - OTA EVERY online device (+ SSH fallback)")
+        print("forceupdate [-y]       - same as update modems")
         print("reauth   - tell the fleet to re-auth now (no download)")
         print("github [url] - show / set GitHub raw base for versions")
       else
-        print("  routes = keep MAIN id; hard/all = also forget MAIN + name")
+        print("  routes = keep MAIN/home; hard/all = also forget MAIN + name")
       end
       print("ssh <id|label> [cmd] - remote shell (full device commands)")
       print("exit")
   elseif cmd == "role" then
       print(("Role: %s  (id #%d)"):format(routerRole, os.getComputerID()))
       if isMain() then
-        print("This is the MAIN router — devices re-auth here after update/reboot.")
+        print("MAIN hub — OTA/directory. Use ender modem; peer routers with `link peer`.")
+      elseif routerRole == "router" then
+        print("ROUTER backbone — ender long-haul. Host local modems with `link modem`.")
       else
-        print("This is a MODEM repeater — use `main` to promote it.")
+        print("MODEM cell — short-range RF. Set hub with `link home <routerId>`.")
       end
+      printNetLinks()
     elseif cmd == "main" then
       if isMain() then
         claimMain()
         print("Already MAIN. Re-broadcast claim so devices refresh.")
       else
-        write("Promote this modem to MAIN router? (other mains should run `modem`) [y/N] ")
+        write("Promote this node to MAIN hub? (other mains should run `modem`/`router`) [y/N] ")
         if read():lower() ~= "y" then print("Cancelled.") else
           patchRouterCfg({ role = "main" })
           print("Saved role=main. Rebooting..."); sleep(1); os.reboot()
         end
       end
-    elseif cmd == "modem" then
-      if not isMain() then
-        print("Already a MODEM repeater.")
+    elseif cmd == "router" then
+      if routerRole == "router" then
+        print("Already a ROUTER backbone node.")
+        printNetLinks()
       else
-        write("Demote this MAIN router to MODEM-only repeater? [y/N] ")
+        write("Set role=ROUTER (ender backbone satellite, not MAIN)? [y/N] ")
+        if read():lower() ~= "y" then print("Cancelled.") else
+          if isMain() and fs.exists(ROSTER) then pcall(fs.delete, ROSTER) end
+          patchRouterCfg({ role = "router" })
+          print("Saved role=router. Use ender modem + `link peer <mainId>`. Rebooting...")
+          sleep(1); os.reboot()
+        end
+      end
+    elseif cmd == "modem" then
+      if isModemRole() then
+        print("Already a MODEM cell repeater.")
+        printNetLinks()
+      else
+        write("Demote to MODEM (local RF cell)? [y/N] ")
         if read():lower() ~= "y" then print("Cancelled.") else
           patchRouterCfg({ role = "modem" })
           if fs.exists(ROSTER) then pcall(fs.delete, ROSTER) end
-          print("Saved role=modem (roster removed). Rebooting..."); sleep(1); os.reboot()
+          print("Saved role=modem. Link home with `link home <routerId>`. Rebooting...")
+          sleep(1); os.reboot()
         end
+      end
+    elseif cmd == "link" or cmd == "netlink" or cmd == "topology" then
+      local sub = (a[2] or ""):lower()
+      if sub == "" or sub == "status" or sub == "show" then
+        printNetLinks()
+        broadcastNetHello()
+      elseif sub == "peer" or sub == "router" then
+        local id = tonumber(a[3])
+        if not id then
+          print("Usage: link peer <routerId>")
+          print("Peers this MAIN/ROUTER to another ender backbone node.")
+        else
+          local ok, err = addNetPeer(id, a[4])
+          if not ok then print(tostring(err)) else
+            rednet.send(id, {
+              type = "net_link", action = "peer",
+              with = os.getComputerID(),
+              withName = os.getComputerLabel(),
+              name = os.getComputerLabel(),
+              role = routerRole,
+            }, PROTO_ROUTER)
+            broadcastNetHello()
+            print(("Linked backbone peer #%d"):format(id))
+          end
+        end
+      elseif sub == "home" then
+        local id = tonumber(a[3])
+        if not id then
+          print("Usage: link home <mainOrRouterId>   (modem cells only)")
+        elseif not isModemRole() then
+          print("link home is for MODEM role. Use `modem` first, or `link modem` on the hub.")
+        else
+          local ok, err = setHomeRouter(id, a[4])
+          if not ok then print(tostring(err)) else
+            rednet.send(id, {
+              type = "net_link", action = "cell",
+              with = os.getComputerID(),
+              withName = os.getComputerLabel(),
+              name = os.getComputerLabel(),
+            }, PROTO_ROUTER)
+            broadcastNetHello()
+            print(("Home router set to #%d"):format(id))
+          end
+        end
+      elseif sub == "modem" or sub == "cell" then
+        local id = tonumber(a[3])
+        if not id then
+          print("Usage: link modem <modemId>   (on MAIN/ROUTER)")
+        elseif not isBackbone() then
+          print("Only MAIN/ROUTER host modem cells.")
+        else
+          local ok, err = addNetCell(id, a[4])
+          if not ok then print(tostring(err)) else
+            rednet.send(id, {
+              type = "net_link", action = "home",
+              with = os.getComputerID(),
+              withName = os.getComputerLabel(),
+            }, PROTO_ROUTER)
+            broadcastNetHello()
+            print(("Attached modem cell #%d"):format(id))
+          end
+        end
+      elseif sub == "unpeer" or sub == "unlink" then
+        local ok, err = removeNetPeer(tonumber(a[3]))
+        print(ok and "Removed peer." or tostring(err))
+      elseif sub == "uncell" then
+        local ok, err = removeNetCell(tonumber(a[3]))
+        print(ok and "Removed cell." or tostring(err))
+      elseif sub == "unhome" then
+        homeRouterId = nil; saveNetLinks()
+        print("Cleared home router.")
+      elseif sub == "hello" or sub == "announce" then
+        broadcastNetHello()
+        print("Announced links on mesh.")
+      else
+        print("Usage: link | link peer <id> | link home <id> | link modem <id>")
       end
     elseif cmd == "devices" or cmd == "list" then
       if not isMain() then print("Roster is MAIN-only. Use `main` to promote."); else
@@ -2260,19 +3661,21 @@ local function handleRouterCommand(a)
     elseif cmd == "view" or cmd == "display" then
       if not isMain() then print("view is MAIN-only.")
       else
-        local role = (a[2] or ""):lower()
+        local role = normalizeScreenRole(a[2] or "")
         if role == "" then
           local left = boardWakeAt and math.max(0, math.floor(boardWakeAt + saverIdleSecs - os.clock())) or 0
           local live = enabledRoles()
           print(("Active: %s  focus=%s  temp-timeout=%ds (left %ds)"):format(
             #live > 0 and table.concat(live, ",") or "(saver)",
             screenFocus, saverIdleSecs, left))
-          print("Usage: view <roster|stats|gps|map>")
+          print("Usage: view <roster|local|global|stats|gps|map>")
+          print("  roster/local — this hub's cell   global — whole mesh")
         elseif not isScreenRole(role) then
-          print("Usage: view <roster|stats|gps|map>")
+          print("Usage: view <roster|local|global|stats|gps|map>")
         else
           wakeBoard(role, false)
-          print(("%s ON for %ds, then screensaver."):format(role, saverIdleSecs))
+          local label = (role == "roster") and "local" or role
+          print(("%s ON for %ds, then screensaver."):format(label, saverIdleSecs))
           drawBoards()
         end
       end
@@ -2470,33 +3873,36 @@ local function handleRouterCommand(a)
         local target = (a[3] or ""):lower()
         local flag = (a[4] or ""):lower()
         if not isScreenRole(role) then
-          print("Usage: screen <roster|stats|gps|map> <on|off|perm>")
+          print("Usage: screen <roster|local|global|stats|gps|map> <on|off|perm>")
           print(("  on   = show %ds then screensaver"):format(saverIdleSecs))
           print("  perm = stay on permanently")
-          print("Example: screen roster on   |   screen map perm")
+          print("  roster/local = this hub   global = whole mesh")
+          print("Example: screen local on   |   screen global perm")
         elseif target == "" then
           print(("Usage: screen %s <on|off|perm>"):format(role))
         elseif target == "on" or target == "true" or target == "1" or target == "yes" then
           local permanent = (flag == "perm" or flag == "permanent" or flag == "always")
           wakeBoard(role, permanent)
+          local label = (normalizeScreenRole(role) == "roster") and "local" or normalizeScreenRole(role)
           if permanent then
-            print(role .. " on permanently (single screen).")
+            print(label .. " on permanently (single screen).")
           else
-            print(("%s on for %ds, then screensaver."):format(role, saverIdleSecs))
+            print(("%s on for %ds, then screensaver."):format(label, saverIdleSecs))
           end
           drawBoards()
         elseif target == "perm" or target == "permanent" or target == "always" then
           wakeBoard(role, true)
-          print(role .. " on permanently (single screen).")
+          local label = (normalizeScreenRole(role) == "roster") and "local" or normalizeScreenRole(role)
+          print(label .. " on permanently (single screen).")
           drawBoards()
         elseif target == "off" or target == "false" or target == "0" or target == "no" then
           setScreenOn(role, false)
-          print(role .. " off — screensaver.")
+          print(normalizeScreenRole(role) .. " off — screensaver.")
           -- Drop back to saver immediately (drawLoop will animate next tick).
           refreshScreens()
           if displayMon then clearMon(displayMon) end
         else
-          print("Usage: screen <roster|stats|gps|map> <on|off|perm>")
+          print("Usage: screen <roster|local|global|stats|gps|map> <on|off|perm>")
         end
       end
     elseif cmd == "gpshost" then
@@ -2521,7 +3927,7 @@ local function handleRouterCommand(a)
           print(("GitHub system: %s"):format(tostring(remote.system or "?")))
           print("Base: " .. ghState.base)
           local cmp = versionCmp(localVer, remote.system)
-          if cmp < 0 then print("Status: GitHub is NEWER — run `update all`")
+          if cmp < 0 then print("Status: GitHub is NEWER — run `update` (modems) or `update all`")
           elseif cmp > 0 then print("Status: local is ahead of GitHub")
           else print("Status: up to date with GitHub") end
           if type(remote.packages) == "table" then
@@ -2567,25 +3973,51 @@ local function handleRouterCommand(a)
           print("Usage: github <raw-base-url/>")
         end
       end
-    elseif cmd == "update" then
+    elseif cmd == "update" or cmd == "forceupdate" or cmd == "upgrade" then
       if not isMain() then
         print("OTA update is MAIN-only. Run `main` on this machine, or use the main router.")
       else
-        local sub = (a[2] or "all"):lower()
-        if sub == "status" then
+        local yes, scope, statusOnly = false, nil, false
+        for i = 2, #a do
+          local s = (a[i] or ""):lower()
+          if s == "-y" or s == "--yes" or s == "yes" then
+            yes = true
+          elseif s == "status" or s == "stat" then
+            statusOnly = true
+          elseif s == "all" or s == "fleet" or s == "aoe" or s == "everyone" then
+            scope = "all"
+          elseif s == "modems" or s == "modem" or s == "extenders" then
+            scope = "modems"
+          elseif s == "help" or s == "?" then
+            print("Usage:")
+            print("  update              force-update online MODEMS only (default)")
+            print("  update modems [-y]  same — mesh extenders only, SSH if no ACK")
+            print("  update all [-y]     every online Titan device (broadcast + SSH)")
+            print("  update status       ACK progress / package version diffs")
+            print("  forceupdate [-y]    alias for update modems")
+            return true
+          end
+        end
+        -- `forceupdate` with no scope → modems; bare `update` → modems
+        if not scope then
+          scope = "modems"
+        end
+        if statusOnly then
           local exp, done, camp = campaignStatus()
           if not camp then
-            print("No active update campaign. Run `update all`.")
+            print("No active update campaign. Run `update` (modems) or `update all`.")
           else
             local _, ackN, failN = campaignCounts()
-            print(("Campaign target v%s  ok %d  fail %d  / %d%s"):format(
-              tostring(camp.version), ackN or 0, failN or 0, exp or 0,
+            print(("Campaign [%s] target v%s  ok %d  fail %d  / %d%s"):format(
+              tostring(camp.scope or "?"), tostring(camp.version),
+              ackN or 0, failN or 0, exp or 0,
               camp.finishedAt and " (finished)" or ""))
             for id, name in pairs(camp.expected) do
               local ainfo = camp.acked[id]
               local finfo = camp.failed[id]
               if ainfo then
-                print(("  OK  #%-3d %s"):format(id, tostring(name)))
+                local via = ainfo.via and (" via " .. ainfo.via) or ""
+                print(("  OK  #%-3d %s%s"):format(id, tostring(name), via))
                 for _, p in ipairs(ainfo.packages or {}) do
                   print(("      %s - version: %s - %s"):format(
                     tostring(p.name or "?"), tostring(p.from or "?"), tostring(p.to or "?")))
@@ -2599,70 +4031,8 @@ local function handleRouterCommand(a)
               end
             end
           end
-        elseif sub == "all" or sub == "aoe" or sub == "fleet" or sub == "yes" then
-          -- update all — every online device on the roster (miners, loaders, DC, …)
-          print("Checking GitHub versions...")
-          local remote, err = fetchGithubVersions()
-          local target = remote and remote.system or localSystemVersion()
-          if not remote then
-            print("GitHub check failed: " .. tostring(err))
-            print("Will still broadcast OTA using each device's install source.")
-            target = localSystemVersion() or "unknown"
-          else
-            print(("GitHub Titan v%s  (local %s)"):format(
-              tostring(remote.system), tostring(localSystemVersion() or "?")))
-          end
-          write(("Push OTA to ALL online devices (target v%s)? [y/N] "):format(
-            tostring(target)))
-          if read():lower() ~= "y" then print("Cancelled."); else
-            local expected = startUpdateCampaign(target)
-            local nExp = 0
-            for _ in pairs(expected) do nExp = nExp + 1 end
-            local rname = os.getComputerLabel() or ("Router-" .. os.getComputerID())
-            local payload = {
-              type = "update", from = os.getComputerID(), name = rname,
-              mainRouterId = os.getComputerID(), hostname = rname,
-              targetVersion = target, aoe = true, all = true,
-              githubBase = githubBase(),
-            }
-            broadcastFleetUpdate(payload)
-            print(("Fleet update broadcast sent (v%s) on router+net+dc."):format(
-              tostring(target)))
-            print(("Expecting %d ACK(s). Monitor shows hostname + package from->to."):format(nExp))
-            print("Watch: `update status`  (monitor returns to previous board when done)")
-            -- Update this main router too (no reboot — stay up to collect ACKs).
-            if titanLib and titanLib.updateSelf then
-              print("Updating main router packages (no reboot)...")
-              local prevMain = localSystemVersion()
-              local uok, detail = titanLib.updateSelf()
-              if uok then
-                local pkgs = type(detail) == "table" and detail.packages or {}
-                if #pkgs == 0 then
-                  pkgs = { {
-                    name = "system", path = "versions.lua",
-                    from = tostring(prevMain or "?"),
-                    to = tostring(localSystemVersion() or target),
-                  } }
-                end
-                updateCampaign.acked[os.getComputerID()] = {
-                  name = rname,
-                  version = localSystemVersion() or target,
-                  packages = pkgs,
-                  at = os.epoch("utc"),
-                }
-                print("Main router packages refreshed to v" .. tostring(localSystemVersion() or target))
-                maybeFinishUpdateCampaign()
-              else
-                print("Main self-update failed: " .. tostring(detail))
-              end
-            elseif nExp == 0 then
-              maybeFinishUpdateCampaign()
-            end
-          end
         else
-          print("Usage: update all | update status")
-          print("  all     push OTA to every online Titan device (not just routers)")
-          print("  status  show ACK progress / package version diffs")
+          runForceUpdate(scope, { yes = yes })
         end
       end
     elseif cmd == "reauth" then
@@ -2740,18 +4110,28 @@ end
 -- Config: role + GPS hosting.
 --------------------------------------------------------------------------------
 local rcfg = loadRouterCfg() or {}
-if rcfg.role == "modem" or rcfg.role == "main" then
+if rcfg.role == "modem" or rcfg.role == "main" or rcfg.role == "router" then
   routerRole = rcfg.role
 else
   -- First boot / upgrade: ask once.
   print("")
-  print("Is this the MAIN router? (Y = directory + OTA / N = modem repeater only)")
-  write("[Y/n] ")
+  print("Network role for this computer:")
+  print("  M = MAIN hub (directory + OTA) — use an ENDER modem")
+  print("  R = ROUTER backbone satellite — ENDER modem, long-haul peer")
+  print("  N = MODEM local cell — normal wireless modem for one area")
+  write("[M/r/n] ")
   local ans = read():lower()
-  routerRole = (ans == "n" or ans == "no") and "modem" or "main"
+  if ans == "n" or ans == "no" or ans == "modem" then
+    routerRole = "modem"
+  elseif ans == "r" or ans == "router" then
+    routerRole = "router"
+  else
+    routerRole = "main"
+  end
   rcfg = patchRouterCfg({ role = routerRole })
   print("Role saved: " .. routerRole)
 end
+loadNetLinks()
 
 if rcfg.gps then
   gpsCoords = rcfg.gps
@@ -2802,19 +4182,45 @@ if isMain() then
   tasks[#tasks + 1] = drawLoop
   tasks[#tasks + 1] = githubWatchLoop
 else
+  -- ROUTER backbone + MODEM cells share the mesh side loop.
   tasks[#tasks + 1] = modemLoop
+  -- Hop perimeter / net traffic toward home hub, MAIN, and backbone peers.
+  tasks[#tasks + 1] = function()
+    while true do
+      local id, msg = rednet.receive("titan_net", 1)
+      if type(msg) == "table" and id and isPerimeterTraffic(msg) then
+        local cfg = loadRouterCfg() or {}
+        local targets = {}
+        local function add(t)
+          t = tonumber(t)
+          if t and t ~= id and t ~= os.getComputerID() then targets[t] = true end
+        end
+        add(homeRouterId)
+        add(cfg.mainRouterId)
+        add(cfg.homeRouter)
+        for peerId in pairs(netPeers) do add(peerId) end
+        local hop = {}
+        for k, v in pairs(msg) do hop[k] = v end
+        hop.hop = true
+        hop.originId = tonumber(msg.originId) or tonumber(msg.sensorId) or id
+        hop.viaModem = os.getComputerID()
+        for tid in pairs(targets) do
+          rednet.send(tid, hop, "titan_net")
+          rednet.send(tid, hop, PROTO_ROUTER)
+        end
+      end
+    end
+  end
 end
 if gpsCoords then tasks[#tasks + 1] = gpsHostLoop end
 if titanLib then
   tasks[#tasks + 1] = function()
-    titanLib.sshHostLoop(isMain() and "router" or "modem")
+    titanLib.sshHostLoop(roleKind())
   end
   if not isMain() then
-    -- Modem also reports OTA ACK after reboot (same as networkLoop devices).
     tasks[#tasks + 1] = function()
       sleep(2)
-      titanLib.reportUpdatedIfPending("modem")
-      -- Keep announcing version via modemLoop hello; nothing else here.
+      titanLib.reportUpdatedIfPending(roleKind())
       while true do sleep(3600) end
     end
   end
@@ -2845,7 +4251,7 @@ if isMain() then
   else
     print(("Single screen on %s. Default=screensaver (%ds temp)."):format(
       displayMonName or "monitor", saverIdleSecs))
-    print("Type `screen roster on` / `view stats` / `screen map perm`.")
+    print("Type `view local` / `view global` / `screen map perm`.")
   end
 else
   clearRosterIfModem()

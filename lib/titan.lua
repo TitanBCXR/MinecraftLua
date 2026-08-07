@@ -1,6 +1,6 @@
 --[[
   titan.lua  -  Shared library for the Titan bot network (CC: Tweaked)
-  Titan-Version: 1.2.16
+  Titan-Version: 1.2.19
 
   Provides:
     * Rednet protocol constants + message type enum
@@ -86,6 +86,20 @@ titan.MSG = {
   PERIMETER_HELLO = "perimeter_hello", -- sensor/manager announce
   PERIMETER_CONFIG = "perimeter_config", -- manager -> sensor : side/range/name
   PERIMETER_ASSIGN_REQ = "perimeter_assign_req", -- sensor -> manager : please auto-assign me
+  PERIMETER_UPDATE = "perimeter_update", -- manager -> sensor : force OTA
+  PERIMETER_UPDATE_ACK = "perimeter_update_ack", -- sensor -> manager : OTA ok (rebooting)
+  PERIMETER_UPDATE_FAIL = "perimeter_update_fail", -- sensor -> manager : OTA failed
+  PERIMETER_ROSTER_REQ = "perimeter_roster_req", -- manager/sensor -> main : list perimeter peers
+  PERIMETER_ROSTER = "perimeter_roster", -- main -> requester : sensors + managers
+  PERIMETER_FWD = "perimeter_fwd", -- main <-> perimeter : hop a payload to dest id
+
+  -- Network topology (ender routers + local RF modems)
+  NET_LINK = "net_link",           -- admin/router -> node : peer / home / cell
+  NET_LINK_ACK = "net_link_ack",   -- node -> requester
+  NET_LINK_HELLO = "net_link_hello", -- backbone announce peers + cells
+  NET_TOPO_REQ = "net_topo_req",   -- admin -> mesh : ask for topology
+  NET_TOPO = "net_topo",           -- node -> admin : local link view
+  NET_HOP = "net_hop",             -- backbone -> backbone : deliver toward dest
 }
 
 -- Compass headings (Minecraft world axes).
@@ -857,6 +871,27 @@ local function sshRunLocal(line)
   if lowl == "id" or lowl == "whoami" then
     return ("#%d %s"):format(os.getComputerID(), os.getComputerLabel() or ""), true, false
   end
+  -- Built-in package update so remote force-update works even without console.lua.
+  if lowl == "update" or lowl == "upgrade"
+      or lowl:match("^update%s") or lowl:match("^upgrade%s") then
+    local text, callOk, uok, detail = sshWithCapture(function()
+      print("[OTA] Remote update via SSH...")
+      local ok, d = titan.updateSelf()
+      if ok then
+        local ver = titan.systemVersion()
+        print("[OTA] Updated to v" .. tostring(ver or "?"))
+      else
+        print("[OTA] Failed: " .. tostring(d))
+      end
+      return ok, d
+    end)
+    if not callOk then return text, false, false end
+    if uok then
+      if text == "" then text = "Updated — rebooting..." end
+      return text, true, true
+    end
+    return text, false, false
+  end
 
   if sshAppHandler then
     local text, callOk, handled = sshWithCapture(function()
@@ -866,6 +901,11 @@ local function sshRunLocal(line)
       return text, false, false
     end
     -- handler may return false to fall through to shell/turtle builtins
+    -- return "reboot" to ack the SSH client then reboot (for remote update -y)
+    if handled == "reboot" then
+      if text == "" then text = "Rebooting..." end
+      return text, true, true
+    end
     if handled ~= false then
       if text == "" then text = "(ok)" end
       return text, true, false

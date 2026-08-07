@@ -1,6 +1,6 @@
 --[[
   admin.lua  -  Titan admin console for a POCKET computer ("Live" tablet)
-  Titan-Version: 1.3.0
+  Titan-Version: 1.4.1
 
   Pocket remote for the whole fleet. Keep it on you; it joins the mesh like
   every other Titan device (MAIN router + modem hops).
@@ -14,11 +14,15 @@
   Advanced commands:
     connections | hosts | list   — who is reachable for SSH
     connect | ssh <id|label>     — remote shell (full device commands)
+    link                         — network topology (routers + modems)
+    link <a> <b>                 — peer two routers OR attach modem→router
+    link auto                    — GPS auto: peer routers, modems→nearest hub
     bots / miners / loaders / markers
     pending | deploy | park | stop | mine | continue
     dc | center                  — jump to Parent Center
     flatten ...                  — run flatten on Parent Center via SSH
-    live                         — full-screen roster
+    live [local|global|stats|gps|bots] — full-screen boards (MAIN stats)
+      Advanced (color) pocket → pretty GUI; normal pocket → mono.
 
   Boots with a master-password prompt (before background loops). Deploy / SSH /
   fleet control need an unlocked session.
@@ -29,12 +33,16 @@
 
 local titan = dofile("lib/titan.lua")
 local MSG   = titan.MSG
+local PROTO_ROUTER = titan.ROUTER_PROTOCOL or "titan_router"
 
 titan.openModem()
 os.setComputerLabel(os.getComputerLabel() or ("Admin-" .. os.getComputerID()))
 
 local CFG_FILE = "admin.cfg"
 local cfg = { mode = "simple" }  -- "simple" | "advanced"
+
+-- Forward decls (filled later; used by live boards fallback).
+local scanNetTopology
 
 local function loadAdminCfg()
   if not fs.exists(CFG_FILE) then return end
@@ -311,17 +319,428 @@ local function printBots(filterType)
 end
 
 --------------------------------------------------------------------------------
--- Live dashboard
+-- Live boards (same stats as MAIN monitor; pretty on advanced pocket)
 --------------------------------------------------------------------------------
-local function drawDash()
+local LIVE_BOARDS = { "local", "global", "stats", "gps", "bots" }
+local liveBoard = "local"
+local boardSnap = nil
+local boardSnapAt = 0
+
+local function termIsColor()
+  local ok, c = pcall(function() return term.isColor and term.isColor() end)
+  return ok and c == true
+end
+
+local function termLayout()
   local w, h = term.getSize()
-  term.setBackgroundColor(colors.black); term.clear()
-  local function line(y, txt, c)
-    term.setCursorPos(1, y)
-    if term.setTextColor then term.setTextColor(c or colors.white) end
-    term.write(tostring(txt):sub(1, w))
+  local color = termIsColor()
+  local tier
+  if w < 22 or h < 10 then tier = "tiny"
+  elseif w < 30 or h < 14 then tier = "small"
+  elseif w < 45 or h < 18 then tier = "medium"
+  else tier = "large" end
+  return {
+    out = term, w = w, h = h, color = color, tier = tier,
+    headerH = (tier == "tiny") and 1 or 2,
+    footerH = 1,
+    pad = (tier == "large" and color) and 1 or 0,
+  }
+end
+
+local function guiFill(out, x, y, w, h, bg, fg)
+  bg = bg or colors.black
+  fg = fg or colors.white
+  for row = y, y + h - 1 do
+    out.setCursorPos(x, row)
+    if out.setBackgroundColor then out.setBackgroundColor(bg) end
+    if out.setTextColor then out.setTextColor(fg) end
+    out.write(string.rep(" ", w))
+  end
+end
+
+local function guiText(out, x, y, txt, fg, bg)
+  if not out or y < 1 then return end
+  local w = select(1, out.getSize())
+  if x > w then return end
+  txt = tostring(txt or "")
+  if out.setBackgroundColor then out.setBackgroundColor(bg or colors.black) end
+  if out.setTextColor then out.setTextColor(fg or colors.white) end
+  out.setCursorPos(x, y)
+  out.write(txt:sub(1, math.max(0, w - x + 1)))
+end
+
+local function guiBar(L, y, title, subtitle, accent)
+  local out, w = L.out, L.w
+  accent = accent or colors.cyan
+  if L.color then
+    guiFill(out, 1, y, w, 1, accent, colors.black)
+    guiText(out, 2, y, title, colors.black, accent)
+    if subtitle and L.tier ~= "tiny" and #title + #subtitle + 4 < w then
+      guiText(out, math.max(1, w - #subtitle), y, subtitle, colors.gray, accent)
+    end
+  else
+    guiText(out, 1, y, title, colors.white, colors.black)
+    if subtitle and L.tier ~= "tiny" then
+      guiText(out, math.max(1, w - #subtitle + 1), y, subtitle, colors.lightGray, colors.black)
+    end
+  end
+end
+
+local function guiChip(out, x, y, label, fg, bg, colorOk)
+  label = " " .. tostring(label) .. " "
+  if colorOk then
+    guiText(out, x, y, label, fg or colors.white, bg or colors.gray)
+  else
+    local bare = tostring(label):match("^%s*(.-)%s*$") or tostring(label)
+    guiText(out, x, y, "[" .. bare .. "]", fg or colors.white, colors.black)
+    return x + #bare + 3
+  end
+  return x + #label + 1
+end
+
+local function statusColorOf(st)
+  if st == "ONLINE" or st == "ON" then return colors.lime end
+  if st == "WIRED" or st == "WR" then return colors.cyan end
+  if st == "OFFLINE" or st == "OFF" then return colors.red end
+  return colors.yellow
+end
+
+local function formatUptime(sec)
+  sec = math.max(0, math.floor(tonumber(sec) or 0))
+  local h = math.floor(sec / 3600)
+  local m = math.floor((sec % 3600) / 60)
+  local s = sec % 60
+  if h > 0 then return ("%dh %dm"):format(h, m) end
+  if m > 0 then return ("%dm %ds"):format(m, s) end
+  return ("%ds"):format(s)
+end
+
+local function synthesizeBoardSnap()
+  -- Fallback when MAIN is not answering board_req yet.
+  local nodes = scanNetTopology(1.2, true)
+  local localRows, globalRows = {}, {}
+  local lon, loff, lunk, gon, goff, gunk = 0, 0, 0, 0, 0, 0
+  local kinds = {}
+  local mainId, mainName, mainGps
+  for _, n in ipairs(nodes) do
+    local role = tostring(n.role or n.kind or ""):lower()
+    local st = "ONLINE"
+    local row = {
+      id = n.id, hostname = n.name or ("#" .. n.id),
+      kind = (role == "main" and "router") or role or "device",
+      status = st, seen = now(),
+      homeRouter = n.homeRouter,
+    }
+    if role == "main" then
+      mainId, mainName = n.id, n.name
+      if n.x then mainGps = { hosting = true, x = n.x, y = n.y, z = n.z } end
+      globalRows[#globalRows + 1] = row
+      gon = gon + 1
+    elseif role == "router" then
+      globalRows[#globalRows + 1] = row
+      gon = gon + 1
+    else
+      localRows[#localRows + 1] = row
+      lon = lon + 1
+    end
+    local k = row.kind
+    kinds[k] = (kinds[k] or 0) + 1
+  end
+  for id, s in pairs(systems) do
+    if ago(s.seen) < 60 then
+      local k = tostring(s.kind or "device")
+      kinds[k] = (kinds[k] or 0) + 1
+    end
+  end
+  return {
+    type = "board_snap",
+    role = mainId and "main" or "synth",
+    id = mainId or 0,
+    name = mainName or "mesh",
+    localRows = localRows,
+    globalRows = globalRows,
+    localCounts = { on = lon, off = loff, unk = lunk },
+    globalCounts = { on = gon, off = goff, unk = gunk },
+    peers = #globalRows, cells = #localRows,
+    stats = {
+      role = mainId and "main" or "?",
+      hostname = mainName or "?",
+      uptimeSec = 0,
+      modems = #nodes, rf = 0, wire = 0, relayed = 0,
+      online = lon + gon, offline = 0, unknown = 0,
+      wired = 0, remembered = lon + gon, kinds = kinds,
+      peers = #globalRows, cells = #localRows,
+    },
+    gps = mainGps or { hosting = false },
+    synth = true,
+  }
+end
+
+local function fetchBoardSnap(timeout)
+  timeout = timeout or 2.0
+  rednet.broadcast({ type = "board_req", from = os.getComputerID() }, PROTO_ROUTER)
+  local deadline = os.clock() + timeout
+  local best
+  while os.clock() < deadline do
+    local id, msg = rednet.receive(PROTO_ROUTER, math.max(0.05, deadline - os.clock()))
+    if id and type(msg) == "table" and msg.type == "board_snap" then
+      msg._from = id
+      if tostring(msg.role or ""):lower() == "main" then
+        return msg
+      end
+      best = best or msg
+    end
+  end
+  return best
+end
+
+local function refreshBoardSnap(force)
+  if not force and boardSnap and (os.clock() - boardSnapAt) < 2.5 then
+    return boardSnap
+  end
+  local snap = fetchBoardSnap(1.8)
+  if not snap then snap = synthesizeBoardSnap() end
+  boardSnap, boardSnapAt = snap, os.clock()
+  return snap
+end
+
+local function drawStatusChips(L, y, on, off, unk)
+  local out, w = L.out, L.w
+  if L.tier == "tiny" then
+    guiText(out, 1, y, ("ON:%d OFF:%d ?:%d"):format(on or 0, off or 0, unk or 0),
+      colors.white, colors.black)
+    return
+  end
+  if L.color then
+    guiFill(out, 1, y, w, 1, colors.black, colors.white)
+    local x = 1
+    x = guiChip(out, x, y, "ON " .. tostring(on or 0), colors.black, colors.lime, true)
+    x = guiChip(out, x, y, "OFF " .. tostring(off or 0), colors.white, colors.red, true)
+    guiChip(out, x, y, "? " .. tostring(unk or 0), colors.black, colors.yellow, true)
+  else
+    guiText(out, 1, y,
+      ("ONLINE:%d  OFFLINE:%d  UNKNOWN:%d"):format(on or 0, off or 0, unk or 0),
+      colors.white, colors.black)
+  end
+end
+
+local function drawRosterBoard(L, scope, snap)
+  local out, w, h = L.out, L.w, L.h
+  local rows = (scope == "global") and (snap.globalRows or {}) or (snap.localRows or {})
+  local counts = (scope == "global") and (snap.globalCounts or {}) or (snap.localCounts or {})
+  local title = (scope == "global") and "GLOBAL MESH" or "LOCAL NETWORK"
+  local accent = (scope == "global") and (colors.orange or colors.yellow) or (colors.cyan or colors.lightBlue)
+  local y = 1
+  local src = snap.synth and "scan" or ("#" .. tostring(snap.id or "?"))
+  guiBar(L, y, title, src, accent)
+  y = y + 1
+  if y < h then
+    drawStatusChips(L, y, counts.on, counts.off, counts.unk)
+    y = y + 1
+  end
+  if L.tier ~= "tiny" and y < h then
+    local meta = ("peers %d  cells %d"):format(
+      tonumber(snap.peers) or 0, tonumber(snap.cells) or 0)
+    if L.color then
+      guiFill(out, 1, y, w, 1, colors.gray, colors.white)
+      guiText(out, 2, y, meta, colors.white, colors.gray)
+    else
+      guiText(out, 1, y, meta, colors.lightGray, colors.black)
+    end
+    y = y + 1
   end
 
+  local showKind = w >= 28
+  local showAge = w >= 34
+  local idW = (w < 22) and 3 or 4
+  if y < h then
+    local hdr = L.tier == "tiny" and "ID ST HOST"
+      or (showKind and ("%-" .. idW .. "s %-8s %-6s HOST"):format("ID", "STATUS", "KIND")
+          or ("%-" .. idW .. "s %-8s HOST"):format("ID", "STATUS"))
+    local hbg = L.color and colors.lightGray or colors.black
+    local hfg = L.color and colors.black or colors.lightGray
+    if L.color then guiFill(out, 1, y, w, 1, hbg, hfg) end
+    guiText(out, 1 + L.pad, y, hdr, hfg, hbg)
+    y = y + 1
+  end
+
+  local listStart = y
+  local y1 = h - L.footerH
+  for _, r in ipairs(rows) do
+    if y > y1 then break end
+    local status = tostring(r.status or "?")
+    local stShort = status
+    if L.tier == "tiny" then
+      if status == "ONLINE" then stShort = "ON"
+      elseif status == "OFFLINE" then stShort = "OFF"
+      elseif status == "WIRED" then stShort = "WR"
+      else stShort = "?" end
+    end
+    local host = tostring(r.hostname or "?")
+    if scope == "global" and r.hub then
+      host = host .. " @" .. tostring(r.hub):sub(1, 8)
+    elseif scope == "global" and r.homeRouter then
+      host = host .. " →#" .. tostring(r.homeRouter)
+    end
+    local age = (r.seen and r.seen > 0) and (ago(r.seen) .. "s") or "-"
+    local bg = colors.black
+    if L.color and ((y - listStart) % 2 == 1) then bg = colors.gray end
+    if L.color then guiFill(out, 1, y, w, 1, bg, colors.white) end
+
+    local x = 1 + L.pad
+    local sc = statusColorOf(status)
+    guiText(out, x, y, ("%-" .. idW .. "d"):format(tonumber(r.id) or 0), colors.white, bg)
+    x = x + idW + 1
+    if L.color and L.tier ~= "tiny" then
+      local chip = ("%-8s"):format(stShort)
+      local chipFg = (status == "OFFLINE") and colors.white or colors.black
+      guiText(out, x, y, chip, chipFg, sc)
+      x = x + 9
+    else
+      guiText(out, x, y, ("%-8s"):format(stShort), sc, bg)
+      x = x + 9
+    end
+    if showKind then
+      local kw = (w >= 40) and 8 or 6
+      local kindCol = (status == "WIRED") and colors.cyan
+        or ((r.remote or scope == "global") and (colors.orange or colors.yellow) or colors.white)
+      guiText(out, x, y, ("%-" .. kw .. "s"):format(tostring(r.kind or "?"):sub(1, kw)), kindCol, bg)
+      x = x + kw + 1
+    end
+    local room = w - x - (showAge and (#age + 1) or 0) - L.pad
+    if room < 1 then room = math.max(0, w - x) end
+    guiText(out, x, y, host:sub(1, room), colors.white, bg)
+    if showAge then
+      guiText(out, w - #age + 1 - L.pad, y, age, colors.lightGray, bg)
+    end
+    y = y + 1
+  end
+  if y == listStart and y <= y1 then
+    local empty = (scope == "global")
+      and "(no remote hubs — link peer)"
+      or "(no local devices — link modem)"
+    guiText(out, 1 + L.pad, y, empty, colors.gray, colors.black)
+  end
+end
+
+local function drawStatsBoard(L, snap)
+  local out, w, h = L.out, L.w, L.h
+  local st = snap.stats or {}
+  local cyan = colors.cyan or colors.lightBlue
+  local y = 1
+  guiBar(L, y, "STATS", ("#%s"):format(tostring(snap.id or "?")), cyan)
+  y = y + 1
+  if y < h then
+    drawStatusChips(L, y, st.online, st.offline, st.unknown)
+    y = y + 1
+  end
+  local cards = {
+    { "ROLE", tostring(st.role or "?"):upper(), colors.white },
+    { "HOST", tostring(st.hostname or "?"):sub(1, 16), colors.lightGray },
+    { "UP", formatUptime(st.uptimeSec), colors.white },
+    { "MODEMS", ("%s rf:%s wire:%s"):format(
+        tostring(st.modems or 0), tostring(st.rf or 0), tostring(st.wire or 0)), colors.white },
+    { "RELAY", tostring(st.relayed or 0), cyan },
+    { "WIRED", tostring(st.wired or 0), cyan },
+    { "MEM", tostring(st.remembered or 0), colors.white },
+  }
+  local y1 = h - L.footerH
+  if L.color and L.tier ~= "tiny" and w >= 28 then
+    local colW = math.floor((w - 2) / 2)
+    local i = 1
+    while i <= #cards and y <= y1 do
+      local a, b = cards[i], cards[i + 1]
+      guiFill(out, 1, y, w, 1, colors.gray, colors.white)
+      guiText(out, 1, y, (" %s %s"):format(a[1], a[2]):sub(1, colW), a[3], colors.gray)
+      if b then
+        guiText(out, colW + 2, y, (" %s %s"):format(b[1], b[2]):sub(1, colW), b[3], colors.gray)
+        i = i + 2
+      else
+        i = i + 1
+      end
+      y = y + 1
+    end
+  else
+    for _, c in ipairs(cards) do
+      if y > y1 then break end
+      guiText(out, 1 + L.pad, y, ("%s: %s"):format(c[1], c[2]), c[3], colors.black)
+      y = y + 1
+    end
+  end
+  if y <= y1 then
+    if L.color then
+      guiFill(out, 1, y, w, 1, colors.lightGray, colors.black)
+      guiText(out, 2, y, "BY KIND", colors.black, colors.lightGray)
+    else
+      guiText(out, 1, y, "By kind:", colors.lightGray, colors.black)
+    end
+    y = y + 1
+  end
+  local kinds = st.kinds or {}
+  local keys = {}
+  for k in pairs(kinds) do keys[#keys + 1] = k end
+  table.sort(keys)
+  for _, k in ipairs(keys) do
+    if y > y1 then break end
+    local n = kinds[k]
+    if L.color and w >= 24 then
+      local barW = math.max(1, math.min(w - 14, n))
+      guiText(out, 1 + L.pad, y, ("%-10s %3d "):format(k:sub(1, 10), n), colors.white, colors.black)
+      guiText(out, 16 + L.pad, y, string.rep(" ", barW), colors.black, cyan)
+    else
+      guiText(out, 1 + L.pad, y, ("%-10s %d"):format(k, n), colors.white, colors.black)
+    end
+    y = y + 1
+  end
+  if #keys == 0 and y <= y1 then
+    guiText(out, 1 + L.pad, y, "(none)", colors.gray, colors.black)
+  end
+end
+
+local function drawGpsBoard(L, snap)
+  local out, w, h = L.out, L.w, L.h
+  local g = snap.gps or {}
+  local y = 1
+  guiBar(L, y, "GPS", g.hosting and "HOSTING" or "IDLE", colors.yellow)
+  y = y + 1
+  local y1 = h - L.footerH
+  local function put(txt, c, bg)
+    if y > y1 then return end
+    if L.color and bg then guiFill(out, 1, y, w, 1, bg, c or colors.white) end
+    guiText(out, 1 + L.pad, y, txt, c or colors.white, bg or colors.black)
+    y = y + 1
+  end
+  if g.hosting then
+    if L.color then
+      put(" MAIN HOSTING ", colors.black, colors.lime)
+      if L.tier == "tiny" then
+        put(("%s,%s,%s"):format(g.x, g.y, g.z), colors.white, colors.gray)
+      else
+        put(("  X %-6s  Y %-6s  Z %-6s"):format(g.x, g.y, g.z), colors.white, colors.gray)
+      end
+    else
+      put("Hosting: YES", colors.lime)
+      put(("X: %s  Y: %s  Z: %s"):format(g.x, g.y, g.z), colors.white)
+    end
+  else
+    put(L.color and " NOT HOSTING " or "Hosting: NO",
+      L.color and colors.white or colors.red,
+      L.color and colors.red or colors.black)
+    put("Set on MAIN: gpshost <x> <y> <z>", colors.lightGray)
+  end
+  if L.tier ~= "tiny" then put("", colors.white) end
+  put("Tablet locate", colors.lightGray, L.color and colors.gray or nil)
+  local lx, ly, lz = gps.locate(0.3)
+  if lx then
+    lx = math.floor(lx + 0.5); ly = math.floor(ly + 0.5); lz = math.floor(lz + 0.5)
+    put(("  %d, %d, %d"):format(lx, ly, lz), colors.lime)
+  else
+    put("  (no fix — need 4 hosts)", colors.orange or colors.yellow)
+  end
+end
+
+local function drawBotsBoard(L)
+  local out, w, h = L.out, L.w, L.h
   local total, gath, build, mine, load, mark = 0, 0, 0, 0, 0, 0
   for _, b in pairs(bots) do
     if ago(b.seen) < 20 then
@@ -333,48 +752,173 @@ local function drawDash()
       elseif b.botType == "marker" or b.kind == "marker" then mark = mark + 1 end
     end
   end
-
-  line(1, "== TITAN ADMIN == " .. (unlocked and "UNLOCKED" or "locked"), colors.yellow)
-  line(2, ("bots:%d  B:%d G:%d M:%d L:%d site:%d"):format(
-    total, build, gath, mine, load, mark), colors.lime)
-  line(3, "connect/ssh <id>   connections   dc   help", colors.lightGray)
-
-  local y = 5
-  line(y, "ID   NAME         TYPE     STATE    POS", colors.orange); y = y + 1
+  local y = 1
+  guiBar(L, y, "BOTS", unlocked and "UNLOCKED" or "locked", colors.yellow)
+  y = y + 1
+  local summary = ("bots:%d B:%d G:%d M:%d L:%d site:%d"):format(
+    total, build, gath, mine, load, mark)
+  if L.color then
+    guiFill(out, 1, y, w, 1, colors.gray, colors.white)
+    guiText(out, 2, y, summary, colors.lime, colors.gray)
+  else
+    guiText(out, 1, y, summary, colors.lime, colors.black)
+  end
+  y = y + 1
+  if y < h then
+    local hbg = L.color and colors.lightGray or colors.black
+    local hfg = L.color and colors.black or colors.orange or colors.yellow
+    if L.color then guiFill(out, 1, y, w, 1, hbg, hfg) end
+    guiText(out, 1 + L.pad, y, "ID   NAME         TYPE     STATE", hfg, hbg)
+    y = y + 1
+  end
   local ids = {}
   for id in pairs(bots) do ids[#ids + 1] = id end
   table.sort(ids)
+  local y1 = h - L.footerH
+  local listStart = y
   for _, id in ipairs(ids) do
-    if y >= h - 1 then break end
+    if y > y1 then break end
     local b = bots[id]
     if ago(b.seen) < 30 then
-      line(y, ("#%-3d %-12s %-8s %-8s %s"):format(
+      local bg = colors.black
+      if L.color and ((y - listStart) % 2 == 1) then bg = colors.gray end
+      if L.color then guiFill(out, 1, y, w, 1, bg, colors.white) end
+      local fg = (b.state == "idle" or b.state == "parked") and colors.white or colors.cyan
+      local line = ("#%-3d %-12s %-8s %-8s"):format(
         id, tostring(b.name or "?"):sub(1, 12),
         tostring(b.botType or "?"):sub(1, 8),
-        tostring(b.state or "?"):sub(1, 8), pos(b)),
-        (b.state == "idle" or b.state == "parked") and colors.white or colors.cyan)
+        tostring(b.state or "?"):sub(1, 8))
+      if w >= 36 then line = line .. " " .. pos(b) end
+      guiText(out, 1 + L.pad, y, line, fg, bg)
       y = y + 1
     end
   end
   local np = 0
-  for _, w in pairs(pending) do if ago(w.seen) < 20 then np = np + 1 end end
-  if np > 0 and y < h then line(y, ("+%d awaiting deploy"):format(np), colors.orange) end
+  for _, wrow in pairs(pending) do if ago(wrow.seen) < 20 then np = np + 1 end end
+  if np > 0 and y <= y1 then
+    guiText(out, 1 + L.pad, y, ("+%d awaiting deploy"):format(np), colors.orange or colors.yellow, colors.black)
+  elseif y == listStart and y <= y1 then
+    guiText(out, 1 + L.pad, y, "(no live bots)", colors.gray, colors.black)
+  end
 end
 
-local function liveView()
+local function drawLiveFooter(L, board)
+  local out, w, h = L.out, L.w, L.h
+  local tabs = "1loc 2glb 3stat 4gps 5bots"
+  if L.tier == "tiny" then tabs = "1-5 board  q quit" end
+  local mode = L.color and "ADV" or "MONO"
+  local right = (" %s %dx%d"):format(mode, w, h)
+  local left = (" %s  %s"):format(board, (L.tier == "tiny") and "q=quit" or "←→ tabs  q quit")
+  if L.color then
+    guiFill(out, 1, h, w, 1, colors.gray, colors.white)
+    guiText(out, 1, h, left, colors.white, colors.gray)
+    if L.tier ~= "tiny" then
+      guiText(out, math.max(1, w - #tabs - #right), h, tabs .. right, colors.lightGray, colors.gray)
+    else
+      guiText(out, math.max(1, w - #right + 1), h, right, colors.lightGray, colors.gray)
+    end
+  else
+    guiText(out, 1, h, (left .. " " .. tabs .. right):sub(1, w), colors.gray, colors.black)
+  end
+end
+
+local function drawLiveBoard(board)
+  board = board or liveBoard
+  local L = termLayout()
+  if L.out.setBackgroundColor then L.out.setBackgroundColor(colors.black) end
+  if L.out.setTextColor then L.out.setTextColor(colors.white) end
+  L.out.clear()
+  local snap = boardSnap or refreshBoardSnap(false)
+  if board == "global" then
+    drawRosterBoard(L, "global", snap or {})
+  elseif board == "stats" then
+    drawStatsBoard(L, snap or {})
+  elseif board == "gps" then
+    drawGpsBoard(L, snap or {})
+  elseif board == "bots" then
+    drawBotsBoard(L)
+  else
+    drawRosterBoard(L, "local", snap or {})
+  end
+  drawLiveFooter(L, board)
+end
+
+local function normalizeLiveBoard(name)
+  name = tostring(name or ""):lower()
+  if name == "roster" or name == "loc" or name == "l" then return "local" end
+  if name == "mesh" or name == "glb" or name == "g" then return "global" end
+  if name == "stat" or name == "s" then return "stats" end
+  if name == "p" then return "gps" end
+  if name == "bot" or name == "b" then return "bots" end
+  for _, b in ipairs(LIVE_BOARDS) do
+    if b == name then return name end
+  end
+  return nil
+end
+
+local function cycleLiveBoard(delta)
+  local idx = 1
+  for i, b in ipairs(LIVE_BOARDS) do
+    if b == liveBoard then idx = i; break end
+  end
+  idx = ((idx - 1 + delta) % #LIVE_BOARDS) + 1
+  liveBoard = LIVE_BOARDS[idx]
+end
+
+local function liveView(startBoard)
+  if startBoard then
+    liveBoard = normalizeLiveBoard(startBoard) or liveBoard
+  end
+  refreshBoardSnap(true)
+  drawLiveBoard(liveBoard)
   local timer = os.startTimer(1)
-  drawDash()
+  local snapTimer = os.startTimer(3)
   while true do
-    local ev, p1 = os.pullEvent()
+    local ev, p1, p2 = os.pullEvent()
     if ev == "timer" and p1 == timer then
-      drawDash()
+      drawLiveBoard(liveBoard)
       timer = os.startTimer(1)
-    elseif ev == "key" or ev == "char" or ev == "mouse_click" or ev == "terminate" then
-      term.setBackgroundColor(colors.black); term.clear(); term.setCursorPos(1, 1)
-      if term.setTextColor then term.setTextColor(colors.white) end
-      return
+    elseif ev == "timer" and p1 == snapTimer then
+      refreshBoardSnap(true)
+      drawLiveBoard(liveBoard)
+      snapTimer = os.startTimer(3)
+    elseif ev == "char" then
+      local ch = tostring(p1 or ""):lower()
+      if ch == "q" then break
+      elseif ch == "1" then liveBoard = "local"; drawLiveBoard(liveBoard)
+      elseif ch == "2" then liveBoard = "global"; drawLiveBoard(liveBoard)
+      elseif ch == "3" then liveBoard = "stats"; drawLiveBoard(liveBoard)
+      elseif ch == "4" then liveBoard = "gps"; drawLiveBoard(liveBoard)
+      elseif ch == "5" then liveBoard = "bots"; drawLiveBoard(liveBoard)
+      elseif ch == "r" then refreshBoardSnap(true); drawLiveBoard(liveBoard)
+      elseif ch == "\t" then cycleLiveBoard(1); drawLiveBoard(liveBoard)
+      end
+    elseif ev == "key" then
+      local K = keys
+      if p1 == K.q or p1 == K.backspace then break
+      elseif p1 == K.right or p1 == K.tab then
+        cycleLiveBoard(1); drawLiveBoard(liveBoard)
+      elseif p1 == K.left then
+        cycleLiveBoard(-1); drawLiveBoard(liveBoard)
+      elseif p1 == K.r then
+        refreshBoardSnap(true); drawLiveBoard(liveBoard)
+      end
+    elseif ev == "mouse_click" then
+      -- button, x, y — tap right half → next board; left → prev
+      local w = select(1, term.getSize())
+      local x = p2
+      if x and x > 0 then
+        if x > w / 2 then cycleLiveBoard(1) else cycleLiveBoard(-1) end
+        drawLiveBoard(liveBoard)
+      end
+    elseif ev == "terminate" then
+      break
     end
   end
+  term.setBackgroundColor(colors.black)
+  term.clear()
+  term.setCursorPos(1, 1)
+  if term.setTextColor then term.setTextColor(colors.white) end
 end
 
 --------------------------------------------------------------------------------
@@ -415,6 +959,224 @@ local function sshOneShot(target, line)
 end
 
 --------------------------------------------------------------------------------
+-- Network link (ender routers + local RF modems)
+--------------------------------------------------------------------------------
+scanNetTopology = function(timeout, quiet)
+  timeout = timeout or 2.5
+  if not quiet then print("Scanning network topology...") end
+  rednet.broadcast({ type = "net_topo_req", from = os.getComputerID() }, PROTO_ROUTER)
+  local nodes, seenN = {}, {}
+  local deadline = os.clock() + timeout
+  while os.clock() < deadline do
+    local id, msg = rednet.receive(PROTO_ROUTER, deadline - os.clock())
+    if id and type(msg) == "table" and (msg.type == "net_topo" or msg.type == "net_link_hello") then
+      if not seenN[id] then
+        seenN[id] = true
+        nodes[#nodes + 1] = {
+          id = id,
+          name = msg.name or msg.hostname or ("#" .. id),
+          role = msg.role or msg.kind or "?",
+          kind = msg.kind or msg.role or "?",
+          homeRouter = msg.homeRouter,
+          peers = msg.peers or {},
+          cells = msg.cells or {},
+          x = msg.x, y = msg.y, z = msg.z,
+        }
+      end
+    end
+  end
+  local peers = titan.sshListPeers(1.2)
+  for _, p in ipairs(peers) do
+    if not seenN[p.id] then
+      local k = tostring(p.kind or "")
+      if k == "router" or k == "modem" or k:find("router", 1, true) then
+        seenN[p.id] = true
+        nodes[#nodes + 1] = {
+          id = p.id, name = p.name or ("#" .. p.id),
+          role = k, kind = k, peers = {}, cells = {},
+        }
+      end
+    end
+  end
+  table.sort(nodes, function(a, b)
+    local function rank(r)
+      r = tostring(r or ""):lower()
+      if r == "main" then return 0 end
+      if r == "router" then return 1 end
+      if r == "modem" then return 2 end
+      return 3
+    end
+    local ra, rb = rank(a.role), rank(b.role)
+    if ra ~= rb then return ra < rb end
+    return a.id < b.id
+  end)
+  return nodes
+end
+
+local function printNetTopology(nodes)
+  nodes = nodes or scanNetTopology()
+  print("== Network topology ==")
+  print("MAIN/ROUTER = ender long-haul    MODEM = local RF cell")
+  if #nodes == 0 then
+    print("(none answered — are routers running updated router.lua?)")
+    return nodes
+  end
+  for _, n in ipairs(nodes) do
+    local pstr = (n.x and ("%d,%d,%d"):format(n.x, n.y or 0, n.z)) or "no-gps"
+    print(("#%d  %-7s  %-16s  %s"):format(
+      n.id, tostring(n.role):upper():sub(1, 7), tostring(n.name):sub(1, 16), pstr))
+    if n.homeRouter then
+      print(("       home -> #%s"):format(tostring(n.homeRouter)))
+    end
+    if type(n.peers) == "table" and #n.peers > 0 then
+      local bits = {}
+      for _, p in ipairs(n.peers) do bits[#bits + 1] = "#" .. tostring(p.id) end
+      print("       peers: " .. table.concat(bits, " "))
+    end
+    if type(n.cells) == "table" and #n.cells > 0 then
+      local bits = {}
+      for _, c in ipairs(n.cells) do bits[#bits + 1] = "#" .. tostring(c.id) end
+      print("       cells: " .. table.concat(bits, " "))
+    end
+  end
+  print("Commands: link <a> <b>  |  link auto  |  link peer|modem ...")
+  return nodes
+end
+
+local function sendNetLink(targetId, action, withId, withName)
+  rednet.send(tonumber(targetId), {
+    type = "net_link",
+    action = action,
+    with = tonumber(withId),
+    withName = withName,
+    name = os.getComputerLabel(),
+    from = os.getComputerID(),
+  }, PROTO_ROUTER)
+  local deadline = os.clock() + 3
+  while os.clock() < deadline do
+    local id, msg = rednet.receive(PROTO_ROUTER, deadline - os.clock())
+    if id == tonumber(targetId) and type(msg) == "table" and msg.type == "net_link_ack" then
+      return msg.ok, msg.err or msg
+    end
+  end
+  return nil, "no ack (update that node / in range?)"
+end
+
+local function classifyNetNode(node)
+  local r = tostring(node.role or node.kind or ""):lower()
+  if r == "main" or r == "router" then return "backbone" end
+  if r == "modem" then return "modem" end
+  if r:find("router", 1, true) then return "backbone" end
+  return "other"
+end
+
+local function dist2(a, b)
+  if not (a.x and a.z and b.x and b.z) then return nil end
+  local dx, dz = a.x - b.x, a.z - b.z
+  local dy = (a.y or 0) - (b.y or 0)
+  return dx * dx + dy * dy + dz * dz
+end
+
+local function doNetworkLink(a)
+  if not requireAuth() then return true end
+  local sub = (a[2] or ""):lower()
+
+  if sub == "" or sub == "status" or sub == "show" or sub == "topo" or sub == "map" then
+    printNetTopology()
+    return true
+  elseif sub == "scan" then
+    printNetTopology(scanNetTopology(3.5))
+    return true
+  elseif sub == "help" or sub == "?" then
+    print("link                 show routers + modem cells")
+    print("link scan            longer topology scan")
+    print("link <idA> <idB>     smart: router↔router OR modem→router")
+    print("link peer <r1> <r2>  force backbone peer (ender)")
+    print("link modem <m> <r>   attach modem cell to MAIN/ROUTER")
+    print("link auto            peer all routers; modems → nearest hub")
+    return true
+  elseif sub == "auto" then
+    local nodes = scanNetTopology(3)
+    local backbone, modems = {}, {}
+    for _, n in ipairs(nodes) do
+      if classifyNetNode(n) == "backbone" then backbone[#backbone + 1] = n
+      elseif classifyNetNode(n) == "modem" then modems[#modems + 1] = n end
+    end
+    print(("Auto-link: %d backbone, %d modems"):format(#backbone, #modems))
+    local peered = 0
+    for i = 1, #backbone do
+      for j = i + 1, #backbone do
+        local aN, bN = backbone[i], backbone[j]
+        print(("  peer #%d ↔ #%d"):format(aN.id, bN.id))
+        local ok1 = sendNetLink(aN.id, "peer", bN.id, bN.name)
+        local ok2 = sendNetLink(bN.id, "peer", aN.id, aN.name)
+        if ok1 or ok2 then peered = peered + 1 end
+      end
+    end
+    local attached = 0
+    for _, m in ipairs(modems) do
+      local best, bestD = backbone[1], nil
+      for _, b in ipairs(backbone) do
+        local d = dist2(m, b)
+        if d and (not bestD or d < bestD) then best, bestD = b, d end
+      end
+      if best then
+        print(("  modem #%d → hub #%d%s"):format(
+          m.id, best.id, bestD and (" (~" .. math.floor(math.sqrt(bestD)) .. "m)") or ""))
+        local okM = sendNetLink(m.id, "home", best.id, best.name)
+        local okH = sendNetLink(best.id, "cell", m.id, m.name)
+        if okM or okH then attached = attached + 1 end
+      end
+    end
+    print(("Done. peered~%d  attached~%d"):format(peered, attached))
+    printNetTopology(scanNetTopology(2))
+    return true
+  elseif sub == "peer" or sub == "router" then
+    local r1, r2 = tonumber(a[3]), tonumber(a[4])
+    if not (r1 and r2) then print("Usage: link peer <routerId> <routerId>"); return true end
+    print(("Peering #%d ↔ #%d ..."):format(r1, r2))
+    local ok1, e1 = sendNetLink(r1, "peer", r2)
+    local ok2, e2 = sendNetLink(r2, "peer", r1)
+    print(ok1 and ("  #%d ok"):format(r1) or ("  #%d: %s"):format(r1, tostring(e1)))
+    print(ok2 and ("  #%d ok"):format(r2) or ("  #%d: %s"):format(r2, tostring(e2)))
+    return true
+  elseif sub == "modem" or sub == "cell" or sub == "home" then
+    local m, r = tonumber(a[3]), tonumber(a[4])
+    if not (m and r) then print("Usage: link modem <modemId> <routerId>"); return true end
+    print(("Attach modem #%d → hub #%d ..."):format(m, r))
+    local okM, eM = sendNetLink(m, "home", r)
+    local okH, eH = sendNetLink(r, "cell", m)
+    print(okM and "  modem home ok" or ("  modem: " .. tostring(eM)))
+    print(okH and "  hub cell ok" or ("  hub: " .. tostring(eH)))
+    return true
+  end
+
+  local idA, idB = tonumber(a[2]), tonumber(a[3])
+  if idA and idB then
+    local nodes = scanNetTopology(2)
+    local byId = {}
+    for _, n in ipairs(nodes) do byId[n.id] = n end
+    local na = byId[idA] or { id = idA, role = systems[idA] and systems[idA].kind or "?" }
+    local nb = byId[idB] or { id = idB, role = systems[idB] and systems[idB].kind or "?" }
+    local ca, cb = classifyNetNode(na), classifyNetNode(nb)
+    if ca == "backbone" and cb == "backbone" then
+      return doNetworkLink({ "link", "peer", tostring(idA), tostring(idB) })
+    elseif ca == "modem" and cb == "backbone" then
+      return doNetworkLink({ "link", "modem", tostring(idA), tostring(idB) })
+    elseif cb == "modem" and ca == "backbone" then
+      return doNetworkLink({ "link", "modem", tostring(idB), tostring(idA) })
+    end
+    print(("Not sure how to link #%d (%s) with #%d (%s)."):format(
+      idA, tostring(na.role), idB, tostring(nb.role)))
+    print("Use: link peer <r1> <r2>   or   link modem <m> <r>")
+    return true
+  end
+
+  print("Unknown. Try: link help")
+  return true
+end
+
+--------------------------------------------------------------------------------
 -- Commands
 --------------------------------------------------------------------------------
 local function handleCommand(a)
@@ -428,8 +1190,10 @@ local function handleCommand(a)
       print("  mode advanced   — switch to command-line console")
       print("  mode simple     — back to menus")
     else
-      print("VIEW  : live | bots | miners | loaders | markers | pending | stuck")
+      print("VIEW  : live [local|global|stats|gps|bots]")
+      print("        bots | miners | loaders | markers | pending | stuck")
       print("NET   : connections | hosts | list [filter] | ping | who")
+      print("        link | link <a> <b> | link auto | link peer|modem ...")
       print("SSH   : connect <id|name> [cmd...]   (alias: ssh)")
       print("BOT   : goto | return | park | refuel | stop | mine | continue")
       print("DEPLOY: deploy <id> <miner|loader|builder|gatherer> [auto] [x y z]")
@@ -468,15 +1232,18 @@ local function handleCommand(a)
       if name then print("hostname set: " .. name) else print(tostring(err)) end
     end
 
-  elseif cmd == "live" then
+  elseif cmd == "live" or cmd == "boards" or cmd == "screen" then
     if titan.sshIsAuthed and titan.sshIsAuthed() then
       print("live view is local-only. Use `bots` / `connections` over SSH.")
     else
-      liveView()
+      liveView(a[2])
     end
 
   elseif cmd == "connections" or cmd == "hosts" or cmd == "list" then
     listConnections(a[2])
+
+  elseif cmd == "link" or cmd == "netlink" or cmd == "topology" then
+    return doNetworkLink(a)
 
   elseif cmd == "who" or cmd == "find" then
     local ref = a[2]
@@ -897,11 +1664,33 @@ local function simpleConnectMenu()
 end
 
 local function simpleStatusBoard()
-  printBots(nil)
-  local np = 0
-  for _, w in pairs(pending) do if ago(w.seen) < 30 then np = np + 1 end end
-  if np > 0 then print(("\n%d turtle(s) awaiting deploy"):format(np)) end
-  pauseSimple()
+  if titan.sshIsAuthed and titan.sshIsAuthed() then
+    printBots(nil)
+    local np = 0
+    for _, w in pairs(pending) do if ago(w.seen) < 30 then np = np + 1 end end
+    if np > 0 then print(("\n%d turtle(s) awaiting deploy"):format(np)) end
+    pauseSimple()
+    return
+  end
+  -- Full-screen MAIN boards (pretty on advanced pocket).
+  liveView("stats")
+end
+
+local function simpleLiveMenu()
+  print("Live boards (MAIN monitor stats)")
+  print("  1) Local network")
+  print("  2) Global mesh")
+  print("  3) Stats")
+  print("  4) GPS")
+  print("  5) Bots")
+  print("  0) Back")
+  local n = askNumber("Pick: ")
+  if n == 1 then liveView("local")
+  elseif n == 2 then liveView("global")
+  elseif n == 3 then liveView("stats")
+  elseif n == 4 then liveView("gps")
+  elseif n == 5 then liveView("bots")
+  end
 end
 
 local function drawSimpleMenu()
@@ -909,8 +1698,10 @@ local function drawSimpleMenu()
   if term.setTextColor then term.setTextColor(colors.white) end
   print("== Titan Admin — SIMPLE ==")
   print(os.getComputerLabel() or ("#" .. os.getComputerID()))
+  local ui = termIsColor() and "advanced color UI" or "mono UI"
+  print("(" .. ui .. ")")
   print("")
-  print("  1) Status board (who's online)")
+  print("  1) Network stats (live boards)")
   print("  2) Miners")
   print("  3) Loaders")
   print("  4) Sites / markers")
@@ -919,14 +1710,41 @@ local function drawSimpleMenu()
   print("  7) Start a flatten job (wizard)")
   print("  8) Connect to a device")
   print("  9) Parent Center")
-  print(" 10) Park a turtle")
-  print(" 11) Stop a turtle")
-  print(" 12) Continue mining")
-  print(" 13) Live screen")
-  print(" 14) Advanced mode (commands)")
-  print(" 15) Lock tablet")
+  print(" 10) Network link (routers + modems)")
+  print(" 11) Park a turtle")
+  print(" 12) Stop a turtle")
+  print(" 13) Continue mining")
+  print(" 14) Live boards (pick view)")
+  print(" 15) Advanced mode (commands)")
+  print(" 16) Lock tablet")
   print("  0) Exit")
   print("")
+end
+
+local function simpleLinkMenu()
+  if not requireAuth() then pauseSimple(); return end
+  print("Network link")
+  print("  1) Show topology")
+  print("  2) Auto-link (peer routers, modems→nearest)")
+  print("  3) Peer two routers (enter ids)")
+  print("  4) Attach modem to router (enter ids)")
+  print("  0) Back")
+  local n = askNumber("Pick: ")
+  if n == 1 then
+    handleCommand({ "link" }); pauseSimple()
+  elseif n == 2 then
+    handleCommand({ "link", "auto" }); pauseSimple()
+  elseif n == 3 then
+    local a = askNumber("Router A id: ")
+    local b = askNumber("Router B id: ")
+    if a and b then handleCommand({ "link", "peer", tostring(a), tostring(b) }) end
+    pauseSimple()
+  elseif n == 4 then
+    local m = askNumber("Modem id: ")
+    local r = askNumber("Home router id: ")
+    if m and r then handleCommand({ "link", "modem", tostring(m), tostring(r) }) end
+    pauseSimple()
+  end
 end
 
 local function simpleMenuLoop()
@@ -954,25 +1772,27 @@ local function simpleMenuLoop()
     elseif n == 9 then
       handleCommand({ "dc" })
     elseif n == 10 then
-      simpleBotAction("park", nil)
+      simpleLinkMenu()
     elseif n == 11 then
-      simpleBotAction("stop", nil)
+      simpleBotAction("park", nil)
     elseif n == 12 then
-      simpleBotAction("continue", "miner")
+      simpleBotAction("stop", nil)
     elseif n == 13 then
+      simpleBotAction("continue", "miner")
+    elseif n == 14 then
       if titan.sshIsAuthed and titan.sshIsAuthed() then
         print("Live view is local-only.")
         pauseSimple()
       else
-        liveView()
+        simpleLiveMenu()
       end
-    elseif n == 14 then
+    elseif n == 15 then
       cfg.mode = "advanced"
       saveAdminCfg()
       print("Switching to ADVANCED mode...")
       sleep(0.4)
       return "switch_advanced"
-    elseif n == 15 then
+    elseif n == 16 then
       unlocked = false
       print("Locked.")
       promptUnlockAtStart()
@@ -989,7 +1809,7 @@ local function advancedConsoleLoop()
   print("== Titan Admin — ADVANCED ==")
   print(os.getComputerLabel() or ("#" .. os.getComputerID()))
   print("Command console. Type 'help'.  mode simple  for menus.")
-  print("Quick:  connections  |  connect <name>  |  dc  |  miners")
+  print("Quick:  live  |  connections  |  connect <name>  |  dc  |  miners")
   while cfg.mode == "advanced" do
     write("admin> ")
     local a = {}
