@@ -1,6 +1,6 @@
 --[[
   admin.lua  -  Titan admin console for a POCKET computer ("Live" tablet)
-  Titan-Version: 1.4.5
+  Titan-Version: 1.4.6
 
   Pocket remote for the whole fleet. Keep it on you; it joins the mesh like
   every other Titan device (MAIN router + modem hops).
@@ -1223,10 +1223,10 @@ end
 local function drawLiveFooter(L, board)
   local out, w, h = L.out, L.w, L.h
   local tabs = "1loc 2glb 3stat 4gps 5bots 6qry"
-  if L.tier == "tiny" then tabs = "1-6 board  q quit" end
+  if L.tier == "tiny" then tabs = "1-6  n/p  q back" end
   local mode = L.color and "ADV" or "MONO"
   local right = (" %s %dx%d"):format(mode, w, h)
-  local left = (" %s  %s"):format(board, (L.tier == "tiny") and "q=quit" or "←→ tabs  q quit")
+  local left = (" %s  %s"):format(board, (L.tier == "tiny") and "q=back" or "n/p tabs  q back")
   if L.color then
     guiFill(out, 1, h, w, 1, colors.gray, colors.white)
     guiText(out, 1, h, left, colors.white, colors.gray)
@@ -1288,6 +1288,15 @@ local function cycleLiveBoard(delta)
   liveBoard = LIVE_BOARDS[idx]
 end
 
+-- Drop queued key/char from the key that closed a sub-UI (CC fires both).
+local function drainInputEvents()
+  local t = os.startTimer(0)
+  while true do
+    local ev, p1 = os.pullEvent()
+    if ev == "timer" and p1 == t then return end
+  end
+end
+
 local function liveView(startBoard)
   if startBoard then
     liveBoard = normalizeLiveBoard(startBoard) or liveBoard
@@ -1316,6 +1325,10 @@ local function liveView(startBoard)
     elseif ev == "char" then
       local ch = tostring(p1 or ""):lower()
       if ch == "q" then break
+      elseif ch == "n" then
+        cycleLiveBoard(1); drawLiveBoard(liveBoard)
+      elseif ch == "p" then
+        cycleLiveBoard(-1); drawLiveBoard(liveBoard)
       elseif ch == "1" then liveBoard = "local"; drawLiveBoard(liveBoard)
       elseif ch == "2" then liveBoard = "global"; drawLiveBoard(liveBoard)
       elseif ch == "3" then liveBoard = "stats"; drawLiveBoard(liveBoard)
@@ -1329,7 +1342,9 @@ local function liveView(startBoard)
       end
     elseif ev == "key" then
       local K = keys
-      if p1 == K.q or p1 == K.backspace then break
+      -- Only backspace here — do NOT also handle keys.q (char "q" already closes;
+      -- handling both leaves a queued event that exits the phone home).
+      if p1 == K.backspace then break
       elseif p1 == K.right or p1 == K.tab then
         cycleLiveBoard(1); drawLiveBoard(liveBoard)
       elseif p1 == K.left then
@@ -1350,6 +1365,7 @@ local function liveView(startBoard)
       break
     end
   end
+  drainInputEvents()
   term.setBackgroundColor(colors.black)
   term.clear()
   term.setCursorPos(1, 1)
@@ -2487,7 +2503,7 @@ local function drawPhoneHome(page, pages, tiles)
   local pageTxt = ("<%d/%d>"):format(page, pages)
   guiFill(out, 1, dockY, w, 1, barBg, barFg)
   guiText(out, 2, dockY, pageTxt, colors.lightGray, barBg)
-  local dock = "< > page  E exit"
+  local dock = "N/P page  E exit"
   guiText(out, math.max(2, w - #dock), dockY, dock, colors.white, barBg)
 end
 
@@ -2517,11 +2533,13 @@ local function simpleMenuLoop()
     local ev, p1, p2, p3 = os.pullEvent()
     if ev == "char" then
       local ch = tostring(p1 or ""):lower()
-      if ch == "e" or ch == "q" then
+      -- E exits admin. Q must NOT exit here — live boards use Q to go back,
+      -- and CC queues both key+char so a leftover Q was killing the whole script.
+      if ch == "e" then
         return "exit"
-      elseif ch == "n" or ch == "d" then
+      elseif ch == "n" then
         page = (page % pages) + 1
-      elseif ch == "p" or ch == "a" then
+      elseif ch == "p" then
         page = page - 1
         if page < 1 then page = pages end
       elseif ch >= "1" and ch <= "9" then
@@ -2529,11 +2547,13 @@ local function simpleMenuLoop()
         if tiles[n] then
           local r = runPhoneApp(tiles[n].id)
           if r then return r end
+          drainInputEvents()
         end
       elseif ch == "0" then
         if tiles[10] then
           local r = runPhoneApp(tiles[10].id)
           if r then return r end
+          drainInputEvents()
         end
       end
     elseif ev == "key" then
@@ -2543,8 +2563,6 @@ local function simpleMenuLoop()
       elseif p1 == K.left or p1 == K.pageup then
         page = page - 1
         if page < 1 then page = pages end
-      elseif p1 == K.q then
-        return "exit"
       end
     elseif ev == "mouse_click" then
       local x, y = p2, p3
@@ -2552,6 +2570,7 @@ local function simpleMenuLoop()
       if app then
         local r = runPhoneApp(app.id)
         if r then return r end
+        drainInputEvents()
       end
     elseif ev == "terminate" then
       return "exit"
