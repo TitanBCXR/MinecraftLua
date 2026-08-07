@@ -1,6 +1,6 @@
 --[[
   install.lua  -  Titan network installer (CC: Tweaked)
-  Titan-Version: 1.1.14
+  Titan-Version: 1.1.15
 
   Downloads the Titan bot-network system onto this device from a running
   `host.lua` on the same rednet network (no pastebin / external web host).
@@ -54,15 +54,21 @@ local ROLES = {
     files = { "lib/titan.lua", "loader.lua" } },
   { key = "16", name = "Site marker (area + fleet job request)", run = "marker.lua",
     files = { "lib/titan.lua", "marker.lua" } },
-  { key = "17", name = "Install host (share files to others)", run = "host.lua",
+  { key = "17", name = "Perimeter sensor (Player Detector gate)", run = "perimeter_sensor.lua",
+    files = { "lib/titan.lua", "perimeter_sensor.lua" } },
+  { key = "18", name = "Perimeter manager (territory board)", run = "perimeter_manager.lua",
+    files = { "lib/titan.lua", "perimeter_manager.lua" } },
+  { key = "19", name = "Install host (share files to others)", run = "host.lua",
     files = { "lib/titan.lua", "hub.lua", "bot.lua", "poi.lua", "worker.lua", "botserver.lua",
               "datacenter.lua", "console.lua", "admin.lua", "gpshost.lua", "locator.lua", "router.lua",
               "miner.lua", "offline_miner.lua", "loader.lua", "marker.lua", "storage_manager.lua",
+              "perimeter_sensor.lua", "perimeter_manager.lua",
               "exclude.txt", "versions.lua", "install.lua" } },
-  { key = "18", name = "Everything (all files, no auto-run)", run = nil,
+  { key = "20", name = "Everything (all files, no auto-run)", run = nil,
     files = { "lib/titan.lua", "hub.lua", "bot.lua", "poi.lua", "worker.lua", "botserver.lua",
               "datacenter.lua", "console.lua", "admin.lua", "gpshost.lua", "locator.lua", "router.lua",
               "miner.lua", "offline_miner.lua", "loader.lua", "marker.lua", "storage_manager.lua",
+              "perimeter_sensor.lua", "perimeter_manager.lua",
               "exclude.txt", "versions.lua", "install.lua" } },
 }
 

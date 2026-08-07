@@ -28,6 +28,7 @@ local FILES = {
   "datacenter.lua",
   "console.lua", "admin.lua", "gpshost.lua", "locator.lua", "router.lua",
   "miner.lua", "offline_miner.lua", "loader.lua", "marker.lua", "storage_manager.lua",
+  "perimeter_sensor.lua", "perimeter_manager.lua",
   "exclude.txt", "versions.lua",
 }
 

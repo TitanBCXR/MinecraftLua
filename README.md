@@ -7,6 +7,7 @@ A wireless dispatch system for Minecraft's **CC: Tweaked** mod:
 - **`poi.lua`** — a "point of interest" computer that marks a location by coordinates and can summon a bot.
 - **`miner.lua`** — quarry turtle: digs between two corners down to a floor Y, skipping `exclude.txt`.
 - **`offline_miner.lua`** — local quarry (no GPS/network): origin at top-front-left, `area` / `box` / `tunnel` / `stair`.
+- **`perimeter_sensor.lua` / `perimeter_manager.lua`** — Player Detector territory enter/exit board (N/E/S/W + timestamps).
 - **`lib/titan.lua`** — shared library (protocol, messaging, navigation). Copy this onto **every** device.
 
 ```
@@ -391,6 +392,34 @@ mine / continue / stop / status
 
 Site markers can send `storage`, `fuelchest`, and `selfchunk` with the job so
 fleet miners pick those up automatically.
+
+---
+
+# Perimeter (Player Detector)
+
+Track players entering / leaving your territory with Advanced Peripherals
+**Player Detector** blocks on the Titan mesh.
+
+### Perimeter sensor (`perimeter_sensor.lua`)
+
+Install on each gate computer (installer → **"Perimeter sensor"**):
+
+- Computer + wireless modem + Player Detector
+- On first run set `side north|east|south|west` (which edge of the base)
+- Optional: `range 8`, `name North Gate`
+
+It polls `getPlayersInRange` and broadcasts enter/exit + pulses to the manager.
+
+### Perimeter manager (`perimeter_manager.lua`)
+
+One board computer (installer → **"Perimeter manager"**), ideally with a monitor:
+
+- Shows who’s inside, entry side (N/E/S/W), enter timestamp
+- Rolling ENTER/EXIT log with times
+- `sensors` lists online gates; `grace 4` sets exit confirm delay
+
+Place sensors so each covers one approach. Overlapping ranges are debounced by
+the grace timer so walking past two gates doesn’t false-exit.
 
 ---
 
