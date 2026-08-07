@@ -1,6 +1,6 @@
 --[[
   miner.lua  -  Area miner turtle for the Titan network (CC: Tweaked)
-  Titan-Version: 1.2.10
+  Titan-Version: 1.3.0
 
   Digs a rectangular "box":
     * set1 <x> <z> / set2 <x> <z> — opposite corners (X/Z footprint)
@@ -12,6 +12,12 @@
     * continue — resume after unload/reboot from GPS / saved progress
     * Parent Center can assign strip jobs (cruise Y ~150)
 
+  Slot map:
+    16 = fuel (never dumped)
+    15 = equipment hot-swap (modem OR chunk loader — whichever is not equipped)
+  With selfChunk: dig offline with chunk loader equipped; on dump/refuel/check-in
+  swap modem from slot 15, talk to the mesh, then swap chunker back.
+
   Never breaks blocks listed in exclude.txt (or titan.RESTRICTED).
 
   Fresh miners wait for Parent Center deploy:
@@ -22,6 +28,7 @@
   NETWORK: joins the Titan mesh; status+assignment go to botserver + datacenter.
 
   Requires: wireless modem, fuel, GPS constellation, lib/titan.lua.
+  Optional: Advanced Peripherals Chunky Turtle (or similar) in slot 15 for selfChunk.
 ]]
 
 local titan = dofile("lib/titan.lua")
@@ -35,6 +42,8 @@ os.setComputerLabel(os.getComputerLabel() or ("Miner-" .. os.getComputerID()))
 local CFG     = "miner.cfg"
 local JOB     = "miner_job.cfg"  -- active quarry for `continue` after unload
 local EXCLUDE = "exclude.txt"
+local EQUIP_SLOT = 15
+local FUEL_SLOT  = nav.FUEL_SLOT or 16
 
 local cfg = {
   name = nil,
@@ -45,11 +54,14 @@ local cfg = {
   yEnd = nil,       -- ending (bottom) Y level, inclusive
   floorY = nil,     -- legacy alias for yEnd (migrated on load)
   deposit = nil,    -- legacy: stand above chest and dropDown (optional)
-  chest = nil,      -- {x,y,z} chest block (default: one block behind home)
+  chest = nil,      -- {x,y,z} storage chest (default: one block behind home)
+  fuelChest = nil,  -- optional site fuel chest
   home = nil,       -- start / return point (face the mine; chest behind)
   homeFacing = nil, -- titan.NORTH/EAST/SOUTH/WEST when home was set
   stage = nil,      -- fleet parking / sheet slot {x,y,z}
   cruiseY = 150,    -- nav layer for long hops to jobs
+  selfChunk = false,-- dig with chunk loader; modem lives in slot 15 while mining
+  siteId = nil,
 }
 
 local state = {
@@ -59,7 +71,11 @@ local state = {
   dug    = 0,
   skipped = 0,
   jobId  = nil,
+  netMode = "online", -- "online" (modem) | "chunk" (chunk loader)
 }
+
+-- Dead-reckon pose while modem is unequipped (world blocks).
+local track = { x = nil, y = nil, z = nil }
 local mineRequested = false
 local continueRequested = false
 local pendingJob = nil  -- strip job from Parent Center
@@ -311,8 +327,278 @@ local function tryDig(dir)
 end
 
 local function invFull()
+  -- Slot 15 (equipment) and 16 (fuel) do not count as dig capacity.
   for s = 1, 16 do
-    if turtle.getItemCount(s) == 0 then return false end
+    if s ~= EQUIP_SLOT and s ~= FUEL_SLOT and turtle.getItemCount(s) == 0 then
+      return false
+    end
+  end
+  return true
+end
+
+--------------------------------------------------------------------------------
+-- Slot 15 equipment swap: modem <-> chunk loader
+--------------------------------------------------------------------------------
+local function detailName(d)
+  return d and tostring(d.name or "") or ""
+end
+
+local function isModemName(n)
+  n = tostring(n or ""):lower()
+  return n:find("modem", 1, true) ~= nil
+end
+
+local function isChunkerName(n)
+  n = tostring(n or ""):lower()
+  if n:find("chunky", 1, true) then return true end
+  if n:find("chunk_controller", 1, true) then return true end
+  if n:find("chunkloader", 1, true) or n:find("chunk_loader", 1, true) then return true end
+  if n:find("chunk", 1, true) and n:find("turtle", 1, true) then return true end
+  return false
+end
+
+local function isPickName(n)
+  n = tostring(n or ""):lower()
+  return n:find("pickaxe", 1, true) ~= nil
+end
+
+local function itemDetail(slot)
+  local ok, d = pcall(turtle.getItemDetail, slot, true)
+  if ok and type(d) == "table" then return d end
+  return turtle.getItemDetail(slot)
+end
+
+local function getEquipped(side)
+  local fn = (side == "left") and turtle.getEquippedLeft or turtle.getEquippedRight
+  if type(fn) ~= "function" then return nil end
+  local ok, d = pcall(fn)
+  if ok and type(d) == "table" then return d end
+  return nil
+end
+
+local function modemSideEquipped()
+  for _, side in ipairs({ "left", "right" }) do
+    if peripheral.getType(side) == "modem" then return side end
+    local d = getEquipped(side)
+    if d and isModemName(d.name) then return side end
+  end
+  return nil
+end
+
+local function chunkerSideEquipped()
+  for _, side in ipairs({ "left", "right" }) do
+    local d = getEquipped(side)
+    if d and isChunkerName(d.name) then return side end
+  end
+  return nil
+end
+
+local function peripheralSwapSide()
+  local m = modemSideEquipped()
+  if m then return m end
+  local c = chunkerSideEquipped()
+  if c then return c end
+  for _, side in ipairs({ "right", "left" }) do
+    local d = getEquipped(side)
+    if d and not isPickName(d.name) then return side end
+  end
+  return "right"
+end
+
+local function parkPeripheralInEquipSlot()
+  for s = 1, 16 do
+    if s ~= EQUIP_SLOT and s ~= FUEL_SLOT then
+      local d = itemDetail(s)
+      local n = detailName(d)
+      if isModemName(n) or isChunkerName(n) then
+        turtle.select(s)
+        if turtle.getItemCount(EQUIP_SLOT) == 0 then
+          turtle.transferTo(EQUIP_SLOT)
+        elseif turtle.getItemSpace(EQUIP_SLOT) > 0 then
+          turtle.transferTo(EQUIP_SLOT)
+        end
+      end
+    end
+  end
+  turtle.select(1)
+end
+
+local function findItemSlot(pred)
+  local d15 = itemDetail(EQUIP_SLOT)
+  if d15 and pred(detailName(d15)) then return EQUIP_SLOT end
+  for s = 1, 16 do
+    if s ~= EQUIP_SLOT and s ~= FUEL_SLOT then
+      local d = itemDetail(s)
+      if d and pred(detailName(d)) then return s end
+    end
+  end
+  return nil
+end
+
+local function equipSlotOntoSide(slot, side)
+  turtle.select(slot)
+  local ok, err
+  if side == "left" then
+    ok, err = turtle.equipLeft()
+  else
+    ok, err = turtle.equipRight()
+  end
+  parkPeripheralInEquipSlot()
+  return ok, err
+end
+
+-- Put modem on the turtle; chunker (if any) lands in slot 15.
+local function ensureModemEquipped()
+  if modemSideEquipped() then
+    pcall(titan.openModem)
+    state.netMode = "online"
+    return true
+  end
+  local slot = findItemSlot(isModemName)
+  if not slot then
+    print("No modem in inventory/slot " .. EQUIP_SLOT)
+    return false, "no modem"
+  end
+  local side = peripheralSwapSide()
+  local ok, err = equipSlotOntoSide(slot, side)
+  if not ok then
+    -- try other side
+    local other = (side == "left") and "right" or "left"
+    ok, err = equipSlotOntoSide(slot, other)
+  end
+  if ok then
+    pcall(titan.openModem)
+    state.netMode = "online"
+    print("Modem equipped (chunker/hot-swap in slot " .. EQUIP_SLOT .. ")")
+    return true
+  end
+  print("Could not equip modem: " .. tostring(err))
+  return false, err
+end
+
+-- Put chunk loader on; modem goes to slot 15. Only if selfChunk / chunker present.
+local function ensureChunkerEquipped()
+  if not cfg.selfChunk then return false, "selfChunk off" end
+  if chunkerSideEquipped() then
+    state.netMode = "chunk"
+    return true
+  end
+  local slot = findItemSlot(isChunkerName)
+  if not slot then return false, "no chunker" end
+  local side = peripheralSwapSide()
+  local ok, err = equipSlotOntoSide(slot, side)
+  if not ok then
+    local other = (side == "left") and "right" or "left"
+    ok, err = equipSlotOntoSide(slot, other)
+  end
+  if ok then
+    state.netMode = "chunk"
+    print("Chunk loader equipped (modem in slot " .. EQUIP_SLOT .. ")")
+    return true
+  end
+  return false, err
+end
+
+local function syncTrackFromGps(timeout)
+  local x, y, z = nav.locatePrecise(timeout or 3)
+  if not x then
+    x, y, z = nav.locate(timeout or 2)
+  end
+  if x then
+    track.x, track.y, track.z = x, y, z
+    return true
+  end
+  return false
+end
+
+local function hasTrack()
+  return track.x ~= nil and track.y ~= nil and track.z ~= nil
+end
+
+-- Online check-in: modem on, GPS sync, ready for dump/travel/status.
+local function goOnline(reason)
+  setStatus("checkin", reason or "modem on")
+  local ok, err = ensureModemEquipped()
+  if not ok then return false, err end
+  syncTrackFromGps(4)
+  return true
+end
+
+-- Enter offline dig mode when configured.
+local function goChunkMine()
+  if not cfg.selfChunk then return false end
+  if hasTrack() or syncTrackFromGps(2) then
+    local ok = ensureChunkerEquipped()
+    return ok
+  end
+  return false
+end
+
+-- Axis walk using heading + dig, updating track (for modem-off mining).
+local function trackMoveTo(tx, ty, tz)
+  tx, ty, tz = math.floor(tx), math.floor(ty), math.floor(tz)
+  if not hasTrack() then
+    if not goOnline("gps fix") then return false, "no gps" end
+    if not syncTrackFromGps(4) then return false, "no gps" end
+  end
+  -- Prefer real GPS nav when modem is up.
+  if modemSideEquipped() then
+    local ok, err = nav.moveTo(tx, ty, tz, { dig = true })
+    if ok then
+      track.x, track.y, track.z = tx, ty, tz
+      return true
+    end
+    -- fall through to tracked steps
+  end
+  if nav.heading == nil then
+    local okc = goOnline("calibrate")
+    if okc then nav.calibrate(true) end
+    if nav.heading == nil then return false, "no heading" end
+  end
+
+  local function digStep(dir)
+    if dir == "up" then
+      if turtle.detectUp() then turtle.digUp() end
+      if turtle.up() then track.y = track.y + 1; return true end
+    elseif dir == "down" then
+      if turtle.detectDown() then turtle.digDown() end
+      if turtle.down() then track.y = track.y - 1; return true end
+    else
+      if turtle.detect() then turtle.dig() end
+      if turtle.forward() then
+        local dx, dz = 0, 0
+        if nav.heading == titan.NORTH then dz = -1
+        elseif nav.heading == titan.SOUTH then dz = 1
+        elseif nav.heading == titan.EAST then dx = 1
+        elseif nav.heading == titan.WEST then dx = -1 end
+        track.x = track.x + dx
+        track.z = track.z + dz
+        return true
+      end
+      turtle.attack()
+      if turtle.forward() then
+        local dx, dz = 0, 0
+        if nav.heading == titan.NORTH then dz = -1
+        elseif nav.heading == titan.SOUTH then dz = 1
+        elseif nav.heading == titan.EAST then dx = 1
+        elseif nav.heading == titan.WEST then dx = -1 end
+        track.x = track.x + dx
+        track.z = track.z + dz
+        return true
+      end
+    end
+    return false
+  end
+
+  while track.y < ty do if not digStep("up") then return false, "up" end end
+  while track.y > ty do if not digStep("down") then return false, "down" end end
+  while track.x ~= tx do
+    nav.face(track.x < tx and titan.EAST or titan.WEST)
+    if not digStep("forward") then return false, "x" end
+  end
+  while track.z ~= tz do
+    nav.face(track.z < tz and titan.SOUTH or titan.NORTH)
+    if not digStep("forward") then return false, "z" end
   end
   return true
 end
@@ -375,9 +661,42 @@ local function faceToward(tx, tz)
   return true
 end
 
+local function dropCargo(dropFn)
+  for s = 1, 16 do
+    if s ~= FUEL_SLOT and s ~= EQUIP_SLOT then
+      turtle.select(s)
+      dropFn()
+    end
+  end
+  turtle.select(1)
+end
+
+local function suckFuelFromChest()
+  if not cfg.fuelChest then return end
+  if not goOnline("fuel chest") then return end
+  setStatus("refuel", "fuel chest @ " .. fmt(cfg.fuelChest))
+  local ok = nav.travelTo(cfg.fuelChest.x, cfg.fuelChest.y, cfg.fuelChest.z)
+  if not ok then
+    -- Stand next to fuel chest: try adjacent approach via home-level travel
+    print("Could not stand on fuel chest coords; trying face-and-suck nearby.")
+  end
+  faceToward(cfg.fuelChest.x, cfg.fuelChest.z)
+  turtle.select(FUEL_SLOT)
+  for _ = 1, 8 do
+    if turtle.getItemSpace(FUEL_SLOT) <= 0 then break end
+    turtle.suck(turtle.getItemSpace(FUEL_SLOT))
+  end
+  nav.ensureFuel(64)
+end
+
 local function dumpInventory()
+  -- Always bring modem online before GPS travel / mesh check-in.
+  if not goOnline("deposit") then
+    print("Need modem in slot " .. EQUIP_SLOT .. " (or equipped) to deposit.")
+    return false
+  end
+
   local chest = ensureChest()
-  local fuelSlot = nav.FUEL_SLOT or 16
 
   -- Preferred: home start + chest one block behind → face chest and drop().
   if chest and cfg.home then
@@ -395,15 +714,11 @@ local function dumpInventory()
     else
       faceToward(chest.x, chest.z)
     end
-    for s = 1, 16 do
-      if s ~= fuelSlot then
-        turtle.select(s)
-        turtle.drop()
-      end
-    end
-    turtle.select(1)
+    dropCargo(function() turtle.drop() end)
     -- Face back toward the mine for the next trip out.
     if cfg.homeFacing ~= nil then pcall(nav.face, cfg.homeFacing) end
+    if cfg.fuelChest then suckFuelFromChest() end
+    syncTrackFromGps(3)
     return true
   end
 
@@ -415,13 +730,9 @@ local function dumpInventory()
       print("Could not reach deposit: " .. tostring(err))
       return false
     end
-    for s = 1, 16 do
-      if s ~= fuelSlot then
-        turtle.select(s)
-        turtle.dropDown()
-      end
-    end
-    turtle.select(1)
+    dropCargo(function() turtle.dropDown() end)
+    if cfg.fuelChest then suckFuelFromChest() end
+    syncTrackFromGps(3)
     return true
   end
 
@@ -435,6 +746,8 @@ local function ensureSpace()
       setStatus("full", "inventory full, no deposit")
       return false
     end
+    -- Resume dig offline if configured.
+    goChunkMine()
   end
   return true
 end
@@ -442,6 +755,14 @@ end
 local function ensureFuel()
   nav.ensureFuel(64)
   if turtle.getFuelLevel() ~= "unlimited" and turtle.getFuelLevel() < 8 then
+    if cfg.fuelChest then
+      suckFuelFromChest()
+      nav.ensureFuel(64)
+    end
+  end
+  if turtle.getFuelLevel() ~= "unlimited" and turtle.getFuelLevel() < 8 then
+    -- Check in online so DC can see the error.
+    goOnline("out of fuel")
     setStatus("error", "out of fuel")
     return false
   end
@@ -482,9 +803,15 @@ local function goDownOne()
     turtle.digDown()
     state.dug = state.dug + 1
   end
-  if turtle.down() then return true end
+  if turtle.down() then
+    if hasTrack() then track.y = track.y - 1 end
+    return true
+  end
   turtle.attackDown()
-  if turtle.down() then return true end
+  if turtle.down() then
+    if hasTrack() then track.y = track.y - 1 end
+    return true
+  end
   return false, "blocked down"
 end
 
@@ -593,9 +920,29 @@ local function mineVolume(opts)
     end
   end
 
+  -- Fix GPS pose, then optionally swap to chunk loader for offline dig.
+  goOnline("mine start")
+  syncTrackFromGps(4)
+  if cfg.selfChunk then
+    if goChunkMine() then
+      print("selfChunk ON — digging offline; modem parked in slot " .. EQUIP_SLOT)
+    else
+      print("selfChunk ON but no chunk loader found — staying on modem.")
+    end
+  end
+
+  local function digMoveTo(tx, ty, tz)
+    if cfg.selfChunk and state.netMode == "chunk" then
+      return trackMoveTo(tx, ty, tz)
+    end
+    local ok, err = nav.moveTo(tx, ty, tz, { dig = true })
+    if ok and hasTrack() then track.x, track.y, track.z = tx, ty, tz end
+    return ok, err
+  end
+
   for y = resumeY, b.floorY, -1 do
     if state.stop then break end
-    setStatus("mining", ("layer Y=%d"):format(y))
+    setStatus("mining", ("layer Y=%d %s"):format(y, state.netMode or ""))
     print(("--- Layer Y=%d ---"):format(y))
 
     local z = (y == resumeY) and resumeZ or b.minZ
@@ -614,7 +961,7 @@ local function mineVolume(opts)
         resumeX, resumeZ, resumeY = nil, nil, nil
       end
 
-      local ok, err = nav.moveTo(x, y, z, { dig = true })
+      local ok, err = digMoveTo(x, y, z)
       if not ok then
         print("moveTo failed: " .. tostring(err) .. " — trying cell-by-cell")
       end
@@ -630,10 +977,13 @@ local function mineVolume(opts)
           return false
         end
 
-        local cx = nav.locate(1)
-        if not cx then
-          touchJobProgress(job, y, z, zDir, x)
-          print("Lost GPS"); setStatus("error", "no GPS"); return false
+        -- GPS optional while selfChunk offline — trust serpentine x counter + track.
+        if not (cfg.selfChunk and state.netMode == "chunk") then
+          local cx = nav.locate(1)
+          if not cx then
+            touchJobProgress(job, y, z, zDir, x)
+            print("Lost GPS"); setStatus("error", "no GPS"); return false
+          end
         end
 
         if (step == 1 and x >= endX) or (step == -1 and x <= endX) then
@@ -641,6 +991,15 @@ local function mineVolume(opts)
         end
 
         local moved, why = stepForward()
+        if moved and hasTrack() and nav.heading ~= nil then
+          local dx, dz = 0, 0
+          if nav.heading == titan.NORTH then dz = -1
+          elseif nav.heading == titan.SOUTH then dz = 1
+          elseif nav.heading == titan.EAST then dx = 1
+          elseif nav.heading == titan.WEST then dx = -1 end
+          track.x = track.x + dx
+          track.z = track.z + dz
+        end
         if not moved then
           if tostring(why):find("^excluded") then
             print("Skip excluded at row: " .. tostring(why))
@@ -654,18 +1013,18 @@ local function mineVolume(opts)
               else
                 turtle.down()
                 x = x + step
-                nav.moveTo(x, y, z, { dig = true })
+                digMoveTo(x, y, z)
                 nav.face(step == 1 and titan.EAST or titan.WEST)
               end
             else
               x = x + step
-              nav.moveTo(x, y, z, { dig = true })
+              digMoveTo(x, y, z)
               nav.face(step == 1 and titan.EAST or titan.WEST)
             end
           else
             print("Blocked: " .. tostring(why))
             x = x + step
-            nav.moveTo(x, y, z, { dig = true })
+            digMoveTo(x, y, z)
             nav.face(step == 1 and titan.EAST or titan.WEST)
           end
         else
@@ -734,7 +1093,14 @@ local function printStatus()
   print(("home: %s"):format(fmt(cfg.home)))
   local chest = cfg.chest or chestBehindHome()
   print(("chest: %s%s"):format(fmt(chest), cfg.chest and "" or " (auto behind home)"))
+  if cfg.fuelChest then print(("fuelChest: %s"):format(fmt(cfg.fuelChest))) end
   if cfg.deposit then print(("deposit (legacy): %s"):format(fmt(cfg.deposit))) end
+  print(("selfChunk=%s  netMode=%s  equipSlot=%d"):format(
+    tostring(cfg.selfChunk), tostring(state.netMode), EQUIP_SLOT))
+  if hasTrack() then
+    print(("track: %d,%d,%d"):format(track.x, track.y, track.z))
+  end
+  if cfg.siteId then print("siteId: " .. tostring(cfg.siteId)) end
   local b = bounds()
   if b then
     local dx = b.maxX - b.minX + 1
@@ -921,6 +1287,17 @@ end
 local function runAssignedJob(job)
   local ok, err = applyStripJob(job)
   if not ok then print(tostring(err)); return false end
+  if job.storage or job.chest then
+    local s = job.storage or job.chest
+    if s.x then cfg.chest = { x = math.floor(s.x), y = math.floor(s.y), z = math.floor(s.z) } end
+  end
+  if job.fuelChest or job.fuel then
+    local s = job.fuelChest or job.fuel
+    if s.x then cfg.fuelChest = { x = math.floor(s.x), y = math.floor(s.y), z = math.floor(s.z) } end
+  end
+  if job.selfChunk ~= nil then cfg.selfChunk = not not job.selfChunk end
+  if job.siteId then cfg.siteId = job.siteId end
+  saveCfg()
   local b = bounds()
   if not b and cfg.yStart == nil then
     -- yStart filled after arrival
@@ -928,6 +1305,7 @@ local function runAssignedJob(job)
   local midX = math.floor((cfg.loc1.x + cfg.loc2.x) / 2)
   local midZ = math.floor((cfg.loc1.z + cfg.loc2.z) / 2)
   local approachY = tonumber(job.approachY) or tonumber(cfg.yStart) or (tonumber(cfg.cruiseY) or 150)
+  goOnline("job travel")
   setStatus("moving", ("job %s via Y%d"):format(tostring(state.jobId or "?"), tonumber(cfg.cruiseY) or 150))
   print(("Traveling to strip @ %d,%d (cruise %d)..."):format(midX, midZ, tonumber(cfg.cruiseY) or 150))
   local tok, terr = goCruiseTo(midX, approachY, midZ)
@@ -991,9 +1369,11 @@ local function handleCommand(a)
     print("  yhere start|end          use current GPS Y")
     print("OTHER:")
     print("  home / start   mark start (face the mine; chest = 1 block behind)")
-    print("  chest          show / recompute behind home")
-    print("  chest <x y z>  set chest block manually")
+    print("  chest / storage [x y z]   storage chest (or behind home)")
+    print("  fuelchest [x y z|here]    site fuel chest")
     print("  deposit        legacy: stand ABOVE a chest (dropDown)")
+    print("  selfchunk on|off          dig with chunk loader; modem in slot 15")
+    print("  modem | chunk | swap      force equipment swap (slot 15)")
     print("  exclude   reload & show exclude.txt")
     print("  mine                 dig configured box")
     print("  mine <W>x<D> <yEnd>  flatten from here (e.g. mine 5x5 -59)")
@@ -1070,7 +1450,7 @@ local function handleCommand(a)
     print("(Legacy dropDown mode. Prefer `home` with chest behind.)")
   elseif cmd == "home" or cmd == "start" then
     setHomeHere()
-  elseif cmd == "chest" then
+  elseif cmd == "chest" or cmd == "storage" then
     if a[2] and a[3] and a[4] then
       local x, y, z = tonumber(a[2]), tonumber(a[3]), tonumber(a[4])
       if not x then
@@ -1093,6 +1473,54 @@ local function handleCommand(a)
           print("Need heading — run `home` again facing the mine.")
         end
       end
+    end
+  elseif cmd == "fuelchest" or cmd == "fuel" then
+    if (a[2] or ""):lower() == "here" then
+      local x, y, z = nav.locatePrecise(4)
+      if not x then print("No GPS.") else
+        cfg.fuelChest = { x = math.floor(x), y = math.floor(y), z = math.floor(z) }
+        saveCfg()
+        print("fuelChest = " .. fmt(cfg.fuelChest))
+      end
+    elseif a[2] and a[3] and a[4] then
+      cfg.fuelChest = {
+        x = math.floor(tonumber(a[2])), y = math.floor(tonumber(a[3])),
+        z = math.floor(tonumber(a[4])),
+      }
+      saveCfg()
+      print("fuelChest = " .. fmt(cfg.fuelChest))
+    elseif (a[2] or ""):lower() == "clear" then
+      cfg.fuelChest = nil; saveCfg(); print("fuelChest cleared")
+    else
+      print("fuelChest = " .. fmt(cfg.fuelChest))
+      print("Usage: fuelchest <x> <y> <z> | fuelchest here | fuelchest clear")
+    end
+  elseif cmd == "selfchunk" or cmd == "chunkmode" then
+    local v = (a[2] or ""):lower()
+    if v == "on" or v == "true" or v == "1" then
+      cfg.selfChunk = true; saveCfg()
+      print("selfChunk ON — put chunk loader in slot " .. EQUIP_SLOT .. " (modem swaps there while digging)")
+    elseif v == "off" or v == "false" or v == "0" then
+      cfg.selfChunk = false; saveCfg()
+      goOnline("selfChunk off")
+      print("selfChunk OFF — modem stays equipped")
+    else
+      print("selfChunk = " .. tostring(cfg.selfChunk))
+      print("Usage: selfchunk on|off")
+    end
+  elseif cmd == "modem" or cmd == "online" then
+    goOnline("manual")
+  elseif cmd == "chunk" or cmd == "chunker" then
+    cfg.selfChunk = true; saveCfg()
+    if not syncTrackFromGps(2) then syncTrackFromGps(4) end
+    local ok, err = ensureChunkerEquipped()
+    if not ok then print("Chunk equip failed: " .. tostring(err)) end
+  elseif cmd == "swap" then
+    if modemSideEquipped() then
+      cfg.selfChunk = true; saveCfg()
+      ensureChunkerEquipped()
+    else
+      goOnline("swap")
     end
   elseif cmd == "exclude" then
     loadExclude()
@@ -1309,21 +1737,30 @@ local function statusLoop()
     local x, y, z = nav.locate(1)
     local fix = nav.lastFix
     local asg = assignmentText()
-    titan.broadcast(MSG.STATUS, {
-      botName = cfg.name or os.getComputerLabel(),
-      label = cfg.name or os.getComputerLabel(),
-      status = state.status,
-      state  = state.status,   -- Parent Center reads `state`
-      task   = state.task,
-      assignment = asg,
-      x = x, y = y, z = z,
-      yLo = fix and fix.yLo, yHi = fix and fix.yHi,
-      gpsN = fix and fix.n, gpsSpreadY = fix and fix.spreadY,
-      fuel   = turtle.getFuelLevel(),
-      dug    = state.dug,
-      botType = "miner",
-      jobId = state.jobId,
-    })
+    if (not x) and hasTrack() then
+      x, y, z = track.x, track.y, track.z
+    end
+    -- Offline (chunker equipped) has no modem — skip mesh noise.
+    if modemSideEquipped() then
+      pcall(titan.broadcast, MSG.STATUS, {
+        botName = cfg.name or os.getComputerLabel(),
+        label = cfg.name or os.getComputerLabel(),
+        status = state.status,
+        state  = state.status,   -- Parent Center reads `state`
+        task   = state.task,
+        assignment = asg,
+        x = x, y = y, z = z,
+        yLo = fix and fix.yLo, yHi = fix and fix.yHi,
+        gpsN = fix and fix.n, gpsSpreadY = fix and fix.spreadY,
+        fuel   = turtle.getFuelLevel(),
+        dug    = state.dug,
+        botType = "miner",
+        jobId = state.jobId,
+        siteId = cfg.siteId,
+        netMode = state.netMode,
+        selfChunk = cfg.selfChunk and true or false,
+      })
+    end
     sleep(5)
   end
 end

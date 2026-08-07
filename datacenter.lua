@@ -1,6 +1,6 @@
 --[[
   datacenter.lua  -  Titan Data Center (CC: Tweaked)   [ single, self-contained script ]
-  Titan-Version: 1.2.12
+  Titan-Version: 1.2.13
 
   ONE script that every computer/terminal in your data center runs. It works out
   its own role automatically:
@@ -745,6 +745,10 @@ local function dispatchAreaJobs(x, z, w, d, yEnd, nBots, opts)
   if mode == "y" or mode == "layer" or mode == "layers" then mode = "yband" end
   local cruiseY = tonumber(opts.cruiseY) or 150
   local returnStage = opts.returnStage ~= false
+  local selfChunk = opts.selfChunk and true or false
+  local storage = opts.storage or opts.chest
+  local fuelChest = opts.fuelChest or opts.fuel
+  local siteId = opts.siteId or opts.name
 
   local idle = idleMiners()
   if #idle == 0 then
@@ -801,7 +805,7 @@ local function dispatchAreaJobs(x, z, w, d, yEnd, nBots, opts)
     jobId, mode, w, d, x, z, yStart, yEnd, #pieces,
     opts.name and ("  (" .. opts.name .. ")") or ""))
 
-  local loaders = idleLoaders()
+  local loaders = selfChunk and {} or idleLoaders()
   for i, piece in ipairs(pieces) do
     local id = idle[i]
     local payload = {
@@ -813,14 +817,17 @@ local function dispatchAreaJobs(x, z, w, d, yEnd, nBots, opts)
       approachY = piece.approachY,
       cruiseY = cruiseY, returnStage = returnStage,
       mode = mode,
+      storage = storage, chest = storage, fuelChest = fuelChest,
+      selfChunk = selfChunk, siteId = siteId,
     }
     rednet.send(id, payload, NET_PROTOCOL)
     netbots[id] = netbots[id] or {}
     netbots[id].assignment = payload.jobId
     netbots[id].task = mode
     netbots[id].state = "queued"
-    print(("  -> miner #%d %s  %s"):format(
-      id, netbots[id].name or "?", piece.label))
+    print(("  -> miner #%d %s  %s%s"):format(
+      id, netbots[id].name or "?", piece.label,
+      selfChunk and " [selfChunk]" or ""))
     local lid = loaders[i]
     if lid then
       local midX = math.floor((piece.x1 + piece.x2) / 2)
@@ -841,8 +848,10 @@ local function dispatchAreaJobs(x, z, w, d, yEnd, nBots, opts)
       print(("  -> loader #%d escort"):format(lid))
     end
   end
-  if #loaders < #pieces then
-    print(("Note: %d loader(s) for %d piece(s). Chunky Turtle recommended."):format(
+  if selfChunk then
+    print("selfChunk site — loaders not assigned (miners swap modem/chunker via slot 15).")
+  elseif #loaders < #pieces then
+    print(("Note: %d loader(s) for %d piece(s). Chunky Turtle recommended, or site selfchunk on."):format(
       #loaders, #pieces))
   end
 
@@ -850,7 +859,8 @@ local function dispatchAreaJobs(x, z, w, d, yEnd, nBots, opts)
     id = jobId, x = x, z = z, w = w, d = d,
     yStart = yStart, yEnd = yEnd, mode = mode,
     bots = #pieces, loaders = math.min(#loaders, #pieces),
-    source = opts.source or "admin", name = opts.name,
+    source = opts.source or "admin", name = opts.name, siteId = siteId,
+    selfChunk = selfChunk,
     at = os.epoch("utc"), status = "dispatched",
   })
   while #mineJobs > 12 do mineJobs[#mineJobs] = nil end
@@ -859,6 +869,7 @@ local function dispatchAreaJobs(x, z, w, d, yEnd, nBots, opts)
     rednet.send(opts.replyTo, {
       type = "site_job_ack", ok = true, jobId = jobId,
       bots = #pieces, mode = mode, yStart = yStart, yEnd = yEnd,
+      selfChunk = selfChunk,
     }, NET_PROTOCOL)
   end
   return true, jobId, #pieces
@@ -914,6 +925,10 @@ local function handleSiteJob(id, msg)
     returnStage = msg.returnStage ~= false,
     source = "marker",
     name = msg.name or msg.site,
+    siteId = msg.siteId or msg.name or msg.site,
+    storage = msg.storage or msg.chest,
+    fuelChest = msg.fuelChest or msg.fuel,
+    selfChunk = msg.selfChunk and true or false,
     replyTo = id,
   })
   if not ok then

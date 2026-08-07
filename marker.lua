@@ -1,6 +1,6 @@
 --[[
   marker.lua  -  Work-site marker computer for Titan fleet mining (CC: Tweaked)
-  Titan-Version: 1.0.2
+  Titan-Version: 1.1.0
 
   Place this computer at (or near) a job site. Define the dig box, how many
   miner bots to request, and `start` — Parent Center assigns idle miners.
@@ -11,6 +11,11 @@
 
   Alternate mode `strip`:
     Each bot owns an X-strip of the footprint and digs full height.
+
+  Site chests (sent with the job):
+    storage / chest <x y z|here>   where miners dump
+    fuelchest <x y z|here>         optional fuel pickup
+    selfchunk on|off               miners dig with chunk loader (modem in slot 15)
 
   Gizmos (Quark-quarry style as far as CC allows):
     * Attached MONITOR — live top-down wireframe + Y bands / bot count
@@ -40,6 +45,7 @@ titan.openModem()
 local CFG = "marker.cfg"
 local cfg = {
   name = nil,
+  siteId = nil,
   x1 = nil, z1 = nil, x2 = nil, z2 = nil,
   yStart = nil, yEnd = nil,
   nBots = 4,
@@ -48,6 +54,9 @@ local cfg = {
   gizmo = true,
   returnStage = true,
   monRate = 1,
+  storage = nil,    -- {x,y,z}
+  fuelChest = nil,  -- {x,y,z}
+  selfChunk = false,
 }
 
 local state = {
@@ -255,12 +264,17 @@ local function requestJob()
   local payload = {
     type = MSG.SITE_JOB,
     name = cfg.name,
+    siteId = cfg.siteId or cfg.name,
     x1 = b.minX, z1 = b.minZ, x2 = b.maxX, z2 = b.maxZ,
     yStart = b.yTop, yEnd = b.yBot,
     nBots = tonumber(cfg.nBots) or 4,
     mode = cfg.mode or "yband",
     cruiseY = tonumber(cfg.cruiseY) or 150,
     returnStage = cfg.returnStage ~= false,
+    storage = cfg.storage,
+    chest = cfg.storage,
+    fuelChest = cfg.fuelChest,
+    selfChunk = cfg.selfChunk and true or false,
   }
   print(("Requesting %s job: %s  bots=%d"):format(
     payload.mode, fmtB(b), payload.nBots))
@@ -300,11 +314,18 @@ end
 --------------------------------------------------------------------------------
 -- Commands
 --------------------------------------------------------------------------------
+local function fmtP(p)
+  return p and ("%d,%d,%d"):format(p.x, p.y, p.z) or "(unset)"
+end
+
 local function printStatus()
-  print("Site: " .. tostring(cfg.name))
+  print("Site: " .. tostring(cfg.name) .. "  id=" .. tostring(cfg.siteId or cfg.name or "?"))
   print(fmtB(bounds()))
-  print(("bots=%s  mode=%s  cruiseY=%s  gizmo=%s  monrate=%.2fs"):format(
+  print(("bots=%s  mode=%s  cruiseY=%s  selfChunk=%s"):format(
     tostring(cfg.nBots), tostring(cfg.mode), tostring(cfg.cruiseY),
+    tostring(cfg.selfChunk)))
+  print(("storage=%s  fuelChest=%s"):format(fmtP(cfg.storage), fmtP(cfg.fuelChest)))
+  print(("gizmo=%s  monrate=%.2fs"):format(
     cfg.gizmo and "on" or "off", tonumber(cfg.monRate) or 1))
   print(("status=%s  lastJob=%s"):format(tostring(state.status), tostring(state.lastJob)))
   if commands then
@@ -314,12 +335,36 @@ local function printStatus()
   end
 end
 
+local function setPosField(field, a)
+  local sub = (a[2] or ""):lower()
+  if sub == "here" or sub == "gps" then
+    local x, y, z = gps.locate(2)
+    if not x then print("No GPS."); return end
+    cfg[field] = { x = math.floor(x), y = math.floor(y), z = math.floor(z) }
+  elseif sub == "clear" or sub == "none" then
+    cfg[field] = nil
+  elseif a[2] and a[3] and a[4] then
+    cfg[field] = {
+      x = math.floor(tonumber(a[2])), y = math.floor(tonumber(a[3])),
+      z = math.floor(tonumber(a[4])),
+    }
+  else
+    print(field .. " = " .. fmtP(cfg[field]))
+    print("Usage: " .. field .. " <x> <y> <z> | " .. field .. " here | " .. field .. " clear")
+    return
+  end
+  saveCfg()
+  print(field .. " = " .. fmtP(cfg[field]))
+end
+
 local function handleCommand(a)
   local cmd = (a[1] or ""):lower()
   if cmd == "" then return true
   elseif cmd == "help" then
     print("AREA : set1/set2 [here|x z] | size <W>x<D> | sety <top> <bot>")
     print("      ystart <y> | yend <y> | here (GPS as set1)")
+    print("SITE : storage|chest [x y z|here] | fuelchest [x y z|here]")
+    print("      selfchunk on|off | siteid <id>")
     print("JOB  : bots <n> | mode yband|strip | cruise <y>")
     print("      start | stop-status | status")
     print("VIZ  : gizmo on|off | show   (particles need command computer)")
@@ -395,6 +440,25 @@ local function handleCommand(a)
   elseif cmd == "bots" then
     if a[2] then cfg.nBots = math.max(1, math.floor(tonumber(a[2]) or 1)); saveCfg() end
     print("bots = " .. tostring(cfg.nBots))
+  elseif cmd == "storage" or cmd == "chest" then
+    setPosField("storage", a)
+  elseif cmd == "fuelchest" or cmd == "fuel" then
+    setPosField("fuelChest", a)
+  elseif cmd == "selfchunk" or cmd == "chunkmode" then
+    local v = (a[2] or ""):lower()
+    if v == "on" or v == "true" or v == "1" then
+      cfg.selfChunk = true; saveCfg()
+    elseif v == "off" or v == "false" or v == "0" then
+      cfg.selfChunk = false; saveCfg()
+    end
+    print("selfChunk = " .. tostring(cfg.selfChunk))
+    print("When on, miners dig with chunk loader; modem stays in slot 15 until dump.")
+  elseif cmd == "siteid" or cmd == "site" then
+    if a[2] then
+      cfg.siteId = table.concat(a, " ", 2)
+      saveCfg()
+    end
+    print("siteId = " .. tostring(cfg.siteId or cfg.name or "?"))
   elseif cmd == "mode" then
     local m = tostring(a[2] or ""):lower()
     if m == "y" or m == "layer" or m == "layers" then m = "yband" end

@@ -371,28 +371,26 @@ restricted list: bedrock, chests, computers, etc.) are **never broken**.
 
 Install via the installer → **"Miner"** (needs GPS + fuel + wireless modem).
 
+**Slots:** **16** = fuel (never dumped). **15** = equipment hot-swap (modem **or**
+chunk loader). With `selfchunk on`, the miner digs offline with a chunk loader
+equipped and parks the modem in slot 15; on dump/refuel it swaps the modem back
+on to use GPS/mesh, then returns to chunk mode.
+
 ### Setup
 
 ```
-set1              stand at corner 1 → mark GPS
-set2              stand at corner 2 → mark GPS
-sety <y>          floor Y to dig down to (e.g. sety -59)
-deposit           stand ABOVE a chest → dump inventory here when full
-home              optional return point
-exclude           reload & list exclude.txt
-mine              start
-stop              abort
-status            show config / progress
+set1 / set2       opposite corners (GPS or x z)
+sety <top> <bot>  vertical range
+home              start pose (chest one block behind)
+chest / storage   storage chest
+fuelchest here    optional fuel chest
+selfchunk on      dig with chunk loader (modem in slot 15)
+modem | chunk | swap
+mine / continue / stop / status
 ```
 
-### `exclude.txt`
-
-One block/item id per line (`minecraft:obsidian`, etc.). `#` starts a comment.
-A starter file ships with the install; edit it on the turtle with `edit exclude.txt`.
-
-The mined volume is the XZ rectangle between loc1 and loc2, from the higher of
-the two corner Y values down to `floorY`. When the inventory fills it returns to
-`deposit`, drops everything down into the chest, then continues.
+Site markers can send `storage`, `fuelchest`, and `selfchunk` with the job so
+fleet miners pick those up automatically.
 
 ---
 
@@ -535,6 +533,16 @@ tablet itself needs no GPS.
 as Parent Center). Keeps asking until accepted. Deploy / SSH / fleet control need
 an unlocked session. No master online → denied until the floppy is up.
 
+### Two UIs (same program)
+
+| Mode | Who it’s for | How to enter |
+|------|----------------|--------------|
+| **Simple** (default) | Anyone — numbered menus, wizards | Boot choice / `mode simple` |
+| **Advanced** | Terminal users — full command line | Boot choice / `mode advanced` |
+
+Simple menus cover status, deploy wizard, flatten wizard, connect, park/stop,
+Parent Center jump, and live roster. Advanced keeps the full command set:
+
 ```
 VIEW  : live | bots | miners | loaders | markers | pending | stuck | who <id|name>
 NET   : connections | hosts | list [filter]   SSH-capable hosts on the mesh
@@ -545,11 +553,12 @@ FLEET : dc | center [cmd...]         jump to Parent Center
 BOT   : goto | return | park | refuel | stop | mine | continue
 DEPLOY: deploy <id> <miner|loader|builder|gatherer> [auto] [x y z]
 BUILD : scan | build
+MODE  : mode simple | mode advanced
         login | lock | hostname | exit
 ```
 
-Pocket workflow: `connections` → `connect ParentCenter` (or `dc`) → run hub
-commands; or `connect Miner-12` for a turtle shell. Control is gated by the
+Pocket workflow: Simple menu **8** (connect) / **9** (Parent Center), or Advanced
+`connections` → `connect ParentCenter` (or `dc`). Control is gated by the
 master password — pull the master floppy and every login (including the tablet)
 is denied.
 
@@ -590,8 +599,12 @@ computer with a wireless (ideally **ender**) modem. It does three things:
 
 - **Repeater:** re-transmits rednet traffic — **both broadcasts and directed
   messages** (bot commands, worker deploys, auth checks) — so devices out of
-  direct modem range still reach each other. Chain several routers to blanket a
-  big base; duplicate messages are de-duplicated so they never loop. (Same
+  direct modem range still reach each other. Chain several **extender** routers
+  (`role=modem`) every ~50–60 blocks like cell towers so pockets/admin can reach
+  MAIN from far sites. Normal wireless modems are ~64 blocks; gaps larger than
+  that break the hop chain. **Rednet hops ≠ GPS** — place 4+ GPS-capable routers
+  (or `gpshost.lua`) near distant areas too, or use ender modems / a wired
+  backbone. Duplicate messages are de-duplicated so they never loop. (Same
   mechanism as CraftOS's built-in `repeat`, but with a roster + dashboard.)
 - **Directory + status board:** listens to every Titan protocol and remembers
   every system that has registered (hostnames persist in `router_roster.cfg`
