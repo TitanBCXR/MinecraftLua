@@ -1,6 +1,6 @@
 --[[
   host.lua  -  Titan install host (CC: Tweaked)
-  Titan-Version: 1.1.12
+  Titan-Version: 1.1.13
 
   Run this on the ONE computer that already has all the Titan `.lua` files.
   It serves those files to other in-game devices over rednet, so you can install
@@ -26,7 +26,8 @@ local FILES = {
   "hub.lua", "bot.lua", "poi.lua",
   "worker.lua", "botserver.lua",
   "datacenter.lua",
-  "console.lua", "admin.lua", "gpshost.lua", "locator.lua", "router.lua",
+  "console.lua", "admin.lua", "gpshost.lua", "locator.lua",
+  "router.lua", "router_main.lua", "router_modem.lua",
   "miner.lua", "offline_miner.lua", "loader.lua", "marker.lua", "storage_manager.lua",
   "perimeter_sensor.lua", "perimeter_manager.lua",
   "exclude.txt", "versions.lua",

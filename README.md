@@ -664,6 +664,16 @@ walking, it infers your facing from movement and adds a relative cue
 
 # Network router (`router.lua`)
 
+`router.lua` is a **bootstrap**: it reads `router.cfg` (or asks once), downloads
+the matching runtime if needed, then runs it:
+
+| Role | Runtime file |
+|------|----------------|
+| **MAIN** / **ROUTER** | `router_main.lua` |
+| **MODEM** | `router_modem.lua` |
+
+Missing files are pulled from the install manifest or GitHub automatically.
+
 Ties the whole network together over wireless. Three roles:
 
 | Role | Modem | Job |

@@ -5,19 +5,21 @@
   The console `packages` command shows these names + versions.
   Installers / OTA updates ship this file so devices know what they have.
 
-  Titan-Version: 1.4.3
+  Titan-Version: 1.4.4
 ]]
 
 return {
-  system = "1.4.3",
+  system = "1.4.4",
   packages = {
     ["lib/titan.lua"]      = "1.2.19",
     ["console.lua"]        = "1.1.8",
-    ["router.lua"]         = "1.3.3",
-    ["host.lua"]           = "1.1.12",
-    ["install.lua"]        = "1.1.15",
-    ["github_install.lua"] = "1.1.15",
-    ["pastebin_install.lua"]= "1.1.15",
+    ["router.lua"]         = "1.4.0",
+    ["router_main.lua"]    = "1.4.0",
+    ["router_modem.lua"]   = "1.4.0",
+    ["host.lua"]           = "1.1.13",
+    ["install.lua"]        = "1.1.16",
+    ["github_install.lua"] = "1.1.16",
+    ["pastebin_install.lua"]= "1.1.16",
     ["hub.lua"]            = "1.1.2",
     ["bot.lua"]            = "1.1.0",
     ["poi.lua"]            = "1.1.0",
@@ -35,6 +37,6 @@ return {
     ["perimeter_sensor.lua"] = "1.2.2",
     ["perimeter_manager.lua"]= "1.3.1",
     ["exclude.txt"]        = "1.0.1",
-    ["versions.lua"]       = "1.4.3",
+    ["versions.lua"]       = "1.4.4",
   },
 }
