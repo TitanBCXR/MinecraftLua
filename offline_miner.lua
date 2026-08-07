@@ -1,6 +1,6 @@
 --[[
   offline_miner.lua  -  Local quarry turtle (optional site board)
-  Titan-Version: 1.2.1
+  Titan-Version: 1.2.2
 
   Place the turtle at the TOP-FRONT-LEFT corner of the dig, facing into the
   mine. That cell is origin 0,0,0:
@@ -1045,12 +1045,40 @@ end
 
 local applyingAssign = false
 
+-- Force physical descent/ascent to target relative Y (+Y = down).
+-- Does not trust a stale pos that already equals ty without moving.
+local function forceGoToY(ty)
+  ty = math.floor(tonumber(ty) or 0)
+  if ty < 0 then ty = 0 end
+  while pos.y > ty do
+    if not moveUp() then return false, "up" end
+  end
+  while pos.y < ty do
+    -- Bypass digFloorY clamp for intentional band entry (caller sets activeJob).
+    if STOP then return false, "stop" end
+    if not ensureFuel() then return false, "fuel" end
+    digDir("down")
+    if not turtle.down() then
+      -- Try dig again then move
+      digDir("down")
+      if not turtle.down() then return false, "blocked-down" end
+    end
+    pos.y = pos.y + 1
+    moves = moves + 1
+    if pos.y % 5 == 0 or pos.y == ty then
+      print(("  … at Y=%d (target %d)"):format(pos.y, ty))
+    end
+  end
+  return true
+end
+
 -- Path to the top of a Y band (0, y0, 0). Pickaxe must be equipped for digs.
-local function moveIntoBand(y0, y1)
+local function moveIntoBand(y0, y1, opts)
+  opts = opts or {}
   y0 = math.floor(tonumber(y0) or 0)
   y1 = math.floor(tonumber(y1) or y0)
   if y1 < y0 then y0, y1 = y1, y0 end
-  if digging then
+  if digging and not opts.force then
     print(("Y band %d..%d saved — finish/stop current dig, then I'll move in."):format(y0, y1))
     return false
   end
@@ -1060,18 +1088,41 @@ local function moveIntoBand(y0, y1)
     print("Need fuel to move into Y band.")
     return false
   end
+
+  -- If caller says we're starting from the depot/origin, reset pose so we
+  -- actually walk down y0 layers (stale pos.y == y0 would skip the descent).
+  if opts.fromOrigin then
+    assumeAtOrigin()
+  end
+
   local prev = activeJob
-  -- Clamp downward travel to this band's floor while pathing in.
   activeJob = { y0 = y0, y1 = y1, stopY = y1 + 1, H = y1 + 1 }
-  print(("Moving into Y band %d..%d (path to 0,%d,0)..."):format(y0, y1, y0))
-  local ok, err = goTo(0, y0, 0)
+  print(("Moving into Y band %d..%d (descend to Y=%d)..."):format(y0, y1, y0))
+
+  -- Home column first (X/Z), then forced Y descent.
+  local ok, err = true, nil
+  if pos.x ~= 0 or pos.z ~= 0 then
+    -- Move X/Z at current Y, then drop.
+    local saveY = pos.y
+    ok, err = goTo(0, saveY, 0)
+  end
+  if ok then
+    ok, err = forceGoToY(y0)
+  end
+  if ok and (pos.x ~= 0 or pos.z ~= 0) then
+    ok, err = goTo(0, y0, 0)
+  end
   activeJob = prev
   faceForward()
   if not ok then
     print("Could not reach band Y=" .. y0 .. ": " .. tostring(err))
     return false
   end
-  print(("In position at Y=%d (band %d..%d). `mine` to dig."):format(pos.y, y0, y1))
+  if pos.y ~= y0 then
+    print(("Pose error: at Y=%d want Y=%d"):format(pos.y, y0))
+    return false
+  end
+  print(("In position at Y=%d (band %d..%d)."):format(pos.y, y0, y1))
   return true
 end
 
@@ -1130,7 +1181,10 @@ local function applyQuarryAssign(msg, fromId)
   applyingAssign = true
   local moved = false
   if not digging and not alreadyThere then
-    moved = moveIntoBand(y0, y1)
+    -- Idle check-ins are almost always from the depot. If pose already claims
+    -- we're at y0 without having just moved, reset and force a real descent.
+    local needOrigin = (pos.y == y0 and y0 > 0) or (pos.y < 1)
+    moved = moveIntoBand(y0, y1, { fromOrigin = needOrigin })
   end
 
   local ack = {
@@ -1661,18 +1715,23 @@ local function runSavedJob(j, fromContinue)
   equipToolFromInventory(nil, true)
 
   local bandY0 = (j.y0 ~= nil) and math.floor(tonumber(j.y0) or 0) or nil
+  local bandY1 = (j.y1 ~= nil) and math.floor(tonumber(j.y1) or 0) or bandY0
   if bandY0 ~= nil then
-    -- Y-band jobs: go to the top of the band (do not yank back to surface first).
+    -- Y-band jobs: always physically enter the band before digging.
     if fromContinue then
-      print("Continue: assuming turtle is at origin 0,0,0 facing into the mine.")
+      print("Continue: place at origin 0,0,0 facing in — descending to band.")
       assumeAtOrigin()
       suckFuelFromLeft()
     elseif pos.y < 1 then
       suckFuelFromLeft()
     end
     activeJob = j
-    print(("Moving into Y band %d..%d ..."):format(bandY0, tonumber(j.y1) or bandY0))
-    if not goTo(0, bandY0, 0) then
+    if pos.x == 0 and pos.z == 0 and pos.y == bandY0 then
+      print(("Already at band Y=%d — starting dig."):format(bandY0))
+    elseif not moveIntoBand(bandY0, bandY1, {
+      force = true,
+      fromOrigin = fromContinue or (pos.y < 1),
+    }) then
       print("Could not reach band Y=" .. bandY0)
       activeJob = nil
       return
@@ -1776,15 +1835,17 @@ local function digStair(W, steps, dir)
 end
 
 -- Dig one claimed Y band. Returns "done" | "paused" | "stop" | "bad".
+-- fromContinue = turtle was placed back at origin (pose reset); job idx may still resume.
 local function runClaimBand(claim, fromContinue, existingJob)
   local W = math.floor(tonumber(claim.W) or 0)
   local L = math.floor(tonumber(claim.L) or 0)
-  local y0 = tonumber(claim.y0)
-  local y1 = tonumber(claim.y1)
-  if W < 1 or L < 1 or y0 == nil or y1 == nil then
+  local y0 = math.floor(tonumber(claim.y0) or 0)
+  local y1 = math.floor(tonumber(claim.y1) or 0)
+  if W < 1 or L < 1 or claim.y0 == nil or claim.y1 == nil then
     print("Bad claim from site.")
     return "bad"
   end
+  if y1 < y0 then y0, y1 = y1, y0 end
   local j = existingJob
   if not j then
     dug, skipped = 0, 0
@@ -1804,10 +1865,25 @@ local function runClaimBand(claim, fromContinue, existingJob)
     j.D = L
     j.H = y1 + 1
     j.stopY = y1 + 1
+    -- Rebuild work list for this band (old total may be a different Y range).
+    local units = boxBandUnits(W, L, y0, y1)
+    j.total = #units
+    j.idx = math.max(1, math.min(tonumber(j.idx) or 1, #units + 1))
   end
+  adminAssign = { y0 = y0, y1 = y1, W = W, L = L }
+  cfg.pendingAssign = adminAssign
+  saveCfg()
   siteSendJob(j)
+  -- Descend into the band BEFORE modem chatter so we don't sit on Y=0.
+  if not moveIntoBand(y0, y1, {
+    force = true,
+    fromOrigin = fromContinue == true or pos.y < 1,
+  }) then
+    return "bad"
+  end
   siteReportProgress({ status = "mining", y0 = y0, y1 = y1, job = j, jobFile = JOB_FILE })
-  runSavedJob(j, fromContinue == true)
+  -- Pose already correct — do not assumeAtOrigin again inside runSavedJob.
+  runSavedJob(j, false)
   if STOP then return "stop" end
   if loadJobFile() then return "paused" end
   return "done"
@@ -1850,24 +1926,23 @@ local function digSiteMine()
     return
   end
 
-  -- Always ask the site which Y bands are free/claimed before digging.
   -- Local/site job files are only resumed when they match the assigned claim.
   local prior = loadJobFile()
   if not prior and siteId then prior = fetchJobFromSite(5, true) end
 
   local bandsDone = 0
   while not STOP do
-    local claim = nil
-    if siteId then
+    -- Tablet / saved assign wins over site auto-claim (prevents every bot
+    -- taking Y0..N when the site still has a stale shared claim).
+    local claim = claimFromAdminAssign()
+    if claim then
+      print(("Using tablet/site assign Y %d..%d"):format(claim.y0, claim.y1))
+    elseif siteId then
       claim = claimBand(bandsDone > 0)
     end
-    if not claim then
-      claim = claimFromAdminAssign()
-      if claim and bandsDone > 0 then
-        -- One-shot admin assign — don't loop the same band forever.
-        print("Admin Y band finished — set a new assign on the tablet, or use site claims.")
-        return
-      end
+    if claim and claim.fromAdmin and bandsDone > 0 then
+      print("Admin Y band finished — set a new assign on the tablet, or use site claims.")
+      return
     end
     if not claim then
       if bandsDone == 0 then
@@ -1879,13 +1954,24 @@ local function digSiteMine()
       return
     end
 
+    -- Remember assign so reboots / site sync keep this turtle on its band.
+    adminAssign = {
+      y0 = claim.y0, y1 = claim.y1,
+      W = claim.W, L = claim.L,
+    }
+    cfg.pendingAssign = adminAssign
+    saveCfg()
+    siteInfo = siteInfo or {}
+    siteInfo.y0, siteInfo.y1 = claim.y0, claim.y1
+    siteInfo.W, siteInfo.L = claim.W or siteInfo.W, claim.L or siteInfo.L
+
     local stored = nil
     if prior and prior.status ~= "done"
         and tonumber(prior.y0) == tonumber(claim.y0)
         and tonumber(prior.y1) == tonumber(claim.y1) then
       stored = prior
       print(("Resuming matching job for Y %d..%d"):format(claim.y0, claim.y1))
-    elseif claim.resume and siteId then
+    elseif claim.resume and siteId and not claim.fromAdmin then
       stored = fetchJobFromSite(3, true)
       if stored and (tonumber(stored.y0) ~= tonumber(claim.y0)
           or tonumber(stored.y1) ~= tonumber(claim.y1)) then
@@ -1894,9 +1980,9 @@ local function digSiteMine()
     end
     prior = nil
 
-    print(("Mining claimed Y %d..%d (%d layers)%s..."):format(
-      claim.y0, claim.y1, claim.y1 - claim.y0 + 1,
-      claim.fromAdmin and " [tablet]" or ""))
+    print(("Mining Y %d..%d (%d layers) — descending to band first..."):format(
+      claim.y0, claim.y1, claim.y1 - claim.y0 + 1))
+    -- fromContinue only when resuming after player put turtle at origin.
     local r = runClaimBand(claim, stored ~= nil, stored)
     if r ~= "done" then return end
     bandsDone = bandsDone + 1

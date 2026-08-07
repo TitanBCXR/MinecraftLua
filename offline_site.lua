@@ -1,6 +1,6 @@
 --[[
   offline_site.lua  -  Quarry site board for multi-turtle offline miners
-  Titan-Version: 1.0.8
+  Titan-Version: 1.0.9
 
   Place this computer to the LEFT of the storage chest (storage sits behind
   the turtles' origin). Attach a modem (wired to the turtles is fine, or
@@ -314,6 +314,8 @@ local function clearClaims(mode, y0, y1)
       if t.y0 and t.y1 and overlaps(t.y0, t.y1, y0, y1) then
         print(("[unclaim] #%d Y %d..%d"):format(id, t.y0, t.y1))
         t.y0, t.y1 = nil, nil
+        t.adminLock = false
+        t.assignId = nil
         if t.status == "assigned" or t.status == "mining" then t.status = "idle" end
         turtles[id] = t
         released = released + 1
@@ -473,8 +475,15 @@ local function touchTurtle(id, msg)
   if msg.moves ~= nil then t.moves = tonumber(msg.moves) or t.moves end
   if msg.coal ~= nil then t.coal = tonumber(msg.coal) or t.coal end
   if msg.status then t.status = msg.status end
-  if msg.y0 ~= nil then t.y0 = tonumber(msg.y0) or t.y0 end
-  if msg.y1 ~= nil then t.y1 = tonumber(msg.y1) or t.y1 end
+  -- Tablet/admin locks pin Y bands — don't let an old job file overwrite them.
+  local locked = t.adminLock == true
+  if not locked then
+    if msg.y0 ~= nil then t.y0 = tonumber(msg.y0) or t.y0 end
+    if msg.y1 ~= nil then t.y1 = tonumber(msg.y1) or t.y1 end
+  elseif msg.y0 ~= nil and msg.y1 ~= nil
+      and tonumber(msg.y0) == tonumber(t.y0) and tonumber(msg.y1) == tonumber(t.y1) then
+    -- Same band — ok
+  end
   if msg.clearJob or msg.job == false then
     t.job = nil
     persistTurtleJob(id, nil)
@@ -483,8 +492,10 @@ local function touchTurtle(id, msg)
     if msg.job.idx ~= nil then t.idx = tonumber(msg.job.idx) or t.idx end
     if msg.job.total ~= nil then t.total = tonumber(msg.job.total) or t.total end
     if msg.job.dug ~= nil then t.dug = tonumber(msg.job.dug) or t.dug end
-    if msg.job.y0 ~= nil then t.y0 = tonumber(msg.job.y0) or t.y0 end
-    if msg.job.y1 ~= nil then t.y1 = tonumber(msg.job.y1) or t.y1 end
+    if not locked then
+      if msg.job.y0 ~= nil then t.y0 = tonumber(msg.job.y0) or t.y0 end
+      if msg.job.y1 ~= nil then t.y1 = tonumber(msg.job.y1) or t.y1 end
+    end
     if msg.job.status and not msg.status then t.status = msg.job.status end
     persistTurtleJob(id, msg.job)
   end
@@ -524,6 +535,8 @@ local function assignClaim(id, msg)
       saveCfg()
     end
     t.y0, t.y1 = nil, nil
+    t.adminLock = false
+    t.assignId = nil
     t.status = "idle"
     t.job = nil
     t.idx, t.total = nil, nil
@@ -531,11 +544,13 @@ local function assignClaim(id, msg)
     turtles[id] = t
   end
   -- Keep the turtle's band forever until done / clearclaims (deep digs go quiet).
+  -- Admin-locked bands always win.
   if t.y0 and t.y1 and t.status ~= "done" then
     return claimPayload({
       ok = true,
       y0 = t.y0, y1 = t.y1,
       resume = true,
+      adminLock = t.adminLock == true,
     })
   end
   local y0, y1 = nextFreeBand()
@@ -544,6 +559,7 @@ local function assignClaim(id, msg)
   end
   t.y0, t.y1 = y0, y1
   t.status = "assigned"
+  t.adminLock = false
   t.idx, t.total = 1, nil
   t.job = nil
   turtles[id] = t
@@ -603,13 +619,14 @@ local function applyAdminAssign(turtleId, msg)
   t.status = "assigned"
   t.assignId = msg.assignId
   t.assignedBy = msg.from
+  t.adminLock = true
   t.seen = now()
   if msg.W then cfg.W = math.max(tonumber(cfg.W) or 0, tonumber(msg.W) or 0) end
   if msg.L then cfg.L = math.max(tonumber(cfg.L) or 0, tonumber(msg.L) or 0) end
   if msg.H then cfg.H = math.max(tonumber(cfg.H) or 0, tonumber(msg.H) or 0) end
   turtles[turtleId] = t
   saveCfg()
-  print(("[admin] #%d assigned Y %d..%d"):format(turtleId, y0, y1))
+  print(("[admin] #%d assigned Y %d..%d (locked)"):format(turtleId, y0, y1))
   broadcastStatus()
   return true
 end
