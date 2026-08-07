@@ -1,0 +1,643 @@
+--[[
+  offline_site.lua  -  Quarry site board for multi-turtle offline miners
+  Titan-Version: 1.0.1
+
+  Place this computer to the LEFT of the storage chest (storage sits behind
+  the turtles' origin). Attach a modem (wired to the turtles is fine, or
+  wireless in range).
+
+  Job:
+    * Define one shared footprint: width × length × total Y layers down
+    * Hand out non-overlapping Y bands to turtles (max 1/2 or 1/3 of height)
+    * Collect BPC (blocks-per-coal) so every turtle knows safe travel distance
+    * Store each turtle's offline_miner_job.cfg under quarry_jobs/
+    * Show % complete on an attached monitor (or the terminal)
+    * Announce to the admin tablet over the Titan mesh
+
+  Commands:
+    setup <W>x<L> <H> [half|third]   define / redefine the quarry
+    fraction half|third              max Y band size per turtle
+    status | turtles | jobs | clear
+    help | exit
+
+  Turtle side: offline_miner → `join` then `mine` (or `area` with site online).
+
+  Run:  offline_site
+]]
+
+local PROTO = "titan_quarry"
+local NET = "titan_net"
+local CFG = "offline_site.cfg"
+local JOB_DIR = "quarry_jobs"
+local ONLINE_SECS = 45
+
+local titan = nil
+if fs.exists("lib/titan.lua") then
+  local ok, t = pcall(dofile, "lib/titan.lua")
+  if ok then titan = t end
+end
+
+local cfg = {
+  W = 16, L = 32, H = 40,
+  fraction = 0.5,   -- half of height per claim (use 1/3 via `fraction third`)
+  label = nil,
+}
+
+local turtles = {}  -- [id] = { name, y0, y1, dug, idx, total, bpc, fuel, seen, status, moves, coal, job }
+local completedBands = {}  -- list of { y0, y1 } finished with no active owner
+
+--------------------------------------------------------------------------------
+local function now() return os.epoch("utc") end
+local function ago(ts) return math.floor((now() - (ts or 0)) / 1000) end
+
+local function turtleJobPath(id)
+  return JOB_DIR .. "/" .. tostring(id) .. "_offline_miner_job.cfg"
+end
+
+local function jobSummaryShort(j)
+  if type(j) ~= "table" then return "(none)" end
+  if j.y0 ~= nil and j.y1 ~= nil then
+    return ("area Y%d-%d step %d/%d [%s]"):format(
+      j.y0, j.y1, tonumber(j.idx) or 1, tonumber(j.total) or 0, tostring(j.status or "?"))
+  end
+  return ("%s step %d/%d [%s]"):format(
+    tostring(j.type or "?"), tonumber(j.idx) or 1, tonumber(j.total) or 0, tostring(j.status or "?"))
+end
+
+local function persistTurtleJob(id, job)
+  if not fs.exists(JOB_DIR) then fs.makeDir(JOB_DIR) end
+  local path = turtleJobPath(id)
+  if type(job) ~= "table" then
+    if fs.exists(path) then pcall(fs.delete, path) end
+    return
+  end
+  local f = fs.open(path, "w")
+  if not f then return end
+  f.write(textutils.serialize(job))
+  f.close()
+end
+
+local function loadCfg()
+  if not fs.exists(CFG) then return end
+  local f = fs.open(CFG, "r")
+  local d = textutils.unserialize(f.readAll())
+  f.close()
+  if type(d) == "table" then
+    for k, v in pairs(d) do cfg[k] = v end
+  end
+  cfg.fraction = tonumber(cfg.fraction) or 0.5
+  if cfg.fraction ~= (1 / 3) and cfg.fraction ~= (1 / 2) then
+    if cfg.fraction < 0.4 then cfg.fraction = 1 / 3 else cfg.fraction = 0.5 end
+  end
+end
+
+local function saveCfg()
+  local f = fs.open(CFG, "w")
+  f.write(textutils.serialize(cfg))
+  f.close()
+end
+
+local function openModem()
+  if titan and titan.openModem then
+    titan.openModem()
+    return true
+  end
+  local any = false
+  for _, side in ipairs(peripheral.getNames()) do
+    if peripheral.getType(side) == "modem" then
+      if not rednet.isOpen(side) then rednet.open(side) end
+      any = true
+    end
+  end
+  return any
+end
+
+local function maxClaimLayers()
+  local H = math.max(1, tonumber(cfg.H) or 1)
+  return math.max(1, math.ceil(H * (tonumber(cfg.fraction) or 0.5)))
+end
+
+local function fractionLabel()
+  local f = tonumber(cfg.fraction) or 0.5
+  if math.abs(f - (1 / 3)) < 0.02 then return "third" end
+  return "half"
+end
+
+-- Occupied Y layers (claimed by live turtles or completed).
+local function occupiedLayers()
+  local occ = {}
+  local H = math.max(0, tonumber(cfg.H) or 0)
+  for y = 0, H - 1 do occ[y] = false end
+  for _, t in pairs(turtles) do
+    if t.y0 and t.y1 and t.status ~= "done" then
+      for y = t.y0, t.y1 do
+        if occ[y] ~= nil then occ[y] = true end
+      end
+    end
+  end
+  for _, b in ipairs(completedBands) do
+    for y = b.y0, b.y1 do
+      if occ[y] ~= nil then occ[y] = true end
+    end
+  end
+  return occ
+end
+
+local function nextFreeBand()
+  local H = math.max(1, tonumber(cfg.H) or 1)
+  local maxN = maxClaimLayers()
+  local occ = occupiedLayers()
+  local y = 0
+  while y < H do
+    if not occ[y] then
+      local y0 = y
+      local y1 = y
+      while y1 + 1 < H and not occ[y1 + 1] and (y1 - y0 + 1) < maxN do
+        y1 = y1 + 1
+      end
+      return y0, y1
+    end
+    y = y + 1
+  end
+  return nil
+end
+
+local function minBpc()
+  local best = nil
+  for _, t in pairs(turtles) do
+    local b = tonumber(t.bpc)
+    if b and b > 0 and ago(t.seen) < ONLINE_SECS * 2 then
+      if not best or b < best then best = b end
+    end
+  end
+  return best or 48  -- conservative default until turtles report
+end
+
+local function maxTravel()
+  -- Round-trip budget from worst BPC × ~32 coal, keep 40% margin.
+  local bpc = minBpc()
+  return math.max(16, math.floor(bpc * 32 * 0.4))
+end
+
+local function siteProgress()
+  local W = tonumber(cfg.W) or 0
+  local L = tonumber(cfg.L) or 0
+  local H = tonumber(cfg.H) or 0
+  local plane = math.max(1, W * L)
+  local total = math.max(1, plane * H)
+  local done = 0
+  for _, b in ipairs(completedBands) do
+    done = done + plane * (b.y1 - b.y0 + 1)
+  end
+  for _, t in pairs(turtles) do
+    if t.y0 and t.y1 and t.status ~= "done" then
+      local bandCells = plane * (t.y1 - t.y0 + 1)
+      local tot = tonumber(t.total) or bandCells
+      local idx = math.max(0, (tonumber(t.idx) or 1) - 1)
+      if tot < 1 then tot = bandCells end
+      done = done + math.min(bandCells, math.floor(bandCells * (idx / tot)))
+    end
+  end
+  local pct = math.floor(math.min(100, (done / total) * 100) + 0.5)
+  return pct, done, total
+end
+
+local function onlineCount()
+  local n = 0
+  for _, t in pairs(turtles) do
+    if ago(t.seen) < ONLINE_SECS then n = n + 1 end
+  end
+  return n
+end
+
+local function snapshot()
+  local pct, done, total = siteProgress()
+  local list = {}
+  for id, t in pairs(turtles) do
+    list[#list + 1] = {
+      id = id, name = t.name, y0 = t.y0, y1 = t.y1,
+      dug = t.dug, idx = t.idx, total = t.total, bpc = t.bpc,
+      fuel = t.fuel, status = t.status, age = ago(t.seen),
+      job = t.job,
+      jobSummary = t.job and jobSummaryShort(t.job) or nil,
+      jobFile = t.job and turtleJobPath(id) or nil,
+    }
+  end
+  table.sort(list, function(a, b) return (a.id or 0) < (b.id or 0) end)
+  return {
+    type = "quarry_site",
+    siteId = os.getComputerID(),
+    name = os.getComputerLabel() or ("Quarry-" .. os.getComputerID()),
+    W = cfg.W, L = cfg.L, H = cfg.H,
+    fraction = fractionLabel(),
+    maxClaim = maxClaimLayers(),
+    pct = pct, done = done, total = total,
+    minBpc = minBpc(), maxTravel = maxTravel(),
+    online = onlineCount(),
+    turtles = list,
+  }
+end
+
+local function broadcastStatus()
+  local snap = snapshot()
+  rednet.broadcast(snap, PROTO)
+  rednet.broadcast(snap, NET)
+  if titan and titan.ROUTER_PROTOCOL then
+    rednet.broadcast(snap, titan.ROUTER_PROTOCOL)
+  end
+end
+
+--------------------------------------------------------------------------------
+-- Claims / turtle messages
+--------------------------------------------------------------------------------
+local function touchTurtle(id, msg)
+  local t = turtles[id] or {}
+  t.name = msg.name or msg.hostname or t.name or ("Turtle-" .. id)
+  t.seen = now()
+  if msg.bpc ~= nil then t.bpc = tonumber(msg.bpc) or t.bpc end
+  if msg.fuel ~= nil then t.fuel = msg.fuel end
+  if msg.dug ~= nil then t.dug = tonumber(msg.dug) or t.dug end
+  if msg.idx ~= nil then t.idx = tonumber(msg.idx) or t.idx end
+  if msg.total ~= nil then t.total = tonumber(msg.total) or t.total end
+  if msg.moves ~= nil then t.moves = tonumber(msg.moves) or t.moves end
+  if msg.coal ~= nil then t.coal = tonumber(msg.coal) or t.coal end
+  if msg.status then t.status = msg.status end
+  if msg.clearJob or msg.job == false then
+    t.job = nil
+    persistTurtleJob(id, nil)
+  elseif type(msg.job) == "table" then
+    t.job = msg.job
+    if msg.job.idx ~= nil then t.idx = tonumber(msg.job.idx) or t.idx end
+    if msg.job.total ~= nil then t.total = tonumber(msg.job.total) or t.total end
+    if msg.job.dug ~= nil then t.dug = tonumber(msg.job.dug) or t.dug end
+    if msg.job.y0 ~= nil then t.y0 = tonumber(msg.job.y0) or t.y0 end
+    if msg.job.y1 ~= nil then t.y1 = tonumber(msg.job.y1) or t.y1 end
+    if msg.job.status and not msg.status then t.status = msg.job.status end
+    persistTurtleJob(id, msg.job)
+  end
+  turtles[id] = t
+  return t
+end
+
+local function assignClaim(id, msg)
+  local t = touchTurtle(id, msg or {})
+  if t.y0 and t.y1 and t.status ~= "done" then
+    return {
+      type = "quarry_claim",
+      ok = true,
+      y0 = t.y0, y1 = t.y1,
+      W = cfg.W, L = cfg.L, H = cfg.H,
+      maxTravel = maxTravel(), minBpc = minBpc(),
+      resume = true,
+    }
+  end
+  local y0, y1 = nextFreeBand()
+  if not y0 then
+    return { type = "quarry_claim", ok = false, err = "no free Y layers" }
+  end
+  t.y0, t.y1 = y0, y1
+  t.status = "assigned"
+  t.idx, t.total = 1, nil
+  turtles[id] = t
+  print(("[claim] #%d %s → Y %d..%d (%d layers)"):format(
+    id, tostring(t.name), y0, y1, y1 - y0 + 1))
+  return {
+    type = "quarry_claim",
+    ok = true,
+    y0 = y0, y1 = y1,
+    W = cfg.W, L = cfg.L, H = cfg.H,
+    maxTravel = maxTravel(), minBpc = minBpc(),
+  }
+end
+
+local function markDone(id, msg)
+  local t = touchTurtle(id, msg or {})
+  if t.y0 and t.y1 then
+    completedBands[#completedBands + 1] = { y0 = t.y0, y1 = t.y1 }
+    print(("[done] #%d finished Y %d..%d"):format(id, t.y0, t.y1))
+  end
+  t.status = "done"
+  t.y0, t.y1 = nil, nil
+  turtles[id] = t
+end
+
+local function handleMsg(id, msg)
+  if type(msg) ~= "table" or not msg.type then return end
+  local t = tostring(msg.type)
+  if t == "quarry_hello" or t == "quarry_join" then
+    touchTurtle(id, msg)
+    print(("[+] #%d %s joined  bpc=%s"):format(
+      id, tostring(msg.name or "?"), tostring(msg.bpc or "?")))
+    rednet.send(id, {
+      type = "quarry_welcome",
+      siteId = os.getComputerID(),
+      name = os.getComputerLabel(),
+      W = cfg.W, L = cfg.L, H = cfg.H,
+      fraction = fractionLabel(),
+      maxClaim = maxClaimLayers(),
+      maxTravel = maxTravel(), minBpc = minBpc(),
+    }, PROTO)
+    broadcastStatus()
+  elseif t == "quarry_claim_req" then
+    local reply = assignClaim(id, msg)
+    rednet.send(id, reply, PROTO)
+    broadcastStatus()
+  elseif t == "quarry_progress" or t == "quarry_job" then
+    touchTurtle(id, msg)
+    if t == "quarry_job" and type(msg.job) == "table" then
+      print(("[job] #%d saved %s"):format(id, turtleJobPath(id)))
+    end
+    if msg.status == "done" or msg.finished then
+      markDone(id, msg)
+      broadcastStatus()
+    elseif t == "quarry_job" then
+      broadcastStatus()
+    end
+  elseif t == "quarry_done" then
+    markDone(id, msg)
+    broadcastStatus()
+  elseif t == "quarry_status_req" then
+    rednet.send(id, snapshot(), PROTO)
+  end
+end
+
+--------------------------------------------------------------------------------
+-- Display
+--------------------------------------------------------------------------------
+local function wrapMonitor()
+  for _, name in ipairs(peripheral.getNames()) do
+    if peripheral.getType(name) == "monitor" then
+      local m = peripheral.wrap(name)
+      if m then
+        pcall(function() m.setTextScale(0.5) end)
+        return m
+      end
+    end
+  end
+  return nil
+end
+
+local function drawBoard(out)
+  out = out or term
+  local w, h = out.getSize()
+  if out.setBackgroundColor then out.setBackgroundColor(colors.black) end
+  if out.setTextColor then out.setTextColor(colors.white) end
+  out.clear()
+  local snap = snapshot()
+  local color = out.isColor and out.isColor()
+
+  local function line(y, txt, c)
+    if y > h then return end
+    out.setCursorPos(1, y)
+    if out.setTextColor then out.setTextColor(c or colors.white) end
+    if out.setBackgroundColor then out.setBackgroundColor(colors.black) end
+    out.write(tostring(txt):sub(1, w))
+  end
+
+  local title = ("QUARRY  %dx%d × %dY  [%s]"):format(
+    snap.W, snap.L, snap.H, snap.fraction)
+  if color then
+    if out.setBackgroundColor then out.setBackgroundColor(colors.cyan) end
+    if out.setTextColor then out.setTextColor(colors.black) end
+    out.setCursorPos(1, 1)
+    out.write((" %-"..w.."s"):format(title):sub(1, w))
+    if out.setBackgroundColor then out.setBackgroundColor(colors.black) end
+  else
+    line(1, title, colors.yellow)
+  end
+
+  line(2, ("Progress  %d%%   %d / %d cells"):format(snap.pct, snap.done, snap.total), colors.lime)
+  -- bar
+  if h >= 3 then
+    local barW = math.max(4, w - 2)
+    local fill = math.floor(barW * (snap.pct / 100))
+    out.setCursorPos(1, 3)
+    if color then
+      out.setBackgroundColor(colors.gray)
+      out.write(string.rep(" ", barW))
+      out.setCursorPos(1, 3)
+      out.setBackgroundColor(colors.lime)
+      out.write(string.rep(" ", fill))
+      out.setBackgroundColor(colors.black)
+    else
+      out.write("[" .. string.rep("#", fill) .. string.rep("-", barW - fill) .. "]")
+    end
+  end
+
+  line(4, ("online:%d  minBPC:%.1f  maxTravel:%d"):format(
+    snap.online, snap.minBpc, snap.maxTravel), colors.lightGray)
+  line(5, ("claim max %d layers (%s of H)"):format(snap.maxClaim, snap.fraction), colors.lightGray)
+
+  local y = 7
+  line(6, "ID   Y-band     BPC   PROG     STATUS", colors.orange or colors.yellow)
+  for _, t in ipairs(snap.turtles) do
+    if y >= h then break end
+    local band = (t.y0 and t.y1) and ("%d-%d"):format(t.y0, t.y1) or "-"
+    local prog = "-"
+    if t.total and t.total > 0 and t.idx then
+      prog = ("%d%%"):format(math.floor(100 * math.min(1, (t.idx - 1) / t.total)))
+    end
+    local st = tostring(t.status or "?")
+    if (t.age or 99) >= ONLINE_SECS then st = "stale" end
+    local col = colors.white
+    if st == "assigned" or st == "mining" then col = colors.lime
+    elseif st == "done" then col = colors.lightGray
+    elseif st == "stale" then col = colors.red end
+    line(y, ("#%-3d %-10s %-5s %-8s %s"):format(
+      t.id, band, tostring(t.bpc or "?"):sub(1, 5), prog, st), col)
+    y = y + 1
+  end
+  if #snap.turtles == 0 and y < h then
+    line(y, "(no turtles — run `join` on offline_miner)", colors.gray)
+  end
+end
+
+--------------------------------------------------------------------------------
+-- Console
+--------------------------------------------------------------------------------
+local function printHelp()
+  print("Quarry site board — place LEFT of the storage chest.")
+  print("  setup <W>x<L> <H> [half|third]   shared dig volume")
+  print("  fraction half|third              max Y band per turtle")
+  print("  status | turtles | jobs | clear | broadcast")
+  print("  help | exit")
+  print("")
+  print("Turtles: offline_miner → join → mine")
+  print("Job files saved under " .. JOB_DIR .. "/<id>_offline_miner_job.cfg")
+end
+
+local function handleCommand(line)
+  local a = {}
+  for w in tostring(line or ""):gmatch("%S+") do a[#a + 1] = w end
+  local cmd = (a[1] or ""):lower()
+  if cmd == "" then return true
+  elseif cmd == "help" or cmd == "?" then printHelp()
+  elseif cmd == "status" then
+    local s = snapshot()
+    print(("Site #%d  %dx%d × %dY  %s  %d%%"):format(
+      s.siteId, s.W, s.L, s.H, s.fraction, s.pct))
+    print(("online=%d  minBPC=%.1f  maxTravel=%d  claimMax=%d"):format(
+      s.online, s.minBpc, s.maxTravel, s.maxClaim))
+  elseif cmd == "turtles" then
+    local s = snapshot()
+    if #s.turtles == 0 then print("(none)")
+    else
+      for _, t in ipairs(s.turtles) do
+        print(("#%d %s  Y%s  bpc=%s  %s  %ss"):format(
+          t.id, tostring(t.name):sub(1, 12),
+          (t.y0 and ("%d-%d"):format(t.y0, t.y1)) or "-",
+          tostring(t.bpc or "?"), tostring(t.status or "?"), tostring(t.age or "?")))
+        if t.jobSummary then
+          print("     job: " .. t.jobSummary)
+        end
+      end
+    end
+  elseif cmd == "jobs" then
+    if not fs.exists(JOB_DIR) then
+      print("(no " .. JOB_DIR .. " yet — turtles send offline_miner_job.cfg on join/mine)")
+    else
+      local files = fs.list(JOB_DIR)
+      if #files == 0 then print("(empty)")
+      else
+        for _, name in ipairs(files) do
+          local path = JOB_DIR .. "/" .. name
+          local f = fs.open(path, "r")
+          local raw = f and f.readAll() or ""
+          if f then f.close() end
+          local j = textutils.unserialize(raw)
+          print(path .. "  " .. jobSummaryShort(j))
+        end
+      end
+    end
+    local s = snapshot()
+    for _, t in ipairs(s.turtles) do
+      if t.job then
+        print(("#%d memory: %s"):format(t.id, t.jobSummary or "?"))
+      end
+    end
+  elseif cmd == "clear" then
+    turtles, completedBands = {}, {}
+    if fs.exists(JOB_DIR) then
+      for _, name in ipairs(fs.list(JOB_DIR)) do
+        pcall(fs.delete, JOB_DIR .. "/" .. name)
+      end
+    end
+    print("Cleared turtle claims / completed bands / quarry_jobs (footprint kept).")
+    broadcastStatus()
+  elseif cmd == "broadcast" or cmd == "push" then
+    broadcastStatus()
+    print("Status broadcast.")
+  elseif cmd == "fraction" then
+    local f = tostring(a[2] or ""):lower()
+    if f == "half" or f == "1/2" or f == "2" then
+      cfg.fraction = 0.5
+    elseif f == "third" or f == "1/3" or f == "3" then
+      cfg.fraction = 1 / 3
+    else
+      print("Usage: fraction half|third   (now " .. fractionLabel() .. ")")
+      return true
+    end
+    saveCfg()
+    print("Claim size: " .. fractionLabel() .. " (" .. maxClaimLayers() .. " layers max)")
+  elseif cmd == "setup" then
+    local raw = a[2]
+    local W, L, H
+    if raw and tostring(raw):find("x") then
+      local p = {}
+      for n in tostring(raw):gmatch("(%-?%d+)") do p[#p + 1] = tonumber(n) end
+      W, L = p[1], p[2]
+      H = tonumber(a[3])
+      local fr = tostring(a[4] or a[3] or ""):lower()
+      if fr == "half" or fr == "third" then
+        if not tonumber(a[3]) then H = nil end
+        cfg.fraction = (fr == "third") and (1 / 3) or 0.5
+        if not H then H = tonumber(a[3]) end
+      end
+      if tostring(a[4] or ""):lower() == "half" then cfg.fraction = 0.5
+      elseif tostring(a[4] or ""):lower() == "third" then cfg.fraction = 1 / 3 end
+    else
+      W, L, H = tonumber(a[2]), tonumber(a[3]), tonumber(a[4])
+      local fr = tostring(a[5] or ""):lower()
+      if fr == "half" then cfg.fraction = 0.5
+      elseif fr == "third" then cfg.fraction = 1 / 3 end
+    end
+    if not W or not L or not H then
+      print("Usage: setup <W>x<L> <H> [half|third]")
+      print("Example: setup 16x32 60 half")
+    else
+      cfg.W, cfg.L, cfg.H = W, L, H
+      turtles, completedBands = {}, {}
+      saveCfg()
+      print(("Site set: %dx%d × %dY  claim=%s (max %d layers)"):format(
+        W, L, H, fractionLabel(), maxClaimLayers()))
+      broadcastStatus()
+    end
+  elseif cmd == "exit" or cmd == "quit" then
+    return "exit"
+  else
+    print("Unknown. Type help.")
+  end
+  return true
+end
+
+--------------------------------------------------------------------------------
+-- Boot
+--------------------------------------------------------------------------------
+if not openModem() then
+  error("No modem. Attach a wireless or wired modem.", 0)
+end
+
+loadCfg()
+os.setComputerLabel(os.getComputerLabel() or cfg.label or ("QuarrySite-" .. os.getComputerID()))
+cfg.label = os.getComputerLabel()
+saveCfg()
+
+term.clear(); term.setCursorPos(1, 1)
+print("== Quarry Site Board ==")
+print(("Footprint %dx%d × %dY  claim=%s"):format(cfg.W, cfg.L, cfg.H, fractionLabel()))
+print("Place LEFT of the storage chest. Turtles: join → mine")
+print("Type help.")
+print("")
+
+local function netLoop()
+  while true do
+    local id, msg, proto = rednet.receive(nil, 1)
+    if id and type(msg) == "table" then
+      if proto == PROTO or msg.type and tostring(msg.type):find("^quarry_", 1) then
+        handleMsg(id, msg)
+      end
+    end
+  end
+end
+
+local function announceLoop()
+  while true do
+    broadcastStatus()
+    sleep(5)
+  end
+end
+
+local function drawLoop()
+  while true do
+    local mon = wrapMonitor()
+    if mon then drawBoard(mon) else drawBoard(term) end
+    sleep(1)
+  end
+end
+
+local function consoleLoop()
+  while true do
+    write("site> ")
+    local line = read()
+    if handleCommand(line) == "exit" then return end
+  end
+end
+
+local tasks = { netLoop, announceLoop, consoleLoop }
+if wrapMonitor() then tasks[#tasks + 1] = drawLoop end
+if titan and titan.networkLoop then
+  tasks[#tasks + 1] = function() titan.networkLoop("quarry_site") end
+end
+
+parallel.waitForAny(table.unpack(tasks))
+print("Site board stopped.")

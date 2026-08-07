@@ -1,6 +1,6 @@
 --[[
-  offline_miner.lua  -  Local quarry turtle (no GPS / no network)
-  Titan-Version: 1.0.9
+  offline_miner.lua  -  Local quarry turtle (optional site board)
+  Titan-Version: 1.1.1
 
   Place the turtle at the TOP-FRONT-LEFT corner of the dig, facing into the
   mine. That cell is origin 0,0,0:
@@ -12,11 +12,17 @@
   First boot (or `setup`):
     * Fuel chest is on the LEFT  → top up slot 16 with coal only (keeps it there)
     * Storage chest is BEHIND    → dumps slots 1-15 (never slot 16)
+    * Site computer (optional) LEFT of the storage chest — multi-turtle Y claims
     * If a pickaxe (incl. enchanted) is in the turtle inventory, equip it as a
       tool upgrade via turtle.equipLeft/Right (crafting often rejects enchantments)
 
   box / area — ALWAYS 1 Y-layer at a time (walk the plane, then drop one).
                Never digs 2 high; no player headroom on quarry jobs.
+
+  Multi-turtle (modem + offline_site.lua):
+    join                     find site board, report BPC
+    mine                     claim a Y band (½ or ⅓ of height) and dig it
+    site                     show last site / claim info
 
   Job memory (offline_miner_job.cfg):
     Progress is saved as you dig. After stop / reboot / dump, put the turtle
@@ -37,7 +43,8 @@
 
   Optional: exclude.txt (same format as the network miner) — never break those.
 
-  No modem / lib / Parent Center required. Run:  offline_miner
+  Solo mode needs no modem. Multi-turtle needs a modem + offline_site.
+  Run:  offline_miner
 ]]
 
 local CFG = "offline_miner.cfg"
@@ -46,21 +53,39 @@ local EXCLUDE = "exclude.txt"
 local FUEL_SLOT = 16
 local MIN_FUEL = 200
 local STOP = false
+local PROTO_QUARRY = "titan_quarry"
 
 -- Relative pose from boot origin. +Y is DOWN.
 local pos = { x = 0, y = 0, z = 0 }
 local facing = 0   -- 0=+Z forward, 1=+X right, 2=-Z back, 3=-X left
 local dug = 0
 local skipped = 0
+local moves = 0
+local coalBurned = 0
 local jobLabel = "-"
 local activeJob = nil   -- in-memory copy of JOB_FILE while running
+
+-- Optional site board (offline_site.lua)
+local siteId = nil
+local siteInfo = nil   -- last welcome / claim
+local maxTravel = nil  -- from site (blocks, round-trip budget)
 
 local exclude = {}
 local cfg = {
   setupDone = false,
   label = nil,
   pattern = "column",  -- "column" | "layer"
+  siteId = nil,
 }
+
+local function currentBpc()
+  local work = dug + moves
+  if coalBurned < 1 then
+    -- No coal burned yet — estimate from fuel if we have sample data later.
+    return work > 0 and work or 48
+  end
+  return work / coalBurned
+end
 
 local function normalizePattern(p)
   p = tostring(p or ""):lower()
@@ -182,6 +207,7 @@ local function applyForwardStep()
   elseif facing == 1 then pos.x = pos.x + 1
   elseif facing == 2 then pos.z = pos.z - 1
   else pos.x = pos.x - 1 end
+  moves = moves + 1
 end
 
 --------------------------------------------------------------------------------
@@ -244,6 +270,7 @@ local function burnSomeFuel()
   local burn = math.min(count - leave, 8)
   if burn < 1 then burn = 1 end
   turtle.refuel(burn)
+  coalBurned = coalBurned + burn
   return turtle.getFuelLevel()
 end
 
@@ -477,6 +504,7 @@ end
 
 local function setupChests()
   print("Setup: fuel chest LEFT → slot 16 only; storage BEHIND → dump 1-15.")
+  print("Optional: site computer LEFT of the storage chest (offline_site).")
   print("Facing into the mine at top-front-left (origin 0,0,0)...")
   equipToolFromInventory(nil, true)
   dumpToStorage()
@@ -515,6 +543,7 @@ local function moveUp()
   digDir("up")
   if turtle.up() then
     pos.y = pos.y - 1
+    moves = moves + 1
     return true
   end
   return false, "blocked"
@@ -526,6 +555,7 @@ local function moveDown()
   digDir("down")
   if turtle.down() then
     pos.y = pos.y + 1
+    moves = moves + 1
     return true
   end
   return false, "blocked"
@@ -569,6 +599,9 @@ local function loadJobFile()
   return nil
 end
 
+-- Forward decl: site sync uses this after save/clear.
+local siteSendJob
+
 local function saveJobFile(j)
   if not j then return end
   j.dug = dug
@@ -580,14 +613,22 @@ local function saveJobFile(j)
   activeJob = j
 end
 
-local function clearJobFile()
+local function clearJobFile(opts)
+  opts = opts or {}
   if fs.exists(JOB_FILE) then pcall(fs.delete, JOB_FILE) end
   activeJob = nil
+  -- Tell site to drop its copy unless this was a normal finish (site keeps last snapshot).
+  if not opts.keepSite and siteSendJob then siteSendJob(nil, true) end
 end
 
 local function jobSummary(j)
   if not j then return "(none)" end
   if j.type == "area" then
+    if j.y0 ~= nil and j.y1 ~= nil then
+      return ("area %dx%d Y%d-%d %s  step %d/%d  [%s]"):format(
+        j.W or 0, j.L or j.D or 0, j.y0, j.y1, tostring(j.pattern or "layer"),
+        tonumber(j.idx) or 1, tonumber(j.total) or 0, tostring(j.status or "?"))
+    end
     return ("area %dx%d stopY=%d %s  step %d/%d  [%s]"):format(
       j.W or 0, j.L or j.D or 0, j.stopY or j.H or 0, tostring(j.pattern or "column"),
       tonumber(j.idx) or 1, tonumber(j.total) or 0, tostring(j.status or "?"))
@@ -624,6 +665,10 @@ local function assumeAtOrigin()
   faceForward()
 end
 
+local function distHome()
+  return math.abs(pos.x) + math.abs(pos.y) + math.abs(pos.z)
+end
+
 local function goHome()
   jobLabel = "home"
   local ok, err = goTo(0, 0, 0)
@@ -631,9 +676,20 @@ local function goHome()
   return ok, err
 end
 
+local function travelBudgetTight()
+  if not maxTravel then return false end
+  return distHome() * 2 >= math.floor(maxTravel * 0.85)
+end
+
 local function manageInventory(resume)
-  if not inventoryFull() and ensureFuel() then return true end
-  print("Inventory/fuel break — returning to origin...")
+  local force = travelBudgetTight()
+  if not force and not inventoryFull() and ensureFuel() then return true end
+  if force then
+    print(("Travel budget (maxTravel=%s) — dumping before going deeper..."):format(
+      tostring(maxTravel)))
+  else
+    print("Inventory/fuel break — returning to origin...")
+  end
   if activeJob then
     activeJob.status = "paused"
     saveJobFile(activeJob)
@@ -705,6 +761,24 @@ local function boxLayerUnits(W, H, D)
   return units
 end
 
+-- Shared footprint W×D, only layers y0..y1 (inclusive, +Y = down).
+local function boxBandUnits(W, D, y0, y1)
+  local units = {}
+  y0 = math.floor(tonumber(y0) or 0)
+  y1 = math.floor(tonumber(y1) or y0)
+  if y1 < y0 then y0, y1 = y1, y0 end
+  for y = y0, y1 do
+    for z = 0, D - 1 do
+      if (z + y) % 2 == 0 then
+        for x = 0, W - 1 do units[#units + 1] = { x = x, y = y, z = z } end
+      else
+        for x = W - 1, 0, -1 do units[#units + 1] = { x = x, y = y, z = z } end
+      end
+    end
+  end
+  return units
+end
+
 local function tunnelUnits(L, W)
   local units = {}
   for z = 0, L - 1 do
@@ -729,13 +803,153 @@ local function stairUnits(W, steps, dir)
 end
 
 --------------------------------------------------------------------------------
+-- Optional quarry site board (offline_site.lua)
+--------------------------------------------------------------------------------
+local function openModem()
+  local any = false
+  for _, side in ipairs(peripheral.getNames()) do
+    if peripheral.getType(side) == "modem" then
+      if not rednet.isOpen(side) then rednet.open(side) end
+      any = true
+    end
+  end
+  return any
+end
+
+local function sitePayload(extra)
+  local msg = {
+    name = os.getComputerLabel(),
+    hostname = os.getComputerLabel(),
+    bpc = currentBpc(),
+    fuel = turtle.getFuelLevel(),
+    dug = dug,
+    moves = moves,
+    coal = coalBurned,
+    status = (activeJob and activeJob.status) or "idle",
+  }
+  local j = activeJob or loadJobFile()
+  if j then
+    msg.job = j
+    msg.jobFile = JOB_FILE
+    msg.idx = j.idx
+    msg.total = j.total
+    msg.y0 = j.y0 or msg.y0
+    msg.y1 = j.y1 or msg.y1
+  elseif siteInfo then
+    msg.y0 = siteInfo.y0
+    msg.y1 = siteInfo.y1
+  end
+  if type(extra) == "table" then
+    for k, v in pairs(extra) do msg[k] = v end
+  end
+  return msg
+end
+
+local function siteSend(msgType, extra)
+  if not siteId then return false end
+  local msg = sitePayload(extra)
+  msg.type = msgType
+  rednet.send(siteId, msg, PROTO_QUARRY)
+  return true
+end
+
+local function siteReportProgress(extra)
+  return siteSend("quarry_progress", extra)
+end
+
+-- Push offline_miner_job.cfg contents to the site board (or clear it).
+siteSendJob = function(j, clearing)
+  if not siteId then return false end
+  if clearing or not j then
+    return siteSend("quarry_job", { clearJob = true, job = false, status = "idle" })
+  end
+  return siteSend("quarry_job", { job = j, jobFile = JOB_FILE, status = j.status or "active" })
+end
+
+local function joinSite(timeout)
+  timeout = tonumber(timeout) or 6
+  if not openModem() then
+    print("No modem — solo mode only (area/box still work).")
+    return false
+  end
+  rednet.broadcast(sitePayload({ type = "quarry_join" }), PROTO_QUARRY)
+  local deadline = os.clock() + timeout
+  while os.clock() < deadline do
+    local id, msg = rednet.receive(PROTO_QUARRY, math.max(0.05, deadline - os.clock()))
+    if id and type(msg) == "table" and msg.type == "quarry_welcome" then
+      siteId = id
+      siteInfo = msg
+      maxTravel = tonumber(msg.maxTravel) or maxTravel
+      cfg.siteId = id
+      saveCfg()
+      print(("Joined site #%d  %dx%d × %dY  claim=%s  minBPC=%s  maxTravel=%s"):format(
+        id,
+        tonumber(msg.W) or 0, tonumber(msg.L) or 0, tonumber(msg.H) or 0,
+        tostring(msg.fraction or "?"),
+        tostring(msg.minBpc or "?"),
+        tostring(msg.maxTravel or "?")))
+      return true
+    end
+  end
+  print("No site board answered. Run offline_site on the computer LEFT of storage.")
+  return false
+end
+
+local function claimBand()
+  if not siteId then
+    if not joinSite() then return nil end
+  end
+  rednet.send(siteId, sitePayload({ type = "quarry_claim_req" }), PROTO_QUARRY)
+  local deadline = os.clock() + 8
+  while os.clock() < deadline do
+    local id, msg = rednet.receive(PROTO_QUARRY, math.max(0.05, deadline - os.clock()))
+    if id == siteId and type(msg) == "table" and msg.type == "quarry_claim" then
+      if not msg.ok then
+        print("Claim failed: " .. tostring(msg.err or "unknown"))
+        return nil
+      end
+      maxTravel = tonumber(msg.maxTravel) or maxTravel
+      siteInfo = msg
+      print(("Claimed Y %d..%d  (%d layers)  maxTravel=%s"):format(
+        msg.y0, msg.y1, (msg.y1 - msg.y0 + 1), tostring(maxTravel or "?")))
+      return msg
+    end
+  end
+  print("Claim timed out.")
+  return nil
+end
+
+local function printSiteInfo()
+  if not siteId and cfg.siteId then siteId = cfg.siteId end
+  print(("siteId=%s  bpc=%.1f  moves=%d coal=%d  maxTravel=%s"):format(
+    tostring(siteId or "-"), currentBpc(), moves, coalBurned, tostring(maxTravel or "-")))
+  if siteInfo then
+    print(("last: %dx%d × %dY  Y=%s..%s  fraction=%s"):format(
+      tonumber(siteInfo.W) or 0, tonumber(siteInfo.L) or 0, tonumber(siteInfo.H) or 0,
+      tostring(siteInfo.y0 or "?"), tostring(siteInfo.y1 or "?"),
+      tostring(siteInfo.fraction or "?")))
+  else
+    print("No site info yet — run `join`.")
+  end
+end
+
+--------------------------------------------------------------------------------
 -- Jobs
 --------------------------------------------------------------------------------
 local function finishJob(ok, err)
+  local wasSite = activeJob and activeJob.site
+  local y0 = activeJob and activeJob.y0
+  local y1 = activeJob and activeJob.y1
+  local lastJob = activeJob
   if activeJob then
     if ok then
-      -- Job fully complete — forget progress so the next dig starts clean.
-      clearJobFile()
+      -- Job fully complete — forget local progress so the next dig starts clean.
+      -- Site keeps a final offline_miner_job.cfg snapshot under quarry_jobs/.
+      if wasSite and lastJob then
+        lastJob.status = "done"
+        siteSendJob(lastJob)
+      end
+      clearJobFile({ keepSite = true })
       activeJob = nil
       print("Job finished — cleared " .. JOB_FILE)
     else
@@ -746,12 +960,23 @@ local function finishJob(ok, err)
       print("(Or `clearjob` to forget this dig.)")
     end
   end
+  if wasSite then
+    if ok then
+      siteSend("quarry_done", {
+        status = "done", finished = true, y0 = y0, y1 = y1,
+        job = lastJob, jobFile = JOB_FILE,
+      })
+    else
+      siteReportProgress({ status = "paused", job = activeJob or lastJob, jobFile = JOB_FILE })
+    end
+  end
   goHome()
   dumpToStorage()
   suckFuelFromLeft()
   jobLabel = "idle"
   if ok then
-    print(("Done. dug=%d skipped=%d fuel=%s"):format(dug, skipped, tostring(turtle.getFuelLevel())))
+    print(("Done. dug=%d skipped=%d bpc=%.1f fuel=%s"):format(
+      dug, skipped, currentBpc(), tostring(turtle.getFuelLevel())))
   end
 end
 
@@ -760,7 +985,12 @@ local function runBoxJob(j)
   local W, H, D = j.W, j.H, j.D
   -- Quarry jobs are ALWAYS true 1-Y-layer passes (never column / never 2-high).
   j.pattern = "layer"
-  local units = boxLayerUnits(W, H, D)
+  local units
+  if j.y0 ~= nil and j.y1 ~= nil then
+    units = boxBandUnits(W, D, j.y0, j.y1)
+  else
+    units = boxLayerUnits(W, H, D)
+  end
   j.total = #units
   j.idx = math.max(1, tonumber(j.idx) or 1)
   j.status = "active"
@@ -769,7 +999,10 @@ local function runBoxJob(j)
   skipped = tonumber(j.skipped) or skipped
   saveJobFile(j)
   jobLabel = jobSummary(j)
-  if j.type == "area" then
+  if j.y0 ~= nil and j.y1 ~= nil then
+    print(("AREA %dx%d  Y%d..%d  (site band)  resume @ %d/%d"):format(
+      W, D, j.y0, j.y1, j.idx, j.total))
+  elseif j.type == "area" then
     print(("AREA %dx%d  stopY=%d  (1 layer at a time)  resume @ %d/%d"):format(
       W, D, H, j.idx, j.total))
   else
@@ -778,6 +1011,7 @@ local function runBoxJob(j)
   end
 
   local lastY = -999
+  local layerCount = (j.y0 ~= nil and j.y1 ~= nil) and (j.y1 - j.y0 + 1) or H
   for i = j.idx, #units do
     if STOP then finishJob(false, "stop"); return end
     local u = units[i]
@@ -791,9 +1025,9 @@ local function runBoxJob(j)
       while pos.y < u.y do
         if not moveDown() then finishJob(false, "layer drop"); return end
       end
-      print(("  layer %d / %d"):format(u.y + 1, H))
+      print(("  layer Y=%d  (%d layers in band)"):format(u.y, layerCount))
     elseif lastY == -999 then
-      print(("  layer %d / %d"):format(u.y + 1, H))
+      print(("  layer Y=%d  (%d layers in band)"):format(u.y, layerCount))
     end
     lastY = u.y
 
@@ -803,6 +1037,10 @@ local function runBoxJob(j)
 
     j.idx = i + 1
     saveJobFile(j)
+    if j.site and (i % 10 == 0) then
+      -- Includes full offline_miner_job.cfg table in the payload.
+      siteReportProgress({ status = "mining", job = j, jobFile = JOB_FILE })
+    end
   end
   finishJob(true)
 end
@@ -986,8 +1224,35 @@ local function continueJob()
     print("No saved job in " .. JOB_FILE .. ". Start with area / box / tunnel / stair.")
     return
   end
+  if j.site and not siteId then
+    joinSite(4)
+  end
   print("Loaded: " .. jobSummary(j))
   runSavedJob(j, true)
+end
+
+local function digSiteMine()
+  local claim = claimBand()
+  if not claim then return end
+  local W = math.floor(tonumber(claim.W) or 0)
+  local L = math.floor(tonumber(claim.L) or 0)
+  local y0 = tonumber(claim.y0)
+  local y1 = tonumber(claim.y1)
+  if W < 1 or L < 1 or y0 == nil or y1 == nil then
+    print("Bad claim from site.")
+    return
+  end
+  dug, skipped = 0, 0
+  local units = boxBandUnits(W, L, y0, y1)
+  local j = {
+    type = "area", W = W, L = L, stopY = y1 + 1,
+    H = y1 + 1, D = L, pattern = "layer",
+    y0 = y0, y1 = y1, site = true,
+    idx = 1, total = #units, status = "active", dug = 0, skipped = 0,
+  }
+  siteSendJob(j)
+  siteReportProgress({ status = "mining", y0 = y0, y1 = y1, job = j, jobFile = JOB_FILE })
+  runSavedJob(j, false)
 end
 
 --------------------------------------------------------------------------------
@@ -1001,11 +1266,15 @@ local function printHelp()
   print("  box <W>x<H>x<D>                  H layers down, 1 Y at a time")
   print("  tunnel <L> [W]                   player-tall (2 high) corridor")
   print("  stair <W>x<steps> <up|down>      player-tall staircase")
+  print("  join                             find quarry site board (modem)")
+  print("  mine                             claim a Y band from site and dig it")
+  print("  site                             show site / BPC / maxTravel")
   print("  equip [left|right]               equip pick from inventory (aliases: tool, pick)")
   print("  continue | resume                resume saved job (from origin)")
   print("  job | clearjob                   show / forget saved job")
   print("  home | dump | refuel | setup | stop | status")
   print("")
+  print("Multi-turtle: site computer LEFT of storage → offline_site → join → mine")
   print("Jobs save to " .. JOB_FILE .. " while running / paused.")
   print("Finished digs clear that file automatically. After stop: origin + continue.")
   print("Enchanted pick: put it in inventory, then `equip` (not craft onto turtle).")
@@ -1013,9 +1282,10 @@ end
 
 local function printStatus()
   print(("pos=%d,%d,%d face=%d"):format(pos.x, pos.y, pos.z, facing))
-  print(("label=%s  dug=%d skipped=%d fuel=%s"):format(
-    jobLabel, dug, skipped, tostring(turtle.getFuelLevel())))
-  print(("setup=%s  pattern=%s"):format(tostring(cfg.setupDone), tostring(cfg.pattern or "column")))
+  print(("label=%s  dug=%d skipped=%d bpc=%.1f fuel=%s"):format(
+    jobLabel, dug, skipped, currentBpc(), tostring(turtle.getFuelLevel())))
+  print(("setup=%s  pattern=%s  site=%s"):format(
+    tostring(cfg.setupDone), tostring(cfg.pattern or "column"), tostring(siteId or "-")))
   local j = activeJob or loadJobFile()
   if j then
     print("saved: " .. jobSummary(j))
@@ -1040,6 +1310,12 @@ local function handleCommand(line)
     print("Stop requested — job will be saved for `continue`.")
   elseif cmd == "setup" then
     setupChests()
+  elseif cmd == "join" then
+    joinSite(tonumber(a[2]) or 6)
+  elseif cmd == "mine" then
+    digSiteMine()
+  elseif cmd == "site" then
+    printSiteInfo()
   elseif cmd == "equip" or cmd == "tool" or cmd == "pick" or cmd == "pickaxe" then
     equipToolFromInventory(a[2])
   elseif cmd == "dump" then
@@ -1188,8 +1464,15 @@ if saved then
   print("Or `clearjob` to forget it.")
 end
 
+if cfg.siteId then
+  siteId = cfg.siteId
+end
+if openModem() then
+  print("Modem present — multi-turtle: `join` then `mine` (needs offline_site).")
+end
+
 print("")
-print("Type help. Examples:  area 16x32 40   |   continue")
+print("Type help. Examples:  area 16x32 40   |   join / mine   |   continue")
 print("")
 
 while true do

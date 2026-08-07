@@ -1,6 +1,6 @@
 --[[
   install.lua  -  Titan network installer (CC: Tweaked)
-  Titan-Version: 1.1.17
+  Titan-Version: 1.1.19
 
   Downloads the Titan bot-network system onto this device from a running
   `host.lua` on the same rednet network (no pastebin / external web host).
@@ -48,32 +48,34 @@ local ROLES = {
               "versions.lua" } },
   { key = "12", name = "Miner (area quarry turtle)",         run = "miner.lua",
     files = { "lib/titan.lua", "miner.lua", "exclude.txt" } },
-  { key = "13", name = "Offline miner (no GPS/network)",    run = "offline_miner.lua",
+  { key = "13", name = "Offline miner (solo or multi Y-band)", run = "offline_miner.lua",
     files = { "offline_miner.lua", "exclude.txt" } },
-  { key = "14", name = "StorageManager (Create storage)",  run = "storage_manager.lua",
+  { key = "14", name = "Offline quarry site board",         run = "offline_site.lua",
+    files = { "offline_site.lua", "lib/titan.lua" } },
+  { key = "15", name = "StorageManager (Create storage)",  run = "storage_manager.lua",
     files = { "lib/titan.lua", "storage_manager.lua" } },
-  { key = "15", name = "Loader (chunk escort / Chunky Turtle)", run = "loader.lua",
+  { key = "16", name = "Loader (chunk escort / Chunky Turtle)", run = "loader.lua",
     files = { "lib/titan.lua", "loader.lua" } },
-  { key = "16", name = "Site marker (area + fleet job request)", run = "marker.lua",
+  { key = "17", name = "Site marker (area + fleet job request)", run = "marker.lua",
     files = { "lib/titan.lua", "marker.lua" } },
-  { key = "17", name = "Perimeter sensor (Player Detector gate)", run = "perimeter_sensor.lua",
+  { key = "18", name = "Perimeter sensor (Player Detector gate)", run = "perimeter_sensor.lua",
     files = { "lib/titan.lua", "perimeter_sensor.lua" } },
-  { key = "18", name = "Perimeter manager (territory board)", run = "perimeter_manager.lua",
+  { key = "19", name = "Perimeter manager (territory board)", run = "perimeter_manager.lua",
     files = { "lib/titan.lua", "perimeter_manager.lua" } },
-  { key = "19", name = "Install host (share files to others)", run = "host.lua",
+  { key = "20", name = "Install host (share files to others)", run = "host.lua",
     files = { "lib/titan.lua", "hub.lua", "bot.lua", "poi.lua", "worker.lua", "botserver.lua",
               "datacenter.lua", "console.lua", "admin.lua", "gpshost.lua", "locator.lua",
               "router.lua", "router_main.lua", "router_modem.lua",
               "lib/router_hub_net.lua", "lib/router_hub_ui.lua", "lib/router_hub_cmd.lua",
-              "miner.lua", "offline_miner.lua", "loader.lua", "marker.lua", "storage_manager.lua",
+              "miner.lua", "offline_miner.lua", "offline_site.lua", "loader.lua", "marker.lua", "storage_manager.lua",
               "perimeter_sensor.lua", "perimeter_manager.lua",
               "exclude.txt", "versions.lua", "install.lua" } },
-  { key = "20", name = "Everything (all files, no auto-run)", run = nil,
+  { key = "21", name = "Everything (all files, no auto-run)", run = nil,
     files = { "lib/titan.lua", "hub.lua", "bot.lua", "poi.lua", "worker.lua", "botserver.lua",
               "datacenter.lua", "console.lua", "admin.lua", "gpshost.lua", "locator.lua",
               "router.lua", "router_main.lua", "router_modem.lua",
               "lib/router_hub_net.lua", "lib/router_hub_ui.lua", "lib/router_hub_cmd.lua",
-              "miner.lua", "offline_miner.lua", "loader.lua", "marker.lua", "storage_manager.lua",
+              "miner.lua", "offline_miner.lua", "offline_site.lua", "loader.lua", "marker.lua", "storage_manager.lua",
               "perimeter_sensor.lua", "perimeter_manager.lua",
               "exclude.txt", "versions.lua", "install.lua" } },
 }
@@ -251,6 +253,7 @@ local LABELS = {
   ["admin.lua"] = "Admin", ["host.lua"] = "Host", ["gpshost.lua"] = "GPS",
   ["locator.lua"] = "Locator", ["router.lua"] = "Router", ["miner.lua"] = "Miner",
   ["offline_miner.lua"] = "OfflineMiner",
+  ["offline_site.lua"]  = "QuarrySite",
   ["loader.lua"] = "Loader", ["marker.lua"] = "SiteMarker",
   ["storage_manager.lua"] = "StorageManager",
 }

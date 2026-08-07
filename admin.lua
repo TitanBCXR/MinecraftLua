@@ -1,6 +1,6 @@
 --[[
   admin.lua  -  Titan admin console for a POCKET computer ("Live" tablet)
-  Titan-Version: 1.4.1
+  Titan-Version: 1.4.2
 
   Pocket remote for the whole fleet. Keep it on you; it joins the mesh like
   every other Titan device (MAIN router + modem hops).
@@ -21,8 +21,9 @@
     pending | deploy | park | stop | mine | continue
     dc | center                  — jump to Parent Center
     flatten ...                  — run flatten on Parent Center via SSH
-    live [local|global|stats|gps|bots] — full-screen boards (MAIN stats)
+    live [local|global|stats|gps|bots|quarry] — full-screen boards
       Advanced (color) pocket → pretty GUI; normal pocket → mono.
+    quarry                       — offline quarry site % / turtles (titan_quarry)
 
   Boots with a master-password prompt (before background loops). Deploy / SSH /
   fleet control need an unlocked session.
@@ -34,6 +35,8 @@
 local titan = dofile("lib/titan.lua")
 local MSG   = titan.MSG
 local PROTO_ROUTER = titan.ROUTER_PROTOCOL or "titan_router"
+local PROTO_QUARRY = "titan_quarry"
+local PROTO_NET = titan.PROTOCOL or "titan_net"
 
 titan.openModem()
 os.setComputerLabel(os.getComputerLabel() or ("Admin-" .. os.getComputerID()))
@@ -77,6 +80,8 @@ local systems  = {}   -- [id] = { name, kind, seen } from SSH pongs / hellos
 local pois     = {}
 local pending  = {}
 local stuck    = {}
+local quarrySnap = nil   -- last quarry_site broadcast from offline_site
+local quarrySnapAt = 0
 
 local function now() return os.epoch("utc") end
 local function ago(ts) return math.floor((now() - (ts or 0)) / 1000) end
@@ -156,6 +161,10 @@ local function handle(id, msg)
 
   elseif t == "hello" or t == "main_here" then
     touchSystem(id, msg.name or msg.hostname or msg.label, msg.kind or "router")
+  elseif t == "quarry_site" then
+    quarrySnap = msg
+    quarrySnapAt = now()
+    touchSystem(id, msg.name or ("Quarry-" .. id), "quarry_site")
   end
 end
 
@@ -165,6 +174,33 @@ local function listenerLoop()
     local id, msg = titan.recv(1)
     if msg then handle(id, msg) end
   end
+end
+
+-- offline_site primary protocol (also mirrored on titan_net → handle())
+local function quarryListenerLoop()
+  while true do
+    local id, msg = rednet.receive(PROTO_QUARRY, 2)
+    if id and type(msg) == "table" and msg.type == "quarry_site" then
+      quarrySnap = msg
+      quarrySnapAt = now()
+      touchSystem(id, msg.name or ("Quarry-" .. id), "quarry_site")
+    end
+  end
+end
+
+local function requestQuarryStatus(timeout)
+  timeout = tonumber(timeout) or 3
+  rednet.broadcast({ type = "quarry_status_req", from = os.getComputerID() }, PROTO_QUARRY)
+  local deadline = os.clock() + timeout
+  while os.clock() < deadline do
+    local id, msg = rednet.receive(PROTO_QUARRY, math.max(0.05, deadline - os.clock()))
+    if id and type(msg) == "table" and msg.type == "quarry_site" then
+      quarrySnap = msg
+      quarrySnapAt = now()
+      return msg
+    end
+  end
+  return quarrySnap
 end
 
 --------------------------------------------------------------------------------
@@ -321,7 +357,7 @@ end
 --------------------------------------------------------------------------------
 -- Live boards (same stats as MAIN monitor; pretty on advanced pocket)
 --------------------------------------------------------------------------------
-local LIVE_BOARDS = { "local", "global", "stats", "gps", "bots" }
+local LIVE_BOARDS = { "local", "global", "stats", "gps", "bots", "quarry" }
 local liveBoard = "local"
 local boardSnap = nil
 local boardSnapAt = 0
@@ -802,10 +838,81 @@ local function drawBotsBoard(L)
   end
 end
 
+local function drawQuarryBoard(L)
+  local out = L.out
+  local snap = quarrySnap
+  local age = snap and ago(quarrySnapAt) or nil
+  guiFill(out, 1, 1, L.w, L.h, colors.black, colors.white)
+  local title = "QUARRY SITE"
+  if L.color then
+    guiFill(out, 1, 1, L.w, 1, colors.cyan, colors.black)
+    guiText(out, 1 + L.pad, 1, " " .. title, colors.black, colors.cyan)
+  else
+    guiText(out, 1, 1, title, colors.yellow, colors.black)
+  end
+  if not snap then
+    guiText(out, 1 + L.pad, 3, "Waiting for offline_site...", colors.lightGray, colors.black)
+    guiText(out, 1 + L.pad, 4, "Site PC left of storage; turtles: join → mine", colors.gray, colors.black)
+    guiText(out, 1 + L.pad, 6, "Press r to request status", colors.gray, colors.black)
+    return
+  end
+  local name = tostring(snap.name or ("#" .. tostring(snap.siteId or "?")))
+  guiText(out, 1 + L.pad, 2, ("%s  %dx%d × %dY  [%s]"):format(
+    name:sub(1, 12),
+    tonumber(snap.W) or 0, tonumber(snap.L) or 0, tonumber(snap.H) or 0,
+    tostring(snap.fraction or "?")), colors.white, colors.black)
+  local pct = tonumber(snap.pct) or 0
+  guiText(out, 1 + L.pad, 3, ("Progress  %d%%   %s / %s"):format(
+    pct, tostring(snap.done or "?"), tostring(snap.total or "?")), colors.lime, colors.black)
+  if L.h > 6 then
+    local barW = math.max(4, L.w - 2 - L.pad)
+    local fill = math.floor(barW * math.min(1, pct / 100))
+    out.setCursorPos(1 + L.pad, 4)
+    if L.color then
+      out.setBackgroundColor(colors.gray)
+      out.write(string.rep(" ", barW))
+      out.setCursorPos(1 + L.pad, 4)
+      out.setBackgroundColor(colors.lime)
+      out.write(string.rep(" ", fill))
+      out.setBackgroundColor(colors.black)
+    else
+      out.write("[" .. string.rep("#", fill) .. string.rep("-", barW - fill) .. "]")
+    end
+  end
+  guiText(out, 1 + L.pad, 5, ("online:%s  minBPC:%s  maxTravel:%s  %ss"):format(
+    tostring(snap.online or 0),
+    tostring(snap.minBpc or "?"),
+    tostring(snap.maxTravel or "?"),
+    tostring(age or "?")), colors.lightGray, colors.black)
+  local y = 7
+  guiText(out, 1 + L.pad, 6, "ID   Y-band   BPC   PROG  STATUS", colors.orange or colors.yellow, colors.black)
+  local list = snap.turtles or {}
+  for _, t in ipairs(list) do
+    if y >= L.h - L.footerH then break end
+    local band = (t.y0 and t.y1) and ("%d-%d"):format(t.y0, t.y1) or "-"
+    local prog = "-"
+    if t.total and t.total > 0 and t.idx then
+      prog = ("%d%%"):format(math.floor(100 * math.min(1, ((t.idx or 1) - 1) / t.total)))
+    end
+    local st = tostring(t.status or "?")
+    if (t.age or 0) >= 45 then st = "stale" end
+    local col = colors.white
+    if st == "mining" or st == "assigned" then col = colors.lime
+    elseif st == "done" then col = colors.lightGray
+    elseif st == "stale" then col = colors.red end
+    guiText(out, 1 + L.pad, y, ("#%-3d %-8s %-5s %-5s %s"):format(
+      t.id or 0, band, tostring(t.bpc or "?"):sub(1, 5), prog, st), col, colors.black)
+    y = y + 1
+  end
+  if #list == 0 then
+    guiText(out, 1 + L.pad, y, "(no turtles joined yet)", colors.gray, colors.black)
+  end
+end
+
 local function drawLiveFooter(L, board)
   local out, w, h = L.out, L.w, L.h
-  local tabs = "1loc 2glb 3stat 4gps 5bots"
-  if L.tier == "tiny" then tabs = "1-5 board  q quit" end
+  local tabs = "1loc 2glb 3stat 4gps 5bots 6qry"
+  if L.tier == "tiny" then tabs = "1-6 board  q quit" end
   local mode = L.color and "ADV" or "MONO"
   local right = (" %s %dx%d"):format(mode, w, h)
   local left = (" %s  %s"):format(board, (L.tier == "tiny") and "q=quit" or "←→ tabs  q quit")
@@ -828,17 +935,21 @@ local function drawLiveBoard(board)
   if L.out.setBackgroundColor then L.out.setBackgroundColor(colors.black) end
   if L.out.setTextColor then L.out.setTextColor(colors.white) end
   L.out.clear()
-  local snap = boardSnap or refreshBoardSnap(false)
-  if board == "global" then
-    drawRosterBoard(L, "global", snap or {})
-  elseif board == "stats" then
-    drawStatsBoard(L, snap or {})
-  elseif board == "gps" then
-    drawGpsBoard(L, snap or {})
-  elseif board == "bots" then
-    drawBotsBoard(L)
+  if board == "quarry" then
+    drawQuarryBoard(L)
   else
-    drawRosterBoard(L, "local", snap or {})
+    local snap = boardSnap or refreshBoardSnap(false)
+    if board == "global" then
+      drawRosterBoard(L, "global", snap or {})
+    elseif board == "stats" then
+      drawStatsBoard(L, snap or {})
+    elseif board == "gps" then
+      drawGpsBoard(L, snap or {})
+    elseif board == "bots" then
+      drawBotsBoard(L)
+    else
+      drawRosterBoard(L, "local", snap or {})
+    end
   end
   drawLiveFooter(L, board)
 end
@@ -850,6 +961,7 @@ local function normalizeLiveBoard(name)
   if name == "stat" or name == "s" then return "stats" end
   if name == "p" then return "gps" end
   if name == "bot" or name == "b" then return "bots" end
+  if name == "q" or name == "site" or name == "offline" then return "quarry" end
   for _, b in ipairs(LIVE_BOARDS) do
     if b == name then return name end
   end
@@ -869,7 +981,11 @@ local function liveView(startBoard)
   if startBoard then
     liveBoard = normalizeLiveBoard(startBoard) or liveBoard
   end
-  refreshBoardSnap(true)
+  if liveBoard == "quarry" then
+    requestQuarryStatus(2)
+  else
+    refreshBoardSnap(true)
+  end
   drawLiveBoard(liveBoard)
   local timer = os.startTimer(1)
   local snapTimer = os.startTimer(3)
@@ -879,7 +995,11 @@ local function liveView(startBoard)
       drawLiveBoard(liveBoard)
       timer = os.startTimer(1)
     elseif ev == "timer" and p1 == snapTimer then
-      refreshBoardSnap(true)
+      if liveBoard == "quarry" then
+        -- keep last broadcast; optional soft refresh
+      else
+        refreshBoardSnap(true)
+      end
       drawLiveBoard(liveBoard)
       snapTimer = os.startTimer(3)
     elseif ev == "char" then
@@ -890,7 +1010,10 @@ local function liveView(startBoard)
       elseif ch == "3" then liveBoard = "stats"; drawLiveBoard(liveBoard)
       elseif ch == "4" then liveBoard = "gps"; drawLiveBoard(liveBoard)
       elseif ch == "5" then liveBoard = "bots"; drawLiveBoard(liveBoard)
-      elseif ch == "r" then refreshBoardSnap(true); drawLiveBoard(liveBoard)
+      elseif ch == "6" then liveBoard = "quarry"; requestQuarryStatus(2); drawLiveBoard(liveBoard)
+      elseif ch == "r" then
+        if liveBoard == "quarry" then requestQuarryStatus(2) else refreshBoardSnap(true) end
+        drawLiveBoard(liveBoard)
       elseif ch == "\t" then cycleLiveBoard(1); drawLiveBoard(liveBoard)
       end
     elseif ev == "key" then
@@ -901,7 +1024,8 @@ local function liveView(startBoard)
       elseif p1 == K.left then
         cycleLiveBoard(-1); drawLiveBoard(liveBoard)
       elseif p1 == K.r then
-        refreshBoardSnap(true); drawLiveBoard(liveBoard)
+        if liveBoard == "quarry" then requestQuarryStatus(2) else refreshBoardSnap(true) end
+        drawLiveBoard(liveBoard)
       end
     elseif ev == "mouse_click" then
       -- button, x, y — tap right half → next board; left → prev
@@ -1190,7 +1314,8 @@ local function handleCommand(a)
       print("  mode advanced   — switch to command-line console")
       print("  mode simple     — back to menus")
     else
-      print("VIEW  : live [local|global|stats|gps|bots]")
+      print("VIEW  : live [local|global|stats|gps|bots|quarry]")
+      print("        quarry               offline quarry % / turtles")
       print("        bots | miners | loaders | markers | pending | stuck")
       print("NET   : connections | hosts | list [filter] | ping | who")
       print("        link | link <a> <b> | link auto | link peer|modem ...")
@@ -1237,6 +1362,30 @@ local function handleCommand(a)
       print("live view is local-only. Use `bots` / `connections` over SSH.")
     else
       liveView(a[2])
+    end
+
+  elseif cmd == "quarry" or cmd == "quarrysite" or cmd == "offlinesite" then
+    if titan.sshIsAuthed and titan.sshIsAuthed() then
+      local s = quarrySnap or requestQuarryStatus(2)
+      if not s then
+        print("No quarry site online (offline_site broadcasting?).")
+      else
+        print(("Quarry #%s  %dx%d × %dY  %d%%  online=%s"):format(
+          tostring(s.siteId or "?"),
+          tonumber(s.W) or 0, tonumber(s.L) or 0, tonumber(s.H) or 0,
+          tonumber(s.pct) or 0, tostring(s.online or 0)))
+        print(("minBPC=%s  maxTravel=%s  claim=%s"):format(
+          tostring(s.minBpc or "?"), tostring(s.maxTravel or "?"),
+          tostring(s.fraction or "?")))
+        for _, t in ipairs(s.turtles or {}) do
+          print(("#%d %s  Y%s  bpc=%s  %s"):format(
+            t.id or 0, tostring(t.name or "?"):sub(1, 12),
+            (t.y0 and ("%d-%d"):format(t.y0, t.y1)) or "-",
+            tostring(t.bpc or "?"), tostring(t.status or "?")))
+        end
+      end
+    else
+      liveView("quarry")
     end
 
   elseif cmd == "connections" or cmd == "hosts" or cmd == "list" then
@@ -1683,6 +1832,7 @@ local function simpleLiveMenu()
   print("  3) Stats")
   print("  4) GPS")
   print("  5) Bots")
+  print("  6) Quarry progress")
   print("  0) Back")
   local n = askNumber("Pick: ")
   if n == 1 then liveView("local")
@@ -1690,6 +1840,7 @@ local function simpleLiveMenu()
   elseif n == 3 then liveView("stats")
   elseif n == 4 then liveView("gps")
   elseif n == 5 then liveView("bots")
+  elseif n == 6 then liveView("quarry")
   end
 end
 
@@ -1715,8 +1866,9 @@ local function drawSimpleMenu()
   print(" 12) Stop a turtle")
   print(" 13) Continue mining")
   print(" 14) Live boards (pick view)")
-  print(" 15) Advanced mode (commands)")
-  print(" 16) Lock tablet")
+  print(" 15) Quarry progress (%)")
+  print(" 16) Advanced mode (commands)")
+  print(" 17) Lock tablet")
   print("  0) Exit")
   print("")
 end
@@ -1787,12 +1939,18 @@ local function simpleMenuLoop()
         simpleLiveMenu()
       end
     elseif n == 15 then
+      if titan.sshIsAuthed and titan.sshIsAuthed() then
+        handleCommand({ "quarry" }); pauseSimple()
+      else
+        liveView("quarry")
+      end
+    elseif n == 16 then
       cfg.mode = "advanced"
       saveAdminCfg()
       print("Switching to ADVANCED mode...")
       sleep(0.4)
       return "switch_advanced"
-    elseif n == 16 then
+    elseif n == 17 then
       unlocked = false
       print("Locked.")
       promptUnlockAtStart()
@@ -1809,7 +1967,7 @@ local function advancedConsoleLoop()
   print("== Titan Admin — ADVANCED ==")
   print(os.getComputerLabel() or ("#" .. os.getComputerID()))
   print("Command console. Type 'help'.  mode simple  for menus.")
-  print("Quick:  live  |  connections  |  connect <name>  |  dc  |  miners")
+  print("Quick:  live  |  quarry  |  connections  |  connect <name>  |  dc")
   while cfg.mode == "advanced" do
     write("admin> ")
     local a = {}
@@ -1874,6 +2032,7 @@ end
 print("Starting network (" .. cfg.mode .. " UI)...")
 parallel.waitForAny(
   listenerLoop,
+  quarryListenerLoop,
   function() titan.networkLoop("admin") end,
   consoleLoop)
 print("Admin console closed.")

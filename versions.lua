@@ -5,11 +5,11 @@
   The console `packages` command shows these names + versions.
   Installers / OTA updates ship this file so devices know what they have.
 
-  Titan-Version: 1.4.5
+  Titan-Version: 1.4.8
 ]]
 
 return {
-  system = "1.4.5",
+  system = "1.4.8",
   packages = {
     ["lib/titan.lua"]      = "1.2.19",
     ["console.lua"]        = "1.1.8",
@@ -19,19 +19,20 @@ return {
     ["lib/router_hub_net.lua"] = "1.4.1",
     ["lib/router_hub_ui.lua"]  = "1.4.1",
     ["lib/router_hub_cmd.lua"] = "1.4.1",
-    ["host.lua"]           = "1.1.14",
-    ["install.lua"]        = "1.1.17",
-    ["github_install.lua"] = "1.1.17",
-    ["pastebin_install.lua"]= "1.1.17",
+    ["host.lua"]           = "1.1.15",
+    ["install.lua"]        = "1.1.19",
+    ["github_install.lua"] = "1.1.19",
+    ["pastebin_install.lua"]= "1.1.19",
     ["hub.lua"]            = "1.1.2",
     ["bot.lua"]            = "1.1.0",
     ["poi.lua"]            = "1.1.0",
     ["worker.lua"]         = "1.2.4",
     ["botserver.lua"]      = "1.2.5",
     ["datacenter.lua"]     = "1.2.13",
-    ["admin.lua"]          = "1.4.1",
+    ["admin.lua"]          = "1.4.2",
     ["miner.lua"]          = "1.3.1",
-    ["offline_miner.lua"]  = "1.0.9",
+    ["offline_miner.lua"]  = "1.1.1",
+    ["offline_site.lua"]   = "1.0.1",
     ["loader.lua"]         = "1.0.1",
     ["marker.lua"]         = "1.1.0",
     ["storage_manager.lua"]= "1.0.4",
@@ -40,6 +41,6 @@ return {
     ["perimeter_sensor.lua"] = "1.2.2",
     ["perimeter_manager.lua"]= "1.3.1",
     ["exclude.txt"]        = "1.0.1",
-    ["versions.lua"]       = "1.4.5",
+    ["versions.lua"]       = "1.4.8",
   },
 }

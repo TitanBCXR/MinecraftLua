@@ -6,7 +6,8 @@ A wireless dispatch system for Minecraft's **CC: Tweaked** mod:
 - **`bot.lua`** — a turtle that reports status, navigates by GPS, and executes tasks.
 - **`poi.lua`** — a "point of interest" computer that marks a location by coordinates and can summon a bot.
 - **`miner.lua`** — quarry turtle: digs between two corners down to a floor Y, skipping `exclude.txt`.
-- **`offline_miner.lua`** — local quarry (no GPS/network): origin at top-front-left, `area` / `box` / `tunnel` / `stair`.
+- **`offline_miner.lua`** — local quarry (solo or multi-turtle): origin at top-front-left, `area` / `box` / `tunnel` / `stair`, or `join` / `mine` with a site board.
+- **`offline_site.lua`** — quarry site computer (left of storage): Y-band claims, BPC / maxTravel, % progress for the admin tablet.
 - **`perimeter_sensor.lua` / `perimeter_manager.lua`** — Player Detector territory enter/exit board (N/E/S/W + timestamps).
 - **`lib/titan.lua`** — shared library (protocol, messaging, navigation). Copy this onto **every** device.
 
@@ -107,6 +108,7 @@ Each device needs:
 | Each turtle (bot) | `bot.lua`, `lib/titan.lua`                 |
 | Miner turtle      | `miner.lua`, `lib/titan.lua`, `exclude.txt` |
 | Offline miner     | `offline_miner.lua`, `exclude.txt` (optional) |
+| Quarry site board | `offline_site.lua`, `lib/titan.lua` (+ modem) |
 | Each POI computer | `poi.lua`, `lib/titan.lua`                 |
 
 (The **Install host** runs `host.lua` and serves everything else over rednet;
@@ -450,11 +452,11 @@ grace timer so walking between detectors doesn’t false-exit.
 
 ---
 
-# Offline miner (`offline_miner.lua`)
+# Offline miner (`offline_miner.lua`) + site board (`offline_site.lua`)
 
-No GPS, modem, or Parent Center — just a turtle and two chests. Stand at the
-**top-front-left** corner of the dig, facing into the mine. That pose is origin
-`0,0,0`:
+Solo mode needs no GPS or Parent Center — just a turtle and two chests. Stand at
+the **top-front-left** corner of the dig, facing into the mine. That pose is
+origin `0,0,0`:
 
 | Axis | Direction |
 |------|-----------|
@@ -475,6 +477,32 @@ continue | job | clearjob
 home | dump | refuel | stop | status
 ```
 
+### Multi-turtle quarry (same footprint, different Y bands)
+
+Place a computer with a modem to the **left of the storage chest**, install
+**Offline quarry site board**, and define the shared volume:
+
+```
+setup 16x32 60 half       # W×L footprint, 60 layers down; claim ≤ half of H
+# or: setup 16x32 60 third
+```
+
+On each mining turtle (modem required for this mode):
+
+```
+join                      # find site, report BPC
+mine                      # claim a free Y band and dig only that band
+site                      # show site / BPC / maxTravel
+```
+
+The site hands out non-overlapping Y bands (max **half** or **third** of total
+height), tracks each turtle’s progress + **BPC** (blocks per coal), and publishes
+a safe **maxTravel** so turtles dump before they outrun fuel. Each turtle also
+sends its `offline_miner_job.cfg` to the site (saved under
+`quarry_jobs/<id>_offline_miner_job.cfg`; site command `jobs`). Progress % and
+online turtles show on the site monitor/terminal and on the admin tablet
+(`live quarry`, menu **Quarry progress**, or `quarry`).
+
 Put an enchanted pick in the turtle’s inventory and run `equip` (or reboot /
 `setup`) — the script uses `turtle.equipLeft`/`equipRight` so you don’t have to
 craft the tool onto the turtle. Dump leaves picks in the inventory so they aren’t
@@ -491,7 +519,7 @@ origin (`0,0,0` facing in) and run `continue`. `job` shows the saved task;
 When the inventory fills it returns to `0,0,0`, dumps behind, refuels from the
 left, then resumes in-session. Optional `exclude.txt` is honored if present.
 
-Install via the installer → **"Offline miner"**.
+Install via the installer → **"Offline miner"** / **"Offline quarry site board"**.
 
 ---
 
