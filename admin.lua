@@ -1,6 +1,6 @@
 --[[
   admin.lua  -  Titan admin console for a POCKET computer ("Live" tablet)
-  Titan-Version: 1.4.4
+  Titan-Version: 1.4.5
 
   Pocket remote for the whole fleet. Keep it on you; it joins the mesh like
   every other Titan device (MAIN router + modem hops).
@@ -25,6 +25,8 @@
     live [local|global|stats|gps|bots|quarry] — full-screen boards
       Advanced (color) pocket → pretty GUI; normal pocket → mono.
     quarry                       — offline quarry site % / turtles (titan_quarry)
+    quarry assign <id> <y0> <y1> — set turtle Y band; delivered on next check-in
+    quarry unassign <id> | quarry pending
 
   Boots with a master-password prompt (before background loops). Deploy / SSH /
   fleet control need an unlocked session.
@@ -84,9 +86,96 @@ local stuck    = {}
 local quarrySnap = nil   -- last quarry_site from offline_site (preferred)
 local quarrySnapAt = 0
 local quarryTurtles = {} -- [id] = turtle mine reports when no site board
+-- [turtleId] = { y0, y1, W, L, H, assignId, setAt, acked, ackedAt, name }
+local quarryAssigns = type(cfg.quarryAssigns) == "table" and cfg.quarryAssigns or {}
 
 local function now() return os.epoch("utc") end
 local function ago(ts) return math.floor((now() - (ts or 0)) / 1000) end
+
+local function persistQuarryAssigns()
+  cfg.quarryAssigns = quarryAssigns
+  saveAdminCfg()
+end
+
+local function findQuarryTurtleRef(ref)
+  if ref == nil then return nil end
+  local n = tonumber(ref)
+  if n then return n end
+  local want = tostring(ref):lower()
+  for id, t in pairs(quarryTurtles) do
+    if tostring(t.name or ""):lower() == want then return id end
+  end
+  if quarrySnap and type(quarrySnap.turtles) == "table" then
+    for _, t in ipairs(quarrySnap.turtles) do
+      if tostring(t.name or ""):lower() == want then return t.id end
+    end
+  end
+  for id, s in pairs(systems) do
+    if tostring(s.name or ""):lower() == want then return id end
+  end
+  return nil
+end
+
+local function quarryAssignPayload(id, row)
+  return {
+    type = "quarry_assign",
+    turtleId = id,
+    y0 = row.y0, y1 = row.y1,
+    W = row.W, L = row.L, H = row.H,
+    assignId = row.assignId,
+    from = os.getComputerID(),
+    name = os.getComputerLabel(),
+  }
+end
+
+local function deliverQuarryAssign(id)
+  local row = quarryAssigns[id]
+  if not row or row.acked then return false end
+  local msg = quarryAssignPayload(id, row)
+  rednet.send(id, msg, PROTO_QUARRY)
+  rednet.broadcast(msg, PROTO_QUARRY)
+  -- Keep site board in sync when present.
+  local siteId = quarrySnap and quarrySnap.siteId
+  if siteId then
+    local set = {
+      type = "quarry_assign_set",
+      turtleId = id,
+      y0 = row.y0, y1 = row.y1,
+      W = row.W, L = row.L, H = row.H,
+      assignId = row.assignId,
+      from = os.getComputerID(),
+    }
+    rednet.send(siteId, set, PROTO_QUARRY)
+    rednet.broadcast(set, PROTO_QUARRY)
+  end
+  row.lastSend = now()
+  quarryAssigns[id] = row
+  return true
+end
+
+local function setQuarryAssign(id, y0, y1)
+  id = tonumber(id)
+  y0 = math.floor(tonumber(y0) or 0)
+  y1 = math.floor(tonumber(y1) or 0)
+  if not id or y0 < 0 or y1 < 0 then return nil, "bad id/y" end
+  if y1 < y0 then y0, y1 = y1, y0 end
+  local qt = quarryTurtles[id]
+  local row = {
+    y0 = y0, y1 = y1,
+    W = (qt and qt.W) or (quarrySnap and quarrySnap.W) or nil,
+    L = (qt and qt.L) or (quarrySnap and quarrySnap.L) or nil,
+    H = (qt and qt.H) or (quarrySnap and quarrySnap.H) or nil,
+    assignId = tostring(os.getComputerID()) .. "-" .. tostring(now()),
+    setAt = now(),
+    acked = false,
+    ackedAt = nil,
+    name = (qt and qt.name) or ("Turtle-" .. id),
+  }
+  quarryAssigns[id] = row
+  persistQuarryAssigns()
+  deliverQuarryAssign(id)
+  return row
+end
 local function pos(b) return ("%s,%s,%s"):format(b.x or "?", b.y or "?", b.z or "?") end
 
 local function findBot(ref)
@@ -202,6 +291,33 @@ local function handle(id, msg)
     end
     quarryTurtles[id] = q
     touchSystem(id, q.name, "offline_miner")
+    -- On check-in, re-send any un-acked Y assignment.
+    local pend = quarryAssigns[id]
+    if pend and not pend.acked then
+      if pend.name == nil then pend.name = q.name end
+      deliverQuarryAssign(id)
+    end
+  elseif t == "quarry_assign_ack" then
+    local tid = tonumber(msg.turtleId) or id
+    local row = quarryAssigns[tid]
+    if row then
+      local same = (not msg.assignId) or (tostring(msg.assignId) == tostring(row.assignId))
+      if same and msg.ok ~= false then
+        row.acked = true
+        row.ackedAt = now()
+        row.name = msg.name or row.name
+        row.y0 = tonumber(msg.y0) or row.y0
+        row.y1 = tonumber(msg.y1) or row.y1
+        quarryAssigns[tid] = row
+        persistQuarryAssigns()
+        local q = quarryTurtles[tid] or {}
+        q.y0, q.y1 = row.y0, row.y1
+        q.name = row.name or q.name
+        q.status = q.status or "assigned"
+        quarryTurtles[tid] = q
+        print(("[quarry] #%d acked Y %d..%d"):format(tid, row.y0, row.y1))
+      end
+    end
   end
 end
 
@@ -1072,15 +1188,23 @@ local function drawQuarryBoard(L)
   local list = snap.turtles or {}
   for _, t in ipairs(list) do
     if y >= L.h - L.footerH then break end
+    local pend = quarryAssigns[t.id]
     local band = (t.y0 and t.y1) and ("%d-%d"):format(t.y0, t.y1) or "-"
+    if pend and not pend.acked then
+      band = ("%d-%d*"):format(pend.y0, pend.y1)
+    elseif pend and pend.acked and (not t.y0) then
+      band = ("%d-%d"):format(pend.y0, pend.y1)
+    end
     local prog = "-"
     if t.total and t.total > 0 and t.idx then
       prog = ("%d%%"):format(math.floor(100 * math.min(1, ((t.idx or 1) - 1) / t.total)))
     end
     local st = tostring(t.status or "?")
-    if (t.age or 0) >= 45 then st = "stale" end
+    if pend and not pend.acked then st = "waitAck"
+    elseif (t.age or 0) >= 45 then st = "stale" end
     local col = colors.white
     if st == "mining" or st == "assigned" then col = colors.lime
+    elseif st == "waitAck" then col = colors.orange or colors.yellow
     elseif st == "done" then col = colors.lightGray
     elseif st == "stale" then col = colors.red end
     guiText(out, 1 + L.pad, y, ("#%-3d %-8s %-5s %-5s %s"):format(
@@ -1089,6 +1213,10 @@ local function drawQuarryBoard(L)
   end
   if #list == 0 then
     guiText(out, 1 + L.pad, y, "(no turtles joined yet)", colors.gray, colors.black)
+    y = y + 1
+  end
+  if y < L.h - L.footerH then
+    guiText(out, 1 + L.pad, L.h - L.footerH, "assign: quarry assign <id> <y0> <y1>", colors.gray, colors.black)
   end
 end
 
@@ -1489,7 +1617,10 @@ end
 local HELP_PER_PAGE = 10
 local HELP_ENTRIES = {
   { "live [board]", "MAIN boards (local/global/stats/gps/bots/quarry)" },
-  { "quarry", "Offline quarry site progress %" },
+  { "quarry", "Quarry board / assign Y bands" },
+  { "quarry assign <id> <y0> <y1>", "Set turtle Y; ack on next check-in" },
+  { "quarry pending", "List tablet Y assigns + ack state" },
+  { "quarry unassign <id>", "Drop a queued/acked Y assign" },
   { "bots", "All known turtles" },
   { "miners", "Miner turtles only" },
   { "loaders", "Loader turtles only" },
@@ -1625,7 +1756,50 @@ local function handleCommand(a)
     end
 
   elseif cmd == "quarry" or cmd == "quarrysite" or cmd == "offlinesite" then
-    if titan.sshIsAuthed and titan.sshIsAuthed() then
+    local sub = tostring(a[2] or ""):lower()
+    if sub == "assign" or sub == "set" or sub == "y" then
+      local id = findQuarryTurtleRef(a[3])
+      local y0, y1 = tonumber(a[4]), tonumber(a[5])
+      if (not y0 or not y1) and a[4] and tostring(a[4]):find("-") then
+        local p = {}
+        for n in tostring(a[4]):gmatch("(%-?%d+)") do p[#p + 1] = tonumber(n) end
+        y0, y1 = p[1], p[2]
+      end
+      if not id or y0 == nil or y1 == nil then
+        print("Usage: quarry assign <id|name> <y0> <y1>")
+        print("Example: quarry assign 12 0 29")
+        print("Delivered when the turtle next checks in; tablet waits for ack.")
+      else
+        local row, err = setQuarryAssign(id, y0, y1)
+        if not row then
+          print("Assign failed: " .. tostring(err))
+        else
+          print(("Queued Y %d..%d for #%d %s — waiting for check-in ack."):format(
+            row.y0, row.y1, id, tostring(row.name)))
+        end
+      end
+    elseif sub == "unassign" or sub == "clearassign" then
+      local id = findQuarryTurtleRef(a[3])
+      if not id then
+        print("Usage: quarry unassign <id|name>")
+      elseif quarryAssigns[id] then
+        quarryAssigns[id] = nil
+        persistQuarryAssigns()
+        print("Cleared pending/acked assign for #" .. id)
+      else
+        print("No tablet assign stored for #" .. id)
+      end
+    elseif sub == "pending" or sub == "acks" or sub == "assigns" then
+      local any = false
+      for id, row in pairs(quarryAssigns) do
+        any = true
+        print(("#%d %s  Y%d..%d  %s"):format(
+          id, tostring(row.name or "?"):sub(1, 12),
+          row.y0, row.y1,
+          row.acked and ("acked " .. tostring(ago(row.ackedAt)) .. "s ago") or "waiting check-in"))
+      end
+      if not any then print("(no quarry assigns)") end
+    elseif titan.sshIsAuthed and titan.sshIsAuthed() then
       local s = requestQuarryStatus(2) or effectiveQuarrySnap()
       if not s then
         print("No offline miners reporting (modem + area dig, or offline_site).")
@@ -1639,10 +1813,12 @@ local function handleCommand(a)
           tostring(s.minBpc or "?"), tostring(s.maxTravel or "?"),
           tostring(s.fraction or "?")))
         for _, t in ipairs(s.turtles or {}) do
+          local pend = quarryAssigns[t.id]
+          local band = (t.y0 and ("%d-%d"):format(t.y0, t.y1)) or "-"
+          if pend and not pend.acked then band = ("%d-%d*"):format(pend.y0, pend.y1) end
           print(("#%d %s  Y%s  bpc=%s  %s"):format(
             t.id or 0, tostring(t.name or "?"):sub(1, 12),
-            (t.y0 and ("%d-%d"):format(t.y0, t.y1)) or "-",
-            tostring(t.bpc or "?"), tostring(t.status or "?")))
+            band, tostring(t.bpc or "?"), tostring(t.status or "?")))
         end
       end
     else
@@ -2189,10 +2365,54 @@ local function runPhoneApp(id)
       simpleLiveMenu()
     end
   elseif id == "quarry" then
-    if titan.sshIsAuthed and titan.sshIsAuthed() then
-      handleCommand({ "quarry" }); pauseSimple()
-    else
-      liveView("quarry")
+    print("Quarry")
+    print("  1) Live board")
+    print("  2) Assign Y heights")
+    print("  3) Pending / acks")
+    print("  0) Back")
+    local choice = askNumber("Pick: ")
+    if choice == 1 then
+      if titan.sshIsAuthed and titan.sshIsAuthed() then
+        handleCommand({ "quarry" }); pauseSimple()
+      else
+        liveView("quarry")
+      end
+    elseif choice == 2 then
+      requestQuarryStatus(1)
+      local list = {}
+      local snap = effectiveQuarrySnap()
+      if snap and snap.turtles then
+        for _, t in ipairs(snap.turtles) do
+          list[#list + 1] = { id = t.id, t = t }
+        end
+      end
+      for id, t in pairs(quarryTurtles) do
+        local seen = false
+        for _, row in ipairs(list) do if row.id == id then seen = true break end end
+        if not seen then list[#list + 1] = { id = id, t = t } end
+      end
+      table.sort(list, function(a, b) return (a.id or 0) < (b.id or 0) end)
+      local row = pickFromList("Assign Y band to turtle:", list, function(r)
+        local t = r.t
+        local band = (t.y0 and t.y1) and ("%d-%d"):format(t.y0, t.y1) or "-"
+        local pend = quarryAssigns[r.id]
+        if pend and not pend.acked then band = ("%d-%d*"):format(pend.y0, pend.y1) end
+        return ("#%d %s  Y%s  %s"):format(
+          r.id, tostring(t.name or "?"):sub(1, 12), band, tostring(t.status or "?"))
+      end)
+      if row then
+        local y0 = askNumber("Y0 (top of band, 0=origin): ")
+        local y1 = askNumber("Y1 (bottom of band): ")
+        if y0 and y1 then
+          handleCommand({ "quarry", "assign", tostring(row.id), tostring(y0), tostring(y1) })
+        else
+          print("Need both Y0 and Y1.")
+        end
+        pauseSimple()
+      end
+    elseif choice == 3 then
+      handleCommand({ "quarry", "pending" })
+      pauseSimple()
     end
   elseif id == "advanced" then
     cfg.mode = "advanced"

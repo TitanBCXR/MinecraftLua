@@ -503,6 +503,9 @@ auto                      # unlock auto-learn again
 join                      # link to site if present
 mine                      # ask site for a free Y band, then dig it
 area 16x32 40             # dig; reports to admin whenever a modem is present
+# admin tablet
+quarry assign 12 0 29     # set turtle Y band; turtle acks on next check-in
+quarry pending            # waiting / acked assigns
 ```
 
 Y-band claims (max **half** / **third** of height) need the site board. Progress

@@ -1,6 +1,6 @@
 --[[
   offline_site.lua  -  Quarry site board for multi-turtle offline miners
-  Titan-Version: 1.0.6
+  Titan-Version: 1.0.7
 
   Place this computer to the LEFT of the storage chest (storage sits behind
   the turtles' origin). Attach a modem (wired to the turtles is fine, or
@@ -570,10 +570,69 @@ local function markDone(id, msg)
   turtles[id] = t
 end
 
+-- Admin tablet sets a turtle's Y band (overrides auto claims for that turtle).
+local function applyAdminAssign(turtleId, msg)
+  turtleId = tonumber(turtleId) or tonumber(msg.turtleId)
+  local y0 = tonumber(msg.y0)
+  local y1 = tonumber(msg.y1)
+  if not turtleId or y0 == nil or y1 == nil then return false end
+  y0, y1 = math.floor(y0), math.floor(y1)
+  if y1 < y0 then y0, y1 = y1, y0 end
+  -- Free other turtles that overlap this admin band.
+  for id, t in pairs(turtles) do
+    if id ~= turtleId and t.y0 and t.y1 and overlaps(t.y0, t.y1, y0, y1) then
+      print(("[admin] #%d freed Y %d..%d (overlap)"):format(id, t.y0, t.y1))
+      t.y0, t.y1 = nil, nil
+      t.status = "idle"
+      turtles[id] = t
+    end
+  end
+  local keep = {}
+  for _, b in ipairs(completedBands) do
+    if not overlaps(b.y0, b.y1, y0, y1) then
+      keep[#keep + 1] = b
+    else
+      print(("[admin] cleared done Y %d..%d (reassigned)"):format(b.y0, b.y1))
+    end
+  end
+  completedBands = keep
+  local t = turtles[turtleId] or {
+    name = "Turtle-" .. turtleId, seen = now(), status = "assigned",
+  }
+  t.y0, t.y1 = y0, y1
+  t.status = "assigned"
+  t.assignId = msg.assignId
+  t.assignedBy = msg.from
+  t.seen = now()
+  if msg.W then cfg.W = math.max(tonumber(cfg.W) or 0, tonumber(msg.W) or 0) end
+  if msg.L then cfg.L = math.max(tonumber(cfg.L) or 0, tonumber(msg.L) or 0) end
+  if msg.H then cfg.H = math.max(tonumber(cfg.H) or 0, tonumber(msg.H) or 0) end
+  turtles[turtleId] = t
+  saveCfg()
+  print(("[admin] #%d assigned Y %d..%d"):format(turtleId, y0, y1))
+  broadcastStatus()
+  return true
+end
+
 local function handleMsg(id, msg)
   if type(msg) ~= "table" or not msg.type then return end
   local t = tostring(msg.type)
-  if t == "quarry_hello" or t == "quarry_join" or t == "quarry_turtle" then
+  if t == "quarry_assign_set" then
+    applyAdminAssign(msg.turtleId or id, msg)
+  elseif t == "quarry_assign_ack" then
+    local tid = tonumber(msg.turtleId) or id
+    local row = turtles[tid]
+    if row and msg.ok ~= false then
+      row.y0 = tonumber(msg.y0) or row.y0
+      row.y1 = tonumber(msg.y1) or row.y1
+      row.status = row.status or "assigned"
+      row.seen = now()
+      turtles[tid] = row
+      print(("[ack] #%d Y %s..%s"):format(
+        tid, tostring(row.y0), tostring(row.y1)))
+      broadcastStatus()
+    end
+  elseif t == "quarry_hello" or t == "quarry_join" or t == "quarry_turtle" then
     local first = turtles[id] == nil
     touchTurtle(id, msg)
     local row = turtles[id]

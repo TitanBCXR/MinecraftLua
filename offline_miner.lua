@@ -1,6 +1,6 @@
 --[[
   offline_miner.lua  -  Local quarry turtle (optional site board)
-  Titan-Version: 1.1.9
+  Titan-Version: 1.2.0
 
   Place the turtle at the TOP-FRONT-LEFT corner of the dig, facing into the
   mine. That cell is origin 0,0,0:
@@ -75,6 +75,8 @@ local activeJob = nil   -- in-memory copy of JOB_FILE while running
 local siteId = nil
 local siteInfo = nil   -- last welcome / claim
 local maxTravel = nil  -- from site (blocks, round-trip budget)
+-- Tablet Y assign: { y0, y1, assignId, from, W, L, H }
+local adminAssign = nil
 
 local exclude = {}
 local cfg = {
@@ -82,6 +84,7 @@ local cfg = {
   label = nil,
   pattern = "column",  -- "column" | "layer"
   siteId = nil,
+  pendingAssign = nil,
 }
 
 local function currentBpc()
@@ -1040,12 +1043,100 @@ local function sitePayload(extra)
   return msg
 end
 
+-- Apply admin-tablet Y band; ack back to the tablet (and broadcast).
+local function applyQuarryAssign(msg, fromId)
+  if type(msg) ~= "table" then return false end
+  local tid = tonumber(msg.turtleId)
+  if tid and tid ~= os.getComputerID() then return false end
+  local y0 = tonumber(msg.y0)
+  local y1 = tonumber(msg.y1)
+  if y0 == nil or y1 == nil then return false end
+  y0, y1 = math.floor(y0), math.floor(y1)
+  if y1 < y0 then y0, y1 = y1, y0 end
+  adminAssign = {
+    y0 = y0, y1 = y1,
+    assignId = msg.assignId,
+    from = fromId or msg.from,
+    W = tonumber(msg.W), L = tonumber(msg.L), H = tonumber(msg.H),
+  }
+  cfg.pendingAssign = adminAssign
+  saveCfg()
+  siteInfo = siteInfo or {}
+  siteInfo.y0, siteInfo.y1 = y0, y1
+  if adminAssign.W then siteInfo.W = adminAssign.W end
+  if adminAssign.L then siteInfo.L = adminAssign.L end
+  if adminAssign.H then siteInfo.H = adminAssign.H end
+
+  local j = activeJob or loadJobFile()
+  if j then
+    local bandChanged = tonumber(j.y0) ~= y0 or tonumber(j.y1) ~= y1
+    j.y0, j.y1 = y0, y1
+    j.site = true
+    j.H = y1 + 1
+    j.stopY = y1 + 1
+    if bandChanged and not digging then
+      j.idx = 1
+      local W = math.floor(tonumber(j.W) or tonumber(siteInfo.W) or 0)
+      local L = math.floor(tonumber(j.L) or tonumber(j.D) or tonumber(siteInfo.L) or 0)
+      if W > 0 and L > 0 then
+        j.total = #boxBandUnits(W, L, y0, y1)
+      end
+    end
+    if not digging then
+      saveJobFile(j)
+      if activeJob then activeJob = j end
+    end
+  end
+
+  local ack = {
+    type = "quarry_assign_ack",
+    ok = true,
+    turtleId = os.getComputerID(),
+    name = os.getComputerLabel(),
+    y0 = y0, y1 = y1,
+    assignId = msg.assignId,
+    digging = digging == true,
+    status = digging and "mining" or "assigned",
+  }
+  if fromId then rednet.send(fromId, ack, PROTO_QUARRY) end
+  local adminId = tonumber(msg.from)
+  if adminId and adminId ~= fromId then rednet.send(adminId, ack, PROTO_QUARRY) end
+  rednet.broadcast(ack, PROTO_QUARRY)
+  print(("\n[admin] Y assign %d..%d — acked%s"):format(
+    y0, y1, digging and " (applies on next mine/band)" or ""))
+  return true
+end
+
+local function pollAssignReplies(timeout)
+  timeout = tonumber(timeout) or 0.75
+  local deadline = os.clock() + timeout
+  while os.clock() < deadline do
+    local id, msg = rednet.receive(PROTO_QUARRY, math.max(0.05, deadline - os.clock()))
+    if id and type(msg) == "table" then
+      local t = tostring(msg.type or "")
+      if t == "quarry_assign" then
+        applyQuarryAssign(msg, id)
+      elseif t == "quarry_welcome" and not siteId then
+        siteId = id
+        siteInfo = msg
+        maxTravel = tonumber(msg.maxTravel) or maxTravel
+        cfg.siteId = id
+        saveCfg()
+      end
+    end
+  end
+end
+
 -- Broadcast mine data for admin (always). Also unicast to site board when joined.
 -- Swaps slot-15 modem over the diamond pickaxe, then restores the pickaxe.
 local function publishMine(extra)
   if not ensureModemForComms(true) then return false end
   extra = extra or {}
   local base = sitePayload(extra)
+  if adminAssign then
+    base.y0 = adminAssign.y0
+    base.y1 = adminAssign.y1
+  end
   local bcast = {}
   for k, v in pairs(base) do bcast[k] = v end
   bcast.type = "quarry_turtle"
@@ -1057,6 +1148,8 @@ local function publishMine(extra)
     uni.type = extra._siteType or "quarry_progress"
     rednet.send(siteId, uni, PROTO_QUARRY)
   end
+  -- Listen briefly for tablet Y assign + ack it.
+  pollAssignReplies(0.8)
   -- Keep modem up while idle (listening); put pickaxe back while digging.
   if digging then restorePickAfterComms() end
   return true
@@ -1277,7 +1370,9 @@ local function mineNetLoop()
       local id, msg = rednet.receive(PROTO_QUARRY, 2)
       if id and type(msg) == "table" then
         local t = tostring(msg.type or "")
-        if t == "quarry_turtle_req" or t == "quarry_status_req" then
+        if t == "quarry_assign" then
+          applyQuarryAssign(msg, id)
+        elseif t == "quarry_turtle_req" or t == "quarry_status_req" then
           publishMine()
         elseif t == "quarry_welcome" and not siteId then
           siteId = id
@@ -1648,24 +1743,66 @@ local function runClaimBand(claim, fromContinue, existingJob)
   return "done"
 end
 
+local function claimFromAdminAssign()
+  if not adminAssign and type(cfg.pendingAssign) == "table" then
+    adminAssign = cfg.pendingAssign
+  end
+  if not adminAssign or adminAssign.y0 == nil or adminAssign.y1 == nil then
+    return nil
+  end
+  local W = math.floor(tonumber(adminAssign.W) or (siteInfo and siteInfo.W) or 0)
+  local L = math.floor(tonumber(adminAssign.L) or (siteInfo and siteInfo.L) or 0)
+  if W < 1 or L < 1 then
+    local j = loadJobFile()
+    if j then
+      W = math.floor(tonumber(j.W) or W)
+      L = math.floor(tonumber(j.L) or tonumber(j.D) or L)
+    end
+  end
+  if W < 1 or L < 1 then
+    print("Admin Y assign needs footprint (W×L). Site setup or area dig first.")
+    return nil
+  end
+  return {
+    ok = true,
+    y0 = adminAssign.y0, y1 = adminAssign.y1,
+    W = W, L = L,
+    resume = false,
+    fromAdmin = true,
+  }
+end
+
 local function digSiteMine()
-  if not siteId and not joinSite(5, false) then
-    print("Site board required for Y-band claims. Solo dig: `area <W>x<L> <stopY>`.")
+  if not siteId then joinSite(5, true) end
+  if not siteId and not adminAssign and type(cfg.pendingAssign) ~= "table" then
+    print("Need a site board (`join`) or a tablet Y assign (`quarry assign`).")
+    print("Solo dig: `area <W>x<L> <stopY>`.")
     return
   end
 
   -- Always ask the site which Y bands are free/claimed before digging.
   -- Local/site job files are only resumed when they match the assigned claim.
   local prior = loadJobFile()
-  if not prior then prior = fetchJobFromSite(5, true) end
+  if not prior and siteId then prior = fetchJobFromSite(5, true) end
 
   local bandsDone = 0
   while not STOP do
-    local claim = claimBand(bandsDone > 0)
+    local claim = nil
+    if siteId then
+      claim = claimBand(bandsDone > 0)
+    end
+    if not claim then
+      claim = claimFromAdminAssign()
+      if claim and bandsDone > 0 then
+        -- One-shot admin assign — don't loop the same band forever.
+        print("Admin Y band finished — set a new assign on the tablet, or use site claims.")
+        return
+      end
+    end
     if not claim then
       if bandsDone == 0 then
         print("No free Y layers. Site needs `setup WxL H`, or all bands are taken/done.")
-        print("On the site board: `claims` / `clearclaims` to inspect or free bands.")
+        print("Tablet: `quarry assign <id> <y0> <y1>`  |  Site: `claims` / `clearclaims`")
       else
         print("No more free Y layers — this turtle is done claiming.")
       end
@@ -1678,7 +1815,7 @@ local function digSiteMine()
         and tonumber(prior.y1) == tonumber(claim.y1) then
       stored = prior
       print(("Resuming matching job for Y %d..%d"):format(claim.y0, claim.y1))
-    elseif claim.resume then
+    elseif claim.resume and siteId then
       stored = fetchJobFromSite(3, true)
       if stored and (tonumber(stored.y0) ~= tonumber(claim.y0)
           or tonumber(stored.y1) ~= tonumber(claim.y1)) then
@@ -1687,11 +1824,17 @@ local function digSiteMine()
     end
     prior = nil
 
-    print(("Mining claimed Y %d..%d (%d layers)..."):format(
-      claim.y0, claim.y1, claim.y1 - claim.y0 + 1))
+    print(("Mining claimed Y %d..%d (%d layers)%s..."):format(
+      claim.y0, claim.y1, claim.y1 - claim.y0 + 1,
+      claim.fromAdmin and " [tablet]" or ""))
     local r = runClaimBand(claim, stored ~= nil, stored)
     if r ~= "done" then return end
     bandsDone = bandsDone + 1
+    if claim.fromAdmin then
+      cfg.pendingAssign = nil
+      adminAssign = nil
+      saveCfg()
+    end
     print(("Finished Y %d..%d — claiming next free band..."):format(claim.y0, claim.y1))
   end
 end
@@ -1900,6 +2043,9 @@ end
 
 loadCfg()
 loadExclude()
+if type(cfg.pendingAssign) == "table" and cfg.pendingAssign.y0 ~= nil then
+  adminAssign = cfg.pendingAssign
+end
 os.setComputerLabel(os.getComputerLabel() or cfg.label or ("OfflineMiner-" .. os.getComputerID()))
 cfg.label = os.getComputerLabel()
 saveCfg()
