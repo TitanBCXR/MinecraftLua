@@ -1,6 +1,6 @@
 --[[
   offline_miner.lua  -  Local quarry turtle (optional site board)
-  Titan-Version: 1.1.4
+  Titan-Version: 1.1.5
 
   Place the turtle at the TOP-FRONT-LEFT corner of the dig, facing into the
   mine. That cell is origin 0,0,0:
@@ -1167,13 +1167,17 @@ fetchJobFromSite = function(timeout, quiet)
   return nil
 end
 
-local function claimBand()
+local function claimBand(nextBand)
   if not siteId then
     if not joinSite() then return nil end
   end
   if not ensureModemForComms() then return nil end
   local req = sitePayload({})
   req.type = "quarry_claim_req"
+  if nextBand then
+    req.nextBand = true
+    req.forceNew = true
+  end
   rednet.send(siteId, req, PROTO_QUARRY)
   local deadline = os.clock() + 8
   local claim = nil
@@ -1544,73 +1548,116 @@ local function digStair(W, steps, dir)
   runSavedJob(j, false)
 end
 
-local function continueJob()
-  local j = loadJobFile()
-  if not j then
-    print("No local " .. JOB_FILE .. " — asking site board...")
-    j = fetchJobFromSite(6, false)
-  end
-  if not j then
-    print("No saved job locally or on site. Start with area / box / mine.")
-    return
-  end
-  if (j.site or j.y0 ~= nil) and not siteId then
-    joinSite(4, true)
-  end
-  print("Loaded: " .. jobSummary(j))
-  runSavedJob(j, true)
-end
-
-local function digSiteMine()
-  -- Prefer resuming a job the site is holding for us.
-  if not loadJobFile() then
-    local remote = fetchJobFromSite(5, true)
-    if remote then
-      print("Resuming job list from site board.")
-      runSavedJob(remote, true)
-      return
-    end
-  else
-    local j = loadJobFile()
-    if j and j.status ~= "done" and (j.site or j.y0 ~= nil) then
-      print("Continuing local site job.")
-      if not siteId then joinSite(3, true) end
-      runSavedJob(j, true)
-      return
-    end
-  end
-
-  local claim = claimBand()
-  if not claim then
-    print("Tip: start with `area <W>x<L> <stopY>` — progress still goes to the admin tablet.")
-    return
-  end
-  -- Resume claim may already have a stored job with progress.
-  local stored = fetchJobFromSite(3, true)
-  if stored and stored.y0 == claim.y0 and stored.y1 == claim.y1 then
-    print("Resuming claimed band from site job list.")
-    runSavedJob(stored, true)
-    return
-  end
+-- Dig one claimed Y band. Returns "done" | "paused" | "stop" | "bad".
+local function runClaimBand(claim, fromContinue, existingJob)
   local W = math.floor(tonumber(claim.W) or 0)
   local L = math.floor(tonumber(claim.L) or 0)
   local y0 = tonumber(claim.y0)
   local y1 = tonumber(claim.y1)
   if W < 1 or L < 1 or y0 == nil or y1 == nil then
     print("Bad claim from site.")
-    return
+    return "bad"
   end
-  dug, skipped = 0, 0
-  local units = boxBandUnits(W, L, y0, y1)
-  local j = {
-    type = "area", W = W, L = L, stopY = y1 + 1,
-    H = y1 + 1, D = L, pattern = "layer",
-    y0 = y0, y1 = y1, site = true,
-    idx = 1, total = #units, status = "active", dug = 0, skipped = 0,
-  }
+  local j = existingJob
+  if not j then
+    dug, skipped = 0, 0
+    local units = boxBandUnits(W, L, y0, y1)
+    j = {
+      type = "area", W = W, L = L, stopY = y1 + 1,
+      H = y1 + 1, D = L, pattern = "layer",
+      y0 = y0, y1 = y1, site = true,
+      idx = 1, total = #units, status = "active", dug = 0, skipped = 0,
+    }
+  else
+    j.site = true
+    j.y0 = y0
+    j.y1 = y1
+    j.W = W
+    j.L = L
+    j.D = L
+    j.H = y1 + 1
+    j.stopY = y1 + 1
+  end
   siteSendJob(j)
   siteReportProgress({ status = "mining", y0 = y0, y1 = y1, job = j, jobFile = JOB_FILE })
-  runSavedJob(j, false)
+  runSavedJob(j, fromContinue == true)
+  if STOP then return "stop" end
+  if loadJobFile() then return "paused" end
+  return "done"
+end
+
+local function digSiteMine()
+  if not siteId and not joinSite(5, false) then
+    print("Site board required for Y-band claims. Solo dig: `area <W>x<L> <stopY>`.")
+    return
+  end
+
+  -- Finish an incomplete claimed band first (local or from site).
+  local j = loadJobFile()
+  if not j then j = fetchJobFromSite(5, true) end
+  if j and j.status ~= "done" and (j.site or j.y0 ~= nil) then
+    print(("Resuming claimed Y %s..%s ..."):format(tostring(j.y0), tostring(j.y1)))
+    local r = runClaimBand({
+      W = j.W, L = j.L or j.D, y0 = j.y0, y1 = j.y1,
+    }, true, j)
+    if r ~= "done" then return end
+    print("Y band complete.")
+  end
+
+  local bandsDone = 0
+  while not STOP do
+    -- After each finished band, ask for a *new* free Y claim.
+    local claim = claimBand(bandsDone > 0 or (j ~= nil))
+    if not claim then
+      if bandsDone == 0 and not j then
+        print("No free Y layers. Site needs `setup WxL H`, or all bands are taken/done.")
+      else
+        print("No more free Y layers — this turtle is done claiming.")
+      end
+      return
+    end
+    local stored = nil
+    if claim.resume then
+      stored = fetchJobFromSite(3, true)
+      if stored and (tonumber(stored.y0) ~= tonumber(claim.y0)
+          or tonumber(stored.y1) ~= tonumber(claim.y1)) then
+        stored = nil
+      end
+    end
+    print(("Mining claimed Y %d..%d (%d layers)..."):format(
+      claim.y0, claim.y1, claim.y1 - claim.y0 + 1))
+    local r = runClaimBand(claim, stored ~= nil, stored)
+    if r ~= "done" then return end
+    bandsDone = bandsDone + 1
+    j = nil
+    print(("Finished Y %d..%d — claiming next free band..."):format(claim.y0, claim.y1))
+  end
+end
+
+local function continueJob()
+  local j = loadJobFile()
+  if not j then
+    print("No local " .. JOB_FILE .. " — asking site board...")
+    j = fetchJobFromSite(6, false)
+  end
+  if j and (j.site or j.y0 ~= nil) then
+    -- Site jobs: resume band then keep claiming more Y levels.
+    if not siteId then joinSite(4, true) end
+    print("Loaded: " .. jobSummary(j))
+    digSiteMine()
+    return
+  end
+  if not j then
+    if siteId or joinSite(4, true) then
+      print("No saved job — claiming a Y band from the site...")
+      digSiteMine()
+      return
+    end
+    print("No saved job locally or on site. Start with area / box / mine.")
+    return
+  end
+  print("Loaded: " .. jobSummary(j))
+  runSavedJob(j, true)
 end
 
 --------------------------------------------------------------------------------
@@ -1625,7 +1672,7 @@ local function printHelp()
   print("  tunnel <L> [W]                   player-tall (2 high) corridor")
   print("  stair <W>x<steps> <up|down>      player-tall staircase")
   print("  join                             find optional site board (modem)")
-  print("  mine                             claim a Y band (needs site board)")
+  print("  mine                             claim Y bands from site until none left")
   print("  site                             show site / BPC / mine broadcast")
   print("  equip [left|right]               equip pick from inventory (aliases: tool, pick)")
   print("  continue | resume                resume saved job (local or from site)")
@@ -1633,8 +1680,8 @@ local function printHelp()
   print("  home | dump | refuel | setup | stop | status")
   print("")
   print("Slot 15 = wireless modem (swaps over diamond pickaxe for site/admin).")
-  print("Loader upgrades are never replaced. Slot 16 = coal.")
-  print("No local job? `continue` / `mine` pull the job list from the site board.")
+  print("With a site board: each turtle claims its own Y band; when finished it")
+  print("claims another until no free layers remain. Solo: `area <W>x<L> <H>`.")
   print("Jobs save to " .. JOB_FILE .. " while running / paused.")
   print("Finished digs clear that file automatically. After stop: origin + continue.")
   print("Enchanted pick: put it in inventory, then `equip` (not craft onto turtle).")

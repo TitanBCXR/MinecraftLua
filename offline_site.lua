@@ -1,6 +1,6 @@
 --[[
   offline_site.lua  -  Quarry site board for multi-turtle offline miners
-  Titan-Version: 1.0.3
+  Titan-Version: 1.0.4
 
   Place this computer to the LEFT of the storage chest (storage sits behind
   the turtles' origin). Attach a modem (wired to the turtles is fine, or
@@ -354,12 +354,26 @@ local function touchTurtle(id, msg)
 end
 
 local function assignClaim(id, msg)
-  local t = touchTurtle(id, msg or {})
+  msg = msg or {}
+  local t = touchTurtle(id, msg)
   if (tonumber(cfg.H) or 0) < 1 or (tonumber(cfg.W) or 0) < 1 then
     return {
       type = "quarry_claim", ok = false,
-      err = "site size unknown — start a turtle with area WxL H first (auto-learn)",
+      err = "site size unknown — setup WxL H or let a turtle area-dig first",
     }
+  end
+  -- Turtle finished a band and wants another: release old claim, don't resume it.
+  if msg.nextBand or msg.forceNew then
+    if t.y0 and t.y1 and t.status ~= "done" then
+      completedBands[#completedBands + 1] = { y0 = t.y0, y1 = t.y1 }
+      print(("[done] #%d released Y %d..%d for next claim"):format(id, t.y0, t.y1))
+    end
+    t.y0, t.y1 = nil, nil
+    t.status = "idle"
+    t.job = nil
+    t.idx, t.total = nil, nil
+    persistTurtleJob(id, nil)
+    turtles[id] = t
   end
   if t.y0 and t.y1 and t.status ~= "done" then
     return {
@@ -378,6 +392,7 @@ local function assignClaim(id, msg)
   t.y0, t.y1 = y0, y1
   t.status = "assigned"
   t.idx, t.total = 1, nil
+  t.job = nil
   turtles[id] = t
   print(("[claim] #%d %s → Y %d..%d (%d layers)"):format(
     id, tostring(t.name), y0, y1, y1 - y0 + 1))
@@ -387,6 +402,7 @@ local function assignClaim(id, msg)
     y0 = y0, y1 = y1,
     W = cfg.W, L = cfg.L, H = cfg.H,
     maxTravel = maxTravel(), minBpc = minBpc(),
+    resume = false,
   }
 end
 
@@ -398,6 +414,8 @@ local function markDone(id, msg)
   end
   t.status = "done"
   t.y0, t.y1 = nil, nil
+  t.job = nil
+  persistTurtleJob(id, nil)  -- clear so turtle can claim a fresh band
   turtles[id] = t
 end
 

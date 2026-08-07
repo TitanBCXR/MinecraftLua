@@ -508,6 +508,10 @@ If a turtle has **no local** `offline_miner_job.cfg`, `continue` / `mine` / `joi
 pull the stored job list from the site board (`quarry_jobs/<id>_…`) and resume
 from that.
 
+With a site board, `mine` **claims a Y band** for that turtle (other turtles get
+their own bands). When a band is finished the turtle claims the **next free**
+band until none remain.
+
 Put an enchanted pick in the turtle’s inventory and run `equip` (or reboot /
 `setup`) — the script uses `turtle.equipLeft`/`equipRight` so you don’t have to
 craft the tool onto the turtle. Dump leaves picks in the inventory so they aren’t
