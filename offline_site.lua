@@ -1,6 +1,6 @@
 --[[
   offline_site.lua  -  Quarry site board for multi-turtle offline miners
-  Titan-Version: 1.0.7
+  Titan-Version: 1.0.8
 
   Place this computer to the LEFT of the storage chest (storage sits behind
   the turtles' origin). Attach a modem (wired to the turtles is fine, or
@@ -101,20 +101,6 @@ local function loadStoredJob(id)
     return d
   end
   return nil
-end
-
-local function jobReplyFor(id)
-  local job = loadStoredJob(id)
-  local t = turtles[id] or {}
-  return {
-    type = "quarry_job_reply",
-    ok = job ~= nil,
-    job = job,
-    jobFile = job and turtleJobPath(id) or nil,
-    y0 = t.y0, y1 = t.y1,
-    W = cfg.W, L = cfg.L, H = cfg.H,
-    maxTravel = maxTravel(), minBpc = minBpc(),
-  }
 end
 
 local function loadCfg()
@@ -384,6 +370,20 @@ local function maxTravel()
   -- Round-trip budget from worst BPC × ~32 coal, keep 40% margin.
   local bpc = minBpc()
   return math.max(16, math.floor(bpc * 32 * 0.4))
+end
+
+local function jobReplyFor(id)
+  local job = loadStoredJob(id)
+  local t = turtles[id] or {}
+  return {
+    type = "quarry_job_reply",
+    ok = job ~= nil,
+    job = job,
+    jobFile = job and turtleJobPath(id) or nil,
+    y0 = t.y0, y1 = t.y1,
+    W = cfg.W, L = cfg.L, H = cfg.H,
+    maxTravel = maxTravel(), minBpc = minBpc(),
+  }
 end
 
 local function siteProgress()
