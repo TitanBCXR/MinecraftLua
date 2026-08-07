@@ -1,6 +1,6 @@
 --[[
   pastebin_install.lua  -  Pastebin bootstrap installer for the Titan system
-  Titan-Version: 1.1.16
+  Titan-Version: 1.1.17
 
   Pulls the Titan files straight from Pastebin (no in-game host needed). Upload
   each file to pastebin.com once, paste its CODE into the table below, then
@@ -34,6 +34,9 @@ local CODES = {
   ["router.lua"]    = "",
   ["router_main.lua"] = "",
   ["router_modem.lua"] = "",
+  ["lib/router_hub_net.lua"] = "",
+  ["lib/router_hub_ui.lua"] = "",
+  ["lib/router_hub_cmd.lua"] = "",
   ["miner.lua"]     = "",
   ["offline_miner.lua"] = "",
   ["loader.lua"]    = "",
@@ -70,7 +73,9 @@ local ROLES = {
   { key = "10", name = "GPS locator (pocket)",             run = "locator.lua",
     files = { "lib/titan.lua", "locator.lua" } },
   { key = "11", name = "Network router (repeater + GPS)",  run = "router.lua",
-    files = { "lib/titan.lua", "router.lua", "router_main.lua", "router_modem.lua", "versions.lua" } },
+    files = { "lib/titan.lua", "router.lua", "router_main.lua", "router_modem.lua",
+              "lib/router_hub_net.lua", "lib/router_hub_ui.lua", "lib/router_hub_cmd.lua",
+              "versions.lua" } },
   { key = "12", name = "Miner (area quarry turtle)",       run = "miner.lua",
     files = { "lib/titan.lua", "miner.lua", "exclude.txt" } },
   { key = "13", name = "Offline miner (no GPS/network)",  run = "offline_miner.lua",
@@ -89,6 +94,7 @@ local ROLES = {
     files = { "lib/titan.lua", "hub.lua", "bot.lua", "poi.lua", "worker.lua", "botserver.lua",
               "datacenter.lua", "console.lua", "admin.lua", "gpshost.lua", "locator.lua",
               "router.lua", "router_main.lua", "router_modem.lua",
+              "lib/router_hub_net.lua", "lib/router_hub_ui.lua", "lib/router_hub_cmd.lua",
               "miner.lua", "offline_miner.lua", "loader.lua", "marker.lua", "storage_manager.lua",
               "perimeter_sensor.lua", "perimeter_manager.lua",
               "exclude.txt", "versions.lua" } },

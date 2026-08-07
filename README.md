@@ -669,10 +669,12 @@ the matching runtime if needed, then runs it:
 
 | Role | Runtime file |
 |------|----------------|
-| **MAIN** / **ROUTER** | `router_main.lua` |
+| **MAIN** / **ROUTER** | `router_main.lua` + `lib/router_hub_*.lua` |
 | **MODEM** | `router_modem.lua` |
 
 Missing files are pulled from the install manifest or GitHub automatically.
+Hub logic is split across `lib/router_hub_net.lua`, `lib/router_hub_ui.lua`, and
+`lib/router_hub_cmd.lua` (avoids Lua’s 200-local limit).
 
 Ties the whole network together over wireless. Three roles:
 

@@ -1,6 +1,6 @@
 --[[
   router.lua  -  Titan network router bootstrap (CC: Tweaked)
-  Titan-Version: 1.4.0
+  Titan-Version: 1.4.2
 
   Detects this computer's role from router.cfg (or asks once), ensures the
   matching runtime file is installed, then runs it:
@@ -9,9 +9,11 @@
     MODEM          →  router_modem.lua  (local RF cell + mesh hop)
 
   Auto-install sources (first that works):
-    1) already on disk
-    2) .titan-install manifest (github / pastebin / host)
-    3) GitHub raw (TitanBCXR/MinecraftLua)
+    1) .titan-install manifest (github / pastebin / host)
+    2) GitHub raw (TitanBCXR/MinecraftLua)
+
+  Re-downloads hub files when local Titan-Version is older than required
+  (so a leftover monolith router_main.lua gets replaced).
 
   Run:  router
 ]]
@@ -23,6 +25,22 @@ local MANIFEST = ".titan-install"
 local HUB_FILE = "router_main.lua"
 local MODEM_FILE = "router_modem.lua"
 local SHARED = { "lib/titan.lua", "versions.lua" }
+local HUB_PARTS = {
+  "lib/router_hub_net.lua",
+  "lib/router_hub_ui.lua",
+  "lib/router_hub_cmd.lua",
+}
+
+-- Minimum versions — bootstrap re-fetches if local is older / missing header.
+local MIN_VER = {
+  ["router.lua"] = "1.4.2",
+  ["router_main.lua"] = "1.4.1",
+  ["router_modem.lua"] = "1.4.0",
+  ["lib/router_hub_net.lua"] = "1.4.1",
+  ["lib/router_hub_ui.lua"] = "1.4.1",
+  ["lib/router_hub_cmd.lua"] = "1.4.1",
+  ["lib/titan.lua"] = "1.2.19",
+}
 
 --------------------------------------------------------------------------------
 -- Tiny helpers (keep this file well under the 200-local limit)
@@ -71,6 +89,55 @@ local function readManifest()
   return type(d) == "table" and d or nil
 end
 
+local function versionCmp(a, b)
+  local function parts(v)
+    local t = {}
+    for n in tostring(v or "0"):gmatch("%d+") do t[#t + 1] = tonumber(n) or 0 end
+    if #t == 0 then t[1] = 0 end
+    return t
+  end
+  local pa, pb = parts(a), parts(b)
+  local n = math.max(#pa, #pb)
+  for i = 1, n do
+    local x, y = pa[i] or 0, pb[i] or 0
+    if x < y then return -1 end
+    if x > y then return 1 end
+  end
+  return 0
+end
+
+local function readFileVersion(path)
+  if not fs.exists(path) or fs.isDir(path) then return nil end
+  local f = fs.open(path, "r")
+  if not f then return nil end
+  for _ = 1, 40 do
+    local line = f.readLine()
+    if not line then break end
+    local ver = line:match("[Tt]itan%-[Vv]ersion:%s*([%d%.]+)")
+    if ver then f.close(); return ver end
+  end
+  f.close()
+  return nil
+end
+
+-- Old monolith hub is huge and has no split parts; force replace.
+local function isStaleHubMain()
+  if not fs.exists(HUB_FILE) then return true end
+  local ver = readFileVersion(HUB_FILE)
+  if not ver or versionCmp(ver, MIN_VER[HUB_FILE]) < 0 then return true end
+  if not fs.exists("lib/router_hub_net.lua") then return true end
+  -- Monolith was ~4000+ lines; split loader is under ~200.
+  local f = fs.open(HUB_FILE, "r")
+  if not f then return true end
+  local n, line = 0, f.readLine()
+  while line and n < 250 do
+    n = n + 1
+    line = f.readLine()
+  end
+  f.close()
+  return n >= 250
+end
+
 local function trackPackage(path)
   if not fs.exists("lib/titan.lua") then return end
   local ok, titan = pcall(dofile, "lib/titan.lua")
@@ -98,39 +165,50 @@ local function fetchFromManifest(path)
   elseif m.source == "pastebin" and m.codes and m.codes[path] then
     return httpGet("https://pastebin.com/raw/" .. m.codes[path] .. "?cb=" .. os.epoch("utc"))
   elseif m.source == "host" then
-    -- Prefer titan OTA if available.
-    if fs.exists("lib/titan.lua") then
-      local ok, titan = pcall(dofile, "lib/titan.lua")
-      if ok and titan and titan.updateSelf then
-        -- Fall through to github below if host pull is awkward; try broadcast file get via update list.
-      end
-    end
-    return nil, "host source — install via host or github"
+    return nil, "host source — use github or reinstall"
   end
   return nil, "unknown manifest source"
 end
 
-local function ensureFile(path, required)
-  if fs.exists(path) and not fs.isDir(path) then
-    return true, "present"
-  end
-  print("[router] Missing " .. path .. " — downloading…")
+local function downloadFile(path)
   local data, err = fetchFromManifest(path)
   if not data then
     data, err = httpGet(GH_BASE .. path .. "?cb=" .. os.epoch("utc"))
   end
-  if not data then
-    if required then
-      return false, err or "download failed"
-    end
-    print("[router] Optional skip: " .. path .. " (" .. tostring(err) .. ")")
-    return false, err
-  end
+  if not data then return false, err or "download failed" end
   local ok, werr = writeFile(path, data)
   if not ok then return false, werr end
   local ver = data:match("[Tt]itan%-[Vv]ersion:%s*([%d%.]+)")
   print("[router] Installed " .. path .. (ver and (" v" .. ver) or ""))
   trackPackage(path)
+  return true, "downloaded"
+end
+
+local function needsUpdate(path)
+  if not fs.exists(path) or fs.isDir(path) then return true, "missing" end
+  local min = MIN_VER[path]
+  if not min then return false, "present" end
+  local ver = readFileVersion(path)
+  if not ver then return true, "no version header" end
+  if versionCmp(ver, min) < 0 then return true, ("v%s < v%s"):format(ver, min) end
+  return false, "present"
+end
+
+local function ensureFile(path, required, force)
+  local stale, why = needsUpdate(path)
+  if path == HUB_FILE and isStaleHubMain() then
+    stale, why = true, "old monolith hub"
+  end
+  if force then stale, why = true, "reload" end
+  if not stale then return true, why end
+
+  print("[router] Fetching " .. path .. " (" .. tostring(why) .. ")…")
+  local ok, err = downloadFile(path)
+  if not ok then
+    if required then return false, err end
+    print("[router] Optional skip: " .. path .. " (" .. tostring(err) .. ")")
+    return false, err
+  end
   return true, "downloaded"
 end
 
@@ -185,7 +263,6 @@ os.setComputerLabel(os.getComputerLabel() or ("Router-" .. os.getComputerID()))
 local role = select(1, detectRole())
 local runtime = (role == "modem") and MODEM_FILE or HUB_FILE
 
--- Shared deps first (titan helps package tracking).
 for _, path in ipairs(SHARED) do
   local ok, err = ensureFile(path, path == "lib/titan.lua")
   if not ok and path == "lib/titan.lua" then
@@ -202,19 +279,42 @@ if not ok then
   return
 end
 
--- Keep the other runtime optional (handy if role changes later).
 if runtime == HUB_FILE then
   ensureFile(MODEM_FILE, false)
+  for _, part in ipairs(HUB_PARTS) do
+    local pok, perr = ensureFile(part, true)
+    if not pok then
+      printError("[router] Could not install " .. part .. ": " .. tostring(perr))
+      return
+    end
+  end
 else
   ensureFile(HUB_FILE, false)
 end
 
 print(("[router] Role %s → %s"):format(role:upper(), runtime))
-local fn, lerr = loadfile(runtime)
+
+local function tryLoad()
+  local fn, lerr = loadfile(runtime)
+  if not fn then return nil, lerr end
+  return fn
+end
+
+local fn, lerr = tryLoad()
+if not fn and runtime == HUB_FILE then
+  print("[router] Load failed — force-refreshing hub files…")
+  print(tostring(lerr))
+  ensureFile(HUB_FILE, true, true)
+  for _, part in ipairs(HUB_PARTS) do ensureFile(part, true, true) end
+  fn, lerr = tryLoad()
+end
+
 if not fn then
   printError("[router] loadfile failed: " .. tostring(lerr))
+  print("Delete router_main.lua and run `router` again, or reinstall from GitHub.")
   return
 end
+
 local okRun, runErr = pcall(fn)
 if not okRun then
   printError("[router] " .. runtime .. " error: " .. tostring(runErr))
