@@ -1,6 +1,6 @@
 --[[
   offline_site.lua  -  Quarry site board for multi-turtle offline miners
-  Titan-Version: 1.0.4
+  Titan-Version: 1.0.6
 
   Place this computer to the LEFT of the storage chest (storage sits behind
   the turtles' origin). Attach a modem (wired to the turtles is fine, or
@@ -19,6 +19,8 @@
     setup <W>x<L> <H> [half|third]   lock footprint manually
     auto                             unlock auto-learn from turtles
     fraction half|third              max Y band size per turtle
+    claims                           list claimed / free Y bands
+    clearclaims [all|done|stale|Y…]  release Y claims (see help)
     status | turtles | jobs | clear
     help | exit
 
@@ -32,6 +34,9 @@ local NET = "titan_net"
 local CFG = "offline_site.cfg"
 local JOB_DIR = "quarry_jobs"
 local ONLINE_SECS = 45
+-- How long without a ping before `clearclaims stale` / UI marks a turtle stale.
+-- Claims are NEVER auto-released on this timer — deep digs can go quiet for a long time.
+local STALE_CLAIM_SECS = ONLINE_SECS * 4
 
 local titan = nil
 if fs.exists("lib/titan.lua") then
@@ -128,12 +133,26 @@ local function loadCfg()
   cfg.W = tonumber(cfg.W) or 0
   cfg.L = tonumber(cfg.L) or 0
   cfg.H = tonumber(cfg.H) or 0
+  completedBands = {}
+  if type(cfg.completedBands) == "table" then
+    for _, b in ipairs(cfg.completedBands) do
+      local y0, y1 = tonumber(b.y0), tonumber(b.y1)
+      if y0 and y1 then
+        completedBands[#completedBands + 1] = { y0 = y0, y1 = y1 }
+      end
+    end
+  end
 end
 
 local function saveCfg()
+  cfg.completedBands = completedBands
   local f = fs.open(CFG, "w")
   f.write(textutils.serialize(cfg))
   f.close()
+end
+
+local function overlaps(a0, a1, b0, b1)
+  return not (a1 < b0 or a0 > b1)
 end
 
 -- Grow (or initially set) footprint from a turtle's mine/job report.
@@ -192,7 +211,23 @@ local function fractionLabel()
   return "half"
 end
 
--- Occupied Y layers (claimed by live turtles or completed).
+-- Manual only (`clearclaims stale`) — never called while assigning bands.
+local function releaseStaleClaims()
+  local n = 0
+  for id, t in pairs(turtles) do
+    if t.y0 and t.y1 and t.status ~= "done" and ago(t.seen) >= STALE_CLAIM_SECS then
+      print(("[stale] #%d released Y %d..%d (no ping %ss)"):format(
+        id, t.y0, t.y1, tostring(ago(t.seen))))
+      t.y0, t.y1 = nil, nil
+      t.status = "stale"
+      turtles[id] = t
+      n = n + 1
+    end
+  end
+  return n
+end
+
+-- Occupied Y layers (any active turtle claim + completed bands). No ping timeout.
 local function occupiedLayers()
   local occ = {}
   local H = math.max(0, tonumber(cfg.H) or 0)
@@ -212,6 +247,50 @@ local function occupiedLayers()
   return occ
 end
 
+local function listClaimEntries()
+  local entries = {}
+  for id, t in pairs(turtles) do
+    if t.y0 and t.y1 and t.status ~= "done" then
+      entries[#entries + 1] = {
+        kind = "active",
+        id = id,
+        name = t.name,
+        y0 = t.y0, y1 = t.y1,
+        stale = ago(t.seen) >= STALE_CLAIM_SECS,
+        status = t.status,
+      }
+    end
+  end
+  for _, b in ipairs(completedBands) do
+    entries[#entries + 1] = { kind = "done", y0 = b.y0, y1 = b.y1 }
+  end
+  table.sort(entries, function(a, b)
+    if a.y0 ~= b.y0 then return a.y0 < b.y0 end
+    return (a.y1 or 0) < (b.y1 or 0)
+  end)
+  return entries
+end
+
+local function listFreeBands()
+  local H = math.max(0, tonumber(cfg.H) or 0)
+  local occ = occupiedLayers()
+  local frees = {}
+  local y = 0
+  while y < H do
+    if not occ[y] then
+      local y0, y1 = y, y
+      while y1 + 1 < H and not occ[y1 + 1] do
+        y1 = y1 + 1
+      end
+      frees[#frees + 1] = { y0 = y0, y1 = y1 }
+      y = y1 + 1
+    else
+      y = y + 1
+    end
+  end
+  return frees
+end
+
 local function nextFreeBand()
   local H = math.max(1, tonumber(cfg.H) or 1)
   local maxN = maxClaimLayers()
@@ -229,6 +308,65 @@ local function nextFreeBand()
     y = y + 1
   end
   return nil
+end
+
+-- Release active and/or completed claims. y0/y1 nil = entire height.
+local function clearClaims(mode, y0, y1)
+  mode = tostring(mode or "all"):lower()
+  local H = math.max(0, tonumber(cfg.H) or 0)
+  if y0 ~= nil then
+    y0 = math.floor(tonumber(y0) or 0)
+    y1 = math.floor(tonumber(y1) or y0)
+    if y1 < y0 then y0, y1 = y1, y0 end
+  else
+    y0, y1 = 0, math.max(0, H - 1)
+  end
+  local released = 0
+
+  if mode == "all" or mode == "active" or mode == "y" or mode == "turtle" then
+    for id, t in pairs(turtles) do
+      if t.y0 and t.y1 and overlaps(t.y0, t.y1, y0, y1) then
+        print(("[unclaim] #%d Y %d..%d"):format(id, t.y0, t.y1))
+        t.y0, t.y1 = nil, nil
+        if t.status == "assigned" or t.status == "mining" then t.status = "idle" end
+        turtles[id] = t
+        released = released + 1
+      end
+    end
+  end
+
+  if mode == "all" or mode == "done" or mode == "y" then
+    local keep = {}
+    for _, b in ipairs(completedBands) do
+      if overlaps(b.y0, b.y1, y0, y1) then
+        print(("[unclaim] done Y %d..%d"):format(b.y0, b.y1))
+        released = released + 1
+      else
+        keep[#keep + 1] = b
+      end
+    end
+    completedBands = keep
+  end
+
+  if mode == "stale" then
+    released = releaseStaleClaims()
+  end
+
+  saveCfg()
+  return released
+end
+
+local function clearTurtleClaim(id)
+  id = tonumber(id)
+  if not id or not turtles[id] then return 0 end
+  local t = turtles[id]
+  if not t.y0 then return 0 end
+  print(("[unclaim] #%d Y %d..%d"):format(id, t.y0, t.y1))
+  t.y0, t.y1 = nil, nil
+  t.status = "idle"
+  turtles[id] = t
+  saveCfg()
+  return 1
 end
 
 local function minBpc()
@@ -306,6 +444,8 @@ local function snapshot()
     minBpc = minBpc(), maxTravel = maxTravel(),
     online = onlineCount(),
     turtles = list,
+    claims = listClaimEntries(),
+    free = listFreeBands(),
   }
 end
 
@@ -353,20 +493,35 @@ local function touchTurtle(id, msg)
   return t
 end
 
+local function claimPayload(extra)
+  local p = {
+    type = "quarry_claim",
+    W = cfg.W, L = cfg.L, H = cfg.H,
+    maxTravel = maxTravel(), minBpc = minBpc(),
+    claims = listClaimEntries(),
+    free = listFreeBands(),
+  }
+  if type(extra) == "table" then
+    for k, v in pairs(extra) do p[k] = v end
+  end
+  return p
+end
+
 local function assignClaim(id, msg)
   msg = msg or {}
   local t = touchTurtle(id, msg)
   if (tonumber(cfg.H) or 0) < 1 or (tonumber(cfg.W) or 0) < 1 then
-    return {
-      type = "quarry_claim", ok = false,
+    return claimPayload({
+      ok = false,
       err = "site size unknown — setup WxL H or let a turtle area-dig first",
-    }
+    })
   end
   -- Turtle finished a band and wants another: release old claim, don't resume it.
   if msg.nextBand or msg.forceNew then
     if t.y0 and t.y1 and t.status ~= "done" then
       completedBands[#completedBands + 1] = { y0 = t.y0, y1 = t.y1 }
       print(("[done] #%d released Y %d..%d for next claim"):format(id, t.y0, t.y1))
+      saveCfg()
     end
     t.y0, t.y1 = nil, nil
     t.status = "idle"
@@ -375,19 +530,17 @@ local function assignClaim(id, msg)
     persistTurtleJob(id, nil)
     turtles[id] = t
   end
+  -- Keep the turtle's band forever until done / clearclaims (deep digs go quiet).
   if t.y0 and t.y1 and t.status ~= "done" then
-    return {
-      type = "quarry_claim",
+    return claimPayload({
       ok = true,
       y0 = t.y0, y1 = t.y1,
-      W = cfg.W, L = cfg.L, H = cfg.H,
-      maxTravel = maxTravel(), minBpc = minBpc(),
       resume = true,
-    }
+    })
   end
   local y0, y1 = nextFreeBand()
   if not y0 then
-    return { type = "quarry_claim", ok = false, err = "no free Y layers" }
+    return claimPayload({ ok = false, err = "no free Y layers" })
   end
   t.y0, t.y1 = y0, y1
   t.status = "assigned"
@@ -396,14 +549,11 @@ local function assignClaim(id, msg)
   turtles[id] = t
   print(("[claim] #%d %s → Y %d..%d (%d layers)"):format(
     id, tostring(t.name), y0, y1, y1 - y0 + 1))
-  return {
-    type = "quarry_claim",
+  return claimPayload({
     ok = true,
     y0 = y0, y1 = y1,
-    W = cfg.W, L = cfg.L, H = cfg.H,
-    maxTravel = maxTravel(), minBpc = minBpc(),
     resume = false,
-  }
+  })
 end
 
 local function markDone(id, msg)
@@ -411,6 +561,7 @@ local function markDone(id, msg)
   if t.y0 and t.y1 then
     completedBands[#completedBands + 1] = { y0 = t.y0, y1 = t.y1 }
     print(("[done] #%d finished Y %d..%d"):format(id, t.y0, t.y1))
+    saveCfg()
   end
   t.status = "done"
   t.y0, t.y1 = nil, nil
@@ -585,11 +736,45 @@ local function printHelp()
   print("  setup <W>x<L> <H> [half|third]   lock shared dig volume")
   print("  auto                             learn size from turtle mine data")
   print("  fraction half|third              max Y band per turtle")
+  print("  claims                           show claimed + free Y bands")
+  print("  clearclaims                      release ALL Y claims (active+done)")
+  print("  clearclaims done                 clear finished bands only")
+  print("  clearclaims stale                free bands from quiet turtles (manual)")
+  print("  clearclaims Y <y0> [y1]          clear claims overlapping Y range")
+  print("  clearclaims turtle <id>          release one turtle's claim")
   print("  status | turtles | jobs | clear | broadcast")
   print("  help | exit")
   print("")
-  print("Auto-learns W×L×H when turtles run area/box (or join).")
+  print("Turtles call mine/join → site assigns the next free Y band.")
   print("Job files: " .. JOB_DIR .. "/<id>_offline_miner_job.cfg")
+end
+
+local function printClaims()
+  local entries = listClaimEntries()
+  local frees = listFreeBands()
+  if #entries == 0 then
+    print("No Y claims.")
+  else
+    print("Claimed Y bands:")
+    for _, e in ipairs(entries) do
+      if e.kind == "done" then
+        print(("  Y %d..%d  [done]"):format(e.y0, e.y1))
+      else
+        print(("  Y %d..%d  #%d %s%s"):format(
+          e.y0, e.y1, e.id, tostring(e.name or "?"):sub(1, 12),
+          e.stale and " (stale)" or ""))
+      end
+    end
+  end
+  if #frees == 0 then
+    print("Free Y: (none)")
+  else
+    local parts = {}
+    for _, f in ipairs(frees) do
+      parts[#parts + 1] = ("%d..%d"):format(f.y0, f.y1)
+    end
+    print("Free Y: " .. table.concat(parts, ", "))
+  end
 end
 
 local function handleCommand(line)
@@ -641,6 +826,42 @@ local function handleCommand(line)
         print(("#%d memory: %s"):format(t.id, t.jobSummary or "?"))
       end
     end
+  elseif cmd == "claims" or cmd == "claim" then
+    printClaims()
+  elseif cmd == "clearclaims" or cmd == "unclaim" then
+    local sub = tostring(a[2] or "all"):lower()
+    local n = 0
+    if sub == "" or sub == "all" then
+      n = clearClaims("all")
+      print(("Cleared all Y claims (%d released). Turtles can re-claim with mine."):format(n))
+    elseif sub == "done" or sub == "completed" then
+      n = clearClaims("done")
+      print(("Cleared completed Y bands (%d)."):format(n))
+    elseif sub == "stale" then
+      n = clearClaims("stale")
+      print(("Released stale turtle claims (%d)."):format(n))
+    elseif sub == "active" then
+      n = clearClaims("active")
+      print(("Released active turtle claims (%d)."):format(n))
+    elseif sub == "turtle" or sub == "id" then
+      n = clearTurtleClaim(a[3] or a[2])
+      if n < 1 then print("No claim for that turtle id.")
+      else print("Released turtle claim.") end
+    elseif sub == "y" or sub == "Y" or tonumber(sub) then
+      local y0 = tonumber(sub == "y" and a[3] or sub)
+      local y1 = tonumber(sub == "y" and a[4] or a[3]) or y0
+      if not y0 then
+        print("Usage: clearclaims Y <y0> [y1]")
+      else
+        n = clearClaims("y", y0, y1)
+        print(("Cleared claims overlapping Y %d..%d (%d)."):format(y0, y1 or y0, n))
+      end
+    else
+      print("Usage: clearclaims [all|done|stale|active|Y <y0> [y1]|turtle <id>]")
+      return true
+    end
+    broadcastStatus()
+    printClaims()
   elseif cmd == "clear" then
     turtles, completedBands = {}, {}
     if fs.exists(JOB_DIR) then
@@ -648,7 +869,9 @@ local function handleCommand(line)
         pcall(fs.delete, JOB_DIR .. "/" .. name)
       end
     end
-    print("Cleared turtle claims / completed bands / quarry_jobs (footprint kept).")
+    saveCfg()
+    print("Cleared turtle registry / Y claims / quarry_jobs (footprint kept).")
+    print("Tip: `clearclaims` frees Y bands without wiping job files.")
     broadcastStatus()
   elseif cmd == "auto" then
     cfg.manual = false

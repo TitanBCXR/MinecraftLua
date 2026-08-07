@@ -1,6 +1,6 @@
 --[[
   offline_miner.lua  -  Local quarry turtle (optional site board)
-  Titan-Version: 1.1.7
+  Titan-Version: 1.1.9
 
   Place the turtle at the TOP-FRONT-LEFT corner of the dig, facing into the
   mine. That cell is origin 0,0,0:
@@ -785,27 +785,16 @@ local function goHome()
   return ok, err
 end
 
--- Only abort early for fuel: must be able to walk home (and a little margin).
--- Do NOT use site maxTravel to force dumps — mine until inventory is full.
-local function cannotAffordTripHome()
-  local level = turtle.getFuelLevel()
-  if level == "unlimited" then return false end
-  level = tonumber(level) or 0
-  if level < 1 then return true end
-  return level < (distHome() * 2 + 32)
-end
-
+-- Dump only when inventory is full (or truly out of fuel). No distance/travel
+-- timeout — deep Y bands stay down until slots fill.
 local function manageInventory(resume)
   local full = inventoryFull()
   local fuelOk = ensureFuel()
-  local fuelTrip = not cannotAffordTripHome()
-  if not full and fuelOk and fuelTrip then return true end
+  if not full and fuelOk then return true end
   if full then
     print("Inventory full — returning to dump...")
-  elseif not fuelOk or not fuelTrip then
-    print("Low fuel — returning to refuel...")
   else
-    print("Depot break — returning to origin...")
+    print("Out of fuel — returning to refuel...")
   end
   if activeJob then
     activeJob.status = "paused"
@@ -1228,8 +1217,27 @@ local function claimBand(nextBand)
       end
       maxTravel = tonumber(msg.maxTravel) or maxTravel
       siteInfo = msg
-      print(("Claimed Y %d..%d  (%d layers)  maxTravel=%s"):format(
-        msg.y0, msg.y1, (msg.y1 - msg.y0 + 1), tostring(maxTravel or "?")))
+      print(("Claimed Y %d..%d  (%d layers)%s"):format(
+        msg.y0, msg.y1, (msg.y1 - msg.y0 + 1),
+        msg.resume and " (resume)" or " (free band)"))
+      if type(msg.free) == "table" and #msg.free > 0 then
+        local parts = {}
+        for _, f in ipairs(msg.free) do
+          if f.y0 and f.y1 then
+            parts[#parts + 1] = ("%d..%d"):format(f.y0, f.y1)
+          end
+        end
+        if #parts > 0 then print("  Free Y on site: " .. table.concat(parts, ", ")) end
+      end
+      if type(msg.claims) == "table" and #msg.claims > 0 then
+        print("  Other claims:")
+        for _, c in ipairs(msg.claims) do
+          if c.y0 and c.y1 and not (c.y0 == msg.y0 and c.y1 == msg.y1 and c.id == os.getComputerID()) then
+            local who = (c.kind == "done") and "done" or ("#" .. tostring(c.id or "?"))
+            print(("    Y %d..%d  %s"):format(c.y0, c.y1, who))
+          end
+        end
+      end
       claim = msg
       break
     end
@@ -1646,45 +1654,44 @@ local function digSiteMine()
     return
   end
 
-  -- Finish an incomplete claimed band first (local or from site).
-  -- Require both y0 and y1 — a site flag alone used to dig full leftover H.
-  local j = loadJobFile()
-  if not j then j = fetchJobFromSite(5, true) end
-  if j and j.status ~= "done" and j.y0 ~= nil and j.y1 ~= nil then
-    print(("Resuming claimed Y %s..%s ..."):format(tostring(j.y0), tostring(j.y1)))
-    local r = runClaimBand({
-      W = j.W, L = j.L or j.D, y0 = j.y0, y1 = j.y1,
-    }, true, j)
-    if r ~= "done" then return end
-    print("Y band complete.")
-  end
+  -- Always ask the site which Y bands are free/claimed before digging.
+  -- Local/site job files are only resumed when they match the assigned claim.
+  local prior = loadJobFile()
+  if not prior then prior = fetchJobFromSite(5, true) end
 
   local bandsDone = 0
   while not STOP do
-    -- After each finished band, ask for a *new* free Y claim.
-    local claim = claimBand(bandsDone > 0 or (j ~= nil))
+    local claim = claimBand(bandsDone > 0)
     if not claim then
-      if bandsDone == 0 and not j then
+      if bandsDone == 0 then
         print("No free Y layers. Site needs `setup WxL H`, or all bands are taken/done.")
+        print("On the site board: `claims` / `clearclaims` to inspect or free bands.")
       else
         print("No more free Y layers — this turtle is done claiming.")
       end
       return
     end
+
     local stored = nil
-    if claim.resume then
+    if prior and prior.status ~= "done"
+        and tonumber(prior.y0) == tonumber(claim.y0)
+        and tonumber(prior.y1) == tonumber(claim.y1) then
+      stored = prior
+      print(("Resuming matching job for Y %d..%d"):format(claim.y0, claim.y1))
+    elseif claim.resume then
       stored = fetchJobFromSite(3, true)
       if stored and (tonumber(stored.y0) ~= tonumber(claim.y0)
           or tonumber(stored.y1) ~= tonumber(claim.y1)) then
         stored = nil
       end
     end
+    prior = nil
+
     print(("Mining claimed Y %d..%d (%d layers)..."):format(
       claim.y0, claim.y1, claim.y1 - claim.y0 + 1))
     local r = runClaimBand(claim, stored ~= nil, stored)
     if r ~= "done" then return end
     bandsDone = bandsDone + 1
-    j = nil
     print(("Finished Y %d..%d — claiming next free band..."):format(claim.y0, claim.y1))
   end
 end

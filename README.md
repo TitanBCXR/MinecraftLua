@@ -494,10 +494,14 @@ those reports (or lock with `setup`), stores each `offline_miner_job.cfg` under
 ```
 # optional site board
 setup 16x32 60 half       # lock footprint (or skip — auto from turtles)
+claims                    # show claimed + free Y bands
+clearclaims               # free all Y claims (turtles re-pick with mine)
+clearclaims Y 0 29        # free claims overlapping that Y range
+clearclaims done          # clear finished bands only
 auto                      # unlock auto-learn again
 # turtles
 join                      # link to site if present
-mine                      # claim a Y band (needs site)
+mine                      # ask site for a free Y band, then dig it
 area 16x32 40             # dig; reports to admin whenever a modem is present
 ```
 
