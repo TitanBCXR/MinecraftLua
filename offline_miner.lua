@@ -1,6 +1,6 @@
 --[[
   offline_miner.lua  -  Local quarry turtle (optional site board)
-  Titan-Version: 1.2.4
+  Titan-Version: 1.2.6
 
   Place the turtle at the TOP-FRONT-LEFT corner of the dig, facing into the
   mine. That cell is origin 0,0,0:
@@ -58,8 +58,11 @@ local PICK_SIDE = "right"  -- turtle upgrade slot 2 — never touch left (loader
 local MIN_FUEL = 200
 local STOP = false
 local PROTO_QUARRY = "titan_quarry"
+local PROTO_NET = "titan_net"
+local PROTO_ROUTER = "titan_router"
 local digging = false
 local modemSwapSide = nil  -- only "right" while modem is over the pick
+local knownPeers = {}      -- [computerId] = true  (site board + admin tablets)
 
 -- Relative pose from boot origin. +Y is DOWN.
 local pos = { x = 0, y = 0, z = 0 }
@@ -590,17 +593,17 @@ end
 local function moveForward()
   if STOP then return false, "stop" end
   if not ensureFuel() then return false, "fuel" end
-  digDir("forward")
-  if turtle.forward() then
-    applyForwardStep()
-    return true
-  end
-  -- Attack entities / retry dig
-  digDir("forward")
-  if turtle.attack() then sleep(0.2) end
-  if turtle.forward() then
-    applyForwardStep()
-    return true
+  -- Exactly one block forward — dig, then a single turtle.forward().
+  for _ = 1, 8 do
+    digDir("forward")
+    if turtle.attack() then sleep(0.05) end
+    if not turtle.detect() then
+      if turtle.forward() then
+        applyForwardStep()
+        return true
+      end
+    end
+    sleep(0.05)
   end
   return false, "blocked"
 end
@@ -608,11 +611,16 @@ end
 local function moveUp()
   if STOP then return false, "stop" end
   if not ensureFuel() then return false, "fuel" end
-  digDir("up")
-  if turtle.up() then
-    pos.y = pos.y - 1
-    moves = moves + 1
-    return true
+  for _ = 1, 8 do
+    digDir("up")
+    if not turtle.detectUp() then
+      if turtle.up() then
+        pos.y = pos.y - 1
+        moves = moves + 1
+        return true
+      end
+    end
+    sleep(0.05)
   end
   return false, "blocked"
 end
@@ -634,43 +642,89 @@ local function moveDown()
     return false, "band-floor"
   end
   if not ensureFuel() then return false, "fuel" end
-  digDir("down")
-  if turtle.down() then
-    pos.y = pos.y + 1
-    moves = moves + 1
-    return true
+  for _ = 1, 8 do
+    digDir("down")
+    if not turtle.detectDown() then
+      if turtle.down() then
+        pos.y = pos.y + 1
+        moves = moves + 1
+        return true
+      end
+    end
+    sleep(0.05)
   end
   return false, "blocked"
 end
 
+-- One block only toward target. Never skips a cell.
+local function stepOnceToward(tx, ty, tz)
+  local ox, oy, oz = pos.x, pos.y, pos.z
+  if oy < ty then
+    if not moveDown() then return false, "down" end
+  elseif oy > ty then
+    if not moveUp() then return false, "up" end
+  elseif ox < tx then
+    faceRight()
+    if not moveForward() then return false, "x+" end
+  elseif ox > tx then
+    faceLeft()
+    if not moveForward() then return false, "x-" end
+  elseif oz < tz then
+    faceForward()
+    if not moveForward() then return false, "z+" end
+  elseif oz > tz then
+    faceBack()
+    if not moveForward() then return false, "z-" end
+  else
+    return true
+  end
+  local dist = math.abs(pos.x - ox) + math.abs(pos.y - oy) + math.abs(pos.z - oz)
+  if dist ~= 1 then
+    -- Pose desync / double-step — snap pose to a single intended step.
+    print(("WARN: move spanned %d blocks; clamping to 1"):format(dist))
+    pos.x, pos.y, pos.z = ox, oy, oz
+    if oy < ty then pos.y = oy + 1
+    elseif oy > ty then pos.y = oy - 1
+    elseif ox < tx then pos.x = ox + 1
+    elseif ox > tx then pos.x = ox - 1
+    elseif oz < tz then pos.z = oz + 1
+    elseif oz > tz then pos.z = oz - 1
+    end
+  end
+  return true
+end
+
 local function goTo(tx, ty, tz)
-  -- Order: Y first (up/down), then X, then Z — keeps us out of uncleared space when possible.
+  -- Step one block at a time (Y, then X, then Z). Never jumps 2+.
   local floor = digFloorY()
+  tx = math.floor(tonumber(tx) or 0)
   ty = math.floor(tonumber(ty) or 0)
+  tz = math.floor(tonumber(tz) or 0)
   if floor ~= nil and ty > floor then
     return false, "past-band"
   end
-  while pos.y > ty do
-    if not moveUp() then return false, "up" end
-  end
-  while pos.y < ty do
-    if not moveDown() then return false, "down" end
-  end
-  if pos.x < tx then
-    faceRight()
-    while pos.x < tx do if not moveForward() then return false, "x+" end end
-  elseif pos.x > tx then
-    faceLeft()
-    while pos.x > tx do if not moveForward() then return false, "x-" end end
-  end
-  if pos.z < tz then
-    faceForward()
-    while pos.z < tz do if not moveForward() then return false, "z+" end end
-  elseif pos.z > tz then
-    faceBack()
-    while pos.z > tz do if not moveForward() then return false, "z-" end end
+  local guard = 0
+  while pos.x ~= tx or pos.y ~= ty or pos.z ~= tz do
+    guard = guard + 1
+    if guard > 20000 then return false, "path-limit" end
+    local ok, err = stepOnceToward(tx, ty, tz)
+    if not ok then return false, err end
   end
   faceForward()
+  return true
+end
+
+-- Dig the block in this cell's footprint (re-clear if we arrived through air).
+local function excavateHere()
+  -- Clear horizontally around feet so a skipped approach still mines the vein.
+  local start = facing
+  for _ = 1, 4 do
+    digDir("forward")
+    turnRight()
+  end
+  turnTo(start)
+  -- Do NOT digDown here — that would steal the next Y layer.
+  digDir("up")
   return true
 end
 
@@ -925,15 +979,57 @@ end
 --------------------------------------------------------------------------------
 -- Optional quarry site board (offline_site.lua)
 --------------------------------------------------------------------------------
+local function rememberPeer(id)
+  id = tonumber(id)
+  if id and id ~= os.getComputerID() then
+    knownPeers[id] = true
+  end
+end
+
+-- Open every modem for rednet + CraftOS hop channel so nearby routers can relay.
 local function openModem()
   local any = false
   for _, side in ipairs(peripheral.getNames()) do
     if peripheral.getType(side) == "modem" then
       if not rednet.isOpen(side) then rednet.open(side) end
+      -- Same hop channel routers / titan.relayLoop use (mesh repeat).
+      pcall(peripheral.call, side, "open", rednet.CHANNEL_REPEAT)
       any = true
     end
   end
   return any
+end
+
+local function rednetIsReady()
+  for _, side in ipairs(peripheral.getNames()) do
+    if peripheral.getType(side) == "modem" and rednet.isOpen(side) then
+      return true
+    end
+  end
+  return false
+end
+
+-- Fire check-in / mine updates on all Titan rednet protocols + known peers.
+local function rednetPublish(msg)
+  if type(msg) ~= "table" then return false end
+  if not openModem() and not rednetIsReady() then return false end
+  msg.from = msg.from or os.getComputerID()
+  msg.turtleId = msg.turtleId or os.getComputerID()
+  msg.name = msg.name or os.getComputerLabel()
+  msg.t = os.epoch("utc")
+
+  rednet.broadcast(msg, PROTO_QUARRY)
+  rednet.broadcast(msg, PROTO_NET)
+  rednet.broadcast(msg, PROTO_ROUTER)
+
+  if siteId then
+    rememberPeer(siteId)
+  end
+  for id in pairs(knownPeers) do
+    rednet.send(id, msg, PROTO_QUARRY)
+    rednet.send(id, msg, PROTO_NET)
+  end
+  return true
 end
 
 local function rightDetail()
@@ -1143,8 +1239,7 @@ end
 
 local applyingAssign = false
 
--- Force physical descent/ascent to target relative Y (+Y = down).
--- Does not trust a stale pos that already equals ty without moving.
+-- Force physical descent/ascent to target relative Y (+Y = down), one Y at a time.
 local function forceGoToY(ty)
   ty = math.floor(tonumber(ty) or 0)
   if ty < 0 then ty = 0 end
@@ -1152,17 +1247,12 @@ local function forceGoToY(ty)
     if not moveUp() then return false, "up" end
   end
   while pos.y < ty do
-    -- Bypass digFloorY clamp for intentional band entry (caller sets activeJob).
-    if STOP then return false, "stop" end
-    if not ensureFuel() then return false, "fuel" end
-    digDir("down")
-    if not turtle.down() then
-      -- Try dig again then move
-      digDir("down")
-      if not turtle.down() then return false, "blocked-down" end
+    local oy = pos.y
+    if not moveDown() then return false, "blocked-down" end
+    if pos.y ~= oy + 1 then
+      print("WARN: down step was not exactly 1 — correcting")
+      pos.y = oy + 1
     end
-    pos.y = pos.y + 1
-    moves = moves + 1
     if pos.y % 5 == 0 or pos.y == ty then
       print(("  … at Y=%d (target %d)"):format(pos.y, ty))
     end
@@ -1297,10 +1387,12 @@ local function applyQuarryAssign(msg, fromId)
     posY = pos.y,
     status = digging and "mining" or (moved or alreadyThere) and "at_band" or "assigned",
   }
+  rememberPeer(fromId)
+  rememberPeer(msg.from)
   if fromId then rednet.send(fromId, ack, PROTO_QUARRY) end
   local adminId = tonumber(msg.from)
   if adminId and adminId ~= fromId then rednet.send(adminId, ack, PROTO_QUARRY) end
-  rednet.broadcast(ack, PROTO_QUARRY)
+  rednetPublish(ack)
   print(("\n[admin] Y assign %d..%d — acked%s"):format(
     y0, y1,
     digging and " (move after current dig)" or (moved and " — moved in") or ""))
@@ -1314,15 +1406,19 @@ local function pollAssignReplies(timeout)
   while os.clock() < deadline do
     local id, msg = rednet.receive(PROTO_QUARRY, math.max(0.05, deadline - os.clock()))
     if id and type(msg) == "table" then
+      rememberPeer(id)
       local t = tostring(msg.type or "")
       if t == "quarry_assign" then
         applyQuarryAssign(msg, id)
-      elseif t == "quarry_welcome" and not siteId then
-        siteId = id
-        siteInfo = msg
-        maxTravel = tonumber(msg.maxTravel) or maxTravel
-        cfg.siteId = id
-        saveCfg()
+      elseif t == "quarry_welcome" then
+        if not siteId then
+          siteId = id
+          siteInfo = msg
+          maxTravel = tonumber(msg.maxTravel) or maxTravel
+          cfg.siteId = id
+          saveCfg()
+        end
+        rememberPeer(id)
       end
     end
   end
@@ -1331,25 +1427,49 @@ end
 -- Broadcast mine data for admin (always). Also unicast to site board when joined.
 -- Swaps slot-15 modem over RIGHT pickaxe only, then restores the pickaxe.
 local function publishMine(extra)
-  if not ensureModemForComms(true) then return false end
   extra = extra or {}
+  local modemOk = ensureModemForComms(true)
+  if not modemOk then
+    modemOk = openModem()
+  end
+  if not modemOk or not rednetIsReady() then
+    print("[rednet] check-in FAILED — modem not open")
+    return false
+  end
+
   local base = sitePayload(extra)
   if adminAssign then
     base.y0 = adminAssign.y0
     base.y1 = adminAssign.y1
   end
   base.posX, base.posY, base.posZ = pos.x, pos.y, pos.z
+  base.checkIn = extra.checkIn or base.checkIn
+
+  -- Admin tablet listens for quarry_turtle; site board wants progress/job types.
   local bcast = {}
   for k, v in pairs(base) do bcast[k] = v end
   bcast.type = "quarry_turtle"
-  rednet.broadcast(bcast, PROTO_QUARRY)
-  rednet.broadcast(bcast, "titan_net")
-  if siteId then
+  if not rednetPublish(bcast) then
+    print("[rednet] broadcast FAILED")
+    if digging then ensurePickReady(true) end
+    return false
+  end
+
+  if siteId or next(knownPeers) then
     local uni = {}
     for k, v in pairs(base) do uni[k] = v end
     uni.type = extra._siteType or "quarry_progress"
-    rednet.send(siteId, uni, PROTO_QUARRY)
+    rednetPublish(uni)
   end
+
+  local nPeers = 0
+  for _ in pairs(knownPeers) do nPeers = nPeers + 1 end
+  if extra.checkIn then
+    print(("[rednet] sent %s → quarry/net/router%s"):format(
+      tostring(extra.checkIn),
+      (nPeers > 0) and (" +" .. nPeers .. " peers") or ""))
+  end
+
   -- Listen briefly for tablet Y assign + ack it (shorter while digging).
   local listen = tonumber(extra.listen) or (digging and 0.35 or 0.75)
   pollAssignReplies(listen)
@@ -1380,16 +1500,19 @@ local function siteReportProgress(extra)
   return publishMine(extra)
 end
 
--- Named check-in helper (depot / end of dig line / layer).
+-- Named check-in helper (depot / end of dig line / layer) — always over rednet.
 checkIn = function(reason, extra)
   extra = extra or {}
   extra.checkIn = reason or "ping"
   extra._siteType = extra._siteType or "quarry_progress"
   extra.status = extra.status or (activeJob and activeJob.status) or "mining"
   if activeJob then extra.job = activeJob; extra.jobFile = JOB_FILE end
-  print(("[check-in] %s @ %d,%d,%d"):format(
+  print(("[check-in] %s @ %d,%d,%d (rednet)"):format(
     tostring(reason), pos.x, pos.y, pos.z))
   local ok = publishMine(extra)
+  if not ok then
+    print("[check-in] rednet send failed — will retry next line/depot")
+  end
   -- Belt-and-suspenders: verify pick before returning to the dig line.
   if digging and not ensurePickReady(true) then
     print("Pickaxe missing after check-in — cannot dig until RIGHT has a pick.")
@@ -1424,7 +1547,7 @@ local function joinSite(timeout, quiet)
   joinMsg.type = "quarry_join"
   -- Ask site to include our stored job if we have none locally.
   joinMsg.wantJob = loadJobFile() == nil
-  rednet.broadcast(joinMsg, PROTO_QUARRY)
+  rednetPublish(joinMsg)
   local deadline = os.clock() + timeout
   local found = false
   local welcomed = nil
@@ -1432,6 +1555,7 @@ local function joinSite(timeout, quiet)
     local id, msg = rednet.receive(PROTO_QUARRY, math.max(0.05, deadline - os.clock()))
     if id and type(msg) == "table" and msg.type == "quarry_welcome" then
       siteId = id
+      rememberPeer(id)
       siteInfo = msg
       maxTravel = tonumber(msg.maxTravel) or maxTravel
       cfg.siteId = id
@@ -1746,9 +1870,15 @@ local function runBoxJob(j)
       return
     end
 
-    -- Excavate ONLY this Y plane (goTo digs 1-high forward). Do NOT digDown —
-    -- that was clearing a second layer under the turtle.
+    -- One cell at a time (goTo steps exactly 1 block per move). Clear this cell.
     if not goTo(u.x, u.y, u.z) then finishJob(false, "path"); return end
+    if pos.x ~= u.x or pos.y ~= u.y or pos.z ~= u.z then
+      print(("Pose mismatch at unit %d: at %d,%d,%d want %d,%d,%d"):format(
+        i, pos.x, pos.y, pos.z, u.x, u.y, u.z))
+      finishJob(false, "pose")
+      return
+    end
+    excavateHere()
 
     j.idx = i + 1
     saveJobFile(j)
