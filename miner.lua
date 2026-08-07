@@ -1,6 +1,6 @@
 --[[
   miner.lua  -  Area miner turtle for the Titan network (CC: Tweaked)
-  Titan-Version: 1.3.0
+  Titan-Version: 1.3.1
 
   Digs a rectangular "box":
     * set1 <x> <z> / set2 <x> <z> — opposite corners (X/Z footprint)
@@ -17,6 +17,11 @@
     15 = equipment hot-swap (modem OR chunk loader — whichever is not equipped)
   With selfChunk: dig offline with chunk loader equipped; on dump/refuel/check-in
   swap modem from slot 15, talk to the mesh, then swap chunker back.
+
+  Fuel budget:
+    Tracks fuel burn vs blocks moved. Before it cannot afford a return trip to
+    the fuel chest/home, it saves depot coords and waits. Place the turtle at
+    those coords with fuel chest LEFT and storage BEHIND — it auto-continues.
 
   Never breaks blocks listed in exclude.txt (or titan.RESTRICTED).
 
@@ -79,6 +84,17 @@ local track = { x = nil, y = nil, z = nil }
 local mineRequested = false
 local continueRequested = false
 local pendingJob = nil  -- strip job from Parent Center
+local activeMineJob = nil -- in-progress quarry table (for fuel/depot hooks)
+
+-- Fuel economy (CC: normally 1 fuel / block moved; we measure actual burn).
+local FUEL_RESERVE = 48          -- keep this much after a return trip
+local fuelEco = {
+  fuelPerBlock = 1.0,
+  blocks = 0,
+  burned = 0,
+  lastFuel = nil,
+  lastX = nil, lastY = nil, lastZ = nil,
+}
 
 local exclude = {}   -- [blockName] = true
 
@@ -752,20 +768,291 @@ local function ensureSpace()
   return true
 end
 
-local function ensureFuel()
-  nav.ensureFuel(64)
-  if turtle.getFuelLevel() ~= "unlimited" and turtle.getFuelLevel() < 8 then
-    if cfg.fuelChest then
-      suckFuelFromChest()
-      nav.ensureFuel(64)
+--------------------------------------------------------------------------------
+-- Fuel economy + forward depot relocate
+--------------------------------------------------------------------------------
+local function manhattan(a, b)
+  if not (a and b and a.x and b.x) then return nil end
+  return math.abs(a.x - b.x) + math.abs((a.y or 0) - (b.y or 0)) + math.abs(a.z - b.z)
+end
+
+local function returnBase()
+  return cfg.fuelChest or cfg.home or cfg.chest
+end
+
+local function fuelLevelNum()
+  local f = turtle.getFuelLevel()
+  if f == "unlimited" then return math.huge end
+  return tonumber(f) or 0
+end
+
+local function noteFuelSample()
+  local f = fuelLevelNum()
+  if f == math.huge then return end
+  local x, y, z = track.x, track.y, track.z
+  if not x then
+    x, y, z = nav.locate(0.5)
+  end
+  if fuelEco.lastFuel ~= nil and x and fuelEco.lastX then
+    local moved = math.abs(x - fuelEco.lastX)
+      + math.abs((y or 0) - (fuelEco.lastY or 0))
+      + math.abs((z or 0) - (fuelEco.lastZ or 0))
+    local burned = fuelEco.lastFuel - f
+    if moved > 0 and burned >= 0 then
+      fuelEco.blocks = fuelEco.blocks + moved
+      fuelEco.burned = fuelEco.burned + burned
+      if fuelEco.blocks >= 8 then
+        local rate = fuelEco.burned / fuelEco.blocks
+        if rate < 0.25 then rate = 0.25 end
+        if rate > 4 then rate = 4 end
+        -- EMA toward measured rate
+        fuelEco.fuelPerBlock = fuelEco.fuelPerBlock * 0.7 + rate * 0.3
+      end
     end
   end
-  if turtle.getFuelLevel() ~= "unlimited" and turtle.getFuelLevel() < 8 then
-    -- Check in online so DC can see the error.
-    goOnline("out of fuel")
-    setStatus("error", "out of fuel")
+  fuelEco.lastFuel = f
+  if x then fuelEco.lastX, fuelEco.lastY, fuelEco.lastZ = x, y, z end
+end
+
+local function maxRangeOnTank()
+  local f = fuelLevelNum()
+  if f == math.huge then return math.huge end
+  local rate = fuelEco.fuelPerBlock
+  if rate < 0.25 then rate = 0.25 end
+  return math.floor(f / rate)
+end
+
+local function returnTripCost(fromPos)
+  local base = returnBase()
+  if not base then return FUEL_RESERVE end
+  local pos = fromPos
+  if not (pos and pos.x) then
+    if hasTrack() then
+      pos = { x = track.x, y = track.y, z = track.z }
+    else
+      local x, y, z = nav.locate(1)
+      if x then pos = { x = x, y = y, z = z } end
+    end
+  end
+  local dist = manhattan(pos, base) or 64
+  local rate = fuelEco.fuelPerBlock
+  if rate < 0.25 then rate = 0.25 end
+  return math.ceil(dist * rate) + FUEL_RESERVE
+end
+
+local function fuelBudget()
+  local f = fuelLevelNum()
+  if f == math.huge then
+    return {
+      unlimited = true, fuel = f, rate = 0, maxRange = math.huge,
+      returnCost = 0, digBudget = math.huge, ok = true,
+    }
+  end
+  local rate = fuelEco.fuelPerBlock
+  local ret = returnTripCost()
+  local digBudget = f - ret
+  if digBudget < 0 then digBudget = 0 end
+  return {
+    unlimited = false,
+    fuel = f,
+    rate = rate,
+    maxRange = maxRangeOnTank(),
+    returnCost = ret,
+    digBudget = digBudget,
+    ok = digBudget >= 8,
+  }
+end
+
+local function isChestBlock(name)
+  name = tostring(name or ""):lower()
+  if name:find("chest", 1, true) then return true end
+  if name:find("barrel", 1, true) then return true end
+  if name:find("shulker", 1, true) then return true end
+  return false
+end
+
+-- Fuel chest on LEFT, storage BEHIND (relative to current facing into the mine).
+local function detectDepotChests()
+  local function lookChest()
+    local ok, data = turtle.inspect()
+    return ok and data and isChestBlock(data.name)
+  end
+  turtle.turnLeft()
+  local leftOk = lookChest()
+  turtle.turnRight()
+  turtle.turnLeft(); turtle.turnLeft()
+  local backOk = lookChest()
+  turtle.turnLeft(); turtle.turnLeft()
+  return leftOk and backOk, leftOk, backOk
+end
+
+local function adoptDepotHere(job)
+  goOnline("depot adopt")
+  local x, y, z = nav.locatePrecise(4)
+  if not x then
+    x, y, z = nav.locate(2)
+  end
+  if not x then
+    print("Depot chests seen but no GPS — cannot lock new home.")
     return false
   end
+  if nav.heading == nil then
+    pcall(nav.calibrate, true)
+  end
+  cfg.home = { x = math.floor(x), y = math.floor(y), z = math.floor(z) }
+  cfg.homeFacing = nav.heading
+  cfg.chest = chestBehindHome(cfg.home, cfg.homeFacing)
+  local dx, dz = headingDelta(cfg.homeFacing)
+  if dx then
+    -- Left of facing = fuel chest
+    -- Facing north (-Z): left is west (-X) → x-1
+    -- left vector from heading: north→west, east→north, south→east, west→south
+    local lx, lz = 0, 0
+    if cfg.homeFacing == titan.NORTH then lx, lz = -1, 0
+    elseif cfg.homeFacing == titan.EAST then lx, lz = 0, -1
+    elseif cfg.homeFacing == titan.SOUTH then lx, lz = 1, 0
+    elseif cfg.homeFacing == titan.WEST then lx, lz = 0, 1
+    end
+    cfg.fuelChest = {
+      x = cfg.home.x + lx, y = cfg.home.y, z = cfg.home.z + lz,
+    }
+  end
+  nav.home = cfg.home
+  saveCfg()
+  if job then
+    job.home, job.chest, job.homeFacing = cfg.home, cfg.chest, cfg.homeFacing
+    job.fuelChest = cfg.fuelChest
+    job.awaitingDepot = false
+    job.depot = nil
+    job.active = true
+    saveJob(job)
+  end
+  print("Depot adopted:")
+  print("  home      " .. fmt(cfg.home))
+  print("  storage  " .. fmt(cfg.chest) .. " (behind)")
+  print("  fuel     " .. fmt(cfg.fuelChest) .. " (left)")
+  suckFuelFromChest()
+  turtle.select(FUEL_SLOT)
+  nav.ensureFuel(64)
+  noteFuelSample()
+  return true
+end
+
+local function printDepotInstructions(job)
+  local d = job and job.depot
+  if not d then
+    print("No depot coords saved.")
+    return
+  end
+  print("========== FUEL DEPOT NEEDED ==========")
+  print(("Place turtle at: %d, %d, %d"):format(d.x, d.y, d.z))
+  if d.facing ~= nil then
+    local names = { [0] = "NORTH/-Z", [1] = "EAST/+X", [2] = "SOUTH/+Z", [3] = "WEST/-X" }
+    print("Face: " .. (names[d.facing] or tostring(d.facing)) .. " (into the mine)")
+  end
+  print("Then place:")
+  print("  * FUEL chest on the LEFT of the turtle")
+  print("  * STORAGE chest BEHIND the turtle")
+  print("Miner will auto-detect and continue.")
+  print("=======================================")
+end
+
+-- Save resume point and wait for player to relocate turtle + chests.
+local function requestDepotRelocate(job, y, z, zDir, x)
+  goOnline("depot relocate")
+  noteFuelSample()
+  local gx, gy, gz = nav.locatePrecise(3)
+  if not gx and hasTrack() then
+    gx, gy, gz = track.x, track.y, track.z
+  end
+  if not gx then
+    setStatus("error", "out of fuel, no GPS for depot")
+    return false
+  end
+  touchJobProgress(job, y, z, zDir, x)
+  job.awaitingDepot = true
+  job.depot = {
+    x = math.floor(gx), y = math.floor(gy), z = math.floor(gz),
+    facing = nav.heading, yProg = y, zProg = z, zDir = zDir, xProg = x,
+  }
+  job.active = true
+  saveJob(job)
+  setStatus("awaiting_depot", ("place @ %d,%d,%d"):format(job.depot.x, job.depot.y, job.depot.z))
+  printDepotInstructions(job)
+  -- Dump cargo if we can still reach home; then park for pickup.
+  local bud = fuelBudget()
+  if bud.fuel >= (bud.returnCost - FUEL_RESERVE) and (cfg.home or cfg.chest or cfg.deposit) then
+    pcall(dumpInventory)
+  end
+  goOnline("awaiting depot")
+  return false
+end
+
+local function ensureFuel()
+  noteFuelSample()
+  nav.ensureFuel(64)
+  local bud = fuelBudget()
+  if bud.unlimited then return true end
+
+  -- Still have dig budget after reserving a return trip.
+  if bud.ok then
+    if bud.fuel < 16 and cfg.fuelChest then
+      -- Top up early if close to empty but somehow return cost is tiny
+    end
+    return true
+  end
+
+  -- Cannot afford more dig + return: try refuel at existing chest first.
+  if cfg.fuelChest then
+    local before = bud.fuel
+    suckFuelFromChest()
+    nav.ensureFuel(64)
+    noteFuelSample()
+    bud = fuelBudget()
+    if bud.ok then return true end
+    -- Refuel didn't restore enough for another sortie — need forward depot.
+    if fuelLevelNum() <= before + 8 then
+      -- Chest empty / unreachable
+    end
+  end
+
+  if activeMineJob then
+    local j = activeMineJob
+    return requestDepotRelocate(j, j.y, j.z, j.zDir, j.x)
+  end
+
+  goOnline("out of fuel")
+  setStatus("error", "out of fuel")
+  return false
+end
+
+local function tryAutoResumeDepot()
+  local job = loadJob()
+  if not job or job.awaitingDepot ~= true then return false end
+  if state.status == "mining" then return false end
+
+  local ok, left, back = detectDepotChests()
+  if not ok then return false end
+
+  -- Optional: warn if GPS far from saved depot (still allow — player may fine-tune).
+  local d = job.depot
+  local x, y, z = nav.locate(1)
+  if d and x then
+    local dist = math.abs(x - d.x) + math.abs(z - d.z)
+    if dist > 6 then
+      print(("Depot chests detected but GPS is %d blocks from saved spot %s"):format(
+        dist, fmt(d)))
+      print("Continuing anyway if you meant to shift the depot.")
+    end
+  end
+
+  print("Fuel LEFT + storage BEHIND detected — adopting depot and continuing...")
+  if not adoptDepotHere(job) then return false end
+  if d and d.facing ~= nil then
+    pcall(nav.face, d.facing)
+  end
+  setStatus("mining", "depot resume")
+  continueRequested = true
   return true
 end
 
@@ -923,6 +1210,22 @@ local function mineVolume(opts)
   -- Fix GPS pose, then optionally swap to chunk loader for offline dig.
   goOnline("mine start")
   syncTrackFromGps(4)
+  noteFuelSample()
+  activeMineJob = job
+  if job.awaitingDepot then
+    print("Job is awaiting a fuel depot — place chests or run `depot` / `continue` after setup.")
+    printDepotInstructions(job)
+    setStatus("awaiting_depot", job.depot and fmt(job.depot) or "depot")
+    activeMineJob = nil
+    return false
+  end
+  do
+    local bud = fuelBudget()
+    if not bud.unlimited then
+      print(("Fuel: %d  ~%.2f/block  maxRange=%s  returnCost=%d  digBudget=%d"):format(
+        bud.fuel, bud.rate, tostring(bud.maxRange), bud.returnCost, bud.digBudget))
+    end
+  end
   if cfg.selfChunk then
     if goChunkMine() then
       print("selfChunk ON — digging offline; modem parked in slot " .. EQUIP_SLOT)
@@ -933,10 +1236,13 @@ local function mineVolume(opts)
 
   local function digMoveTo(tx, ty, tz)
     if cfg.selfChunk and state.netMode == "chunk" then
-      return trackMoveTo(tx, ty, tz)
+      local ok, err = trackMoveTo(tx, ty, tz)
+      noteFuelSample()
+      return ok, err
     end
     local ok, err = nav.moveTo(tx, ty, tz, { dig = true })
     if ok and hasTrack() then track.x, track.y, track.z = tx, ty, tz end
+    noteFuelSample()
     return ok, err
   end
 
@@ -973,7 +1279,12 @@ local function mineVolume(opts)
         if state.stop then break end
         if not ensureFuel() or not ensureSpace() then
           touchJobProgress(job, y, z, zDir, x)
+          if state.status == "awaiting_depot" then
+            activeMineJob = nil
+            return false
+          end
           setStatus("error", state.task)
+          activeMineJob = nil
           return false
         end
 
@@ -1048,6 +1359,11 @@ local function mineVolume(opts)
     end
   end
 
+  if state.status == "awaiting_depot" then
+    activeMineJob = nil
+    return false
+  end
+
   -- Dump leftovers and return home
   if cfg.deposit or cfg.chest or cfg.home then dumpInventory() end
   if cfg.home then
@@ -1063,12 +1379,15 @@ local function mineVolume(opts)
     print(("Mine paused. dug=%d skipped=%d  (run `continue`)"):format(state.dug, state.skipped))
   else
     job.active = false
+    job.awaitingDepot = false
+    job.depot = nil
     job.finished = os.epoch("utc")
     job.dug, job.skipped = state.dug, state.skipped
     saveJob(job)
     setStatus("idle", ("done dug=%d skipped=%d"):format(state.dug, state.skipped))
     print(("Mine finished. dug=%d skipped=%d"):format(state.dug, state.skipped))
   end
+  activeMineJob = nil
   return true
 end
 
@@ -1113,11 +1432,22 @@ local function printStatus()
   end
   print(("dug=%d skipped=%d fuel=%s"):format(
     state.dug, state.skipped, tostring(turtle.getFuelLevel())))
+  local bud = fuelBudget()
+  if bud.unlimited then
+    print("fuel eco: unlimited")
+  else
+    print(("fuel eco: %.2f fuel/block  maxRange=%d  returnCost=%d  digBudget=%d"):format(
+      bud.rate, bud.maxRange, bud.returnCost, bud.digBudget))
+  end
   local job = loadJob()
   if job and job.active ~= false then
     print(("job: ACTIVE  progress Y=%s Z=%s X=%s  (continue to resume)"):format(
       tostring(job.y), tostring(job.z), tostring(job.x)))
     if job.init then print("job init: " .. fmt(job.init)) end
+    if job.awaitingDepot and job.depot then
+      print("AWAITING DEPOT:")
+      printDepotInstructions(job)
+    end
   elseif job then
     print("job: finished (miner_job.cfg kept for reference)")
   end
@@ -1380,6 +1710,8 @@ local function handleCommand(a)
     print("  continue  resume after unload/reboot from GPS/job")
     print("  stage [here|x y z]   fleet parking sheet slot")
     print("  cruise [y]           long-hop altitude (default 150)")
+    print("  fuel | eco           fuel burn rate / max range / return budget")
+    print("  depot                show saved depot coords / try auto-resume")
     print("  stop | status | dump | goto <x> <y> <z>")
     print("  hostname [name] | exit")
   elseif cmd == "hostname" or cmd == "host" then
@@ -1474,7 +1806,7 @@ local function handleCommand(a)
         end
       end
     end
-  elseif cmd == "fuelchest" or cmd == "fuel" then
+  elseif cmd == "fuelchest" then
     if (a[2] or ""):lower() == "here" then
       local x, y, z = nav.locatePrecise(4)
       if not x then print("No GPS.") else
@@ -1494,6 +1826,7 @@ local function handleCommand(a)
     else
       print("fuelChest = " .. fmt(cfg.fuelChest))
       print("Usage: fuelchest <x> <y> <z> | fuelchest here | fuelchest clear")
+      print("(tank stats: eco)")
     end
   elseif cmd == "selfchunk" or cmd == "chunkmode" then
     local v = (a[2] or ""):lower()
@@ -1521,6 +1854,34 @@ local function handleCommand(a)
       ensureChunkerEquipped()
     else
       goOnline("swap")
+    end
+  elseif cmd == "fuel" or cmd == "eco" then
+    noteFuelSample()
+    local bud = fuelBudget()
+    print(("tank=%s  samples blocks=%d burned=%d"):format(
+      tostring(turtle.getFuelLevel()), fuelEco.blocks, fuelEco.burned))
+    if bud.unlimited then
+      print("unlimited fuel")
+    else
+      print(("rate=%.3f fuel/block  maxRange=%d blocks on this tank"):format(
+        bud.rate, bud.maxRange))
+      print(("return to %s costs ~%d  digBudget=%d %s"):format(
+        fmt(returnBase()), bud.returnCost, bud.digBudget,
+        bud.ok and "(ok)" or "(NEED DEPOT / REFUEL)"))
+    end
+  elseif cmd == "depot" then
+    local job = loadJob()
+    if a[2] and (a[2]:lower() == "try" or a[2]:lower() == "resume" or a[2]:lower() == "check") then
+      if tryAutoResumeDepot() then
+        print("Depot resume queued.")
+      else
+        print("No depot chests detected (need fuel LEFT + storage BEHIND).")
+        if job and job.depot then printDepotInstructions(job) end
+      end
+    elseif job and job.depot then
+      printDepotInstructions(job)
+    else
+      print("No depot saved. Miner writes one when digBudget runs out.")
     end
   elseif cmd == "exclude" then
     loadExclude()
@@ -1759,6 +2120,11 @@ local function statusLoop()
         siteId = cfg.siteId,
         netMode = state.netMode,
         selfChunk = cfg.selfChunk and true or false,
+        fuelRate = fuelEco.fuelPerBlock,
+        maxRange = maxRangeOnTank(),
+        digBudget = fuelBudget().digBudget,
+        awaitingDepot = (loadJob() or {}).awaitingDepot and true or false,
+        depot = (loadJob() or {}).depot,
       })
     end
     sleep(5)
@@ -1873,23 +2239,28 @@ end
 
 local function jobLoop()
   while true do
+    if state.status == "awaiting_depot" or (loadJob() or {}).awaitingDepot then
+      pcall(tryAutoResumeDepot)
+    end
     if pendingJob and state.status ~= "mining" and state.status ~= "moving"
-        and state.status ~= "returning" then
+        and state.status ~= "returning" and state.status ~= "awaiting_depot" then
       local job = pendingJob
       pendingJob = nil
       runAssignedJob(job)
       state.jobId = nil
-      if state.status ~= "error" then setStatus("idle", "-") end
-    elseif mineRequested and state.status ~= "mining" then
+      if state.status ~= "error" and state.status ~= "awaiting_depot" then setStatus("idle", "-") end
+    elseif mineRequested and state.status ~= "mining" and state.status ~= "awaiting_depot" then
       mineRequested = false
       mineVolume()
       state.jobId = nil
-      if state.status ~= "error" and state.status ~= "stopped" then setStatus("idle", "-") end
+      if state.status ~= "error" and state.status ~= "stopped"
+          and state.status ~= "awaiting_depot" then setStatus("idle", "-") end
     elseif continueRequested and state.status ~= "mining" then
       continueRequested = false
       continueMine()
       state.jobId = nil
-      if state.status ~= "error" and state.status ~= "stopped" then setStatus("idle", "-") end
+      if state.status ~= "error" and state.status ~= "stopped"
+          and state.status ~= "awaiting_depot" then setStatus("idle", "-") end
     end
     sleep(0.4)
   end
@@ -1951,8 +2322,16 @@ if bootJob and bootJob.active ~= false then
   print(("  last progress Y=%s Z=%s X=%s dug=%s"):format(
     tostring(bootJob.y), tostring(bootJob.z), tostring(bootJob.x),
     tostring(bootJob.dug or 0)))
+  if bootJob.awaitingDepot and bootJob.depot then
+    setStatus("awaiting_depot", fmt(bootJob.depot))
+    printDepotInstructions(bootJob)
+    print("Waiting for fuel LEFT + storage BEHIND at that spot...")
+  else
+    setStatus("idle", "-")
+  end
+else
+  setStatus("idle", "-")
 end
-setStatus("idle", "-")
 
 parallel.waitForAny(
   consoleLoop,

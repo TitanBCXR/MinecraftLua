@@ -1,6 +1,6 @@
 --[[
   offline_miner.lua  -  Local quarry turtle (no GPS / no network)
-  Titan-Version: 1.0.8
+  Titan-Version: 1.0.9
 
   Place the turtle at the TOP-FRONT-LEFT corner of the dig, facing into the
   mine. That cell is origin 0,0,0:
@@ -734,15 +734,16 @@ end
 local function finishJob(ok, err)
   if activeJob then
     if ok then
-      activeJob.status = "done"
-      activeJob.idx = (activeJob.total or 0) + 1
-      saveJobFile(activeJob)
-      print("Job finished (kept in " .. JOB_FILE .. " — `clearjob` to forget).")
+      -- Job fully complete — forget progress so the next dig starts clean.
+      clearJobFile()
+      activeJob = nil
+      print("Job finished — cleared " .. JOB_FILE)
     else
       activeJob.status = "paused"
       saveJobFile(activeJob)
       print("Job paused: " .. tostring(err or "stop"))
       print("Put turtle at origin 0,0,0 facing in, then: continue")
+      print("(Or `clearjob` to forget this dig.)")
     end
   end
   goHome()
@@ -884,8 +885,8 @@ local function runSavedJob(j, fromContinue)
     return
   end
   if j.status == "done" then
-    print("Saved job already finished. `clearjob` to forget, or start a new dig.")
-    print("  " .. jobSummary(j))
+    clearJobFile()
+    print("Old finished job cleared. Start a new dig (area / box / …).")
     return
   end
   STOP = false
@@ -1005,7 +1006,8 @@ local function printHelp()
   print("  job | clearjob                   show / forget saved job")
   print("  home | dump | refuel | setup | stop | status")
   print("")
-  print("Jobs save to " .. JOB_FILE .. ". After stop/reboot: origin + continue.")
+  print("Jobs save to " .. JOB_FILE .. " while running / paused.")
+  print("Finished digs clear that file automatically. After stop: origin + continue.")
   print("Enchanted pick: put it in inventory, then `equip` (not craft onto turtle).")
 end
 
@@ -1055,9 +1057,11 @@ local function handleCommand(line)
     local j = activeJob or loadJobFile()
     if not j then print("No saved job.")
     else print(jobSummary(j)) end
-  elseif cmd == "clearjob" or cmd == "forgetjob" then
+  elseif cmd == "clearjob" or cmd == "forgetjob" or cmd == "clear" then
     clearJobFile()
-    print("Cleared saved job.")
+    activeJob = nil
+    jobLabel = "idle"
+    print("Cleared " .. JOB_FILE)
   elseif cmd == "continue" or cmd == "resume" then
     continueJob()
   elseif cmd == "pattern" or cmd == "mode" then
@@ -1173,13 +1177,15 @@ else
 end
 
 local saved = loadJobFile()
-if saved and saved.status ~= "done" then
+if saved and saved.status == "done" then
+  clearJobFile()
+  saved = nil
+end
+if saved then
   print("")
   print("Saved job: " .. jobSummary(saved))
   print("Place at origin facing in, then: continue")
-elseif saved and saved.status == "done" then
-  print("")
-  print("Last job finished. `clearjob` to forget, or start a new dig.")
+  print("Or `clearjob` to forget it.")
 end
 
 print("")

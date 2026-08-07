@@ -377,6 +377,12 @@ chunk loader). With `selfchunk on`, the miner digs offline with a chunk loader
 equipped and parks the modem in slot 15; on dump/refuel it swaps the modem back
 on to use GPS/mesh, then returns to chunk mode.
 
+**Fuel budget:** tracks burn rate vs movement (`eco`). It always reserves enough
+fuel to return to the fuel chest/home. When a tank can’t dig further and still
+return, it saves **depot coords**, prints them, and waits. Place the turtle there
+with a **fuel chest on the LEFT** and **storage BEHIND** — it auto-detects and
+continues (`depot` to reprint coords).
+
 ### Setup
 
 ```
@@ -400,26 +406,30 @@ fleet miners pick those up automatically.
 Track players entering / leaving your territory with Advanced Peripherals
 **Player Detector** blocks on the Titan mesh.
 
-### Perimeter sensor (`perimeter_sensor.lua`)
-
-Install on each gate computer (installer → **"Perimeter sensor"**):
-
-- Computer + wireless modem + Player Detector
-- On first run set `side north|east|south|west` (which edge of the base)
-- Optional: `range 8`, `name North Gate`
-
-It polls `getPlayersInRange` and broadcasts enter/exit + pulses to the manager.
-
 ### Perimeter manager (`perimeter_manager.lua`)
 
-One board computer (installer → **"Perimeter manager"**), ideally with a monitor:
+One board computer (installer → **"Perimeter manager"**), ideally with a monitor + GPS:
 
-- Shows who’s inside, entry side (N/E/S/W), enter timestamp
-- Rolling ENTER/EXIT log with times
-- `sensors` lists online gates; `grace 4` sets exit confirm delay
+```
+here                 set territory origin (stand at center)
+assign all           auto-map sensors to N/NE/E/SE/S/SW/W/NW from GPS
+set <id|all> range 50
+set <id> side ne
+sensors | status | log
+```
 
-Place sensors so each covers one approach. Overlapping ranges are debounced by
-the grace timer so walking past two gates doesn’t false-exit.
+Shows who’s inside, entry sector, timestamps, and a rolling ENTER/EXIT log.
+
+### Perimeter sensor (`perimeter_sensor.lua`)
+
+Install on each gate (installer → **"Perimeter sensor"**):
+
+- Computer + wireless modem + Player Detector + GPS coverage
+- Default **range 50**; side auto-assigned by the manager from position vs `here`
+- Manual: `side ne`, `range 50`, `auto` (re-request assign)
+
+Manager can push `side` / `range` / `name` remotely. Overlapping gates use a
+grace timer so walking between detectors doesn’t false-exit.
 
 ---
 
@@ -456,9 +466,10 @@ sent to the storage chest.
 **box / area** always mine **one Y layer at a time** (walk the plane, then drop
 one). They never dig 2 high. **tunnel / stair** stay player-tall (2).
 
-Progress is saved to `offline_miner_job.cfg`. After `stop`, reboot, or a dump
-break: put the turtle back at origin (`0,0,0` facing in) and run `continue`.
-`job` shows the saved task; `clearjob` forgets it.
+Progress is saved to `offline_miner_job.cfg` while running or paused. A finished
+dig clears that file automatically. After `stop` / reboot: put the turtle back at
+origin (`0,0,0` facing in) and run `continue`. `job` shows the saved task;
+`clearjob` forgets a paused dig.
 
 When the inventory fills it returns to `0,0,0`, dumps behind, refuels from the
 left, then resumes in-session. Optional `exclude.txt` is honored if present.

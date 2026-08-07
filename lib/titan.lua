@@ -1,6 +1,6 @@
 --[[
   titan.lua  -  Shared library for the Titan bot network (CC: Tweaked)
-  Titan-Version: 1.2.15
+  Titan-Version: 1.2.16
 
   Provides:
     * Rednet protocol constants + message type enum
@@ -84,6 +84,8 @@ titan.MSG = {
   PERIMETER_EXIT  = "perimeter_exit",  -- sensor -> manager : player left range
   PERIMETER_PULSE = "perimeter_pulse", -- sensor -> manager : who's in range now
   PERIMETER_HELLO = "perimeter_hello", -- sensor/manager announce
+  PERIMETER_CONFIG = "perimeter_config", -- manager -> sensor : side/range/name
+  PERIMETER_ASSIGN_REQ = "perimeter_assign_req", -- sensor -> manager : please auto-assign me
 }
 
 -- Compass headings (Minecraft world axes).
