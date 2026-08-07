@@ -1,6 +1,6 @@
 --[[
   offline_miner.lua  -  Local quarry turtle (optional site board)
-  Titan-Version: 1.1.5
+  Titan-Version: 1.1.7
 
   Place the turtle at the TOP-FRONT-LEFT corner of the dig, facing into the
   mine. That cell is origin 0,0,0:
@@ -610,8 +610,22 @@ local function moveUp()
   return false, "blocked"
 end
 
+-- Deepest allowed turtle Y for the active job (+Y = down). Nil = no clamp.
+local function digFloorY(j)
+  j = j or activeJob
+  if not j then return nil end
+  if j.y1 ~= nil then return math.floor(tonumber(j.y1) or 0) end
+  local stop = tonumber(j.stopY) or tonumber(j.H)
+  if stop and stop >= 1 then return math.floor(stop) - 1 end
+  return nil
+end
+
 local function moveDown()
   if STOP then return false, "stop" end
+  local floor = digFloorY()
+  if floor ~= nil and pos.y >= floor then
+    return false, "band-floor"
+  end
   if not ensureFuel() then return false, "fuel" end
   digDir("down")
   if turtle.down() then
@@ -624,6 +638,11 @@ end
 
 local function goTo(tx, ty, tz)
   -- Order: Y first (up/down), then X, then Z — keeps us out of uncleared space when possible.
+  local floor = digFloorY()
+  ty = math.floor(tonumber(ty) or 0)
+  if floor ~= nil and ty > floor then
+    return false, "past-band"
+  end
   while pos.y > ty do
     if not moveUp() then return false, "up" end
   end
@@ -729,13 +748,23 @@ local function jobSummary(j)
 end
 
 -- Normalize area jobs onto W/H/D used by the box digger (H = stopY down, D = length).
+-- Site/band jobs keep y0..y1; H/stopY are forced to the band floor (never full site H).
 local function normalizeAreaJob(j)
   if not j or j.type ~= "area" then return j end
   j.L = tonumber(j.L) or tonumber(j.D) or 0
-  j.stopY = tonumber(j.stopY) or tonumber(j.H) or 0
   j.W = tonumber(j.W) or 0
-  j.H = j.stopY
   j.D = j.L
+  if j.y0 ~= nil and j.y1 ~= nil then
+    local y0 = math.floor(tonumber(j.y0) or 0)
+    local y1 = math.floor(tonumber(j.y1) or 0)
+    if y1 < y0 then y0, y1 = y1, y0 end
+    j.y0, j.y1 = y0, y1
+    j.stopY = y1 + 1
+    j.H = y1 + 1
+  else
+    j.stopY = tonumber(j.stopY) or tonumber(j.H) or 0
+    j.H = j.stopY
+  end
   return j
 end
 
@@ -756,19 +785,27 @@ local function goHome()
   return ok, err
 end
 
-local function travelBudgetTight()
-  if not maxTravel then return false end
-  return distHome() * 2 >= math.floor(maxTravel * 0.85)
+-- Only abort early for fuel: must be able to walk home (and a little margin).
+-- Do NOT use site maxTravel to force dumps — mine until inventory is full.
+local function cannotAffordTripHome()
+  local level = turtle.getFuelLevel()
+  if level == "unlimited" then return false end
+  level = tonumber(level) or 0
+  if level < 1 then return true end
+  return level < (distHome() * 2 + 32)
 end
 
 local function manageInventory(resume)
-  local force = travelBudgetTight()
-  if not force and not inventoryFull() and ensureFuel() then return true end
-  if force then
-    print(("Travel budget (maxTravel=%s) — dumping before going deeper..."):format(
-      tostring(maxTravel)))
+  local full = inventoryFull()
+  local fuelOk = ensureFuel()
+  local fuelTrip = not cannotAffordTripHome()
+  if not full and fuelOk and fuelTrip then return true end
+  if full then
+    print("Inventory full — returning to dump...")
+  elseif not fuelOk or not fuelTrip then
+    print("Low fuel — returning to refuel...")
   else
-    print("Inventory/fuel break — returning to origin...")
+    print("Depot break — returning to origin...")
   end
   if activeJob then
     activeJob.status = "paused"
@@ -1308,14 +1345,24 @@ local function runBoxJob(j)
   local W, H, D = j.W, j.H, j.D
   -- Quarry jobs are ALWAYS true 1-Y-layer passes (never column / never 2-high).
   j.pattern = "layer"
+
+  -- Site / claimed bands MUST dig only y0..y1. Never fall back to full H —
+  -- a missing band + leftover stopY used to send turtles past their claim.
   local units
+  if j.site == true and (j.y0 == nil or j.y1 == nil) then
+    print("Site job missing Y claim (y0/y1) — aborting (will not dig full height).")
+    digging = false
+    return
+  end
   if j.y0 ~= nil and j.y1 ~= nil then
     units = boxBandUnits(W, D, j.y0, j.y1)
+    H = j.y1 - j.y0 + 1
   else
     units = boxLayerUnits(W, H, D)
   end
   j.total = #units
   j.idx = math.max(1, tonumber(j.idx) or 1)
+  if j.idx > #units + 1 then j.idx = 1 end
   j.status = "active"
   activeJob = j
   dug = tonumber(j.dug) or dug
@@ -1335,9 +1382,15 @@ local function runBoxJob(j)
 
   local lastY = -999
   local layerCount = (j.y0 ~= nil and j.y1 ~= nil) and (j.y1 - j.y0 + 1) or H
+  local floor = digFloorY(j)
   for i = j.idx, #units do
     if STOP then finishJob(false, "stop"); return end
     local u = units[i]
+    if floor ~= nil and u.y > floor then
+      print(("Abort: work unit Y=%d past claim floor Y=%d"):format(u.y, floor))
+      finishJob(false, "past-band")
+      return
+    end
     j.idx = i
     saveJobFile(j)
     if not manageInventory(true) then finishJob(false, "inventory/fuel"); return end
@@ -1346,6 +1399,7 @@ local function runBoxJob(j)
     if lastY ~= -999 and u.y > lastY then
       if not goTo(0, lastY, 0) then finishJob(false, "layer path"); return end
       while pos.y < u.y do
+        if floor ~= nil and pos.y >= floor then break end
         if not moveDown() then finishJob(false, "layer drop"); return end
       end
       print(("  layer Y=%d  (%d layers in band)"):format(u.y, layerCount))
@@ -1593,9 +1647,10 @@ local function digSiteMine()
   end
 
   -- Finish an incomplete claimed band first (local or from site).
+  -- Require both y0 and y1 — a site flag alone used to dig full leftover H.
   local j = loadJobFile()
   if not j then j = fetchJobFromSite(5, true) end
-  if j and j.status ~= "done" and (j.site or j.y0 ~= nil) then
+  if j and j.status ~= "done" and j.y0 ~= nil and j.y1 ~= nil then
     print(("Resuming claimed Y %s..%s ..."):format(tostring(j.y0), tostring(j.y1)))
     local r = runClaimBand({
       W = j.W, L = j.L or j.D, y0 = j.y0, y1 = j.y1,
@@ -1640,7 +1695,7 @@ local function continueJob()
     print("No local " .. JOB_FILE .. " — asking site board...")
     j = fetchJobFromSite(6, false)
   end
-  if j and (j.site or j.y0 ~= nil) then
+  if j and j.y0 ~= nil and j.y1 ~= nil then
     -- Site jobs: resume band then keep claiming more Y levels.
     if not siteId then joinSite(4, true) end
     print("Loaded: " .. jobSummary(j))
