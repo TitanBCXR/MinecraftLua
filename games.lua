@@ -1,13 +1,14 @@
 --[[
   games.lua  -  Titan Games Launcher (CC: Tweaked)
-  Titan-Version: 1.0.2
+  Titan-Version: 1.0.3
 
   Run:
 
       games
 
   Installs / updates every game from the GitHub catalog (`games_catalog.lua`),
-  auto-adds newly published games, and launches them from a tap-friendly menu.
+  auto-adds newly published games, removes games dropped from the catalog,
+  and launches them from a tap-friendly menu.
 
   Games are started in --speaker mode (notes / SFX only — no modem or mesh).
   Updates use HTTP to GitHub, not rednet.
@@ -23,10 +24,23 @@ local CAT_FILE = "games_catalog.lua"
 local VER_FILE = "versions.lua"
 local STATE_FILE = "games_launcher.cfg"
 
+-- Never delete these when pruning removed catalog games.
+local PROTECTED = {
+  ["games.lua"] = true,
+  ["games_catalog.lua"] = true,
+  ["versions.lua"] = true,
+  ["games_install.lua"] = true,
+  ["lib/titan.lua"] = true,
+  ["startup.lua"] = true,
+  [STATE_FILE] = true,
+}
+
 local NATIVE = term.current()
 local USING_MONITOR = false
 local STATUS = "Ready"
 local LAST_SYNC = 0
+local MANAGED_FILES = {} -- path -> true (files last installed from catalog games)
+local MANAGED_IDS = {}   -- game id -> true
 
 --------------------------------------------------------------------------------
 -- Display helpers
@@ -100,15 +114,83 @@ local function loadState()
   local f = fs.open(STATE_FILE, "r")
   local d = textutils.unserialize(f.readAll() or "")
   f.close()
-  if type(d) == "table" then
-    LAST_SYNC = tonumber(d.lastSync) or 0
+  if type(d) ~= "table" then return end
+  LAST_SYNC = tonumber(d.lastSync) or 0
+  MANAGED_FILES = {}
+  if type(d.managedFiles) == "table" then
+    for _, p in ipairs(d.managedFiles) do
+      if type(p) == "string" then MANAGED_FILES[p] = true end
+    end
+    -- also allow map form
+    for k, v in pairs(d.managedFiles) do
+      if type(k) == "string" and v == true then MANAGED_FILES[k] = true end
+    end
+  end
+  MANAGED_IDS = {}
+  if type(d.managedIds) == "table" then
+    for _, id in ipairs(d.managedIds) do
+      if type(id) == "string" then MANAGED_IDS[id] = true end
+    end
+    for k, v in pairs(d.managedIds) do
+      if type(k) == "string" and v == true then MANAGED_IDS[k] = true end
+    end
   end
 end
 
 local function saveState()
+  local files, ids = {}, {}
+  for p in pairs(MANAGED_FILES) do files[#files + 1] = p end
+  table.sort(files)
+  for id in pairs(MANAGED_IDS) do ids[#ids + 1] = id end
+  table.sort(ids)
   local f = fs.open(STATE_FILE, "w")
-  f.write(textutils.serialize({ lastSync = LAST_SYNC }))
+  f.write(textutils.serialize({
+    lastSync = LAST_SYNC,
+    managedFiles = files,
+    managedIds = ids,
+  }))
   f.close()
+end
+
+local function catalogGameFiles(catalog)
+  local files, ids = {}, {}
+  if not catalog or type(catalog.games) ~= "table" then return files, ids end
+  for _, g in ipairs(catalog.games) do
+    if type(g.id) == "string" then ids[g.id] = true end
+    if type(g.run) == "string" then files[g.run] = true end
+    for _, p in ipairs(g.files or {}) do
+      if type(p) == "string" then files[p] = true end
+    end
+  end
+  return files, ids
+end
+
+-- Delete game files that were managed / in the old catalog but not in the new one.
+local function pruneRemovedGames(oldCat, newCat, onStatus)
+  onStatus = onStatus or function() end
+  local oldFiles, oldIds = catalogGameFiles(oldCat)
+  local newFiles, newIds = catalogGameFiles(newCat)
+  -- Include previously managed set (covers mid-upgrade cases).
+  for p in pairs(MANAGED_FILES) do oldFiles[p] = true end
+  for id in pairs(MANAGED_IDS) do oldIds[id] = true end
+
+  local removed = 0
+  for path in pairs(oldFiles) do
+    if not newFiles[path] and not PROTECTED[path] then
+      if fs.exists(path) and not fs.isDir(path) then
+        onStatus("Removing " .. path)
+        pcall(fs.delete, path)
+        removed = removed + 1
+      end
+      MANAGED_FILES[path] = nil
+    end
+  end
+  for id in pairs(oldIds) do
+    if not newIds[id] then MANAGED_IDS[id] = nil end
+  end
+  -- Refresh managed set to match new catalog game files only.
+  MANAGED_FILES, MANAGED_IDS = newFiles, newIds
+  return removed
 end
 
 local function loadLocalVersions()
@@ -225,11 +307,16 @@ local function syncAll(onStatus)
   if not remoteCat then
     if localCat then
       onStatus("Offline — using cached catalog")
-      return { ok = true, offline = true, added = 0, updated = 0, failed = 0 }, localCat, loadLocalVersions()
+      return { ok = true, offline = true, added = 0, updated = 0, removed = 0, failed = 0 }, localCat, loadLocalVersions()
     end
     return { ok = false, err = catData or "no catalog" }, nil, nil
   end
   base = rawBase(remoteCat)
+
+  -- Drop games removed from the remote catalog (files + menu via new catalog).
+  onStatus("Pruning removed games…")
+  local removed = pruneRemovedGames(localCat, remoteCat, onStatus)
+
   if catData then writeFile(CAT_FILE, catData) end
 
   onStatus("Fetching versions…")
@@ -271,16 +358,20 @@ local function syncAll(onStatus)
     end
   end
 
+  -- Track current catalog game files for the next prune.
+  MANAGED_FILES, MANAGED_IDS = catalogGameFiles(remoteCat)
+
   if verData then writeFile(VER_FILE, verData) end
 
   LAST_SYNC = os.epoch("utc")
   saveState()
-  onStatus(("Sync done (+%d new, %d upd, %d fail)"):format(added, updated, failed))
+  onStatus(("Sync +%d new %d upd -%d rem %d fail"):format(added, updated, removed, failed))
   remoteCat = loadLocalCatalog() or remoteCat
   return {
     ok = true,
     added = added,
     updated = updated,
+    removed = removed,
     failed = failed,
   }, remoteCat, loadLocalVersions()
 end
@@ -448,7 +539,8 @@ local function main()
     elseif stats.offline then
       STATUS = "Offline — cached games"
     else
-      STATUS = ("Ready  +%d new  %d updated"):format(stats.added or 0, stats.updated or 0)
+      STATUS = ("Ready  +%d  ~%d  -%d"):format(
+        stats.added or 0, stats.updated or 0, stats.removed or 0)
     end
   end
 
