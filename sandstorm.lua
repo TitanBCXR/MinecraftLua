@@ -1,21 +1,30 @@
 --[[
   sandstorm.lua  -  Note-block Sandstorm knockoff + monitor pixel show
-  Titan-Version: 1.0.0
+  Titan-Version: 1.0.1
 
   Run:
 
       sandstorm
+      sandstorm --launcher   (from Games launcher: Close returns, no shutdown)
 
   Needs a speaker (or Noisy pocket). Advanced color monitor preferred for the
   visualizer; works on the computer screen too.
 
   Touch / keys:
     Space / Enter / tap PLAY  start·stop
-    M mute   Q quit
+    M mute   Q / CLOSE quit
 ]]
 
 local NATIVE = term.current()
 local USING_MONITOR = false
+local FROM_LAUNCHER = false
+do
+  local argv = { ... }
+  for i = 1, #argv do
+    local s = tostring(argv[i] or ""):lower()
+    if s == "--launcher" or s == "launcher" then FROM_LAUNCHER = true end
+  end
+end
 local SPEAKER = nil
 local MUSIC_ON = true
 local PLAYING = false
@@ -330,7 +339,7 @@ local function drawFrame(controls)
   -- Controls
   local playLabel = PLAYING and " STOP " or " PLAY "
   local muteLabel = MUSIC_ON and " MUTE " or " UNMUTE "
-  local quitLabel = " QUIT "
+  local quitLabel = FROM_LAUNCHER and " CLOSE " or " QUIT "
   local y = th - padH + 1
   local bw = math.floor(tw / 3)
   controls.play = { x = 1, y = y, w = bw, h = padH, id = "play" }

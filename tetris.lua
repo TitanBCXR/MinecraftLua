@@ -1,13 +1,14 @@
 --[[
   tetris.lua  -  Standalone Tetris for CC: Tweaked (pocket / computer)
-  Titan-Version: 1.2.7
+  Titan-Version: 1.2.8
 
   Drop on a pocket PC or advanced computer and run:
 
       tetris
-      tetris --speaker   (Games launcher: speaker only, no modem/mesh)
+      tetris --speaker --launcher   (Games launcher: speaker only, Close exits)
 
-  Main menu: top-3 leaderboard, Play, Controls (C). Q shuts the device down.
+  Main menu: top-3 leaderboard, Play, Controls (C). Q shuts down (or Close
+  back to Games launcher when started with --launcher).
   In-game / Controls screen: Q always returns to the main menu.
   Mid-game Q abandons the run (score is not kept).
 
@@ -46,13 +47,17 @@ local SIDE_W = 5 -- compact HUD column (score uses K/M/B/T)
 local LB_TOP = 3 -- only show top 3 on menu
 local PLAYER_RANGE = 8
 
--- Games launcher passes --speaker: no modem / rednet / mesh OTA this run.
+-- Games launcher: --speaker (no modem) + --launcher (Close exits, no shutdown).
 local SPEAKER_ONLY = false
+local FROM_LAUNCHER = false
 do
   local argv = { ... }
   for i = 1, #argv do
     local s = tostring(argv[i] or ""):lower()
     if s == "--speaker" or s == "speaker" or s == "--offline" or s == "offline" then
+      SPEAKER_ONLY = true
+    elseif s == "--launcher" or s == "launcher" then
+      FROM_LAUNCHER = true
       SPEAKER_ONLY = true
     end
   end
@@ -751,7 +756,8 @@ local function touchPadButtons(L)
   local defs = {
     { "left", "<" }, { "rot", "ROT" }, { "right", ">" },
     { "soft", "v" }, { "drop", "DROP" }, { "pause", "P" },
-    { "mute", "MUTE" }, { "noop", "" }, { "quit", "QUIT" },
+    { "mute", "MUTE" }, { "noop", "" },
+    { "quit", FROM_LAUNCHER and "CLOSE" or "QUIT" },
   }
   local buttons = {}
   for i = 1, #defs do
@@ -1282,7 +1288,9 @@ local function drawMenu(playBtn, ctrlBtn)
   ctrlBtn.x, ctrlBtn.y, ctrlBtn.w, ctrlBtn.h = cx, rowY, #ctrlLabel, 1
 
   local net = NET_LOCKED and "local LB" or meshStatusLine()
-  local foot = ("Enter play  C ctrl  M mute  R local  %s"):format(net)
+  local foot = FROM_LAUNCHER
+    and ("Enter play  C  M  R  Q=Close  %s"):format(net)
+    or ("Enter play  C ctrl  M mute  R local  Q=off  %s"):format(net)
   text(2, th, foot:sub(1, tw - 2), colors.gray, colors.black)
 end
 
@@ -1305,7 +1313,7 @@ local function controlsScreen()
       { "Mute",  "M (note music)" },
       { "Swap",  "U (modem <-> speaker)" },
       { "Board", "R reload local cache" },
-      { "Menu",  "Q (always)" },
+      { "Menu",  FROM_LAUNCHER and "Q / Close (back to launcher)" or "Q (always)" },
     }
     local y = 3
     for i = 1, #lines do
@@ -1443,6 +1451,11 @@ local function mainMenu()
         stopMusic()
         clearScreen(colors.black)
         term.setCursorPos(1, 1)
+        if FROM_LAUNCHER then
+          print("Closing…")
+          sleep(0.15)
+          return
+        end
         print("Shutting down...")
         sleep(0.2)
         os.shutdown()
@@ -1454,6 +1467,11 @@ local function mainMenu()
         stopMusic()
         clearScreen(colors.black)
         term.setCursorPos(1, 1)
+        if FROM_LAUNCHER then
+          print("Closing…")
+          sleep(0.15)
+          return
+        end
         print("Shutting down...")
         sleep(0.2)
         os.shutdown()

@@ -1,10 +1,11 @@
 --[[
   luigi_poker.lua  -  Luigi Picture Poker (SMB3-style) for CC: Tweaked
-  Titan-Version: 1.2.0
+  Titan-Version: 1.2.1
 
   Run:
 
       luigi_poker
+      luigi_poker --launcher   (from Games launcher: Close returns, no shutdown)
 
   Beat Luigi: he shows a 5-card hand you must beat. Hold/draw once, then
   compare. Win pays 2x (or more if you also hit a bonus hand). Push returns
@@ -27,6 +28,14 @@ local MAX_BET = 5
 local NATIVE = term.current()
 local USING_MONITOR = false
 local IS_POCKET = (pocket ~= nil)
+local FROM_LAUNCHER = false
+do
+  local argv = { ... }
+  for i = 1, #argv do
+    local s = tostring(argv[i] or ""):lower()
+    if s == "--launcher" or s == "launcher" then FROM_LAUNCHER = true end
+  end
+end
 local SPEAKER = nil
 local MUSIC_ON = true
 local COINS = START_COINS
@@ -477,18 +486,21 @@ local function drawScreen(state)
     drawBtn(state.btns.minus, pocket and " - " or " -BET ", color and colors.gray or colors.black)
     drawBtn(state.btns.plus, pocket and " + " or " +BET ", color and colors.gray or colors.black)
     drawBtn(state.btns.deal, " DEAL ", color and colors.lime or colors.white, colors.black)
-    drawBtn(state.btns.quit, pocket and " Q " or " QUIT ", color and colors.red or colors.black)
+    local qLab = FROM_LAUNCHER and (pocket and " X " or " CLOSE ") or (pocket and " Q " or " QUIT ")
+    drawBtn(state.btns.quit, qLab, color and colors.red or colors.black)
   elseif state.phase == "hold" then
     state.btns.draw = { x = 1, y = by, w = math.floor(tw * 2 / 3), h = padH }
     state.btns.quit = { x = state.btns.draw.w + 1, y = by, w = tw - state.btns.draw.w, h = padH }
     drawBtn(state.btns.draw, " DRAW ", color and colors.orange or colors.white, colors.black)
-    drawBtn(state.btns.quit, pocket and " Q " or " QUIT ", color and colors.red or colors.black)
+    local qLab = FROM_LAUNCHER and (pocket and " X " or " CLOSE ") or (pocket and " Q " or " QUIT ")
+    drawBtn(state.btns.quit, qLab, color and colors.red or colors.black)
   else
     state.btns.deal = { x = 1, y = by, w = math.floor(tw * 2 / 3), h = padH }
     state.btns.quit = { x = state.btns.deal.w + 1, y = by, w = tw - state.btns.deal.w, h = padH }
     drawBtn(state.btns.deal, COINS > 0 and " NEXT " or " BROKE ",
       color and colors.lime or colors.white, colors.black)
-    drawBtn(state.btns.quit, pocket and " Q " or " QUIT ", color and colors.red or colors.black)
+    local qLab = FROM_LAUNCHER and (pocket and " X " or " CLOSE ") or (pocket and " Q " or " QUIT ")
+    drawBtn(state.btns.quit, qLab, color and colors.red or colors.black)
   end
 end
 

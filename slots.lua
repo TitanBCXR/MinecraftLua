@@ -1,10 +1,11 @@
 --[[
   slots.lua  -  3-reel slots for CC: Tweaked
-  Titan-Version: 1.0.0
+  Titan-Version: 1.0.1
 
   Run:
 
       slots
+      slots --launcher   (from Games launcher: Close returns, no shutdown)
 
   Bet coins, spin three reels, win on matching lines. Pocket / advanced PC;
   color monitor gets a tap UI with spinning reels.
@@ -12,7 +13,7 @@
   Controls:
     +/- or [ ]   change bet
     Space / SPIN spin
-    M mute   Q quit
+    M mute   Q / CLOSE quit
 ]]
 
 local CFG = "slots.cfg"
@@ -21,6 +22,14 @@ local MAX_BET = 10
 
 local NATIVE = term.current()
 local USING_MONITOR = false
+local FROM_LAUNCHER = false
+do
+  local argv = { ... }
+  for i = 1, #argv do
+    local s = tostring(argv[i] or ""):lower()
+    if s == "--launcher" or s == "launcher" then FROM_LAUNCHER = true end
+  end
+end
 local SPEAKER = nil
 local MUSIC_ON = true
 local COINS = START_COINS
@@ -281,7 +290,8 @@ local function drawScreen(state)
   drawBtn(state.btns.plus, " +BET ", color and colors.gray or colors.black)
   drawBtn(state.btns.spin, busy and " ..." or " SPIN ",
     color and (busy and colors.gray or colors.lime) or colors.white, colors.black)
-  drawBtn(state.btns.quit, " QUIT ", color and colors.red or colors.black)
+  drawBtn(state.btns.quit, FROM_LAUNCHER and " CLOSE " or " QUIT ",
+    color and colors.red or colors.black)
 end
 
 --------------------------------------------------------------------------------

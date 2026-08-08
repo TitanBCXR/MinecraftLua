@@ -1,10 +1,11 @@
 --[[
   minesweeper.lua  -  Lightweight Minesweeper for CC: Tweaked
-  Titan-Version: 1.2.1
+  Titan-Version: 1.2.2
 
   Run:
 
       minesweeper
+      minesweeper --launcher   (from Games launcher: Close returns, no shutdown)
 
   Works on pocket PCs and advanced computers. If a monitor is attached, the
   game draws there. On monitors the bottom half is a touch bar (Open/Flag mode,
@@ -26,6 +27,14 @@ local BEST = {} -- [diffKey] = best seconds
 local MUSIC_ON = true
 local NATIVE = term.current()
 local USING_MONITOR = false
+local FROM_LAUNCHER = false
+do
+  local argv = { ... }
+  for i = 1, #argv do
+    local s = tostring(argv[i] or ""):lower()
+    if s == "--launcher" or s == "launcher" then FROM_LAUNCHER = true end
+  end
+end
 
 local DIFFS = {
   { key = "1", name = "Easy",   w = 9,  h = 9,  mines = 10 },
@@ -265,7 +274,7 @@ local function touchPadButtons(tw, th, flagMode)
     { "flag", flagMode and ">FLAG<" or "FLAG" },
     { "mute", MUSIC_ON and "MUTE" or "UNMUTE" },
     { "new", "NEW" },
-    { "quit", "QUIT" },
+    { "quit", FROM_LAUNCHER and "CLOSE" or "QUIT" },
   }
   -- 2 rows: OPEN FLAG MUTE on top, NEW QUIT on bottom (or 5 across if wide).
   local buttons = {}

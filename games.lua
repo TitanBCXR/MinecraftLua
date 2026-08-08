@@ -1,6 +1,6 @@
 --[[
   games.lua  -  Titan Games Launcher (CC: Tweaked)
-  Titan-Version: 1.0.1
+  Titan-Version: 1.0.2
 
   Run:
 
@@ -399,10 +399,10 @@ local function launchGame(game)
   term.clear()
   term.setCursorPos(1, 1)
   print("Starting " .. (game.name or game.run) .. "…")
-  print("(speaker mode — no modem)")
+  print("(speaker mode — Close returns here)")
   sleep(0.2)
-  -- All suite games: speaker/SFX only; Tetris skips mesh/LB modem sync.
-  shell.run(game.run, "--speaker")
+  -- Speaker-only + launcher: Close/Q exits the game (no tablet shutdown).
+  shell.run(game.run, "--speaker", "--launcher")
   -- Return to launcher UI
   attachMonitor()
   STATUS = "Back from " .. (game.name or game.run)
