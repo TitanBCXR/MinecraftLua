@@ -1,6 +1,6 @@
 --[[
   offline_site.lua  -  Quarry site board for multi-turtle offline miners
-  Titan-Version: 1.2.0
+  Titan-Version: 1.2.1
 
   Place this computer to the LEFT of the storage chest (storage sits behind
   the turtles' origin). Attach a modem (wired to the turtles is fine, or
@@ -988,7 +988,7 @@ advanceResetQueue = function()
       local extra = claimExtrasFor(t) or {}
       local park = rebandState.parkOffset[id] or 0
       print(("[reband] reset turn → #%d (epoch %d)"):format(id, rebandState.epoch))
-      rednet.send(id, {
+      local go = {
         type = "quarry_reset_go",
         epoch = rebandState.epoch,
         parkOffset = park,
@@ -1000,7 +1000,9 @@ advanceResetQueue = function()
         x0 = extra.x0, x1 = extra.x1, z0 = extra.z0, z1 = extra.z1,
         continueIdx = extra.continueIdx or 1,
         ok = extra.ok ~= false,
-      }, PROTO)
+      }
+      rednet.send(id, go, PROTO)
+      rednet.broadcast(go, PROTO)  -- in case unicast missed
       if t then
         t.status = "reset"
         turtles[id] = t
@@ -1104,13 +1106,19 @@ local function onTurtleHome(id, msg)
     turtles[id] = t
   end
   if not rebandState.active then return end
-  if tonumber(msg and msg.epoch) and tonumber(msg.epoch) ~= rebandState.epoch then
+  local ep = tonumber(msg and msg.epoch)
+  if ep and ep ~= rebandState.epoch then
     return  -- stale epoch
   end
+  local already = rebandState.homeReady[id] == true
   rebandState.homeReady[id] = true
-  print(("[reband] #%d home (epoch %d)"):format(id, rebandState.epoch))
-  -- Start / continue turns when the current slot is free.
+  if not already then
+    print(("[reband] #%d home (epoch %d)"):format(id, rebandState.epoch))
+  end
+  -- Start turns, or re-send reset_go if this turtle is current and still waiting.
   if not rebandState.currentTurn then
+    advanceResetQueue()
+  elseif rebandState.currentTurn == id and not rebandState.resetDone[id] then
     advanceResetQueue()
   end
 end
@@ -1363,9 +1371,15 @@ local function handleMsg(id, msg)
       if stored then
         print(("[job] #%d can resume %s"):format(id, jobSummaryShort(stored)))
       end
-      -- If reband already sent quarry_reband, remind this turtle of its turn state.
+      -- During reband: do NOT re-spam quarry_reband (that loops miners).
+      -- If this turtle is already home and it's their turn, nudge reset_go again.
       if rebandState.active then
-        sendRebandMsg(id, row)
+        if rebandState.homeReady[id] and rebandState.currentTurn == id
+            and not rebandState.resetDone[id] then
+          advanceResetQueue()
+        elseif not rebandState.homeReady[id] and first then
+          sendRebandMsg(id, row)
+        end
       end
     end
     if t ~= "quarry_turtle" then broadcastStatus() end

@@ -656,8 +656,8 @@ from the install source (GitHub / pastebin / `host.lua`). Extras on disk that
 aren’t listed show as `*` and are not updated.
 
 Bump versions in `versions.lua` (and each file’s `Titan-Version:` header) when
-you ship a change; current system version is **1.5.26** (`offline_miner` **1.4.1**,
-`offline_site` **1.2.0**).
+you ship a change; current system version is **1.5.27** (`offline_miner` **1.4.2**,
+`offline_site` **1.2.1**).
 
 ---
 

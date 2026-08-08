@@ -1,6 +1,6 @@
 --[[
   offline_miner.lua  -  Local quarry turtle (optional site board)
-  Titan-Version: 1.4.1
+  Titan-Version: 1.4.2
 
   Place the turtle at the TOP-FRONT-LEFT corner of the dig, facing into the
   mine. That cell is origin 0,0,0:
@@ -56,7 +56,7 @@ local MODEM_SLOT = 15   -- wireless modem; swapped only with RIGHT pickaxe
 local PICK_SIDE = "right"  -- turtle upgrade slot 2 — never touch left (loaders)
 local MIN_FUEL = 200
 -- Keep in sync with Titan-Version header (label uses major.minor → V1.4-Miner12).
-local MINER_VERSION = "1.4.1"
+local MINER_VERSION = "1.4.2"
 local STOP = false
 local PROTO_QUARRY = "titan_quarry"
 local PROTO_NET = "titan_net"
@@ -86,6 +86,8 @@ local pendingReband = nil     -- quarry_reband msg
 local pendingResetGo = nil    -- quarry_reset_go msg
 local rebandEpoch = 0
 local rebandClaim = nil       -- claim to dig after reset
+-- nil | "homing" | "waiting_reset" | "resetting"
+local rebandPhase = nil
 local handleQuarryNetMsg      -- forward decl (joinSite / reband wait)
 
 local exclude = {}
@@ -2047,15 +2049,24 @@ handleQuarryNetMsg = function(id, msg)
   if type(msg) ~= "table" then return end
   local t = tostring(msg.type or "")
   if t == "quarry_reband" then
+    local ep = tonumber(msg.epoch) or 0
+    -- Ignore duplicate same-epoch spam while already homing / waiting for turn.
+    if rebandPhase and ep > 0 and ep <= (tonumber(rebandEpoch) or 0) then
+      return
+    end
+    if ep > 0 and ep < (tonumber(rebandEpoch) or 0) then
+      return  -- stale
+    end
     pendingReband = msg
-    rebandEpoch = tonumber(msg.epoch) or rebandEpoch
+    rebandEpoch = ep > 0 and ep or rebandEpoch
     STOP = true
-    print(("\n[reband] epoch %d — returning home"):format(rebandEpoch))
+    print(("\n[reband] epoch %d — return home"):format(rebandEpoch))
   elseif t == "quarry_reset_go" then
-    if not tonumber(msg.epoch) or tonumber(msg.epoch) == rebandEpoch
-        or (pendingReband and tonumber(msg.epoch) == tonumber(pendingReband.epoch)) then
+    local ep = tonumber(msg.epoch)
+    if not ep or ep == rebandEpoch
+        or (pendingReband and ep == tonumber(pendingReband.epoch)) then
       pendingResetGo = msg
-      rebandEpoch = tonumber(msg.epoch) or rebandEpoch
+      rebandEpoch = ep or rebandEpoch
       print(("\n[reband] reset turn (epoch %d)"):format(rebandEpoch))
     end
   elseif t == "quarry_assign" then
@@ -2068,20 +2079,24 @@ handleQuarryNetMsg = function(id, msg)
     maxTravel = tonumber(msg.maxTravel) or maxTravel
     cfg.siteId = id
     saveCfg()
-    if msg.rebandActive and (msg.y0 ~= nil or msg.x0 ~= nil) then
-      pendingReband = pendingReband or {
-        type = "quarry_reband",
-        epoch = msg.rebandEpoch or rebandEpoch,
-        y0 = msg.y0, y1 = msg.y1,
-        x0 = msg.x0, x1 = msg.x1, z0 = msg.z0, z1 = msg.z1,
-        continueIdx = msg.continueIdx or 1,
-        W = msg.W, L = msg.L, H = msg.H,
-        pattern = msg.pattern,
-        parkOffset = 0,
-        clearOrigin = { down = 1, right = 1 },
-        ok = true,
-      }
-      STOP = true
+    -- Only start a reband from welcome if we are idle (not already in one).
+    local ep = tonumber(msg.rebandEpoch) or 0
+    if msg.rebandActive and not rebandPhase and (msg.y0 ~= nil or msg.x0 ~= nil) then
+      if ep > (tonumber(rebandEpoch) or 0) or (ep == 0 and not pendingReband) then
+        pendingReband = {
+          type = "quarry_reband",
+          epoch = ep > 0 and ep or ((tonumber(rebandEpoch) or 0) + 1),
+          y0 = msg.y0, y1 = msg.y1,
+          x0 = msg.x0, x1 = msg.x1, z0 = msg.z0, z1 = msg.z1,
+          continueIdx = msg.continueIdx or 1,
+          W = msg.W, L = msg.L, H = msg.H,
+          pattern = msg.pattern,
+          parkOffset = 0,
+          clearOrigin = { down = 1, right = 1 },
+          ok = true,
+        }
+        STOP = true
+      end
     end
   end
 end
@@ -2551,6 +2566,21 @@ local function claimFromRebandMsg(msg)
   return nil
 end
 
+local function sendRebandHome(epoch, park)
+  ensureModemForComms(true)
+  local homeMsg = sitePayload({
+    _siteType = "quarry_home",
+    status = "homing",
+    epoch = epoch,
+    parkOffset = park or 0,
+    posX = pos.x, posY = pos.y, posZ = pos.z,
+  })
+  homeMsg.type = "quarry_home"
+  if siteId then rednet.send(siteId, homeMsg, PROTO_QUARRY) end
+  rednet.broadcast(homeMsg, PROTO_QUARRY)
+  rednet.broadcast(homeMsg, PROTO_NET)
+end
+
 -- Return home, wait for reset turn, depot keep-list, adopt claim+continueIdx.
 -- Returns claim table or nil.
 local function processRebandCycle()
@@ -2560,6 +2590,7 @@ local function processRebandCycle()
   local epoch = tonumber(rb.epoch) or rebandEpoch
   rebandEpoch = epoch
   rebandClaim = claimFromRebandMsg(rb)
+  rebandPhase = "homing"
 
   digging = false
   STOP = false
@@ -2568,46 +2599,53 @@ local function processRebandCycle()
     saveJobFile(activeJob)
   end
 
-  print(("REBAND epoch %d — heading to origin"):format(epoch))
-  ensureModemForComms(true)
-  if not goHome() then
-    print("Could not reach origin for reband.")
-    return nil
+  local park = math.max(0, math.floor(tonumber(rb.parkOffset) or 0))
+
+  -- Dig home with pickaxe; skip pathing when already at origin.
+  restorePickAfterComms()
+  equipToolFromInventory(nil, true)
+  if pos.x == 0 and pos.y == 0 and pos.z == 0 then
+    print(("REBAND epoch %d — already at origin"):format(epoch))
+    turnTo(0)
+  else
+    print(("REBAND epoch %d — heading to origin"):format(epoch))
+    if not goHome() then
+      print("Could not reach origin for reband — assuming origin pose.")
+      assumeAtOrigin()
+    end
   end
 
-  -- Park if not first in line so origin stays clear for the active reset turtle.
-  local park = math.max(0, math.floor(tonumber(rb.parkOffset) or 0))
   if park > 0 then
     clearOriginCorridor(park)
   end
 
-  local homeMsg = sitePayload({
-    _siteType = "quarry_home",
-    status = "homing",
-    epoch = epoch,
-    parkOffset = park,
-  })
-  homeMsg.type = "quarry_home"
-  if siteId then rednet.send(siteId, homeMsg, PROTO_QUARRY) end
-  rednet.broadcast(homeMsg, PROTO_QUARRY)
+  rebandPhase = "waiting_reset"
+  sendRebandHome(epoch, park)
+  print(("REBAND epoch %d — home, waiting for reset turn..."):format(epoch))
 
-  -- Wait for our reset turn.
+  -- Wait for our reset turn; re-ping site periodically (in case home was missed).
   local deadline = os.clock() + 600
+  local lastPing = 0
   while os.clock() < deadline do
     if pendingReband and tonumber(pendingReband.epoch) and tonumber(pendingReband.epoch) > epoch then
-      -- Newer reband supersedes.
+      rebandPhase = nil
       return processRebandCycle()
     end
+    -- Drop same-epoch spam so digSiteMine doesn't restart this cycle.
+    if pendingReband and tonumber(pendingReband.epoch) == epoch then
+      pendingReband = nil
+    end
+
     local go = pendingResetGo
     if go and (not tonumber(go.epoch) or tonumber(go.epoch) == epoch) then
       pendingResetGo = nil
-      print("Reset turn — clearing origin / dumping / adopting claim")
+      rebandPhase = "resetting"
+      print("Reset turn — dump / adopt claim")
 
-      -- Leave parking and take origin.
       if park > 0 then
+        restorePickAfterComms()
         goHome()
       end
-      -- If something is still on origin path, nudge down+right once then back.
       if turtle.detect() then
         clearOriginCorridor(1)
         goHome()
@@ -2633,6 +2671,7 @@ local function processRebandCycle()
         for k, v in pairs(claim) do siteInfo[k] = v end
       end
 
+      ensureModemForComms(true)
       local doneMsg = sitePayload({
         _siteType = "quarry_reset_done",
         status = "mining",
@@ -2646,14 +2685,20 @@ local function processRebandCycle()
       if siteId then rednet.send(siteId, doneMsg, PROTO_QUARRY) end
       rednet.broadcast(doneMsg, PROTO_QUARRY)
       restorePickAfterComms()
+      pendingReband = nil
+      rebandPhase = nil
       return claim
     end
 
-    -- mineNetLoop owns rednet.receive — just wait for pendingResetGo.
-    ensureModemForComms(true)
+    if (os.clock() - lastPing) >= 5 then
+      sendRebandHome(epoch, park)
+      lastPing = os.clock()
+    end
     sleep(0.25)
   end
   print("Timed out waiting for reset turn.")
+  pendingReband = nil
+  rebandPhase = nil
   return rebandClaim
 end
 
