@@ -1,6 +1,6 @@
 --[[
   games.lua  -  Titan Games Launcher (CC: Tweaked)
-  Titan-Version: 1.0.3
+  Titan-Version: 1.0.4
 
   Run:
 
@@ -407,7 +407,10 @@ local function drawMenu(state)
   textAt(2, 2, STATUS:sub(1, tw - 2), colors.lightGray, colors.black)
 
   local games = state.catalog and state.catalog.games or {}
-  local headerH, footerH = 3, USING_MONITOR and 3 or 2
+  -- On-screen UP/DOWN only on monitor setups; pockets use tap / keys / scroll.
+  local showNav = USING_MONITOR == true
+  local headerH = 3
+  local footerH = showNav and 3 or 1
   local tileH = (th < 14) and 2 or 3
   local gap = 1
   local usable = th - headerH - footerH
@@ -430,6 +433,7 @@ local function drawMenu(state)
   state.cols = cols
   state.headerH = headerH
   state.rects = {}
+  state.upBtn, state.dnBtn = nil, nil
 
   for i = 1, #games do
     local localIdx = i - state.scroll
@@ -461,16 +465,22 @@ local function drawMenu(state)
     textAt(2, 5, "No games yet — press U to sync", colors.orange, colors.black)
   end
 
-  local footY = th - footerH + 1
-  local half = math.floor(tw / 2)
-  state.upBtn = { x = 1, y = footY, w = half, h = footerH }
-  state.dnBtn = { x = half + 1, y = footY, w = tw - half, h = footerH }
-  local canUp = state.scroll > 0
-  local canDn = state.scroll + page < #games
-  fill(1, footY, half, footerH, canUp and colors.cyan or colors.gray)
-  fill(half + 1, footY, tw - half, footerH, canDn and colors.cyan or colors.gray)
-  textAt(2, footY + math.floor((footerH - 1) / 2), " UP ", colors.white, canUp and colors.cyan or colors.gray)
-  textAt(half + 2, footY + math.floor((footerH - 1) / 2), " DOWN ", colors.white, canDn and colors.cyan or colors.gray)
+  if showNav then
+    local footY = th - footerH + 1
+    local half = math.floor(tw / 2)
+    state.upBtn = { x = 1, y = footY, w = half, h = footerH }
+    state.dnBtn = { x = half + 1, y = footY, w = tw - half, h = footerH }
+    local canUp = state.scroll > 0
+    local canDn = state.scroll + page < #games
+    fill(1, footY, half, footerH, canUp and colors.cyan or colors.gray)
+    fill(half + 1, footY, tw - half, footerH, canDn and colors.cyan or colors.gray)
+    textAt(2, footY + math.floor((footerH - 1) / 2), " UP ", colors.white, canUp and colors.cyan or colors.gray)
+    textAt(half + 2, footY + math.floor((footerH - 1) / 2), " DOWN ", colors.white, canDn and colors.cyan or colors.gray)
+  else
+    -- Slim pocket footer hint (no nav buttons).
+    fill(1, th, tw, 1, colors.gray)
+    textAt(2, th, "Tap game  U update  Q quit", colors.white, colors.gray)
+  end
 end
 
 local function inRect(mx, my, r)
