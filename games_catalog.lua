@@ -1,6 +1,6 @@
 --[[
   games_catalog.lua  -  Titan games suite catalog
-  Titan-Version: 1.0.0
+  Titan-Version: 1.0.1
 
   Source of truth for the Games launcher (`games.lua`).
   Add a new game here (+ versions.lua + ship the .lua) and every launcher
@@ -12,7 +12,7 @@
 ]]
 
 return {
-  version = "1.0.0",
+  version = "1.0.1",
   base = "https://raw.githubusercontent.com/TitanBCXR/MinecraftLua/main/",
   -- Launcher self-update files (always kept current).
   launcher = {
@@ -23,7 +23,7 @@ return {
       id = "tetris",
       name = "Tetris",
       run = "tetris.lua",
-      desc = "Pocket / monitor + music + leaderboard",
+      desc = "Pocket / monitor + music (speaker; local LB)",
       files = { "lib/titan.lua", "tetris.lua", "versions.lua" },
     },
     {

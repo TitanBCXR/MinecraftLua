@@ -14,7 +14,7 @@ A wireless dispatch system for Minecraft's **CC: Tweaked** mod (active packages)
 - **`sandstorm.lua`** — Darude Sandstorm note-block knockoff + desert pixel visualizer (speaker + color monitor).
 - **`luigi_poker.lua`** — Luigi Picture Poker (beat Luigi’s visible hand; pocket-first; hold/draw).
 - **`slots.lua`** — 3-reel slots (bet/spin animation, coin bank; monitor tap UI).
-- **`games.lua`** + **`games_catalog.lua`** — Games launcher: installs all games, auto-updates, auto-adds new catalog entries.
+- **`games.lua`** + **`games_catalog.lua`** — Games launcher: suite install/update over HTTP; launches games in speaker-only mode (no modem).
 - **`github_install.lua`** — On an advanced PC + color monitor, role select draws on the monitor (touch tiles + UP/DOWN scroll).
 - **`lib/titan.lua`** — shared library (protocol, messaging, navigation).
 

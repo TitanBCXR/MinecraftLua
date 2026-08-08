@@ -1,10 +1,11 @@
 --[[
   tetris.lua  -  Standalone Tetris for CC: Tweaked (pocket / computer)
-  Titan-Version: 1.2.6
+  Titan-Version: 1.2.7
 
   Drop on a pocket PC or advanced computer and run:
 
       tetris
+      tetris --speaker   (Games launcher: speaker only, no modem/mesh)
 
   Main menu: top-3 leaderboard, Play, Controls (C). Q shuts the device down.
   In-game / Controls screen: Q always returns to the main menu.
@@ -19,10 +20,11 @@
   and the session goes fully offline — no more rednet calls (avoids pocket
   crashes with speaker music). New scores update the local top-3 and queue for
   the next boot sync. R reloads the local cache only.
+  `--speaker` / Games launcher skips modem entirely (local LB + notes only).
 
   Music (speaker / Noisy pocket): two in-script note tracks — calm menu bed +
-  retro Korobeiniki in-game. M mutes. Mesh / leaderboard sync still need a
-  wireless modem at boot.
+  retro Korobeiniki in-game. M mutes. Optional mesh LB sync needs a modem
+  when not in --speaker mode.
 
   Player name: uses Advanced Peripherals Player Detector when present; otherwise
   prompts for a name after a game (saved in tetris.cfg). That name is what
@@ -43,6 +45,18 @@ local ROUTER_PROTO = "titan_router"
 local SIDE_W = 5 -- compact HUD column (score uses K/M/B/T)
 local LB_TOP = 3 -- only show top 3 on menu
 local PLAYER_RANGE = 8
+
+-- Games launcher passes --speaker: no modem / rednet / mesh OTA this run.
+local SPEAKER_ONLY = false
+do
+  local argv = { ... }
+  for i = 1, #argv do
+    local s = tostring(argv[i] or ""):lower()
+    if s == "--speaker" or s == "speaker" or s == "--offline" or s == "offline" then
+      SPEAKER_ONLY = true
+    end
+  end
+end
 
 -- Cached host leaderboard (disk + RAM). After boot sync, NET_LOCKED stops all rednet.
 local LEADERBOARD = {}
@@ -212,6 +226,9 @@ end
 
 local function meshStatusLine()
   local sp = refreshSpeaker()
+  if SPEAKER_ONLY then
+    return sp and "speaker only" or "no speaker"
+  end
   local md = hasModem()
   if sp and md then return "notes+mesh"
   elseif sp then return "notes (U=modem)"
@@ -1508,8 +1525,12 @@ local function bootCheckUpdates()
   if fs.exists(LEGACY_MUSIC_FILE) then pcall(fs.delete, LEGACY_MUSIC_FILE) end
   print(meshStatusLine())
 
-  if not hasModem() then
-    print("No modem — using local leaderboard only.")
+  if SPEAKER_ONLY or not hasModem() then
+    if SPEAKER_ONLY then
+      print("Speaker mode — local LB, no modem.")
+    else
+      print("No modem — using local leaderboard only.")
+    end
     lockNetworkOffline()
     sleep(0.55)
     showQuitDisclaimer()

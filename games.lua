@@ -1,6 +1,6 @@
 --[[
   games.lua  -  Titan Games Launcher (CC: Tweaked)
-  Titan-Version: 1.0.0
+  Titan-Version: 1.0.1
 
   Run:
 
@@ -8,6 +8,9 @@
 
   Installs / updates every game from the GitHub catalog (`games_catalog.lua`),
   auto-adds newly published games, and launches them from a tap-friendly menu.
+
+  Games are started in --speaker mode (notes / SFX only — no modem or mesh).
+  Updates use HTTP to GitHub, not rednet.
 
   Pocket + advanced PC (+ color monitor). Needs HTTP enabled.
 
@@ -396,8 +399,10 @@ local function launchGame(game)
   term.clear()
   term.setCursorPos(1, 1)
   print("Starting " .. (game.name or game.run) .. "…")
+  print("(speaker mode — no modem)")
   sleep(0.2)
-  shell.run(game.run)
+  -- All suite games: speaker/SFX only; Tetris skips mesh/LB modem sync.
+  shell.run(game.run, "--speaker")
   -- Return to launcher UI
   attachMonitor()
   STATUS = "Back from " .. (game.name or game.run)
