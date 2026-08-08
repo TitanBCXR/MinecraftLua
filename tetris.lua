@@ -1,6 +1,6 @@
 --[[
   tetris.lua  -  Standalone Tetris for CC: Tweaked (pocket / computer)
-  Titan-Version: 1.2.2
+  Titan-Version: 1.2.3
 
   Drop on a pocket PC and run:
 
@@ -103,6 +103,7 @@ HI, PLAYER_NAME = loadCfg()
 --------------------------------------------------------------------------------
 local SPEAKER = nil
 local musicIdx = 1
+local musicBassPulse = 0
 -- Compact note-block Korobeiniki (folk melody). No audio files — tiny in-script data.
 local MELODY = {
   {16, 2}, {11, 1}, {12, 1}, {14, 2}, {12, 1}, {11, 1},
@@ -116,7 +117,11 @@ local MELODY = {
   {12, 2}, {9, 2}, {9, 4},
   {false, 4},
 }
-local MUSIC_BEAT = 0.16
+-- Pedal bass roots (played on a steady pulse so the lead never sits in silence).
+local BASS = { 4, 4, 2, 2, 0, 0, 4, 4, 7, 7, 4, 4, 0, 0, 4, 4 }
+local MUSIC_BEAT = 0.13
+-- Start the next note before the previous duration ends (legato / less choppy).
+local MUSIC_LEGATO = 0.72
 local LEGACY_MUSIC_FILE = "tetris_lofi.dfpwm"
 
 local function refreshSpeaker()
@@ -156,39 +161,60 @@ local function swapPocketUpgrade()
 end
 
 local function stopMusic()
+  -- Only cut audio on pause/mute/exit — never between notes (that causes chop).
   if SPEAKER then pcall(function() SPEAKER.stop() end) end
 end
 
 local function startMusic()
-  stopMusic()
   musicIdx = 1
+  musicBassPulse = 0
   return MUSIC_ON and refreshSpeaker()
+end
+
+local function playSoft(instrument, volume, pitch)
+  if pitch == nil or pitch < 0 or pitch > 24 then return end
+  pcall(function() SPEAKER.playNote(instrument, volume, pitch) end)
 end
 
 local function musicStepSeconds()
   if not MUSIC_ON then return 0.5 end
   if not SPEAKER and not refreshSpeaker() then return 1.0 end
+
   local note = MELODY[musicIdx] or { false, 1 }
   musicIdx = musicIdx + 1
   if musicIdx > #MELODY then musicIdx = 1 end
   local pitch, beats = note[1], tonumber(note[2]) or 1
+
+  -- Steady soft bass pulse keeps the bed continuous under the lead.
+  musicBassPulse = musicBassPulse + 1
+  local bassPitch = BASS[((musicBassPulse - 1) % #BASS) + 1]
+  playSoft("bass", 0.22, bassPitch)
+
   if pitch ~= false and pitch ~= nil then
-    pcall(function()
-      SPEAKER.playNote("pling", 0.55, pitch)
-      if beats >= 2 then
-        SPEAKER.playNote("bass", 0.3, math.max(0, pitch - 12))
-      end
-    end)
+    -- Layered soft lead: harp + quiet harmony (fills gaps between note attacks).
+    playSoft("harp", 0.42, pitch)
+    playSoft("pling", 0.18, pitch)
+    local harmony = pitch - 5
+    if harmony < 0 then harmony = pitch + 3 end
+    playSoft("guitar", 0.16, harmony)
+    if beats >= 2 then
+      playSoft("flute", 0.14, math.min(24, pitch + 7))
+    end
+  else
+    -- Rest: keep a gentle pad so it doesn't go dead-silent.
+    playSoft("guitar", 0.10, bassPitch + 12 <= 24 and bassPitch + 12 or bassPitch)
   end
-  return math.max(0.08, beats * MUSIC_BEAT)
+
+  -- Legato: fire the next step before this beat fully ends.
+  local wait = beats * MUSIC_BEAT * MUSIC_LEGATO
+  return math.max(0.06, wait)
 end
 
 local function sfxLineClear(n)
   if not MUSIC_ON or not SPEAKER then return end
   n = math.max(1, math.min(4, tonumber(n) or 1))
-  pcall(function()
-    SPEAKER.playNote("hat", 0.35, 8 + n)
-  end)
+  -- Quiet click — avoid SPEAKER.stop() which would cut the song.
+  playSoft("hat", 0.2, 10 + n)
 end
 
 -- Advanced Peripherals Player Detector (optional on pockets / desks).
