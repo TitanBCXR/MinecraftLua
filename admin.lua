@@ -1,6 +1,6 @@
 --[[
   admin.lua  -  Titan admin console for a POCKET computer ("Live" tablet)
-  Titan-Version: 1.5.0
+  Titan-Version: 1.5.1
 
   Pocket remote for the whole fleet. Keep it on you; it joins the mesh like
   every other Titan device (MAIN router + modem hops).
@@ -22,9 +22,11 @@
     pending | deploy | park | stop | mine | continue
     dc | center                  — jump to Parent Center
     flatten ...                  — run flatten on Parent Center via SSH
-    live [local|global|stats|gps|bots|quarry] — full-screen boards
+    live [local|global|stats|gps|bots|quarry|qsite] — full-screen boards
+      Arrow right/left cycles; quarry ↔ qsite is the site monitor layout.
       Advanced (color) pocket → pretty GUI; normal pocket → mono.
-    quarry                       — cell quarry board % / turtles (titan_quarry)
+    quarry                       — cell quarry % board (compact)
+    live qsite                   — site-manager style roster (rel + world)
     quarry assign <id> <y0> <y1> — legacy tablet Y lock (layer sites only)
     quarry unassign <id> | quarry pending
     where <siteId> <botId>       — live GPS distance to a quarry turtle
@@ -622,7 +624,7 @@ end
 --------------------------------------------------------------------------------
 -- Live boards (same stats as MAIN monitor; pretty on advanced pocket)
 --------------------------------------------------------------------------------
-local LIVE_BOARDS = { "local", "global", "stats", "gps", "bots", "quarry" }
+local LIVE_BOARDS = { "local", "global", "stats", "gps", "bots", "quarry", "qsite" }
 local liveBoard = "local"
 local boardSnap = nil
 local boardSnapAt = 0
@@ -1308,17 +1310,91 @@ local function drawQuarryBoard(L)
     y = y + 1
   end
   if y < L.h - L.footerH then
-    guiText(out, 1 + L.pad, L.h - L.footerH, "cell fleet: one bot / XZ cell; SOS=out of fuel", colors.gray, colors.black)
+    guiText(out, 1 + L.pad, L.h - L.footerH,
+      "→ site board layout   cell fleet; SOS=out of fuel", colors.gray, colors.black)
+  end
+end
+
+-- Mirrors offline_site monitor: progress + ID/Name/Cell/Rel/World roster.
+local function drawQuarrySiteBoard(L)
+  local out = L.out
+  local snap = effectiveQuarrySnap()
+  local age = nil
+  if snap and snap.source == "site_board" and quarrySnapAt > 0 then
+    age = ago(quarrySnapAt)
+  elseif snap and snap.turtles and snap.turtles[1] then
+    age = snap.turtles[1].age
+  end
+  guiFill(out, 1, 1, L.w, L.h, colors.black, colors.white)
+  local title = ("QUARRY  %dx%d × %dY  cells@%s"):format(
+    tonumber(snap and snap.W) or 0,
+    tonumber(snap and snap.L) or 0,
+    tonumber(snap and snap.H) or 0,
+    tostring((snap and snap.cellSize) or "?"))
+  if L.color then
+    guiFill(out, 1, 1, L.w, 1, colors.cyan, colors.black)
+    guiText(out, 1 + L.pad, 1, " " .. title:sub(1, L.w - 2), colors.black, colors.cyan)
+  else
+    guiText(out, 1, 1, title, colors.yellow, colors.black)
+  end
+  if not snap then
+    guiText(out, 1 + L.pad, 3, "Waiting for site board / miners...", colors.lightGray, colors.black)
+    guiText(out, 1 + L.pad, 4, "← back to quarry stats    r refresh", colors.gray, colors.black)
+    return
+  end
+  guiText(out, 1 + L.pad, 2, ("Progress %d%%  cells %s/%s  free=%s asg=%s"):format(
+    tonumber(snap.pct) or 0,
+    tostring(snap.done or "?"), tostring(snap.total or "?"),
+    tostring(snap.cellsFree or "?"), tostring(snap.cellsAssigned or "?")),
+    colors.lime, colors.black)
+  guiText(out, 1 + L.pad, 3, ("Online %s  travel≤%s  origin=%s  %ss"):format(
+    tostring(snap.online or 0),
+    tostring(snap.maxTravel or "?"),
+    (snap.originSet and "set") or "unset",
+    tostring(age or "?")), colors.lightGray, colors.black)
+
+  local y = 5
+  guiText(out, 1 + L.pad, 4, "ID  Name         Cell     Rel XYZ      World",
+    colors.orange or colors.yellow, colors.black)
+  for _, t in ipairs(snap.turtles or {}) do
+    if y >= L.h - L.footerH then break end
+    local rel = (t.posX ~= nil)
+      and ("%d,%d,%d"):format(t.posX, t.posY or 0, t.posZ or 0) or "-"
+    local world = (t.hasWorld and t.wx ~= nil)
+      and ("%d,%d,%d"):format(t.wx, t.wy or 0, t.wz or 0) or "-"
+    local cell = t.cellId and ("C" .. tostring(t.cellId)) or "-"
+    local st = tostring(t.status or "?")
+    local col = colors.white
+    if t.sos or st == "sos" then col = colors.red
+    elseif st == "travel" then col = colors.yellow
+    elseif st == "mining" or st == "arrive" or st == "assigned" then col = colors.lime
+    elseif st == "homing" then col = colors.orange or colors.yellow
+    elseif (t.age or 0) >= 45 then col = colors.red end
+    guiText(out, 1 + L.pad, y, ("#%-3d %-12s %-8s %-12s %s"):format(
+      t.id or 0,
+      tostring(t.name or "?"):sub(1, 12),
+      cell:sub(1, 8),
+      rel:sub(1, 12),
+      world), col, colors.black)
+    y = y + 1
+  end
+  if #(snap.turtles or {}) == 0 then
+    guiText(out, 1 + L.pad, y, "(no turtles online)", colors.gray, colors.black)
+    y = y + 1
+  end
+  if y < L.h - L.footerH then
+    guiText(out, 1 + L.pad, L.h - L.footerH,
+      "← quarry stats   site monitor layout", colors.gray, colors.black)
   end
 end
 
 local function drawLiveFooter(L, board)
   local out, w, h = L.out, L.w, L.h
-  local tabs = "1loc 2glb 3stat 4gps 5bots 6qry"
-  if L.tier == "tiny" then tabs = "1-6  n/p  q back" end
+  local tabs = "1loc 2glb 3stat 4gps 5bots 6qry 7site"
+  if L.tier == "tiny" then tabs = "1-7  n/p  q back" end
   local mode = L.color and "ADV" or "MONO"
   local right = (" %s %dx%d"):format(mode, w, h)
-  local left = (" %s  %s"):format(board, (L.tier == "tiny") and "q=back" or "n/p tabs  q back")
+  local left = (" %s  %s"):format(board, (L.tier == "tiny") and "q=back" or "←/→ tabs  q back")
   if L.color then
     guiFill(out, 1, h, w, 1, colors.gray, colors.white)
     guiText(out, 1, h, left, colors.white, colors.gray)
@@ -1340,6 +1416,8 @@ local function drawLiveBoard(board)
   L.out.clear()
   if board == "quarry" then
     drawQuarryBoard(L)
+  elseif board == "qsite" then
+    drawQuarrySiteBoard(L)
   else
     local snap = boardSnap or refreshBoardSnap(false)
     if board == "global" then
@@ -1364,11 +1442,18 @@ local function normalizeLiveBoard(name)
   if name == "stat" or name == "s" then return "stats" end
   if name == "p" then return "gps" end
   if name == "bot" or name == "b" then return "bots" end
-  if name == "q" or name == "site" or name == "offline" then return "quarry" end
+  if name == "q" or name == "offline" then return "quarry" end
+  if name == "site" or name == "qsite" or name == "cells" or name == "monitor" then
+    return "qsite"
+  end
   for _, b in ipairs(LIVE_BOARDS) do
     if b == name then return name end
   end
   return nil
+end
+
+local function isQuarryLiveBoard(b)
+  return b == "quarry" or b == "qsite"
 end
 
 local function cycleLiveBoard(delta)
@@ -1393,7 +1478,7 @@ local function liveView(startBoard)
   if startBoard then
     liveBoard = normalizeLiveBoard(startBoard) or liveBoard
   end
-  if liveBoard == "quarry" then
+  if isQuarryLiveBoard(liveBoard) then
     requestQuarryStatus(2)
   else
     refreshBoardSnap(true)
@@ -1407,7 +1492,7 @@ local function liveView(startBoard)
       drawLiveBoard(liveBoard)
       timer = os.startTimer(1)
     elseif ev == "timer" and p1 == snapTimer then
-      if liveBoard == "quarry" then
+      if isQuarryLiveBoard(liveBoard) then
         -- keep last broadcast; optional soft refresh
       else
         refreshBoardSnap(true)
@@ -1418,19 +1503,27 @@ local function liveView(startBoard)
       local ch = tostring(p1 or ""):lower()
       if ch == "q" then break
       elseif ch == "n" then
-        cycleLiveBoard(1); drawLiveBoard(liveBoard)
+        cycleLiveBoard(1)
+        if isQuarryLiveBoard(liveBoard) then requestQuarryStatus(1) end
+        drawLiveBoard(liveBoard)
       elseif ch == "p" then
-        cycleLiveBoard(-1); drawLiveBoard(liveBoard)
+        cycleLiveBoard(-1)
+        if isQuarryLiveBoard(liveBoard) then requestQuarryStatus(1) end
+        drawLiveBoard(liveBoard)
       elseif ch == "1" then liveBoard = "local"; drawLiveBoard(liveBoard)
       elseif ch == "2" then liveBoard = "global"; drawLiveBoard(liveBoard)
       elseif ch == "3" then liveBoard = "stats"; drawLiveBoard(liveBoard)
       elseif ch == "4" then liveBoard = "gps"; drawLiveBoard(liveBoard)
       elseif ch == "5" then liveBoard = "bots"; drawLiveBoard(liveBoard)
       elseif ch == "6" then liveBoard = "quarry"; requestQuarryStatus(2); drawLiveBoard(liveBoard)
+      elseif ch == "7" then liveBoard = "qsite"; requestQuarryStatus(2); drawLiveBoard(liveBoard)
       elseif ch == "r" then
-        if liveBoard == "quarry" then requestQuarryStatus(2) else refreshBoardSnap(true) end
+        if isQuarryLiveBoard(liveBoard) then requestQuarryStatus(2) else refreshBoardSnap(true) end
         drawLiveBoard(liveBoard)
-      elseif ch == "\t" then cycleLiveBoard(1); drawLiveBoard(liveBoard)
+      elseif ch == "\t" then
+        cycleLiveBoard(1)
+        if isQuarryLiveBoard(liveBoard) then requestQuarryStatus(1) end
+        drawLiveBoard(liveBoard)
       end
     elseif ev == "key" then
       local K = keys
@@ -1438,11 +1531,15 @@ local function liveView(startBoard)
       -- handling both leaves a queued event that exits the phone home).
       if p1 == K.backspace then break
       elseif p1 == K.right or p1 == K.tab then
-        cycleLiveBoard(1); drawLiveBoard(liveBoard)
+        cycleLiveBoard(1)
+        if isQuarryLiveBoard(liveBoard) then requestQuarryStatus(1) end
+        drawLiveBoard(liveBoard)
       elseif p1 == K.left then
-        cycleLiveBoard(-1); drawLiveBoard(liveBoard)
+        cycleLiveBoard(-1)
+        if isQuarryLiveBoard(liveBoard) then requestQuarryStatus(1) end
+        drawLiveBoard(liveBoard)
       elseif p1 == K.r then
-        if liveBoard == "quarry" then requestQuarryStatus(2) else refreshBoardSnap(true) end
+        if isQuarryLiveBoard(liveBoard) then requestQuarryStatus(2) else refreshBoardSnap(true) end
         drawLiveBoard(liveBoard)
       end
     elseif ev == "mouse_click" then
@@ -1451,6 +1548,7 @@ local function liveView(startBoard)
       local x = p2
       if x and x > 0 then
         if x > w / 2 then cycleLiveBoard(1) else cycleLiveBoard(-1) end
+        if isQuarryLiveBoard(liveBoard) then requestQuarryStatus(1) end
         drawLiveBoard(liveBoard)
       end
     elseif ev == "terminate" then

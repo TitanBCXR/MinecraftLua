@@ -1,8 +1,10 @@
 --[[
   offline_site.lua  -  Quarry site board (XZ cell fleet)
-  Titan-Version: 1.3.0
+  Titan-Version: 1.3.1
 
   Place LEFT of the storage chest (storage behind turtle origin). Modem required.
+  Attach a **monitor** for the live status board — the computer terminal stays
+  free for the `site>` console.
 
   Dig model:
     * Site W×L×H footprint
@@ -1244,14 +1246,29 @@ else
   print(("Footprint %dx%d × %dY  cellSize=%d  cells=%d"):format(
     cfg.W, cfg.L, cfg.H, cfg.cellSize, #(cfg.cells or {})))
 end
+local mon = wrapMonitor()
+if mon then
+  print("Status board → attached monitor (this screen is the console).")
+else
+  print("No monitor attached — status board idle until you add one.")
+  print("(Console stays on this computer; board never draws here.)")
+end
 print("Type help.")
 
-local mon = wrapMonitor()
+-- Live board ONLY on a peripheral monitor — never on `term` (that steals the console).
 local function uiLoop()
+  local warned = false
   while true do
-    drawBoard(mon or term)
+    mon = wrapMonitor()
+    if mon then
+      warned = false
+      local ok, err = pcall(drawBoard, mon)
+      if not ok then print("[monitor] " .. tostring(err)) end
+    elseif not warned then
+      -- one-shot; don't spam the console
+      warned = true
+    end
     sleep(1)
-    if not mon then mon = wrapMonitor() end
   end
 end
 
