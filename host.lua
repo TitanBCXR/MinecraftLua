@@ -1,26 +1,28 @@
 --[[
   host.lua  -  Titan install / update host + Tetris leaderboard (CC: Tweaked)
-  Titan-Version: 1.2.2
+  Titan-Version: 1.2.3
 
   Run this on ONE computer that already has the Titan files (your "update
   server"). It serves those files over rednet so pockets and other devices can
   install / OTA without storing any GitHub / wget URL on the clients.
 
-  Also holds the shared Tetris leaderboard (tetris_leaderboard.cfg), keyed by
-  player name so shared tablets can track different people. Tablets sync on
-  boot / after games via titan_install.
+  Tetris leaderboard lives on a floppy disk in an attached disk drive
+  (tetris_leaderboard.cfg), keyed by player name. Attach a drive + leave a
+  disk inserted. Tablets sync on boot / after games via titan_install.
 
   Usage:
     1. Keep this machine updated (you may wget/GitHub here — clients never see it).
-    2. Wireless (or ender) modem + run:  host
+    2. Wireless (or ender) modem + disk drive with floppy + run:  host
     3. Give out tablets via install.lua role `t` (or disk copy).
 
   Only serves files on the published list. Ctrl+T to stop.
 ]]
 
 local PROTOCOL = "titan_install"
-local LB_FILE = "tetris_leaderboard.cfg"
+local LB_NAME = "tetris_leaderboard.cfg"
+local LB_LOCAL_LEGACY = "tetris_leaderboard.cfg" -- migrate once from computer FS
 local LB_MAX = 25 -- keep extras; tablets only display top 3
+local LB_DISK_LABEL = "Tetris LB"
 
 local FILES = {
   "install.lua",
@@ -86,27 +88,105 @@ local function relayLoop()
 end
 
 --------------------------------------------------------------------------------
--- Tetris leaderboard (persisted)
+-- Tetris leaderboard (persisted on floppy disk)
 --------------------------------------------------------------------------------
 local leaderboard = {} -- sorted descending: { id, name, score, at }
+local lbDriveName, lbMount, lbPath = nil, nil, nil
 
-local function loadLeaderboard()
-  leaderboard = {}
-  if not fs.exists(LB_FILE) then return end
-  local f = fs.open(LB_FILE, "r")
+-- Prefer a floppy that already has the board file; else any present disk.
+local function findLbDisk()
+  local anyName, anyMount = nil, nil
+  for _, name in ipairs(peripheral.getNames()) do
+    if peripheral.getType(name) == "drive" then
+      local d = peripheral.wrap(name)
+      if d and d.isDiskPresent and d.isDiskPresent() then
+        local mount = d.getMountPath and d.getMountPath()
+        if mount and mount ~= "" then
+          local path = fs.combine(mount, LB_NAME)
+          if fs.exists(path) and not fs.isDir(path) then
+            return name, mount, path
+          end
+          if not anyMount then
+            anyName, anyMount = name, mount
+          end
+        end
+      end
+    end
+  end
+  if anyMount then
+    return anyName, anyMount, fs.combine(anyMount, LB_NAME)
+  end
+  return nil, nil, nil
+end
+
+local function refreshLbDisk()
+  lbDriveName, lbMount, lbPath = findLbDisk()
+  return lbPath ~= nil
+end
+
+local function readBoardFile(path)
+  if not path or not fs.exists(path) or fs.isDir(path) then return {} end
+  local f = fs.open(path, "r")
+  if not f then return {} end
   local d = textutils.unserialize(f.readAll() or "")
   f.close()
   if type(d) == "table" and type(d.entries) == "table" then
-    leaderboard = d.entries
+    return d.entries
   elseif type(d) == "table" then
-    leaderboard = d
+    return d
   end
+  return {}
+end
+
+local function writeBoardFile(path)
+  if not path then return false, "no disk" end
+  local f = fs.open(path, "w")
+  if not f then return false, "open failed" end
+  f.write(textutils.serialize({ entries = leaderboard }))
+  f.close()
+  if lbDriveName then
+    pcall(function()
+      local d = peripheral.wrap(lbDriveName)
+      if d and d.setDiskLabel and (not d.getDiskLabel or d.getDiskLabel() == nil or d.getDiskLabel() == "") then
+        d.setDiskLabel(LB_DISK_LABEL)
+      end
+    end)
+  end
+  return true
+end
+
+local function loadLeaderboard()
+  leaderboard = {}
+  refreshLbDisk()
+  if lbPath and fs.exists(lbPath) then
+    leaderboard = readBoardFile(lbPath)
+    return "disk"
+  end
+  -- One-time migrate from computer-local file onto the floppy.
+  if fs.exists(LB_LOCAL_LEGACY) and not fs.isDir(LB_LOCAL_LEGACY) then
+    leaderboard = readBoardFile(LB_LOCAL_LEGACY)
+    if lbPath then
+      local ok = writeBoardFile(lbPath)
+      if ok then
+        pcall(fs.delete, LB_LOCAL_LEGACY)
+        return "migrated"
+      end
+    end
+    return "legacy"
+  end
+  return lbPath and "empty" or "no_disk"
 end
 
 local function saveLeaderboard()
-  local f = fs.open(LB_FILE, "w")
-  f.write(textutils.serialize({ entries = leaderboard }))
-  f.close()
+  if not refreshLbDisk() then
+    print("[tetris_lb] no floppy — score kept in RAM until a disk is inserted")
+    return false
+  end
+  local ok, err = writeBoardFile(lbPath)
+  if not ok then
+    print("[tetris_lb] save failed: " .. tostring(err))
+  end
+  return ok
 end
 
 local function sortBoard()
@@ -117,6 +197,34 @@ local function sortBoard()
     return (a.at or 0) < (b.at or 0)
   end)
   while #leaderboard > LB_MAX do table.remove(leaderboard) end
+end
+
+-- Watch disk insert/eject so the board follows the floppy.
+local function diskWatchLoop()
+  while true do
+    local ev = os.pullEvent()
+    if ev == "disk" or ev == "disk_eject" or ev == "peripheral" or ev == "peripheral_detach" then
+      local had = #leaderboard
+      refreshLbDisk()
+      if lbPath then
+        if fs.exists(lbPath) then
+          leaderboard = readBoardFile(lbPath)
+          sortBoard()
+          print(("[tetris_lb] disk ready (%s) — %d entr%s"):format(
+            tostring(lbMount), #leaderboard, #leaderboard == 1 and "y" or "ies"))
+        elseif had > 0 then
+          -- Blank floppy: flush in-memory board onto it.
+          writeBoardFile(lbPath)
+          print(("[tetris_lb] wrote RAM board to %s (%d)"):format(tostring(lbMount), had))
+        else
+          leaderboard = {}
+          print(("[tetris_lb] disk ready (%s) — empty board"):format(tostring(lbMount)))
+        end
+      else
+        print("[tetris_lb] floppy removed — serving last scores from RAM (not saving)")
+      end
+    end
+  end
 end
 
 local function boardSnapshot()
@@ -192,13 +300,21 @@ end
 
 openModem()
 os.setComputerLabel(os.getComputerLabel() or ("TitanHost-" .. os.getComputerID()))
-loadLeaderboard()
+local lbSrc = loadLeaderboard()
 sortBoard()
 
 term.clear(); term.setCursorPos(1, 1)
 print("== Titan Install Host ==")
 print(("Serving %d files as '%s' (#%d)."):format(#manifest(), os.getComputerLabel(), os.getComputerID()))
-print(("Tetris leaderboard: %d entr%s"):format(#leaderboard, #leaderboard == 1 and "y" or "ies"))
+if lbPath then
+  print(("Tetris LB disk: %s (%s)"):format(tostring(lbMount), tostring(lbDriveName)))
+  print(("Tetris leaderboard: %d entr%s [%s]"):format(
+    #leaderboard, #leaderboard == 1 and "y" or "ies", tostring(lbSrc)))
+else
+  print("Tetris LB: NO FLOPPY — insert a disk in the drive to persist scores.")
+  print(("Tetris leaderboard (RAM): %d entr%s"):format(
+    #leaderboard, #leaderboard == 1 and "y" or "ies"))
+end
 print("Clients update over rednet (no GitHub URL on tablets).")
 print("Mesh relay on. Ctrl+T to stop.")
 print("")
@@ -248,7 +364,7 @@ local function serveLoop()
   end
 end
 
-local tasks = { serveLoop, relayLoop }
+local tasks = { serveLoop, relayLoop, diskWatchLoop }
 if fs.exists("lib/titan.lua") then
   local titan = dofile("lib/titan.lua")
   tasks[#tasks + 1] = function() titan.networkLoop("host") end

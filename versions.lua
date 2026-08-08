@@ -5,11 +5,11 @@
   The console `packages` command shows these names + versions.
   Installers / OTA updates ship this file so devices know what they have.
 
-  Titan-Version: 1.6.20
+  Titan-Version: 1.6.21
 ]]
 
 return {
-  system = "1.6.20",
+  system = "1.6.21",
   packages = {
     ["lib/titan.lua"]      = "1.2.22",
     ["console.lua"]        = "1.1.8",
@@ -29,8 +29,8 @@ return {
     ["perimeter_sensor.lua"] = "1.2.3",
     ["perimeter_manager.lua"]= "1.3.2",
     ["tetris.lua"]         = "1.0.8",
-    ["host.lua"]           = "1.2.2",
+    ["host.lua"]           = "1.2.3",
     ["exclude.txt"]        = "1.0.1",
-    ["versions.lua"]       = "1.6.20",
+    ["versions.lua"]       = "1.6.21",
   },
 }
