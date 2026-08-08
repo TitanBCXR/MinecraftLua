@@ -1,6 +1,6 @@
 --[[
   offline_miner.lua  -  Local quarry turtle (optional site board)
-  Titan-Version: 1.3.2
+  Titan-Version: 1.3.3
 
   Place the turtle at the TOP-FRONT-LEFT corner of the dig, facing into the
   mine. That cell is origin 0,0,0:
@@ -886,6 +886,10 @@ local function restorePoseFromJob(j)
   return true
 end
 
+local function distHome()
+  return math.abs(pos.x) + math.abs(pos.y) + math.abs(pos.z)
+end
+
 -- Tank fuel + estimated value of remaining fuel items (after a light top-up burn).
 local function estimateFuelUnits()
   local level = turtle.getFuelLevel()
@@ -1002,10 +1006,6 @@ local function assumeAtOrigin()
   pos.x, pos.y, pos.z = 0, 0, 0
   facing = 0
   faceForward()
-end
-
-local function distHome()
-  return math.abs(pos.x) + math.abs(pos.y) + math.abs(pos.z)
 end
 
 local function goHome()
