@@ -1,6 +1,6 @@
 --[[
   tetris.lua  -  Standalone Tetris for CC: Tweaked (pocket / computer)
-  Titan-Version: 1.0.10
+  Titan-Version: 1.1.0
 
   Drop on a pocket PC and run:
 
@@ -9,6 +9,11 @@
   Main menu: top-3 leaderboard, Play, Controls (C). Q shuts the device down.
   In-game / Controls screen: Q always returns to the main menu.
   Mid-game Q abandons the run (score is not kept).
+
+  Music: on an Advanced Noisy pocket (speaker upgrade), plays an 8-bit style
+  Korobeiniki loop while you play (M mutes). Mesh / SSH / leaderboard need a
+  wireless modem — pockets usually have only ONE upgrade, so carry a modem and
+  press U to swap (pocket.equipBack), or sync on a desk PC with both attached.
 
   Player name: uses Advanced Peripherals Player Detector when present; otherwise
   prompts for a name after a game (saved in tetris.cfg). That name is what
@@ -54,6 +59,8 @@ local function isColor()
   return ok and c == true
 end
 
+local MUSIC_ON = true -- persisted; M toggles
+
 local function loadCfg()
   local hi, name = 0, nil
   if not fs.exists(CFG) then return hi, name end
@@ -65,6 +72,7 @@ local function loadCfg()
     if type(d.playerName) == "string" and d.playerName:match("%S") then
       name = d.playerName:match("^%s*(.-)%s*$")
     end
+    if d.music == false then MUSIC_ON = false end
   end
   return hi, name
 end
@@ -74,12 +82,94 @@ local function saveCfg()
   f.write(textutils.serialize({
     hi = HI,
     playerName = PLAYER_NAME,
+    music = MUSIC_ON,
   }))
   f.close()
 end
 
 local HI
 HI, PLAYER_NAME = loadCfg()
+
+--------------------------------------------------------------------------------
+-- Speaker music (Noisy pocket) + modem detection for mesh
+--------------------------------------------------------------------------------
+local SPEAKER = nil
+local musicIdx = 1
+-- Korobeiniki-ish loop: {pitch 0-24 or false=rest, beats}. pling = bright 8-bit.
+local MELODY = {
+  {16, 1}, {11, 1}, {12, 1}, {14, 1}, {12, 1}, {11, 1}, {9, 2},
+  {9, 1}, {12, 1}, {16, 1}, {14, 1}, {12, 1}, {11, 2},
+  {11, 1}, {12, 1}, {14, 1}, {16, 1}, {12, 1}, {9, 1}, {9, 2},
+  {false, 1},
+  {14, 2}, {17, 1}, {21, 2}, {19, 1}, {17, 1}, {16, 2},
+  {12, 1}, {16, 1}, {14, 1}, {12, 1}, {11, 2},
+  {11, 1}, {12, 1}, {14, 1}, {16, 1}, {12, 1}, {9, 1}, {9, 2},
+  {false, 2},
+}
+local MUSIC_BEAT = 0.11
+
+local function refreshSpeaker()
+  SPEAKER = peripheral.find("speaker")
+  return SPEAKER ~= nil
+end
+
+local function hasModem()
+  for _, name in ipairs(peripheral.getNames()) do
+    if peripheral.getType(name) == "modem" then return true end
+  end
+  return false
+end
+
+local function meshStatusLine()
+  local sp = refreshSpeaker()
+  local md = hasModem()
+  if sp and md then return "music+mesh"
+  elseif sp then return "music (U=modem for mesh)"
+  elseif md then return "mesh (no speaker)"
+  else return "offline (no modem/speaker)"
+  end
+end
+
+-- Swap pocket back upgrade (speaker <-> wireless modem in inventory).
+-- Select the upgrade slot you want before pressing U for best results.
+local function swapPocketUpgrade()
+  if not pocket or type(pocket.equipBack) ~= "function" then
+    return false, "not a pocket PC"
+  end
+  local ok, err = pocket.equipBack()
+  refreshSpeaker()
+  if hasModem() and titan and titan.openModem then
+    pcall(titan.openModem)
+  end
+  return ok, err
+end
+
+local function musicStepSeconds()
+  if not MUSIC_ON then return 0.4 end
+  if not SPEAKER and not refreshSpeaker() then return 1.0 end
+  local note = MELODY[musicIdx] or { false, 1 }
+  musicIdx = musicIdx + 1
+  if musicIdx > #MELODY then musicIdx = 1 end
+  local pitch, beats = note[1], tonumber(note[2]) or 1
+  if pitch ~= false and pitch ~= nil then
+    pcall(function()
+      SPEAKER.playNote("pling", 0.7, pitch)
+      if beats >= 2 then
+        SPEAKER.playNote("bass", 0.35, math.max(0, pitch - 12))
+      end
+    end)
+  end
+  return math.max(0.05, beats * MUSIC_BEAT)
+end
+
+local function sfxLineClear(n)
+  if not MUSIC_ON or not SPEAKER then return end
+  n = math.max(1, math.min(4, tonumber(n) or 1))
+  pcall(function()
+    SPEAKER.playNote("chime", 0.5, 12 + n * 2)
+    if n >= 4 then SPEAKER.playNote("bell", 0.6, 18) end
+  end)
+end
 
 -- Advanced Peripherals Player Detector (optional on pockets / desks).
 local function detectNearbyPlayer()
@@ -550,6 +640,10 @@ local function runGame()
 
   if not piece then over = true end
 
+  refreshSpeaker()
+  musicIdx = 1
+  local musicTimer = os.startTimer(MUSIC_ON and refreshSpeaker() and 0.05 or 3600)
+
   while true do
     TRACK.score, TRACK.level, TRACK.lines = score, level, lines
     if dirty then
@@ -562,6 +656,12 @@ local function runGame()
     if ev == "term_resize" then
       L = layout()
       dirty = true
+    elseif ev == "timer" and p1 == musicTimer then
+      if not paused and not over and MUSIC_ON then
+        musicTimer = os.startTimer(musicStepSeconds())
+      else
+        musicTimer = os.startTimer(0.35)
+      end
     elseif ev == "timer" and p1 == dropTimer then
       if not paused and not over and piece then
         if fits(grid, piece.kind, piece.rot, piece.x, piece.y + 1) then
@@ -573,6 +673,7 @@ local function runGame()
             score = score + lineScore(n, level)
             lines = lines + n
             level = math.floor(lines / 10)
+            sfxLineClear(n)
           end
           piece, bag = spawn(grid, bag)
           if not piece then over = true end
@@ -591,8 +692,18 @@ local function runGame()
         if not paused then
           dropTimer = os.startTimer(gravityMs(level) / 1000)
         end
+      elseif k == K.m then
+        MUSIC_ON = not MUSIC_ON
+        saveCfg()
+        if MUSIC_ON and SPEAKER then
+          musicTimer = os.startTimer(0.05)
+        elseif SPEAKER then
+          pcall(function() SPEAKER.stop() end)
+        end
+        dirty = true
       elseif k == K.q then
         -- Mid-game Q: abandon run (score not kept / not submitted).
+        if SPEAKER then pcall(function() SPEAKER.stop() end) end
         TRACK.playing = false
         TRACK.score = 0
         return 0
@@ -639,6 +750,7 @@ local function runGame()
             score = score + lineScore(n, level)
             lines = lines + n
             level = math.floor(lines / 10)
+            sfxLineClear(n)
           end
           piece, bag = spawn(grid, bag)
           if not piece then over = true end
@@ -648,6 +760,7 @@ local function runGame()
       end
     elseif ev == "key" and over then
       if p1 == keys.enter or p1 == keys.q or p1 == keys.space then
+        if SPEAKER then pcall(function() SPEAKER.stop() end) end
         TRACK.playing = false
         TRACK.score = score
         return score
@@ -657,11 +770,21 @@ local function runGame()
       -- key+char for "p" does not toggle pause twice (appear broken).
       local ch = tostring(p1 or ""):lower()
       if ch == "q" then
+        if SPEAKER then pcall(function() SPEAKER.stop() end) end
         TRACK.playing = false
         TRACK.score = 0
         return 0
+      elseif ch == "m" then
+        MUSIC_ON = not MUSIC_ON
+        saveCfg()
+        if MUSIC_ON and SPEAKER then
+          musicTimer = os.startTimer(0.05)
+        elseif SPEAKER then
+          pcall(function() SPEAKER.stop() end)
+        end
       end
     elseif ev == "terminate" then
+      if SPEAKER then pcall(function() SPEAKER.stop() end) end
       TRACK.playing = false
       TRACK.score = 0
       return 0
@@ -797,7 +920,8 @@ local function drawMenu(playBtn, ctrlBtn)
   text(cx, rowY, ctrlLabel, colors.black, ctrlBg)
   ctrlBtn.x, ctrlBtn.y, ctrlBtn.w, ctrlBtn.h = cx, rowY, #ctrlLabel, 1
 
-  text(2, th, "Enter play  C controls  N name  R sync  Q power off", colors.gray, colors.black)
+  local foot = ("Enter play  C ctrl  M mute  U swap  %s"):format(meshStatusLine())
+  text(2, th, foot:sub(1, tw - 2), colors.gray, colors.black)
 end
 
 local function controlsScreen()
@@ -816,6 +940,8 @@ local function controlsScreen()
       { "Soft",  "S / J / ↓" },
       { "Hard",  "Space / Enter" },
       { "Pause", "P" },
+      { "Mute",  "M (noisy speaker)" },
+      { "Swap",  "U (modem <-> speaker)" },
       { "Menu",  "Q (always)" },
     }
     local y = 3
@@ -829,6 +955,10 @@ local function controlsScreen()
     y = y + 1
     if y < th then
       text(2, y, "Q mid-game abandons score.", color and colors.red or colors.white, colors.black)
+      y = y + 1
+    end
+    if y < th then
+      text(2, y, ("Now: %s"):format(meshStatusLine()), colors.gray, colors.black)
     end
     text(2, th, "Q  main menu", colors.gray, colors.black)
 
@@ -904,6 +1034,19 @@ local function mainMenu()
         pcall(syncLeaderboard, nil, PLAYER_NAME)
       elseif p1 == keys.n then
         editPlayerName()
+      elseif p1 == keys.m then
+        MUSIC_ON = not MUSIC_ON
+        saveCfg()
+      elseif p1 == keys.u then
+        local ok, err = swapPocketUpgrade()
+        if not ok then
+          clearScreen(colors.black)
+          term.setCursorPos(1, 1)
+          print("Upgrade swap failed: " .. tostring(err or "none in hotbar"))
+          print("Select a wireless modem or speaker, then U.")
+          sleep(1.6)
+          drainInputEvents()
+        end
       elseif p1 == keys.q then
         clearScreen(colors.black)
         term.setCursorPos(1, 1)
@@ -930,6 +1073,19 @@ local function mainMenu()
         pcall(syncLeaderboard, nil, PLAYER_NAME)
       elseif ch == "n" then
         editPlayerName()
+      elseif ch == "m" then
+        MUSIC_ON = not MUSIC_ON
+        saveCfg()
+      elseif ch == "u" then
+        local ok, err = swapPocketUpgrade()
+        if not ok then
+          clearScreen(colors.black)
+          term.setCursorPos(1, 1)
+          print("Upgrade swap failed: " .. tostring(err or "none in hotbar"))
+          print("Select a wireless modem or speaker, then U.")
+          sleep(1.6)
+          drainInputEvents()
+        end
       end
     elseif ev == "mouse_click" then
       local x, y = p2, p3
@@ -960,7 +1116,7 @@ local function sendTrackerBeacon()
     name = host,
     hostname = host,
     mainRouterId = titan.getMainRouterId and titan.getMainRouterId() or nil,
-    version = titan.systemVersion and titan.systemVersion() or "1.0.10",
+    version = titan.systemVersion and titan.systemVersion() or "1.1.0",
     game = "tetris",
     playing = TRACK.playing and true or false,
     score = TRACK.score,
@@ -1042,6 +1198,7 @@ local function bootCheckUpdates()
   term.setCursorPos(1, 1)
   if term.setTextColor then term.setTextColor(colors.lightGray) end
   print("Tetris")
+  print(meshStatusLine())
   -- Need modem for host OTA + leaderboard even without full mesh lib.
   if titan and titan.openModem then
     pcall(titan.openModem)
@@ -1073,7 +1230,7 @@ local function bootCheckUpdates()
     end
     if titan.ensureHostManifest then
       titan.ensureHostManifest({
-        role = "Tetris (pocket game + mesh tracker)",
+        role = "Tetris (pocket + music/mesh)",
         run = "tetris.lua",
         files = { "lib/titan.lua", "tetris.lua", "versions.lua" },
       })
@@ -1081,7 +1238,7 @@ local function bootCheckUpdates()
     local updated, detail = titan.bootUpdateCheck({
       quiet = false,
       hostOnly = true,
-      role = "Tetris (pocket game + mesh tracker)",
+      role = "Tetris (pocket + music/mesh)",
       run = "tetris.lua",
       files = { "lib/titan.lua", "tetris.lua", "versions.lua" },
     })

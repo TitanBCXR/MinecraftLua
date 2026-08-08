@@ -9,6 +9,7 @@ A wireless dispatch system for Minecraft's **CC: Tweaked** mod (active packages)
 - **`offline_miner.lua`** — quarry turtle: solo `area`/`box`, or online **cell fleet**.
 - **`offline_site.lua`** — site board: XZ **cells** (target 20×20, min 4), one bot/cell, full-H layer digs, dual pose, `where`.
 - **`perimeter_sensor.lua` / `perimeter_manager.lua`** — Player Detector territory (one manager + admin alerts).
+- **`tetris.lua`** — pocket Tetris (leaderboard + mesh tracker; **Noisy** speaker music).
 - **`lib/titan.lua`** — shared library (protocol, messaging, navigation).
 
 Older packages (hub/bot/poi/miner/…) live under [`archive/`](archive/) and are not in the installer menu.
@@ -402,7 +403,8 @@ Track players entering / leaving your territory with Advanced Peripherals
 
 Sensors **bind to one manager** (not the whole mesh). The manager can forward
 ENTER/EXIT to an **admin tablet**; the tablet **Stats** board shows recent
-activity, and **Gates** / `live perimeter` is the full activity screen.
+activity, and **Gates** / `live perimeter` is the full activity screen
+(polls the manager every **2 seconds**, with enter/exit **player Y**).
 
 ### Perimeter manager (`perimeter_manager.lua`)
 
@@ -451,7 +453,8 @@ Install on each gate or as one territory detector (installer → **"Perimeter se
 
 - Computer + wireless modem + Player Detector + GPS coverage
 - Default **range 50** per axis (half-extent from detector); no side = whole-area
-- ENTER reports **approach bearing** + **player Y** (useful when the sensor sits at Y=0)
+- ENTER/EXIT report **approach bearing** + **player Y** (Y is cached while inside
+  so EXIT still has a level after the player leaves detector range)
 - Axis ranges: `range x 80`, `range z 40`, `range y 256` (or `range 50` for all)
 - **GPS host** for routers/nav: on by default once GPS is known (`gpshost here|off|x y z`)
 - Multi-gate: `auto` / manager `assign`, or `side ne`, `name My Gate`, `autoname`

@@ -71,7 +71,7 @@ local ROLES = {
     files = { "lib/titan.lua", "perimeter_sensor.lua" } },
   { key = "8", name = "Perimeter manager (territory board)", run = "perimeter_manager.lua",
     files = { "lib/titan.lua", "perimeter_manager.lua" } },
-  { key = "t", name = "Tetris (pocket game + mesh tracker)", run = "tetris.lua",
+  { key = "t", name = "Tetris (pocket + music/mesh)", run = "tetris.lua",
     files = { "lib/titan.lua", "tetris.lua", "versions.lua" } },
   { key = "h", name = "Install / update host (serves files over rednet)", run = "host.lua",
     files = { "lib/titan.lua", "host.lua", "install.lua", "versions.lua" } },
