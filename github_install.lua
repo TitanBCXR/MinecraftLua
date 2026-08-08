@@ -1,6 +1,6 @@
 --[[
   github_install.lua  -  Install the Titan system straight from a GitHub repo
-  Titan-Version: 1.2.1
+  Titan-Version: 1.2.2
 
   Point RAW_BASE at your repo's raw content root, then on each Minecraft device:
 
@@ -33,6 +33,13 @@ local KEEP_ALL = {
   "host.lua", "versions.lua",
 }
 
+local GAMES = {
+  { key = "1", name = "Tetris (pocket + music/mesh)", run = "tetris.lua",
+    files = { "lib/titan.lua", "tetris.lua", "versions.lua" } },
+  { key = "2", name = "Minesweeper (lightweight pocket)", run = "minesweeper.lua",
+    files = { "minesweeper.lua" } },
+}
+
 local ROLES = {
   { key = "1", name = "Parent Center (data center)",       run = "datacenter.lua",
     files = { "lib/titan.lua", "datacenter.lua" } },
@@ -52,10 +59,7 @@ local ROLES = {
     files = { "lib/titan.lua", "perimeter_sensor.lua" } },
   { key = "8", name = "Perimeter manager (territory board)", run = "perimeter_manager.lua",
     files = { "lib/titan.lua", "perimeter_manager.lua" } },
-  { key = "t", name = "Tetris (pocket + music/mesh)", run = "tetris.lua",
-    files = { "lib/titan.lua", "tetris.lua", "versions.lua" } },
-  { key = "s", name = "Minesweeper (lightweight pocket)", run = "minesweeper.lua",
-    files = { "minesweeper.lua" } },
+  { key = "g", name = "Games...", submenu = "games" },
   { key = "h", name = "Install / update host (serves files over rednet)", run = "host.lua",
     files = { "lib/titan.lua", "host.lua", "install.lua", "versions.lua" } },
   { key = "9", name = "Everything (kept files, no auto-run)", run = nil,
@@ -97,42 +101,75 @@ if RAW_BASE:find("YOURNAME/REPO") then
   return
 end
 
-local function pickRole(title, sourceLine)
-  local lastKey = ROLES[#ROLES].key
+-- Pick from a role list. cancelKey returns nil; backKey (optional) returns false.
+local function pickFromList(list, opts)
+  opts = opts or {}
+  local title = opts.title or "== Install =="
+  local sourceLine = opts.sourceLine
+  local promptHint = opts.promptHint or "What is this device?"
+  local cancelKey = (opts.cancelKey or "q"):lower()
+  local backKey = opts.backKey and tostring(opts.backKey):lower() or nil
+  local lastKey = list[#list].key
   while true do
     local idx = 1
-    while idx <= #ROLES do
+    while idx <= #list do
       local _, h = term.getSize()
       term.clear(); term.setCursorPos(1, 1)
       print(title)
       if sourceLine then print(sourceLine) end
-      print("What is this device?  (13=StorageManager)")
+      print(promptHint)
       print("")
       local budget = math.max(4, (h or 13) - 7)
       local shown = 0
-      while idx <= #ROLES and shown < budget do
-        local r = ROLES[idx]
+      while idx <= #list and shown < budget do
+        local r = list[idx]
         print("  " .. r.key .. ") " .. r.name)
         idx = idx + 1
         shown = shown + 1
       end
       print("")
-      if idx <= #ROLES then
-        write("Enter #, or Enter=more (Q cancel): ")
+      local qHint = backKey and ("B back, " .. cancelKey:upper() .. " cancel")
+        or (cancelKey:upper() .. " cancel")
+      if idx <= #list then
+        write("Enter #, or Enter=more (" .. qHint .. "): ")
       else
-        write("Choose 1-" .. lastKey .. " (Q cancel): ")
+        write("Choose (" .. qHint .. "): ")
       end
-      local choice = tostring(read() or "")
-      if choice:lower() == "q" then return nil end
+      local choice = tostring(read() or ""):lower()
+      if choice == cancelKey then return nil end
+      if backKey and choice == backKey then return false end
       if choice ~= "" then
-        for _, r in ipairs(ROLES) do
-          if r.key == choice then return r end
+        for _, r in ipairs(list) do
+          if tostring(r.key):lower() == choice then return r end
         end
         print("Invalid choice."); sleep(1.2)
         idx = 1
-      elseif idx > #ROLES then
+      elseif idx > #list then
         idx = 1
       end
+    end
+  end
+end
+
+local function pickRole(title, sourceLine)
+  while true do
+    local role = pickFromList(ROLES, {
+      title = title,
+      sourceLine = sourceLine,
+      promptHint = "What is this device?  (g = Games)",
+    })
+    if role == nil then return nil end
+    if role.submenu == "games" then
+      local game = pickFromList(GAMES, {
+        title = "== Games ==",
+        promptHint = "Pick a game:",
+        backKey = "b",
+      })
+      if game then return game end
+      -- nil = cancel all; false = back to main menu
+      if game == nil then return nil end
+    else
+      return role
     end
   end
 end
