@@ -12,7 +12,7 @@ A wireless dispatch system for Minecraft's **CC: Tweaked** mod (active packages)
 - **`tetris.lua`** — Tetris for pocket / advanced PC + monitor (local LB; note music; monitor bottom half = touch pad).
 - **`minesweeper.lua`** — Minesweeper for pocket / advanced PC + monitor (no modem; monitor bottom half = Open/Flag touch pad).
 - **`sandstorm.lua`** — Darude Sandstorm note-block knockoff + desert pixel visualizer (speaker + color monitor).
-- **`luigi_poker.lua`** — Luigi Picture Poker (SMB3-style hold/draw, coin payouts; monitor tap UI).
+- **`luigi_poker.lua`** — Luigi Picture Poker (pocket-first tap UI; SMB3 hold/draw; desk PC can use a monitor).
 - **`slots.lua`** — 3-reel slots (bet/spin animation, coin bank; monitor tap UI).
 - **`github_install.lua`** — On an advanced PC + color monitor, role select draws on the monitor (touch tiles + UP/DOWN scroll).
 - **`lib/titan.lua`** — shared library (protocol, messaging, navigation).

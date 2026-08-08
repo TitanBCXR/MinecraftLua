@@ -1,6 +1,6 @@
 --[[
   install.lua  -  Titan network installer (CC: Tweaked)
-  Titan-Version: 1.2.5
+  Titan-Version: 1.2.6
 
   Downloads the Titan bot-network system onto this device from a running
   `host.lua` on the same rednet network (no pastebin / external web host).
@@ -38,7 +38,7 @@ local GAMES = {
     files = { "minesweeper.lua" } },
   { key = "3", name = "Sandstorm (noteblock + pixel show)", run = "sandstorm.lua",
     files = { "sandstorm.lua" } },
-  { key = "4", name = "Luigi Picture Poker", run = "luigi_poker.lua",
+  { key = "4", name = "Luigi Picture Poker (pocket)", run = "luigi_poker.lua",
     files = { "luigi_poker.lua" } },
   { key = "5", name = "Slots (3-reel)", run = "slots.lua",
     files = { "slots.lua" } },

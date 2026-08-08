@@ -5,11 +5,11 @@
   The console `packages` command shows these names + versions.
   Installers / OTA updates ship this file so devices know what they have.
 
-  Titan-Version: 1.6.49
+  Titan-Version: 1.6.50
 ]]
 
 return {
-  system = "1.6.49",
+  system = "1.6.50",
   packages = {
     ["lib/titan.lua"]      = "1.2.25",
     ["console.lua"]        = "1.1.8",
@@ -19,9 +19,9 @@ return {
     ["lib/router_hub_net.lua"] = "1.4.6",
     ["lib/router_hub_ui.lua"]  = "1.4.3",
     ["lib/router_hub_cmd.lua"] = "1.4.2",
-    ["install.lua"]        = "1.2.5",
-    ["github_install.lua"] = "1.2.7",
-    ["pastebin_install.lua"]= "1.2.5",
+    ["install.lua"]        = "1.2.6",
+    ["github_install.lua"] = "1.2.8",
+    ["pastebin_install.lua"]= "1.2.6",
     ["datacenter.lua"]     = "1.2.14",
     ["admin.lua"]          = "1.5.7",
     ["offline_miner.lua"]  = "1.5.9",
@@ -31,10 +31,10 @@ return {
     ["tetris.lua"]         = "1.2.6",
     ["minesweeper.lua"]    = "1.2.1",
     ["sandstorm.lua"]      = "1.0.0",
-    ["luigi_poker.lua"]    = "1.0.0",
+    ["luigi_poker.lua"]    = "1.1.0",
     ["slots.lua"]          = "1.0.0",
     ["host.lua"]           = "1.2.7",
     ["exclude.txt"]        = "1.0.1",
-    ["versions.lua"]       = "1.6.49",
+    ["versions.lua"]       = "1.6.50",
   },
 }

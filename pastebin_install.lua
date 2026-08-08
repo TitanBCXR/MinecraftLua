@@ -1,6 +1,6 @@
 --[[
   pastebin_install.lua  -  Pastebin bootstrap installer for the Titan system
-  Titan-Version: 1.2.5
+  Titan-Version: 1.2.6
 
   Pulls the Titan files straight from Pastebin (no in-game host needed). Upload
   each file to pastebin.com once, paste its CODE into the table below, then
@@ -63,7 +63,7 @@ local GAMES = {
     files = { "minesweeper.lua" } },
   { key = "3", name = "Sandstorm (noteblock + pixel show)", run = "sandstorm.lua",
     files = { "sandstorm.lua" } },
-  { key = "4", name = "Luigi Picture Poker", run = "luigi_poker.lua",
+  { key = "4", name = "Luigi Picture Poker (pocket)", run = "luigi_poker.lua",
     files = { "luigi_poker.lua" } },
   { key = "5", name = "Slots (3-reel)", run = "slots.lua",
     files = { "slots.lua" } },

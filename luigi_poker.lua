@@ -1,13 +1,16 @@
 --[[
   luigi_poker.lua  -  Luigi Picture Poker (SMB3-style) for CC: Tweaked
-  Titan-Version: 1.0.0
+  Titan-Version: 1.1.0
 
   Run:
 
       luigi_poker
 
   Classic picture poker: bet coins, hold cards, draw once, cash out on the
-  payout table. Works on pocket / advanced PC; color monitor gets a tap UI.
+  payout table.
+
+  Pocket-first: advanced (color) pockets get a compact tap UI on the device
+  itself. Desk computers may redirect to an attached color monitor.
 
   Cards (low → high): Cloud  Mushroom  Flower  Star  Mario  Luigi
 
@@ -25,6 +28,7 @@ local MAX_BET = 5
 
 local NATIVE = term.current()
 local USING_MONITOR = false
+local IS_POCKET = (pocket ~= nil)
 local SPEAKER = nil
 local MUSIC_ON = true
 local COINS = START_COINS
@@ -60,7 +64,15 @@ local function isColor()
   return ok and c == true
 end
 
+local function isPocketLayout()
+  if IS_POCKET then return true end
+  local tw, th = term.getSize()
+  return tw <= 26 or th <= 20
+end
+
 local function attachMonitor()
+  -- Keep gameplay on the pocket screen (that's the point of the pocket build).
+  if IS_POCKET then return false end
   local m = peripheral.find("monitor")
   if not m then return false end
   local okColor, col = pcall(function() return m.isColor and m.isColor() end)
@@ -255,7 +267,7 @@ end
 --------------------------------------------------------------------------------
 -- UI
 --------------------------------------------------------------------------------
-local function drawCard(x, y, w, h, rankId, held, faceUp)
+local function drawCard(x, y, w, h, rankId, held, faceUp, pocket)
   local color = isColor()
   local r = RANKS[rankId] or RANKS[1]
   local bg = colors.white
@@ -265,33 +277,43 @@ local function drawCard(x, y, w, h, rankId, held, faceUp)
     fg = faceUp and r.fg or colors.white
   end
   if held then
-    -- gold hold border
     fill(x, y, w, h, color and colors.yellow or colors.white)
-    fill(x + 1, y + 1, math.max(1, w - 2), math.max(1, h - 2), bg)
+    local ix = (w >= 4) and 1 or 0
+    local iy = (h >= 3) and 1 or 0
+    fill(x + ix, y + iy, math.max(1, w - ix * 2), math.max(1, h - iy * 2), bg)
   else
     fill(x, y, w, h, bg)
   end
   if faceUp then
-    local label = r.short
-    if w < 5 then label = r.ch end
-    textAt(x + math.max(0, math.floor((w - #label) / 2)), y + math.floor(h / 2),
-      label:sub(1, w), fg, bg)
-    if h >= 4 and w >= 5 then
-      textAt(x + 1, y + 1, r.ch, fg, bg)
-    end
+    local label = pocket and r.ch or r.short
+    if (not pocket) and w < 5 then label = r.ch end
+    if pocket and w >= 4 then label = r.ch end
+    local ly = y + math.floor((h - 1) / 2)
+    textAt(x + math.max(0, math.floor((w - #label) / 2)), ly, label:sub(1, w), fg, bg)
   else
-    textAt(x + math.floor(w / 2), y + math.floor(h / 2), "?", fg, bg)
+    textAt(x + math.max(0, math.floor((w - 1) / 2)), y + math.floor((h - 1) / 2),
+      "?", fg, bg)
   end
 end
 
 local function layoutCards(tw, th)
   local n = 5
-  local gap = 1
-  local cardH = math.max(3, math.min(6, math.floor(th * 0.35)))
-  local cardW = math.max(3, math.floor((tw - (n + 1) * gap) / n))
+  local pocket = isPocketLayout()
+  local gap = pocket and 1 or 1
+  local padH = pocket and 3 or math.max(2, math.min(4, math.floor(th * 0.2)))
+  local cardH, cardW, oy
+  if pocket then
+    -- Fit 5 fat tap targets on a ~26x20 advanced pocket.
+    cardH = math.max(3, math.min(4, th - 2 - 1 - padH - 2))
+    cardW = math.max(3, math.floor((tw - (n + 1) * gap) / n))
+    oy = 3
+  else
+    cardH = math.max(3, math.min(6, math.floor(th * 0.35)))
+    cardW = math.max(3, math.floor((tw - (n + 1) * gap) / n))
+    oy = math.max(3, math.floor(th * 0.28))
+  end
   local total = n * cardW + (n + 1) * gap
   local ox = math.max(1, math.floor((tw - total) / 2) + 1)
-  local oy = math.max(3, math.floor(th * 0.28))
   local rects = {}
   for i = 1, n do
     rects[i] = {
@@ -299,7 +321,7 @@ local function layoutCards(tw, th)
       y = oy, w = cardW, h = cardH,
     }
   end
-  return rects, oy + cardH + 1
+  return rects, oy + cardH + 1, pocket, padH
 end
 
 local function hit(rects, mx, my)
@@ -328,45 +350,61 @@ end
 local function drawScreen(state)
   local tw, th = term.getSize()
   local color = isColor()
+  local cardRects, below, pocket, padH = layoutCards(tw, th)
+  state.cardRects = cardRects
   fill(1, 1, tw, th, colors.black)
 
-  -- Header
+  -- Header (shorter on pocket)
   local hdrBg = color and colors.lime or colors.gray
   fill(1, 1, tw, 1, hdrBg)
-  textAt(2, 1, " LUIGI PICTURE POKER ", colors.black, hdrBg)
-  local coinTxt = ("Coins:%d  Bet:%d  Best:%d"):format(COINS, state.bet, BEST)
+  local title = pocket and " LUIGI POKER " or " LUIGI PICTURE POKER "
+  textAt(2, 1, title:sub(1, tw - 2), colors.black, hdrBg)
+  local coinTxt = pocket
+    and ("$%d  bet%d  hi%d"):format(COINS, state.bet, BEST)
+    or ("Coins:%d  Bet:%d  Best:%d"):format(COINS, state.bet, BEST)
   textAt(2, 2, coinTxt:sub(1, tw - 2), colors.yellow, colors.black)
 
-  local cardRects, below = layoutCards(tw, th)
-  state.cardRects = cardRects
-
   if state.phase == "bet" then
-    textAt(2, below, "Set bet, then DEAL", colors.lightGray, colors.black)
-    textAt(2, below + 1, "Pair Mario+ pays 1x · Luigi pair 2x · …", colors.gray, colors.black)
+    textAt(2, below, pocket and "Bet, then DEAL" or "Set bet, then DEAL",
+      colors.lightGray, colors.black)
+    if not pocket and below + 1 < th - padH then
+      textAt(2, below + 1, "Pair Mario+ 1x · Luigi pair 2x · …", colors.gray, colors.black)
+    end
   elseif state.phase == "hold" then
-    textAt(2, below, "Tap cards to HOLD, then DRAW", colors.white, colors.black)
+    textAt(2, below, pocket and "Tap HOLD · DRAW" or "Tap cards to HOLD, then DRAW",
+      colors.white, colors.black)
   elseif state.phase == "result" then
     local msg = state.resultName or "No win"
     local win = state.win or 0
     local fg = win > 0 and colors.lime or colors.red
-    textAt(2, below, (msg .. (win > 0 and ("  +" .. win) or "  —")):sub(1, tw - 2),
+    textAt(2, below, (msg .. (win > 0 and (" +" .. win) or " —")):sub(1, tw - 2),
       fg, colors.black)
   end
 
   for i = 1, 5 do
     local rank = state.hand[i]
     local face = state.phase ~= "bet"
+    local held = state.held[i] == true and state.phase == "hold"
     if rank then
       drawCard(cardRects[i].x, cardRects[i].y, cardRects[i].w, cardRects[i].h,
-        rank, state.held[i] == true and state.phase == "hold", face)
+        rank, held, face, pocket)
     else
       drawCard(cardRects[i].x, cardRects[i].y, cardRects[i].w, cardRects[i].h,
-        1, false, false)
+        1, false, false, pocket)
+    end
+    -- Pocket: HOLD tag under each card for clear tap feedback
+    if pocket and state.phase == "hold" then
+      local tag = held and "H" or tostring(i)
+      local tx = cardRects[i].x + math.floor((cardRects[i].w - 1) / 2)
+      local ty = cardRects[i].y + cardRects[i].h
+      if ty < th - padH + 1 then
+        textAt(tx, ty, tag, held and colors.yellow or colors.gray, colors.black)
+      end
     end
   end
 
-  -- Buttons
-  local padH = math.max(2, math.min(4, th - (below + 3)))
+  -- Buttons (fat for pocket thumbs)
+  padH = math.max(pocket and 3 or 2, math.min(pocket and 3 or 4, padH))
   local by = th - padH + 1
   local bw = math.floor(tw / 4)
   state.btns = {}
@@ -375,21 +413,21 @@ local function drawScreen(state)
     state.btns.plus = { x = bw + 1, y = by, w = bw, h = padH }
     state.btns.deal = { x = 2 * bw + 1, y = by, w = bw, h = padH }
     state.btns.quit = { x = 3 * bw + 1, y = by, w = tw - 3 * bw, h = padH }
-    drawBtn(state.btns.minus, " -BET ", color and colors.gray or colors.black)
-    drawBtn(state.btns.plus, " +BET ", color and colors.gray or colors.black)
+    drawBtn(state.btns.minus, pocket and " - " or " -BET ", color and colors.gray or colors.black)
+    drawBtn(state.btns.plus, pocket and " + " or " +BET ", color and colors.gray or colors.black)
     drawBtn(state.btns.deal, " DEAL ", color and colors.lime or colors.white, colors.black)
-    drawBtn(state.btns.quit, " QUIT ", color and colors.red or colors.black)
+    drawBtn(state.btns.quit, pocket and " Q " or " QUIT ", color and colors.red or colors.black)
   elseif state.phase == "hold" then
-    state.btns.draw = { x = 1, y = by, w = math.floor(tw / 2), h = padH }
-    state.btns.quit = { x = math.floor(tw / 2) + 1, y = by, w = tw - math.floor(tw / 2), h = padH }
+    state.btns.draw = { x = 1, y = by, w = math.floor(tw * 2 / 3), h = padH }
+    state.btns.quit = { x = state.btns.draw.w + 1, y = by, w = tw - state.btns.draw.w, h = padH }
     drawBtn(state.btns.draw, " DRAW ", color and colors.orange or colors.white, colors.black)
-    drawBtn(state.btns.quit, " QUIT ", color and colors.red or colors.black)
-  else -- result
-    state.btns.deal = { x = 1, y = by, w = math.floor(tw / 2), h = padH }
-    state.btns.quit = { x = math.floor(tw / 2) + 1, y = by, w = tw - math.floor(tw / 2), h = padH }
+    drawBtn(state.btns.quit, pocket and " Q " or " QUIT ", color and colors.red or colors.black)
+  else
+    state.btns.deal = { x = 1, y = by, w = math.floor(tw * 2 / 3), h = padH }
+    state.btns.quit = { x = state.btns.deal.w + 1, y = by, w = tw - state.btns.deal.w, h = padH }
     drawBtn(state.btns.deal, COINS > 0 and " NEXT " or " BROKE ",
       color and colors.lime or colors.white, colors.black)
-    drawBtn(state.btns.quit, " QUIT ", color and colors.red or colors.black)
+    drawBtn(state.btns.quit, pocket and " Q " or " QUIT ", color and colors.red or colors.black)
   end
 end
 
