@@ -1,16 +1,14 @@
 --[[
   luigi_poker.lua  -  Luigi Picture Poker (SMB3-style) for CC: Tweaked
-  Titan-Version: 1.1.0
+  Titan-Version: 1.2.0
 
   Run:
 
       luigi_poker
 
-  Classic picture poker: bet coins, hold cards, draw once, cash out on the
-  payout table.
-
-  Pocket-first: advanced (color) pockets get a compact tap UI on the device
-  itself. Desk computers may redirect to an attached color monitor.
+  Beat Luigi: he shows a 5-card hand you must beat. Hold/draw once, then
+  compare. Win pays 2x (or more if you also hit a bonus hand). Push returns
+  the bet. Pocket-first tap UI; desk PCs may use a color monitor.
 
   Cards (low → high): Cloud  Mushroom  Flower  Star  Mario  Luigi
 
@@ -222,7 +220,8 @@ local function counts(hand)
   return c
 end
 
-local function evaluate(hand)
+-- Bonus multipliers when you beat Luigi (on top of base 2x).
+local function bonusMult(hand)
   local c = counts(hand)
   local trips, pairs, four, five = {}, {}, nil, nil
   for r = 6, 1, -1 do
@@ -232,36 +231,69 @@ local function evaluate(hand)
     elseif c[r] == 2 then pairs[#pairs + 1] = r
     end
   end
-
   for _, p in ipairs(PAYOUTS) do
-    if p.test == "five" and five then
-      if not p.rank or p.rank == five then
-        return p.name, p.mult
-      end
-    elseif p.test == "four" and four then
-      if not p.rank or p.rank == four then
-        return p.name, p.mult
-      end
+    if p.test == "five" and five and (not p.rank or p.rank == five) then
+      return p.mult
+    elseif p.test == "four" and four and (not p.rank or p.rank == four) then
+      return p.mult
     elseif p.test == "full" and #trips > 0 and #pairs > 0 then
-      return p.name, p.mult
-    elseif p.test == "three" and #trips > 0 then
-      if not p.rank or p.rank == trips[1] then
-        return p.name, p.mult
-      end
+      return p.mult
+    elseif p.test == "three" and #trips > 0 and (not p.rank or p.rank == trips[1]) then
+      return p.mult
     elseif p.test == "two_pair" and #pairs >= 2 then
-      return p.name, p.mult
-    elseif p.test == "pair" and #pairs >= 1 then
-      if p.rank and pairs[1] == p.rank then
-        return p.name, p.mult
-      end
-    elseif p.test == "pair_high" and #pairs >= 1 then
-      -- Mario (5) or Luigi (6) pair — Luigi already matched above
-      if pairs[1] >= 5 then
-        return p.name, p.mult
-      end
+      return p.mult
+    elseif p.test == "pair" and #pairs >= 1 and p.rank and pairs[1] == p.rank then
+      return p.mult
+    elseif p.test == "pair_high" and #pairs >= 1 and pairs[1] >= 5 then
+      return p.mult
     end
   end
-  return "No win", 0
+  return 0
+end
+
+-- Comparable strength for beating Luigi (higher = better).
+local function handRank(hand)
+  if not hand or #hand < 5 then return 0, "—" end
+  local c = counts(hand)
+  local groups = {}
+  for r = 1, 6 do
+    if c[r] > 0 then groups[#groups + 1] = { c = c[r], r = r } end
+  end
+  table.sort(groups, function(a, b)
+    if a.c ~= b.c then return a.c > b.c end
+    return a.r > b.r
+  end)
+
+  local cat, name = 0, "High card"
+  if groups[1].c == 5 then
+    cat, name = 6, "Five " .. RANKS[groups[1].r].name
+  elseif groups[1].c == 4 then
+    cat, name = 5, "Four " .. RANKS[groups[1].r].name
+  elseif groups[1].c == 3 and groups[2] and groups[2].c >= 2 then
+    cat, name = 4, "Full house"
+  elseif groups[1].c == 3 then
+    cat, name = 3, "Three " .. RANKS[groups[1].r].name
+  elseif groups[1].c == 2 and groups[2] and groups[2].c == 2 then
+    cat, name = 2, "Two pair"
+  elseif groups[1].c == 2 then
+    cat, name = 1, "Pair " .. RANKS[groups[1].r].name
+  else
+    local hi = 0
+    for i = 1, 5 do if hand[i] > hi then hi = hand[i] end end
+    name = RANKS[hi].name .. " high"
+  end
+
+  local score = cat
+  for i = 1, #groups do
+    score = score * 10 + groups[i].c
+    score = score * 10 + groups[i].r
+  end
+  local cards = { hand[1], hand[2], hand[3], hand[4], hand[5] }
+  table.sort(cards, function(a, b) return a > b end)
+  for i = 1, 5 do
+    score = score * 7 + cards[i]
+  end
+  return score, name
 end
 
 --------------------------------------------------------------------------------
@@ -296,22 +328,8 @@ local function drawCard(x, y, w, h, rankId, held, faceUp, pocket)
   end
 end
 
-local function layoutCards(tw, th)
+local function rowRects(tw, oy, cardW, cardH, gap)
   local n = 5
-  local pocket = isPocketLayout()
-  local gap = pocket and 1 or 1
-  local padH = pocket and 3 or math.max(2, math.min(4, math.floor(th * 0.2)))
-  local cardH, cardW, oy
-  if pocket then
-    -- Fit 5 fat tap targets on a ~26x20 advanced pocket.
-    cardH = math.max(3, math.min(4, th - 2 - 1 - padH - 2))
-    cardW = math.max(3, math.floor((tw - (n + 1) * gap) / n))
-    oy = 3
-  else
-    cardH = math.max(3, math.min(6, math.floor(th * 0.35)))
-    cardW = math.max(3, math.floor((tw - (n + 1) * gap) / n))
-    oy = math.max(3, math.floor(th * 0.28))
-  end
   local total = n * cardW + (n + 1) * gap
   local ox = math.max(1, math.floor((tw - total) / 2) + 1)
   local rects = {}
@@ -321,7 +339,32 @@ local function layoutCards(tw, th)
       y = oy, w = cardW, h = cardH,
     }
   end
-  return rects, oy + cardH + 1, pocket, padH
+  return rects
+end
+
+-- Luigi row (top) + player row (bottom, tappable).
+local function layoutCards(tw, th)
+  local n = 5
+  local pocket = isPocketLayout()
+  local gap = 1
+  local padH = pocket and 3 or math.max(2, math.min(3, math.floor(th * 0.18)))
+  local cardW = math.max(3, math.floor((tw - (n + 1) * gap) / n))
+  -- Reserve: header(2) + L label(1) + L cards + gap + You label(1) + You cards + msg(1) + pad
+  local luigiH = pocket and 2 or math.max(2, math.min(3, math.floor(th * 0.18)))
+  local playerH = pocket and 3 or math.max(3, math.min(5, math.floor(th * 0.28)))
+  local luigiY = 4
+  local playerY = luigiY + luigiH + 2
+  -- Shrink if overflowing small screens
+  while playerY + playerH + 1 + padH > th and (luigiH > 2 or playerH > 2) do
+    if playerH > luigiH and playerH > 2 then playerH = playerH - 1
+    elseif luigiH > 2 then luigiH = luigiH - 1
+    else playerH = math.max(2, playerH - 1) end
+    playerY = luigiY + luigiH + 2
+  end
+  local luigiRects = rowRects(tw, luigiY, cardW, luigiH, gap)
+  local playerRects = rowRects(tw, playerY, cardW, playerH, gap)
+  local below = playerY + playerH + 1
+  return playerRects, luigiRects, below, pocket, padH, luigiY - 1, playerY - 1
 end
 
 local function hit(rects, mx, my)
@@ -350,11 +393,12 @@ end
 local function drawScreen(state)
   local tw, th = term.getSize()
   local color = isColor()
-  local cardRects, below, pocket, padH = layoutCards(tw, th)
+  local cardRects, luigiRects, below, pocket, padH, luigiLabelY, youLabelY =
+    layoutCards(tw, th)
   state.cardRects = cardRects
+  state.luigiRects = luigiRects
   fill(1, 1, tw, th, colors.black)
 
-  -- Header (shorter on pocket)
   local hdrBg = color and colors.lime or colors.gray
   fill(1, 1, tw, 1, hdrBg)
   local title = pocket and " LUIGI POKER " or " LUIGI PICTURE POKER "
@@ -364,46 +408,63 @@ local function drawScreen(state)
     or ("Coins:%d  Bet:%d  Best:%d"):format(COINS, state.bet, BEST)
   textAt(2, 2, coinTxt:sub(1, tw - 2), colors.yellow, colors.black)
 
-  if state.phase == "bet" then
-    textAt(2, below, pocket and "Bet, then DEAL" or "Set bet, then DEAL",
-      colors.lightGray, colors.black)
-    if not pocket and below + 1 < th - padH then
-      textAt(2, below + 1, "Pair Mario+ 1x · Luigi pair 2x · …", colors.gray, colors.black)
+  -- Luigi's hand (always face-up once dealt — what you must beat)
+  local _, luigiHandName = handRank(state.luigi)
+  textAt(2, luigiLabelY,
+    (pocket and "LUIGI " or "LUIGI'S HAND ") .. (state.phase == "bet" and "" or ("(" .. luigiHandName .. ")")),
+    color and colors.lime or colors.white, colors.black)
+  for i = 1, 5 do
+    local r = luigiRects[i]
+    local rank = state.luigi and state.luigi[i]
+    if rank and state.phase ~= "bet" then
+      drawCard(r.x, r.y, r.w, r.h, rank, false, true, true)
+    else
+      drawCard(r.x, r.y, r.w, r.h, 1, false, false, true)
     end
-  elseif state.phase == "hold" then
-    textAt(2, below, pocket and "Tap HOLD · DRAW" or "Tap cards to HOLD, then DRAW",
-      colors.white, colors.black)
-  elseif state.phase == "result" then
-    local msg = state.resultName or "No win"
-    local win = state.win or 0
-    local fg = win > 0 and colors.lime or colors.red
-    textAt(2, below, (msg .. (win > 0 and (" +" .. win) or " —")):sub(1, tw - 2),
-      fg, colors.black)
   end
 
+  textAt(2, youLabelY, pocket and "YOU" or "YOUR HAND",
+    color and colors.yellow or colors.white, colors.black)
   for i = 1, 5 do
     local rank = state.hand[i]
     local face = state.phase ~= "bet"
     local held = state.held[i] == true and state.phase == "hold"
+    local r = cardRects[i]
     if rank then
-      drawCard(cardRects[i].x, cardRects[i].y, cardRects[i].w, cardRects[i].h,
-        rank, held, face, pocket)
+      drawCard(r.x, r.y, r.w, r.h, rank, held, face, pocket)
     else
-      drawCard(cardRects[i].x, cardRects[i].y, cardRects[i].w, cardRects[i].h,
-        1, false, false, pocket)
+      drawCard(r.x, r.y, r.w, r.h, 1, false, false, pocket)
     end
-    -- Pocket: HOLD tag under each card for clear tap feedback
     if pocket and state.phase == "hold" then
       local tag = held and "H" or tostring(i)
-      local tx = cardRects[i].x + math.floor((cardRects[i].w - 1) / 2)
-      local ty = cardRects[i].y + cardRects[i].h
-      if ty < th - padH + 1 then
+      local tx = r.x + math.floor((r.w - 1) / 2)
+      local ty = r.y + r.h
+      if ty < th - padH + 1 and ty < below then
         textAt(tx, ty, tag, held and colors.yellow or colors.gray, colors.black)
       end
     end
   end
 
-  -- Buttons (fat for pocket thumbs)
+  if state.phase == "bet" then
+    textAt(2, below, pocket and "Bet · DEAL vs Luigi" or "Set bet, DEAL — beat Luigi's hand",
+      colors.lightGray, colors.black)
+  elseif state.phase == "hold" then
+    textAt(2, below, pocket and "HOLD · beat Luigi · DRAW" or "Hold cards, then DRAW to beat Luigi",
+      colors.white, colors.black)
+  else
+    local msg = state.resultName or "—"
+    local win = state.win or 0
+    local fg = colors.lightGray
+    if state.outcome == "win" then fg = colors.lime
+    elseif state.outcome == "lose" then fg = colors.red
+    elseif state.outcome == "push" then fg = colors.yellow end
+    local extra = ""
+    if state.outcome == "win" then extra = " +" .. win
+    elseif state.outcome == "push" then extra = " +" .. win .. " back"
+    end
+    textAt(2, below, (msg .. extra):sub(1, tw - 2), fg, colors.black)
+  end
+
   padH = math.max(pocket and 3 or 2, math.min(pocket and 3 or 4, padH))
   local by = th - padH + 1
   local bw = math.floor(tw / 4)
@@ -440,10 +501,13 @@ local function newState()
     bet = 1,
     deck = {},
     hand = {},
+    luigi = {},
     held = { false, false, false, false, false },
     resultName = nil,
     win = 0,
+    outcome = nil, -- win | lose | push
     cardRects = {},
+    luigiRects = {},
     btns = {},
   }
 end
@@ -454,12 +518,17 @@ local function dealHand(state)
   saveCfg()
   state.deck = newDeck()
   state.hand = {}
+  state.luigi = {}
   state.held = { false, false, false, false, false }
+  -- Luigi's hand first (face-up target), then yours.
+  for i = 1, 5 do
+    state.luigi[i] = table.remove(state.deck)
+  end
   for i = 1, 5 do
     state.hand[i] = table.remove(state.deck)
   end
   state.phase = "hold"
-  state.resultName, state.win = nil, 0
+  state.resultName, state.win, state.outcome = nil, 0, nil
   sfx("deal")
   return true
 end
@@ -470,13 +539,26 @@ local function doDraw(state)
       state.hand[i] = table.remove(state.deck) or state.hand[i]
     end
   end
-  local name, mult = evaluate(state.hand)
-  state.resultName = name
-  state.win = state.bet * mult
-  if state.win > 0 then
+  local pScore, pName = handRank(state.hand)
+  local lScore, lName = handRank(state.luigi)
+  if pScore > lScore then
+    local bonus = bonusMult(state.hand)
+    local mult = math.max(2, bonus > 0 and bonus or 2)
+    state.win = state.bet * mult
+    state.outcome = "win"
+    state.resultName = "Beat Luigi! " .. pName
     COINS = COINS + state.win
     sfx("win")
+  elseif pScore == lScore then
+    state.win = state.bet
+    state.outcome = "push"
+    state.resultName = "Push — " .. pName
+    COINS = COINS + state.win
+    sfx("coin")
   else
+    state.win = 0
+    state.outcome = "lose"
+    state.resultName = "Luigi: " .. lName
     sfx("lose")
   end
   saveCfg()
@@ -533,7 +615,8 @@ local function main()
         if inBtn(b.deal, mx, my) then
           bankruptReset()
           state.phase = "bet"
-          state.hand = {}
+          state.hand, state.luigi = {}, {}
+          state.outcome = nil
           drawScreen(state)
         elseif inBtn(b.quit, mx, my) then
           return
@@ -572,7 +655,8 @@ local function main()
         if p1 == K.space or p1 == K.enter then
           bankruptReset()
           state.phase = "bet"
-          state.hand = {}
+          state.hand, state.luigi = {}, {}
+          state.outcome = nil
           drawScreen(state)
         end
       end
