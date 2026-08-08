@@ -1,6 +1,6 @@
 --[[
   github_install.lua  -  Install the Titan system straight from a GitHub repo
-  Titan-Version: 1.2.3
+  Titan-Version: 1.2.4
 
   Point RAW_BASE at your repo's raw content root, then on each Minecraft device:
 
@@ -10,8 +10,9 @@
   pulls that role's files from GitHub (creating lib/ as needed), offers a
   startup.lua, and can launch it.
 
-  Advanced (color) pocket computers get a tap-friendly tile GUI; other devices
-  keep the classic text menu.
+  Advanced (color) pocket computers get a tap-friendly tile GUI. Advanced
+  computers with a color monitor redirect the picker to the monitor (touch
+  tiles + UP/DOWN scroll buttons). Other devices keep the classic text menu.
 
   GitHub is a public HTTPS host, so it's on CC: Tweaked's allow-list by default -
   no config changes needed. Use the RAW url (raw.githubusercontent.com), NOT the
@@ -104,10 +105,63 @@ if RAW_BASE:find("YOURNAME/REPO") then
   return
 end
 
--- Advanced pocket = color terminal + pocket API (golden / advanced pocket PC).
+local NATIVE = term.current()
+local USING_MONITOR = false
+
+local function attachMonitor()
+  local m = peripheral.find("monitor")
+  if not m then return false end
+  local okColor, isCol = pcall(function() return m.isColor and m.isColor() end)
+  if not (okColor and isCol) then return false end -- touch GUI needs advanced monitor
+  pcall(function()
+    if m.setTextScale then
+      m.setTextScale(1)
+      local w, h = m.getSize()
+      if w < 24 or h < 14 then m.setTextScale(0.5) end
+    end
+    if m.setBackgroundColor then m.setBackgroundColor(colors.black) end
+    m.clear()
+  end)
+  term.redirect(m)
+  USING_MONITOR = true
+  pcall(function()
+    NATIVE.setBackgroundColor(colors.black)
+    NATIVE.clear()
+    NATIVE.setCursorPos(1, 1)
+    if NATIVE.setTextColor then NATIVE.setTextColor(colors.lightGray) end
+    NATIVE.write("Installer on monitor")
+    NATIVE.setCursorPos(1, 2)
+    NATIVE.write("Close this UI — tap")
+    NATIVE.setCursorPos(1, 3)
+    NATIVE.write("tiles / UP DOWN scroll")
+  end)
+  return true
+end
+
+local function detachMonitor()
+  if USING_MONITOR then
+    pcall(term.redirect, NATIVE)
+    USING_MONITOR = false
+  end
+end
+
+-- Advanced pocket OR advanced computer + color monitor.
 local function useModernGui()
   local ok, color = pcall(function() return term.isColor and term.isColor() end)
-  return ok and color == true and pocket ~= nil
+  if not (ok and color == true) then return false end
+  if USING_MONITOR then return true end
+  return pocket ~= nil
+end
+
+local function pullGuiEvent()
+  local ev, p1, p2, p3 = os.pullEvent()
+  if ev == "monitor_touch" then
+    return "mouse_click", 1, p2, p3
+  end
+  if ev == "monitor_resize" then
+    return "term_resize"
+  end
+  return ev, p1, p2, p3
 end
 
 local TILE_BG = {
@@ -141,7 +195,7 @@ local function shortName(name)
   return name
 end
 
--- Modern tile picker for advanced pockets. Returns item, false (back), or nil (cancel).
+-- Modern tile picker (pocket / monitor). Returns item, false (back), or nil (cancel).
 local function pickFromListGui(list, opts)
   opts = opts or {}
   local title = opts.title or "TITAN INSTALL"
@@ -154,14 +208,19 @@ local function pickFromListGui(list, opts)
     local tw, th = term.getSize()
     cols = (tw >= 28) and 2 or 1
     local headerH = 3
-    local footerH = 1
-    local tileH = 3
+    -- Extra footer rows for UP/DOWN scroll buttons (monitor-friendly).
+    local footerH = USING_MONITOR and 3 or 2
+    local tileH = USING_MONITOR and 3 or 3
     local gap = 1
     local usable = th - headerH - footerH
     local rows = math.max(1, math.floor((usable + gap) / (tileH + gap)))
     local page = rows * cols
     local tileW = math.floor((tw - (cols + 1)) / cols)
-    return tw, th, headerH, footerH, tileH, gap, rows, page, tileW
+    local footY = th - footerH + 1
+    local half = math.floor(tw / 2)
+    local upBtn = { x = 1, y = footY, w = half, h = footerH }
+    local dnBtn = { x = half + 1, y = footY, w = tw - half, h = footerH }
+    return tw, th, headerH, footerH, tileH, gap, rows, page, tileW, upBtn, dnBtn
   end
 
   local function tileRect(i, tw, headerH, tileH, gap, rows, tileW)
@@ -175,8 +234,13 @@ local function pickFromListGui(list, opts)
     return x, y, tileW, tileH
   end
 
+  local function inRect(mx, my, r)
+    return mx >= r.x and mx <= r.x + r.w - 1
+      and my >= r.y and my <= r.y + r.h - 1
+  end
+
   while true do
-    local tw, th, headerH, footerH, tileH, gap, rows, page, tileW = layout()
+    local tw, th, headerH, footerH, tileH, gap, rows, page, tileW, upBtn, dnBtn = layout()
     if sel < 1 then sel = 1 end
     if sel > #list then sel = #list end
     if sel <= scroll then scroll = math.max(0, sel - 1) end
@@ -193,8 +257,9 @@ local function pickFromListGui(list, opts)
     else
       textAt(math.max(2, tw - 2), 1, "X", colors.red, colors.blue)
     end
-    textAt(2, 2, (subtitle ~= "" and subtitle or "Tap a role to install"):sub(1, tw - 2),
-      colors.lightGray, colors.black)
+    local sub = subtitle ~= "" and subtitle
+      or (USING_MONITOR and "Tap a role · use UP/DOWN to scroll" or "Tap a role to install")
+    textAt(2, 2, sub:sub(1, tw - 2), colors.lightGray, colors.black)
 
     for i = 1, #list do
       local x, y, w, h = tileRect(i, tw, headerH, tileH, gap, rows, tileW)
@@ -206,7 +271,6 @@ local function pickFromListGui(list, opts)
         end
         local fg = colors.white
         if i == sel then
-          -- Selection ring
           fill(x - 1, y, w + 2, h, colors.white, colors.black)
           fill(x, y, w, h, bg, fg)
         else
@@ -218,14 +282,20 @@ local function pickFromListGui(list, opts)
       end
     end
 
-    local foot = allowBack and "Tap  Enter  B back  Q quit" or "Tap  Enter  Q quit"
-    if scroll > 0 or scroll + page < #list then
-      foot = "↑↓  " .. foot
-    end
-    fill(1, th, tw, 1, colors.gray, colors.white)
-    textAt(2, th, foot:sub(1, tw - 2), colors.white, colors.gray)
+    local canUp = scroll > 0
+    local canDn = scroll + page < #list
+    local pageN = page > 0 and (math.floor(scroll / page) + 1) or 1
+    local pageMax = page > 0 and (math.floor((#list - 1) / page) + 1) or 1
+    fill(upBtn.x, upBtn.y, upBtn.w, upBtn.h, canUp and colors.cyan or colors.gray, colors.white)
+    fill(dnBtn.x, dnBtn.y, dnBtn.w, dnBtn.h, canDn and colors.cyan or colors.gray, colors.white)
+    local upLabel = (" UP  %d/%d"):format(pageN, pageMax)
+    local dnLabel = " DOWN "
+    textAt(upBtn.x + 1, upBtn.y + math.floor((upBtn.h - 1) / 2),
+      upLabel:sub(1, upBtn.w - 2), colors.white, canUp and colors.cyan or colors.gray)
+    textAt(dnBtn.x + 1, dnBtn.y + math.floor((dnBtn.h - 1) / 2),
+      dnLabel:sub(1, dnBtn.w - 2), colors.white, canDn and colors.cyan or colors.gray)
 
-    local ev, p1, p2, p3 = os.pullEvent()
+    local ev, p1, p2, p3 = pullGuiEvent()
     if ev == "term_resize" then
       -- redraw
     elseif ev == "key" then
@@ -242,8 +312,10 @@ local function pickFromListGui(list, opts)
         return false
       elseif p1 == K.pageUp then
         sel = math.max(1, sel - page)
+        scroll = math.max(0, scroll - page)
       elseif p1 == K.pageDown then
         sel = math.min(#list, sel + page)
+        scroll = math.min(maxScroll, scroll + page)
       end
     elseif ev == "char" then
       local ch = tostring(p1 or ""):lower()
@@ -258,15 +330,33 @@ local function pickFromListGui(list, opts)
         if allowBack and mx >= tw - 5 then return false end
         if not allowBack and mx >= tw - 2 then return nil end
       end
-      for i = 1, #list do
-        local x, y, w, h = tileRect(i, tw, headerH, tileH, gap, rows, tileW)
-        if x and mx >= x and mx < x + w and my >= y and my < y + h then
-          if btn == 1 then return list[i] end
+      if inRect(mx, my, upBtn) then
+        if canUp then
+          scroll = math.max(0, scroll - page)
+          sel = math.max(1, math.min(sel, scroll + page))
+          if sel <= scroll then sel = scroll + 1 end
+        end
+      elseif inRect(mx, my, dnBtn) then
+        if canDn then
+          scroll = math.min(maxScroll, scroll + page)
+          sel = math.min(#list, math.max(sel, scroll + 1))
+        end
+      else
+        for i = 1, #list do
+          local x, y, w, h = tileRect(i, tw, headerH, tileH, gap, rows, tileW)
+          if x and mx >= x and mx < x + w and my >= y and my < y + h then
+            if btn == 1 then return list[i] end
+          end
         end
       end
     elseif ev == "mouse_scroll" then
-      if p1 < 0 then sel = math.max(1, sel - 1)
-      elseif p1 > 0 then sel = math.min(#list, sel + 1) end
+      if p1 < 0 then
+        scroll = math.max(0, scroll - 1)
+        sel = math.max(1, sel - 1)
+      elseif p1 > 0 then
+        scroll = math.min(maxScroll, scroll + 1)
+        sel = math.min(#list, sel + 1)
+      end
     elseif ev == "terminate" then
       return nil
     end
@@ -351,7 +441,7 @@ local function askYesNo(question, defaultYes)
     fill(nX, yY, nW, 3, colors.red, colors.white)
     textAt(nX + 2, yY + 1, "NO", colors.white, colors.red)
     textAt(2, th, "Y / N   tap a button", colors.lightGray, colors.black)
-    local ev, p1, p2, p3 = os.pullEvent()
+    local ev, p1, p2, p3 = pullGuiEvent()
     if ev == "char" then
       local ch = tostring(p1 or ""):lower()
       if ch == "y" then return true end
@@ -397,107 +487,120 @@ local function pickRole(title, sourceLine)
   end
 end
 
-local role = pickRole("== Titan GitHub Installer ==", "Source: " .. RAW_BASE)
-if not role then
-  if useModernGui() then
-    fill(1, 1, select(1, term.getSize()), select(2, term.getSize()), colors.black, colors.white)
+local function runInstaller()
+  local role = pickRole("== Titan GitHub Installer ==", "Source: " .. RAW_BASE)
+  if not role then
+    if useModernGui() then
+      fill(1, 1, select(1, term.getSize()), select(2, term.getSize()), colors.black, colors.white)
+      term.setCursorPos(1, 1)
+    end
+    print("Cancelled.")
+    return
+  end
+
+  -- Show download logs on the computer (easier to read / copy), keep confirms on monitor.
+  if USING_MONITOR then
+    detachMonitor()
+  elseif useModernGui() then
+    term.setBackgroundColor(colors.black)
+    term.setTextColor(colors.white)
+    term.clear()
     term.setCursorPos(1, 1)
   end
-  print("Cancelled.")
-  return
-end
 
--- Leave GUI chrome before download logs.
-if useModernGui() then
-  term.setBackgroundColor(colors.black)
-  term.setTextColor(colors.white)
-  term.clear()
-  term.setCursorPos(1, 1)
-end
-
-local files, hasVersions = {}, false
-for _, path in ipairs(role.files) do
-  files[#files + 1] = path
-  if path == "versions.lua" then hasVersions = true end
-end
-if not hasVersions then files[#files + 1] = "versions.lua" end
-
-print("")
-print("Installing: " .. role.name)
-local failed = {}
-for _, path in ipairs(files) do
-  write("  " .. path .. " ... ")
-  local data, err = fetch(path)
-  if data then
-    writeFile(path, data)
-    print("ok (" .. #data .. "b)")
-  else
-    print("FAILED (" .. tostring(err) .. ")")
-    failed[#failed + 1] = path
+  local files, hasVersions = {}, false
+  for _, path in ipairs(role.files) do
+    files[#files + 1] = path
+    if path == "versions.lua" then hasVersions = true end
   end
-end
+  if not hasVersions then files[#files + 1] = "versions.lua" end
 
-if #failed > 0 then
   print("")
-  print("Failed: " .. table.concat(failed, ", "))
-  print("Check RAW_BASE, the branch name, and that the repo is public.")
-  return
-end
-
-print("")
-print("Install complete.")
-
-local sysVer = "1.1.0"
-if fs.exists("versions.lua") then
-  local ok, cat = pcall(dofile, "versions.lua")
-  if ok and type(cat) == "table" and cat.system then sysVer = cat.system end
-end
-
--- Desired packages list (`packages` file) — edit anytime, then run `update`.
-if fs.exists("lib/titan.lua") then
-  local ok, titan = pcall(dofile, "lib/titan.lua")
-  if ok and titan and titan.writePackageList then files = titan.writePackageList(files) end
-else
-  local pf = fs.open("packages", "w")
-  pf.write("# Titan packages — desired packages for this computer\n")
-  pf.write("# One path per line. Edit this list, then run: update\n#\n")
-  for _, path in ipairs(files) do pf.write(path .. "\n") end
-  pf.close()
-end
-
--- Record how this device was installed so it can self-update later when the
--- network router pushes an OTA update (see lib/titan.lua : titan.updateSelf).
-writeFile(".titan-install", textutils.serialize({
-  source = "github", role = role.name, run = role.run, files = files, base = RAW_BASE, version = sysVer,
-}))
-
--- Give this device a role-based label if it doesn't have one yet.
-local LABELS = {
-  ["datacenter.lua"] = "ParentCenter",
-  ["console.lua"] = "Console",
-  ["admin.lua"] = "Admin",
-  ["router.lua"] = "Router",
-  ["offline_miner.lua"] = "OfflineMiner",
-  ["offline_site.lua"]  = "QuarrySite",
-  ["perimeter_sensor.lua"] = "PerimSensor",
-  ["perimeter_manager.lua"] = "PerimMgr",
-  ["tetris.lua"] = "Tetris",
-  ["minesweeper.lua"] = "Minesweeper",
-  ["host.lua"] = "TitanHost",
-}
-local lbl = role.run and LABELS[role.run]
-if lbl and not os.getComputerLabel() then
-  os.setComputerLabel(lbl .. "-" .. os.getComputerID())
-  print("Label set: " .. os.getComputerLabel())
-end
-
-if role.run then
-  if askYesNo("Auto-run " .. role.run .. " on boot?", true) then
-    writeFile("startup.lua", ('shell.run("%s")\n'):format(role.run))
-    print("Wrote startup.lua.")
+  print("Installing: " .. role.name)
+  local failed = {}
+  for _, path in ipairs(files) do
+    write("  " .. path .. " ... ")
+    local data, err = fetch(path)
+    if data then
+      writeFile(path, data)
+      print("ok (" .. #data .. "b)")
+    else
+      print("FAILED (" .. tostring(err) .. ")")
+      failed[#failed + 1] = path
+    end
   end
-  if askYesNo("Run " .. role.run .. " now?", true) then
-    return shell.run(role.run)
+
+  if #failed > 0 then
+    print("")
+    print("Failed: " .. table.concat(failed, ", "))
+    print("Check RAW_BASE, the branch name, and that the repo is public.")
+    return
   end
+
+  print("")
+  print("Install complete.")
+
+  local sysVer = "1.1.0"
+  if fs.exists("versions.lua") then
+    local ok, cat = pcall(dofile, "versions.lua")
+    if ok and type(cat) == "table" and cat.system then sysVer = cat.system end
+  end
+
+  -- Desired packages list (`packages` file) — edit anytime, then run `update`.
+  if fs.exists("lib/titan.lua") then
+    local ok, titan = pcall(dofile, "lib/titan.lua")
+    if ok and titan and titan.writePackageList then files = titan.writePackageList(files) end
+  else
+    local pf = fs.open("packages", "w")
+    pf.write("# Titan packages — desired packages for this computer\n")
+    pf.write("# One path per line. Edit this list, then run: update\n#\n")
+    for _, path in ipairs(files) do pf.write(path .. "\n") end
+    pf.close()
+  end
+
+  -- Record how this device was installed so it can self-update later when the
+  -- network router pushes an OTA update (see lib/titan.lua : titan.updateSelf).
+  writeFile(".titan-install", textutils.serialize({
+    source = "github", role = role.name, run = role.run, files = files, base = RAW_BASE, version = sysVer,
+  }))
+
+  -- Give this device a role-based label if it doesn't have one yet.
+  local LABELS = {
+    ["datacenter.lua"] = "ParentCenter",
+    ["console.lua"] = "Console",
+    ["admin.lua"] = "Admin",
+    ["router.lua"] = "Router",
+    ["offline_miner.lua"] = "OfflineMiner",
+    ["offline_site.lua"]  = "QuarrySite",
+    ["perimeter_sensor.lua"] = "PerimSensor",
+    ["perimeter_manager.lua"] = "PerimMgr",
+    ["tetris.lua"] = "Tetris",
+    ["minesweeper.lua"] = "Minesweeper",
+    ["host.lua"] = "TitanHost",
+  }
+  local lbl = role.run and LABELS[role.run]
+  if lbl and not os.getComputerLabel() then
+    os.setComputerLabel(lbl .. "-" .. os.getComputerID())
+    print("Label set: " .. os.getComputerLabel())
+  end
+
+  -- Re-attach monitor for yes/no taps if we had one.
+  attachMonitor()
+
+  if role.run then
+    if askYesNo("Auto-run " .. role.run .. " on boot?", true) then
+      writeFile("startup.lua", ('shell.run("%s")\n'):format(role.run))
+      print("Wrote startup.lua.")
+    end
+    if askYesNo("Run " .. role.run .. " now?", true) then
+      detachMonitor()
+      return shell.run(role.run)
+    end
+  end
+  print("Done.")
 end
-print("Done.")
+
+attachMonitor()
+local ok, err = pcall(runInstaller)
+detachMonitor()
+if not ok then error(err, 0) end

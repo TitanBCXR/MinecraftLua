@@ -1,20 +1,22 @@
 --[[
   minesweeper.lua  -  Lightweight Minesweeper for CC: Tweaked
-  Titan-Version: 1.2.0
+  Titan-Version: 1.2.1
 
   Run:
 
       minesweeper
 
   Works on pocket PCs and advanced computers. If a monitor is attached, the
-  game draws there (keys still work on the computer). Color monitors / advanced
-  pockets get colored numbers.
+  game draws there. On monitors the bottom half is a touch bar (Open/Flag mode,
+  mute, new, quit) so you can close the computer UI and play from the screen.
+  Keys still work on the PC. Color monitors / advanced pockets get colored numbers.
 
   Music (speaker / Noisy pocket): calm menu bed + tense in-game pulse.
   M mutes. Tiny note-block tracks only (no audio files).
 
   Controls:
     Mouse / monitor touch  left = open   right = flag (mouse)
+    Monitor pad            OPEN/FLAG toggles tap mode on the board
     Keys   arrows move cursor   Space/Enter open   F flag   M mute
            1/2/3 difficulty on menu   N new game   Q quit
 ]]
@@ -58,9 +60,9 @@ local function attachMonitor()
     if NATIVE.setTextColor then NATIVE.setTextColor(colors.lightGray) end
     NATIVE.write("Minesweeper on monitor")
     NATIVE.setCursorPos(1, 2)
-    NATIVE.write("Keys work on this PC")
+    NATIVE.write("Close this UI — play")
     NATIVE.setCursorPos(1, 3)
-    NATIVE.write("Touch=open  F=flag  M=mute")
+    NATIVE.write("via touch pad below")
   end)
   return true
 end
@@ -221,14 +223,23 @@ local function sfxWin()
   end
 end
 
+local function padHeight(th)
+  if not USING_MONITOR or th < 12 then return 0 end
+  local padH = math.max(4, math.floor(th / 2))
+  if th - padH < 6 then padH = math.max(3, th - 6) end
+  return padH
+end
+
 local function clampBoard(diff)
   local tw, th = term.getSize()
-  -- Reserve 2 rows for HUD / footer.
-  local maxW, maxH = math.max(5, tw), math.max(5, th - 2)
+  local padH = padHeight(th)
+  -- Reserve HUD row + footer (or bottom touch pad on monitors).
+  local reserved = (padH > 0) and (1 + padH) or 2
+  local maxW, maxH = math.max(5, tw), math.max(5, th - reserved)
   local w = math.min(diff.w, maxW)
   local h = math.min(diff.h, maxH)
-  -- Large advanced monitors: grow medium/hard toward the screen.
-  if maxW >= 28 and maxH >= 16 and diff.key ~= "1" then
+  -- Large advanced monitors: grow medium/hard toward the board area.
+  if maxW >= 28 and maxH >= 10 and diff.key ~= "1" then
     if diff.key == "3" then
       w, h = maxW, maxH
     else
@@ -242,6 +253,97 @@ local function clampBoard(diff)
     math.max(diff.mines, math.floor(cells * density)),
     math.max(1, cells - 9))
   return w, h, mines
+end
+
+local function touchPadButtons(tw, th, flagMode)
+  local padH = padHeight(th)
+  if padH < 3 then return {}, 0 end
+  local y0 = th - padH + 1
+  local bw = math.max(4, math.floor(tw / 4))
+  local defs = {
+    { "open", flagMode and "OPEN" or ">OPEN<" },
+    { "flag", flagMode and ">FLAG<" or "FLAG" },
+    { "mute", MUSIC_ON and "MUTE" or "UNMUTE" },
+    { "new", "NEW" },
+    { "quit", "QUIT" },
+  }
+  -- 2 rows: OPEN FLAG MUTE on top, NEW QUIT on bottom (or 5 across if wide).
+  local buttons = {}
+  if tw >= 30 then
+    local n = #defs
+    bw = math.floor(tw / n)
+    for i = 1, n do
+      local x = (i - 1) * bw + 1
+      local w = (i == n) and (tw - x + 1) or bw
+      buttons[#buttons + 1] = {
+        id = defs[i][1], label = defs[i][2],
+        x = x, y = y0, w = w, h = padH,
+      }
+    end
+  else
+    local row1 = { defs[1], defs[2], defs[3] }
+    local row2 = { defs[4], defs[5] }
+    local bh = math.max(1, math.floor(padH / 2))
+    for i = 1, #row1 do
+      local x = (i - 1) * bw + 1
+      local w = (i == #row1) and (tw - x + 1) or bw
+      buttons[#buttons + 1] = {
+        id = row1[i][1], label = row1[i][2],
+        x = x, y = y0, w = w, h = bh,
+      }
+    end
+    local bw2 = math.floor(tw / 2)
+    for i = 1, #row2 do
+      local x = (i - 1) * bw2 + 1
+      local w = (i == #row2) and (tw - x + 1) or bw2
+      buttons[#buttons + 1] = {
+        id = row2[i][1], label = row2[i][2],
+        x = x, y = y0 + bh, w = w,
+        h = math.max(1, y0 + padH - (y0 + bh)),
+      }
+    end
+  end
+  return buttons, padH
+end
+
+local function drawTouchPad(tw, th, flagMode)
+  local buttons = touchPadButtons(tw, th, flagMode)
+  if #buttons == 0 then return buttons end
+  for i = 1, #buttons do
+    local b = buttons[i]
+    local bg = colors.gray
+    if b.id == "open" and not flagMode then bg = colors.lime
+    elseif b.id == "flag" and flagMode then bg = colors.orange
+    elseif b.id == "quit" then bg = colors.red
+    elseif b.id == "mute" and not MUSIC_ON then bg = colors.orange
+    elseif b.id == "new" then bg = colors.blue
+    end
+    for row = b.y, b.y + b.h - 1 do
+      if term.setBackgroundColor then term.setBackgroundColor(bg) end
+      if term.setTextColor then term.setTextColor(colors.white) end
+      term.setCursorPos(b.x, row)
+      term.write(string.rep(" ", b.w))
+    end
+    local label = b.label:sub(1, b.w)
+    local lx = b.x + math.max(0, math.floor((b.w - #label) / 2))
+    local ly = b.y + math.floor((b.h - 1) / 2)
+    if term.setBackgroundColor then term.setBackgroundColor(bg) end
+    if term.setTextColor then term.setTextColor(colors.white) end
+    term.setCursorPos(lx, ly)
+    term.write(label)
+  end
+  return buttons
+end
+
+local function hitTouchPad(buttons, mx, my)
+  for i = 1, #buttons do
+    local b = buttons[i]
+    if mx >= b.x and mx <= b.x + b.w - 1
+        and my >= b.y and my <= b.y + b.h - 1 then
+      return b.id
+    end
+  end
+  return nil
 end
 
 local function idx(x, y, w)
@@ -360,8 +462,9 @@ local function drawGame(state)
   local left = state.mines - countFlags(state.grid)
   local elapsed = math.floor((os.clock() - state.t0))
   if state.over then elapsed = state.finalTime or elapsed end
-  local hud = ("Mines %-3d  Time %-4d  %s"):format(
-    left, elapsed, state.diff.name)
+  local mode = state.flagMode and "FLAG" or "OPEN"
+  local hud = ("Mines %-3d  Time %-4d  %s  %s"):format(
+    left, elapsed, state.diff.name, USING_MONITOR and mode or "")
   if term.setTextColor then term.setTextColor(colors.white) end
   term.setCursorPos(1, 1)
   term.write(hud:sub(1, tw))
@@ -402,14 +505,18 @@ local function drawGame(state)
     term.setBackgroundColor(colors.black)
     term.setTextColor(colors.lightGray)
   end
-  local foot = USING_MONITOR
-    and "Touch open  F flag  M mute  N new  Q"
-    or "Spc open  F flag  M mute  N new  Q"
-  if state.over then
-    foot = state.won and "Cleared!  N new  Q menu" or "Boom!  N new  Q menu"
+
+  state.buttons = drawTouchPad(tw, th, state.flagMode)
+  if #(state.buttons or {}) == 0 then
+    local foot = USING_MONITOR
+      and "Touch open  F flag  M mute  N new  Q"
+      or "Spc open  F flag  M mute  N new  Q"
+    if state.over then
+      foot = state.won and "Cleared!  N new  Q menu" or "Boom!  N new  Q menu"
+    end
+    term.setCursorPos(1, th)
+    term.write(foot:sub(1, tw))
   end
-  term.setCursorPos(1, th)
-  term.write(foot:sub(1, tw))
 end
 
 local function openCell(state, x, y)
@@ -479,6 +586,8 @@ local function newState(diff)
     won = false,
     t0 = os.clock(),
     finalTime = nil,
+    flagMode = false,
+    buttons = {},
   }
 end
 
@@ -495,6 +604,46 @@ local function runGame(diff)
   local tick = os.startTimer(0.5)
   startMusic("game")
   local musicTimer = os.startTimer(MUSIC_ON and refreshSpeaker() and 0.05 or 3600)
+
+  local function toggleMute()
+    MUSIC_ON = not MUSIC_ON
+    saveCfg()
+    if MUSIC_ON and not state.over then
+      startMusic("game")
+      musicTimer = os.startTimer(0.05)
+    else
+      stopMusic()
+    end
+    drawGame(state)
+  end
+
+  local function newRound()
+    local keepFlag = state.flagMode
+    state = newState(diff)
+    state.flagMode = keepFlag
+    startMusic("game")
+    musicTimer = os.startTimer(MUSIC_ON and 0.05 or 3600)
+    drawGame(state)
+  end
+
+  local function padAction(id)
+    if not id then return false end
+    if id == "open" then
+      state.flagMode = false; drawGame(state)
+    elseif id == "flag" then
+      state.flagMode = true; drawGame(state)
+    elseif id == "mute" then
+      toggleMute()
+    elseif id == "new" then
+      newRound()
+    elseif id == "quit" then
+      stopMusic()
+      drainInput()
+      return true
+    end
+    return false
+  end
+
   drawGame(state)
   while true do
     local ev, p1, p2, p3 = pullGameEvent()
@@ -511,12 +660,20 @@ local function runGame(diff)
       drawGame(state)
     elseif ev == "mouse_click" then
       local btn, mx, my = p1, p2, p3
-      local x, y = mx, my - 1
-      if inBounds(x, y, state.w, state.h) then
-        state.cursorX, state.cursorY = x, y
-        if btn == 1 then openCell(state, x, y)
-        elseif btn == 2 then toggleFlag(state, x, y) end
-        drawGame(state)
+      local padId = hitTouchPad(state.buttons, mx, my)
+      if padId then
+        if padAction(padId) then return end
+      else
+        local x, y = mx, my - 1
+        if inBounds(x, y, state.w, state.h) then
+          state.cursorX, state.cursorY = x, y
+          if btn == 2 or (btn == 1 and state.flagMode) then
+            toggleFlag(state, x, y)
+          else
+            openCell(state, x, y)
+          end
+          drawGame(state)
+        end
       end
     elseif ev == "key" then
       local K = keys
@@ -533,19 +690,9 @@ local function runGame(diff)
       elseif p1 == K.f then
         toggleFlag(state, state.cursorX, state.cursorY); drawGame(state)
       elseif p1 == K.m then
-        MUSIC_ON = not MUSIC_ON
-        saveCfg()
-        if MUSIC_ON and not state.over then
-          startMusic("game")
-          musicTimer = os.startTimer(0.05)
-        else
-          stopMusic()
-        end
+        toggleMute()
       elseif p1 == K.n then
-        state = newState(diff)
-        startMusic("game")
-        musicTimer = os.startTimer(MUSIC_ON and 0.05 or 3600)
-        drawGame(state)
+        newRound()
       elseif p1 == K.q or p1 == K.backspace then
         stopMusic()
         drainInput()
@@ -556,19 +703,9 @@ local function runGame(diff)
       if ch == "f" then
         toggleFlag(state, state.cursorX, state.cursorY); drawGame(state)
       elseif ch == "m" then
-        MUSIC_ON = not MUSIC_ON
-        saveCfg()
-        if MUSIC_ON and not state.over then
-          startMusic("game")
-          musicTimer = os.startTimer(0.05)
-        else
-          stopMusic()
-        end
+        toggleMute()
       elseif ch == "n" then
-        state = newState(diff)
-        startMusic("game")
-        musicTimer = os.startTimer(MUSIC_ON and 0.05 or 3600)
-        drawGame(state)
+        newRound()
       elseif ch == "q" then
         stopMusic()
         drainInput()

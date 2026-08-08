@@ -9,8 +9,9 @@ A wireless dispatch system for Minecraft's **CC: Tweaked** mod (active packages)
 - **`offline_miner.lua`** — quarry turtle: solo `area`/`box`, or online **cell fleet**.
 - **`offline_site.lua`** — site board: XZ **cells** (target 20×20, min 4), one bot/cell, full-H layer digs, dual pose, `where`.
 - **`perimeter_sensor.lua` / `perimeter_manager.lua`** — Player Detector territory (one manager + admin alerts).
-- **`tetris.lua`** — Tetris for pocket / advanced PC + monitor (local LB; note music).
-- **`minesweeper.lua`** — Minesweeper for pocket / advanced PC + monitor (no modem).
+- **`tetris.lua`** — Tetris for pocket / advanced PC + monitor (local LB; note music; monitor bottom half = touch pad).
+- **`minesweeper.lua`** — Minesweeper for pocket / advanced PC + monitor (no modem; monitor bottom half = Open/Flag touch pad).
+- **`github_install.lua`** — On an advanced PC + color monitor, role select draws on the monitor (touch tiles + UP/DOWN scroll).
 - **`lib/titan.lua`** — shared library (protocol, messaging, navigation).
 
 Older packages (hub/bot/poi/miner/…) live under [`archive/`](archive/) and are not in the installer menu.

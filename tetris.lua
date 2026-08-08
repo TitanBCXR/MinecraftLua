@@ -1,6 +1,6 @@
 --[[
   tetris.lua  -  Standalone Tetris for CC: Tweaked (pocket / computer)
-  Titan-Version: 1.2.5
+  Titan-Version: 1.2.6
 
   Drop on a pocket PC or advanced computer and run:
 
@@ -10,8 +10,10 @@
   In-game / Controls screen: Q always returns to the main menu.
   Mid-game Q abandons the run (score is not kept).
 
-  Display: if a monitor is attached, the game draws there (keys still work on
-  the computer). Advanced color monitors / pockets get colored pieces.
+  Display: if a monitor is attached, the game draws there. On monitors the
+  bottom half is a touch pad (move / rotate / drop / pause / mute / quit) so
+  you can close the computer UI and play from the screen. Keys still work on
+  the PC. Advanced color monitors / pockets get colored pieces.
 
   Network: one boot sync (OTA + leaderboard) then the board is cached locally
   and the session goes fully offline — no more rednet calls (avoids pocket
@@ -95,9 +97,9 @@ local function attachMonitor()
     if NATIVE.setTextColor then NATIVE.setTextColor(colors.lightGray) end
     NATIVE.write("Tetris on monitor")
     NATIVE.setCursorPos(1, 2)
-    NATIVE.write("Keys work on this PC")
+    NATIVE.write("Close this UI — play")
     NATIVE.setCursorPos(1, 3)
-    NATIVE.write("Touch = menu buttons")
+    NATIVE.write("via touch pad below")
   end)
   return true
 end
@@ -697,22 +699,94 @@ end
 --------------------------------------------------------------------------------
 local function layout()
   local tw, th = term.getSize()
+  -- Monitor: reserve bottom half for an on-screen touch pad.
+  local padH, gameH = 0, th
+  if USING_MONITOR and th >= 12 then
+    padH = math.max(6, math.floor(th / 2))
+    if th - padH < 10 then padH = math.max(5, th - 10) end
+    gameH = th - padH
+  end
   local cellW = 1
   local boardW = COLS * cellW + 2 -- borders
   -- Shrink visible rows if screen is short (still play full logic; scroll top)
-  local visRows = math.min(ROWS, math.max(8, th - 2))
+  local visRows = math.min(ROWS, math.max(6, gameH - 2))
   -- Leave a slim HUD column on the right (SIDE_W), not a wide score box.
   local totalW = boardW + 1 + SIDE_W
   local ox = math.max(1, math.floor((tw - totalW) / 2) + 1)
   if ox + totalW - 1 > tw then ox = 1 end
-  local oy = math.max(1, math.floor((th - (visRows + 2)) / 2))
+  local oy = math.max(1, math.floor((gameH - (visRows + 2)) / 2))
   local px = ox + boardW + 1
   if px + SIDE_W - 1 > tw then px = math.max(1, tw - SIDE_W + 1) end
   return {
     tw = tw, th = th, ox = ox, oy = oy, px = px,
     cellW = cellW, boardW = boardW, visRows = visRows,
     color = isColor(),
+    padH = padH, padTop = gameH + 1, gameH = gameH,
+    buttons = {},
   }
+end
+
+local function touchPadButtons(L)
+  if not L or (L.padH or 0) < 4 then return {} end
+  local y0, tw, padH = L.padTop, L.tw, L.padH
+  local bw = math.max(3, math.floor(tw / 3))
+  local bh = math.max(1, math.floor(padH / 3))
+  local defs = {
+    { "left", "<" }, { "rot", "ROT" }, { "right", ">" },
+    { "soft", "v" }, { "drop", "DROP" }, { "pause", "P" },
+    { "mute", "MUTE" }, { "noop", "" }, { "quit", "QUIT" },
+  }
+  local buttons = {}
+  for i = 1, #defs do
+    local id, label = defs[i][1], defs[i][2]
+    if id ~= "noop" then
+      local col = (i - 1) % 3
+      local row = math.floor((i - 1) / 3)
+      local x = col * bw + 1
+      local w = (col == 2) and (tw - x + 1) or bw
+      local y = y0 + row * bh
+      local h = (row == 2) and (y0 + padH - y) or bh
+      if h < 1 then h = 1 end
+      buttons[#buttons + 1] = { id = id, x = x, y = y, w = w, h = h, label = label }
+    end
+  end
+  return buttons
+end
+
+local function drawTouchPad(L, paused)
+  local buttons = touchPadButtons(L)
+  L.buttons = buttons
+  if #buttons == 0 then return end
+  for i = 1, #buttons do
+    local b = buttons[i]
+    local bg = colors.gray
+    if b.id == "drop" then bg = colors.blue
+    elseif b.id == "quit" then bg = colors.red
+    elseif b.id == "pause" and paused then bg = colors.yellow
+    elseif b.id == "mute" and not MUSIC_ON then bg = colors.orange
+    elseif b.id == "rot" then bg = colors.purple
+    end
+    fill(b.x, b.y, b.w, b.h, bg, colors.white)
+    local label = b.label
+    if b.id == "mute" then label = MUSIC_ON and "MUTE" or "UNMUTE" end
+    if b.id == "pause" then label = paused and "PLAY" or "P" end
+    label = label:sub(1, b.w)
+    local lx = b.x + math.max(0, math.floor((b.w - #label) / 2))
+    local ly = b.y + math.floor((b.h - 1) / 2)
+    text(lx, ly, label, colors.white, bg)
+  end
+end
+
+local function hitTouchPad(L, mx, my)
+  local buttons = L and L.buttons or {}
+  for i = 1, #buttons do
+    local b = buttons[i]
+    if mx >= b.x and mx <= b.x + b.w - 1
+        and my >= b.y and my <= b.y + b.h - 1 then
+      return b.id
+    end
+  end
+  return nil
 end
 
 local function drawCell(L, bx, by, kind, ghost)
@@ -821,12 +895,19 @@ local function drawBoard(L, grid, piece, nextKind, score, level, lines, paused, 
   end
   if over then
     text(L.ox + 1, L.oy + math.floor(L.visRows / 2), " GAME OVER ", colors.white, colors.red)
-    text(L.ox + 1, L.oy + math.floor(L.visRows / 2) + 1, " Enter/Q ", colors.black, colors.white)
+    text(L.ox + 1, L.oy + math.floor(L.visRows / 2) + 1,
+      USING_MONITOR and " Tap pad " or " Enter/Q ",
+      colors.black, colors.white)
   end
 
-  if L.th >= L.oy + L.visRows + 3 then
-    text(1, L.th, "Arrows  Up=rot  Spc=drop  P  Q",
-      colors.gray, colors.black)
+  if (L.padH or 0) >= 4 then
+    drawTouchPad(L, paused)
+  else
+    L.buttons = {}
+    if L.th >= L.oy + L.visRows + 3 then
+      text(1, L.th, "Arrows  Up=rot  Spc=drop  P  Q",
+        colors.gray, colors.black)
+    end
   end
 end
 
@@ -866,6 +947,124 @@ local function runGame()
   startMusic("game")
   local musicTimer = os.startTimer(MUSIC_ON and SPEAKER and 0.05 or 3600)
 
+  local function finish(keepScore)
+    stopMusic()
+    TRACK.playing = false
+    TRACK.score = keepScore and score or 0
+    return keepScore and score or 0
+  end
+
+  local function togglePause()
+    paused = not paused
+    dirty = true
+    if paused then
+      if SPEAKER then pcall(function() SPEAKER.stop() end) end
+    else
+      dropTimer = os.startTimer(gravityMs(level) / 1000)
+      if MUSIC_ON then
+        startMusic("game")
+        musicTimer = os.startTimer(0.05)
+      end
+    end
+  end
+
+  local function toggleMute()
+    MUSIC_ON = not MUSIC_ON
+    saveCfg()
+    if MUSIC_ON and SPEAKER and not paused and not over then
+      startMusic("game")
+      musicTimer = os.startTimer(0.05)
+    else
+      stopMusic()
+    end
+    dirty = true
+  end
+
+  local function lockAndSpawn()
+    lock(grid, piece.kind, piece.rot, piece.x, piece.y)
+    local n = clearLines(grid)
+    if n > 0 then
+      score = score + lineScore(n, level)
+      lines = lines + n
+      level = math.floor(lines / 10)
+      sfxLineClear(n)
+    end
+    piece, bag = spawn(grid, bag)
+    if not piece then over = true end
+    dirty = true
+  end
+
+  local function doLeft()
+    if paused or over or not piece then return end
+    if fits(grid, piece.kind, piece.rot, piece.x - 1, piece.y) then
+      piece.x = piece.x - 1; dirty = true
+    end
+  end
+
+  local function doRight()
+    if paused or over or not piece then return end
+    if fits(grid, piece.kind, piece.rot, piece.x + 1, piece.y) then
+      piece.x = piece.x + 1; dirty = true
+    end
+  end
+
+  local function doRot()
+    if paused or over or not piece then return end
+    local nr = (piece.rot + 1) % 4
+    if fits(grid, piece.kind, nr, piece.x, piece.y)
+        or fits(grid, piece.kind, nr, piece.x - 1, piece.y)
+        or fits(grid, piece.kind, nr, piece.x + 1, piece.y) then
+      if not fits(grid, piece.kind, nr, piece.x, piece.y) then
+        if fits(grid, piece.kind, nr, piece.x - 1, piece.y) then
+          piece.x = piece.x - 1
+        else
+          piece.x = piece.x + 1
+        end
+      end
+      piece.rot = nr
+      dirty = true
+    end
+  end
+
+  local function doSoft()
+    if paused or over or not piece then return end
+    if fits(grid, piece.kind, piece.rot, piece.x, piece.y + 1) then
+      piece.y = piece.y + 1
+      score = score + 1
+      dirty = true
+    end
+  end
+
+  local function doDrop()
+    if paused or over or not piece then return end
+    local dropped = 0
+    while fits(grid, piece.kind, piece.rot, piece.x, piece.y + 1) do
+      piece.y = piece.y + 1
+      dropped = dropped + 1
+    end
+    score = score + dropped * 2
+    lockAndSpawn()
+    dropTimer = os.startTimer(gravityMs(level) / 1000)
+  end
+
+  local function padAction(id)
+    if not id then return nil end
+    if over then
+      if id == "mute" then toggleMute(); return nil end
+      return finish(true)
+    end
+    if id == "left" then doLeft()
+    elseif id == "right" then doRight()
+    elseif id == "rot" then doRot()
+    elseif id == "soft" then doSoft()
+    elseif id == "drop" then doDrop()
+    elseif id == "pause" then togglePause()
+    elseif id == "mute" then toggleMute()
+    elseif id == "quit" then return finish(false)
+    end
+    return nil
+  end
+
   while true do
     TRACK.score, TRACK.level, TRACK.lines = score, level, lines
     if dirty then
@@ -889,135 +1088,51 @@ local function runGame()
         if fits(grid, piece.kind, piece.rot, piece.x, piece.y + 1) then
           piece.y = piece.y + 1
         else
-          lock(grid, piece.kind, piece.rot, piece.x, piece.y)
-          local n = clearLines(grid)
-          if n > 0 then
-            score = score + lineScore(n, level)
-            lines = lines + n
-            level = math.floor(lines / 10)
-            sfxLineClear(n)
-          end
-          piece, bag = spawn(grid, bag)
-          if not piece then over = true end
+          lockAndSpawn()
         end
         dirty = true
       end
       if not over then
         dropTimer = os.startTimer(gravityMs(level) / 1000)
       end
+    elseif ev == "mouse_click" then
+      local ret = padAction(hitTouchPad(L, p2, p3))
+      if ret ~= nil then return ret end
     elseif ev == "key" and not over then
       local k = p1
       local K = keys
       if k == K.p or (K.pause and k == K.pause) then
-        paused = not paused
-        dirty = true
-        if paused then
-          if SPEAKER then pcall(function() SPEAKER.stop() end) end
-        else
-          dropTimer = os.startTimer(gravityMs(level) / 1000)
-          if MUSIC_ON then
-            startMusic("game")
-            musicTimer = os.startTimer(0.05)
-          end
-        end
+        togglePause()
       elseif k == K.m then
-        MUSIC_ON = not MUSIC_ON
-        saveCfg()
-        if MUSIC_ON and SPEAKER then
-          startMusic("game")
-          musicTimer = os.startTimer(0.05)
-        else
-          stopMusic()
-        end
-        dirty = true
+        toggleMute()
       elseif k == K.q then
-        -- Mid-game Q: abandon run (score not kept / not submitted).
-        stopMusic()
-        TRACK.playing = false
-        TRACK.score = 0
-        return 0
-      elseif not paused and piece then
-        if k == K.left or k == K.a or k == K.h then
-          if fits(grid, piece.kind, piece.rot, piece.x - 1, piece.y) then
-            piece.x = piece.x - 1; dirty = true
-          end
-        elseif k == K.right or k == K.d or k == K.l then
-          if fits(grid, piece.kind, piece.rot, piece.x + 1, piece.y) then
-            piece.x = piece.x + 1; dirty = true
-          end
-        elseif k == K.up or k == K.w or k == K.k or k == K.x then
-          local nr = (piece.rot + 1) % 4
-          if fits(grid, piece.kind, nr, piece.x, piece.y)
-              or fits(grid, piece.kind, nr, piece.x - 1, piece.y)
-              or fits(grid, piece.kind, nr, piece.x + 1, piece.y) then
-            if not fits(grid, piece.kind, nr, piece.x, piece.y) then
-              if fits(grid, piece.kind, nr, piece.x - 1, piece.y) then
-                piece.x = piece.x - 1
-              else
-                piece.x = piece.x + 1
-              end
-            end
-            piece.rot = nr
-            dirty = true
-          end
-        elseif k == K.down or k == K.s or k == K.j then
-          if fits(grid, piece.kind, piece.rot, piece.x, piece.y + 1) then
-            piece.y = piece.y + 1
-            score = score + 1
-            dirty = true
-          end
-        elseif k == K.space or k == K.enter then
-          local dropped = 0
-          while fits(grid, piece.kind, piece.rot, piece.x, piece.y + 1) do
-            piece.y = piece.y + 1
-            dropped = dropped + 1
-          end
-          score = score + dropped * 2
-          lock(grid, piece.kind, piece.rot, piece.x, piece.y)
-          local n = clearLines(grid)
-          if n > 0 then
-            score = score + lineScore(n, level)
-            lines = lines + n
-            level = math.floor(lines / 10)
-            sfxLineClear(n)
-          end
-          piece, bag = spawn(grid, bag)
-          if not piece then over = true end
-          dirty = true
-          dropTimer = os.startTimer(gravityMs(level) / 1000)
-        end
+        return finish(false)
+      elseif k == K.left or k == K.a or k == K.h then
+        doLeft()
+      elseif k == K.right or k == K.d or k == K.l then
+        doRight()
+      elseif k == K.up or k == K.w or k == K.k or k == K.x then
+        doRot()
+      elseif k == K.down or k == K.s or k == K.j then
+        doSoft()
+      elseif k == K.space or k == K.enter then
+        doDrop()
       end
     elseif ev == "key" and over then
       if p1 == keys.enter or p1 == keys.q or p1 == keys.space then
-        stopMusic()
-        TRACK.playing = false
-        TRACK.score = score
-        return score
+        return finish(true)
       end
     elseif ev == "char" and not over then
       -- Q only here as a fallback; pause is key-only so CC's paired
       -- key+char for "p" does not toggle pause twice (appear broken).
       local ch = tostring(p1 or ""):lower()
       if ch == "q" then
-        stopMusic()
-        TRACK.playing = false
-        TRACK.score = 0
-        return 0
+        return finish(false)
       elseif ch == "m" then
-        MUSIC_ON = not MUSIC_ON
-        saveCfg()
-        if MUSIC_ON and SPEAKER then
-          startMusic("game")
-          musicTimer = os.startTimer(0.05)
-        else
-          stopMusic()
-        end
+        toggleMute()
       end
     elseif ev == "terminate" then
-      stopMusic()
-      TRACK.playing = false
-      TRACK.score = 0
-      return 0
+      return finish(false)
     end
   end
 end
