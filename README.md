@@ -6,8 +6,8 @@ A wireless dispatch system for Minecraft's **CC: Tweaked** mod:
 - **`bot.lua`** — a turtle that reports status, navigates by GPS, and executes tasks.
 - **`poi.lua`** — a "point of interest" computer that marks a location by coordinates and can summon a bot.
 - **`miner.lua`** — quarry turtle: digs between two corners down to a floor Y, skipping `exclude.txt`.
-- **`offline_miner.lua`** — local quarry turtle: `mode online|offline`, solo `area` / `box` / `tunnel` / `stair`, or site `join` / `mine`. Layer dig stays on the dig line (no spin); fuel SOS to admin + MAIN.
-- **`offline_site.lua`** — quarry site board (left of storage): dig mode `column` (2×2 XZ shafts) or `layer` (Y bands), job store, % progress for the admin tablet.
+- **`offline_miner.lua`** — local quarry turtle: `mode online|offline`, solo `area` / `box` / `tunnel` / `stair`, or online site fleet (modem → join → reband/reset → mine). Dig-line facing; fuel SOS to admin + MAIN.
+- **`offline_site.lua`** — quarry site board: `column` / `layer` claims, fleet reband on join, origin reset turns, continueIdx skip of mined work, % progress for admin.
 - **`perimeter_sensor.lua` / `perimeter_manager.lua`** — Player Detector territory enter/exit board (N/E/S/W + timestamps).
 - **`lib/titan.lua`** — shared library (protocol, messaging, navigation). Copy this onto **every** device.
 
@@ -489,8 +489,15 @@ mode offline              solo dig — no site board, no admin check-ins
 mode online               modem + site claims / admin tablet (default)
 ```
 
-Use **offline** for a lone turtle (`area` / `box` / …). Use **online** when you
-want `join` / `mine`, tablet progress, fuel SOS, and reboot sync with the site.
+Use **offline** for a lone turtle (`area` / `box` / …). Use **online** for the
+same dig style plus site check-ins and multi-turtle projects.
+
+**Online boot:** waits until a wireless modem is in inventory (slot 15), joins
+the site board, then enters the site mine loop. When the fleet changes, the site
+**rebands** everyone (see below).
+
+**Label:** each turtle sets `V{major}.{minor}-Miner{id}` from the miner version and
+computer id (e.g. `V1.4-Miner12`).
 
 ### Turtle commands
 
@@ -545,42 +552,52 @@ resumes. Optional `exclude.txt` is honored if present.
 ### Site board (`offline_site.lua`)
 
 Left of the storage chest. Auto-learns W×L×H from turtle reports, or lock with
-`setup`. Stores each job under `quarry_jobs/`, hands out claims, relays a
+`setup`. Stores each job under `quarry_jobs/`, owns fleet bands, relays a
 combined snapshot to the admin tablet.
 
 **Dig / claim patterns** (site-wide):
 
-| Pattern | What `mine` claims | Best for |
-|---------|-------------------|----------|
-| **`column`** (default) | Non-overlapping **2×2 XZ** shafts, full height | Multi-turtle speed, less surface walking |
-| **`layer`** | Y bands across the whole footprint (max half / third of H) | Classic slice-by-slice |
+| Pattern | What the site assigns | Best for |
+|---------|----------------------|----------|
+| **`column`** (default) | Remaining **2×2 XZ** columns split across N turtles | Multi-turtle shafts |
+| **`layer`** | Remaining Y layers split into N contiguous bands | Slice-by-slice |
+
+**Fleet reband (on join / `reband` / next band):**
+
+1. Site recounts active turtles and splits **remaining** (unmined) work into N bands.
+2. Broadcasts `quarry_reband` — every miner stops and returns to origin.
+3. Turtles not on reset turn park **down then right** so origin stays clear.
+4. One at a time: `quarry_reset_go` → dump loot (keep fuel / modem / pick / left upgrade) → adopt claim + **continueIdx**.
+5. Each turtle digs like offline from that continue point (skips already-mined units in its claim). Completed columns/layers stay archived and are never reassigned.
 
 ```
 # site board
 setup 16x32 60 half column   # lock footprint + fraction + pattern
 setup 16x32 60 third layer
-pattern column|layer         # claim style for mine/
-fraction half|third          # max Y band size (layer mode)
-claims                       # active + free claims
+pattern column|layer         # claim style
+fraction half|third          # layer band size hint
+reband                       # force fleet reband + origin reset turns
+claims                       # active + free regions
 clearclaims                  # free all (turtles re-pick with mine)
 clearclaims Y 0 29           # free claims overlapping that Y range
 clearclaims done             # finished bands only
 auto                         # unlock auto-learn again
 
 # turtles (mode online)
-join
-mine                         # claim next free column or Y band, dig until none left
-area 16x32 40                # also reports footprint / progress with a modem
+# boot: wait for modem → join → reband/reset → mine
+mine                         # claim / continue site work
+area 16x32 40                # also reports footprint (helps auto-setup)
 
 # admin tablet
-quarry                       # live board: claim, last @x,y,z pose, SOS
+quarry                       # live board: claim, @pose, continue, SOS, homing/reset
 quarry assign 12 0 29        # set turtle Y band; acks on next check-in
 quarry pending
 ```
 
 Progress % shows on the site monitor and admin (`live quarry` / Quarry app).
-If a turtle has **no local** job file, `continue` / `mine` / `join` pull the
-stored list from the site (`quarry_jobs/<id>_…`) and resume.
+Statuses include `homing` / `reset` / `mining`. If a turtle has **no local** job
+file, `continue` / `mine` / `join` pull the stored list from the site
+(`quarry_jobs/<id>_…`) and resume at continueIdx.
 
 Put an enchanted pick in inventory and run `equip` (or reboot / `setup`) —
 `equipLeft`/`equipRight` keep NBT when the pack allows. Dump leaves tools in
@@ -639,8 +656,8 @@ from the install source (GitHub / pastebin / `host.lua`). Extras on disk that
 aren’t listed show as `*` and are not updated.
 
 Bump versions in `versions.lua` (and each file’s `Titan-Version:` header) when
-you ship a change; current system version is **1.5.24** (`offline_miner` **1.3.7**,
-`offline_site` **1.1.0**).
+you ship a change; current system version is **1.5.26** (`offline_miner` **1.4.1**,
+`offline_site` **1.2.0**).
 
 ---
 

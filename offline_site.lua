@@ -1,6 +1,6 @@
 --[[
   offline_site.lua  -  Quarry site board for multi-turtle offline miners
-  Titan-Version: 1.1.0
+  Titan-Version: 1.2.0
 
   Place this computer to the LEFT of the storage chest (storage sits behind
   the turtles' origin). Attach a modem (wired to the turtles is fine, or
@@ -10,7 +10,9 @@
   site board. When this board IS present it:
     * Auto-sets W×L×H from turtle mine/job data (or `setup` to lock manually)
     * Dig mode `column` (default): hands out non-overlapping 2×2 XZ columns
-      (full height). Dig mode `layer`: Y bands (max 1/2 or 1/3 of height)
+      (full height). Dig mode `layer`: Y bands across the footprint
+    * On join: rebands the whole fleet (split remaining work), calls all
+      turtles home, turn-taking origin reset (depot), then continueIdx digs
     * Collects BPC so every turtle knows safe travel distance
     * Stores each turtle's offline_miner_job.cfg under quarry_jobs/
     * Hands that job back if a turtle rejoins with no local job file
@@ -20,13 +22,14 @@
     setup <W>x<L> <H> [half|third] [column|layer]
     auto                             unlock auto-learn from turtles
     pattern column|layer             claim style for mine/
-    fraction half|third              max Y band size (layer mode)
+    fraction half|third              max Y band size hint (layer mode)
+    reband                           force fleet reband + origin reset turns
     claims                           list claimed / free regions
     clearclaims [all|done|stale|Y…]  release claims (see help)
     status | turtles | jobs | clear
     help | exit
 
-  Turtle side: offline_miner with modem; `join`/`mine` for site claims.
+  Turtle side: offline_miner online mode; modem → join → reband → mine.
 
   Run:  offline_site
 ]]
@@ -54,8 +57,20 @@ local cfg = {
   label = nil,
 }
 
-local turtles = {}  -- [id] = { name, y0, y1, x0, x1, z0, z1, dug, idx, total, bpc, fuel, seen, status, pos*, job }
+local turtles = {}  -- [id] = { name, y0, y1, x0, x1, z0, z1, dug, idx, total, continueIdx, bpc, fuel, seen, status, pos*, job }
 local completedBands = {}  -- list of { y0, y1 } (layer) or { x0,x1,z0,z1,y0,y1 } (column)
+
+-- Fleet reband / origin reset turn queue.
+local rebandState = {
+  epoch = 0,
+  active = false,
+  turnOrder = {},       -- computer ids, ascending
+  homeReady = {},       -- [id] = true
+  resetDone = {},       -- [id] = true
+  currentTurn = nil,
+  parkOffset = {},      -- [id] = corridor slot (down then right)
+  reason = nil,
+}
 
 local function normalizePattern(p)
   p = tostring(p or ""):lower()
@@ -619,7 +634,9 @@ local function snapshot()
       x0 = t.x0, x1 = t.x1, z0 = t.z0, z1 = t.z1,
       posX = t.posX, posY = t.posY, posZ = t.posZ,
       lastPosAt = t.lastPosAt, sos = t.sos,
-      dug = t.dug, idx = t.idx, total = t.total, bpc = t.bpc,
+      dug = t.dug, idx = t.idx, total = t.total,
+      continueIdx = t.continueIdx or t.idx,
+      bpc = t.bpc,
       fuel = t.fuel, status = t.status, age = ago(t.seen),
       job = t.job,
       jobSummary = t.job and jobSummaryShort(t.job) or nil,
@@ -645,6 +662,9 @@ local function snapshot()
     turtles = list,
     claims = listClaimEntries(),
     free = freeList,
+    rebandEpoch = rebandState.epoch,
+    rebandActive = rebandState.active == true,
+    rebandTurn = rebandState.currentTurn,
   }
 end
 
@@ -667,7 +687,13 @@ local function touchTurtle(id, msg)
   if msg.bpc ~= nil then t.bpc = tonumber(msg.bpc) or t.bpc end
   if msg.fuel ~= nil then t.fuel = msg.fuel end
   if msg.dug ~= nil then t.dug = tonumber(msg.dug) or t.dug end
-  if msg.idx ~= nil then t.idx = tonumber(msg.idx) or t.idx end
+  if msg.idx ~= nil then
+    t.idx = tonumber(msg.idx) or t.idx
+    t.continueIdx = tonumber(msg.idx) or t.continueIdx
+  end
+  if msg.continueIdx ~= nil then
+    t.continueIdx = tonumber(msg.continueIdx) or t.continueIdx
+  end
   if msg.total ~= nil then t.total = tonumber(msg.total) or t.total end
   if msg.moves ~= nil then t.moves = tonumber(msg.moves) or t.moves end
   if msg.coal ~= nil then t.coal = tonumber(msg.coal) or t.coal end
@@ -702,7 +728,10 @@ local function touchTurtle(id, msg)
     persistTurtleJob(id, nil)
   elseif type(msg.job) == "table" then
     t.job = msg.job
-    if msg.job.idx ~= nil then t.idx = tonumber(msg.job.idx) or t.idx end
+    if msg.job.idx ~= nil then
+      t.idx = tonumber(msg.job.idx) or t.idx
+      t.continueIdx = tonumber(msg.job.idx) or t.continueIdx
+    end
     if msg.job.total ~= nil then t.total = tonumber(msg.job.total) or t.total end
     if msg.job.dug ~= nil then t.dug = tonumber(msg.job.dug) or t.dug end
     if not locked then
@@ -751,6 +780,361 @@ local function archiveClaim(t)
   end
 end
 
+--------------------------------------------------------------------------------
+-- Fleet reband: split remaining work among N turtles, origin reset turns
+--------------------------------------------------------------------------------
+local function fleetIds()
+  local ids = {}
+  for id, t in pairs(turtles) do
+    if t and t.status ~= "done" then
+      ids[#ids + 1] = id
+    end
+  end
+  table.sort(ids)
+  return ids
+end
+
+-- Occupancy from completed work only (active claims are cleared during reband).
+local function completedOnlyLayers()
+  local H = math.max(0, tonumber(cfg.H) or 0)
+  local occ = {}
+  for y = 0, H - 1 do occ[y] = false end
+  for _, b in ipairs(completedBands) do
+    if b.x0 == nil and b.y0 and b.y1 then
+      for y = b.y0, b.y1 do
+        if occ[y] ~= nil then occ[y] = true end
+      end
+    end
+  end
+  return occ
+end
+
+local function freeLayerSpans()
+  local H = math.max(0, tonumber(cfg.H) or 0)
+  local occ = completedOnlyLayers()
+  local spans = {}
+  local y = 0
+  while y < H do
+    if not occ[y] then
+      local y0 = y
+      while y + 1 < H and not occ[y + 1] do y = y + 1 end
+      spans[#spans + 1] = { y0 = y0, y1 = y }
+    end
+    y = y + 1
+  end
+  return spans
+end
+
+local function partitionLayerSpans(spans, n)
+  local bands = {}
+  if n < 1 then return bands end
+  local total = 0
+  for _, s in ipairs(spans) do total = total + (s.y1 - s.y0 + 1) end
+  if total < 1 then return bands end
+  local target = math.max(1, math.ceil(total / n))
+  local si, ycur = 1, nil
+  if spans[1] then ycur = spans[1].y0 end
+  for _ = 1, n do
+    local need = target
+    local y0, y1 = nil, nil
+    while need > 0 and si <= #spans do
+      local s = spans[si]
+      if not ycur or ycur < s.y0 or ycur > s.y1 then ycur = s.y0 end
+      local take = math.min(need, s.y1 - ycur + 1)
+      if not y0 then y0 = ycur end
+      y1 = ycur + take - 1
+      need = need - take
+      ycur = y1 + 1
+      if ycur > s.y1 then
+        si = si + 1
+        if spans[si] then ycur = spans[si].y0 end
+      end
+    end
+    if y0 then bands[#bands + 1] = { y0 = y0, y1 = y1, pattern = "layer" } end
+  end
+  return bands
+end
+
+local function freeColumnList()
+  local W = math.max(1, tonumber(cfg.W) or 1)
+  local L = math.max(1, tonumber(cfg.L) or 1)
+  local H = math.max(1, tonumber(cfg.H) or 1)
+  local occ = {}
+  for z = 0, L - 1 do
+    occ[z] = {}
+    for x = 0, W - 1 do occ[z][x] = false end
+  end
+  for _, b in ipairs(completedBands) do
+    if b.x0 ~= nil then
+      for z = b.z0, (b.z1 or b.z0) do
+        for x = b.x0, (b.x1 or b.x0) do
+          if occ[z] and occ[z][x] ~= nil then occ[z][x] = true end
+        end
+      end
+    end
+  end
+  local cols = {}
+  for z = 0, L - 1, 2 do
+    for x = 0, W - 1, 2 do
+      local x1 = math.min(x + 1, W - 1)
+      local z1 = math.min(z + 1, L - 1)
+      local free = true
+      for zz = z, z1 do
+        for xx = x, x1 do
+          if occ[zz] and occ[zz][xx] then free = false end
+        end
+      end
+      if free then
+        cols[#cols + 1] = { x0 = x, x1 = x1, z0 = z, z1 = z1, y0 = 0, y1 = H - 1, pattern = "column" }
+      end
+    end
+  end
+  return cols
+end
+
+local function partitionColumns(cols, n)
+  local bands = {}
+  if n < 1 or #cols < 1 then return bands end
+  local per = math.max(1, math.ceil(#cols / n))
+  for i = 1, n do
+    local group = {}
+    for j = 1, per do
+      local c = cols[(i - 1) * per + j]
+      if c then group[#group + 1] = c end
+    end
+    if #group > 0 then
+      local x0, x1 = group[1].x0, group[1].x1
+      local z0, z1 = group[1].z0, group[1].z1
+      local y0, y1 = group[1].y0, group[1].y1
+      for _, c in ipairs(group) do
+        x0 = math.min(x0, c.x0); x1 = math.max(x1, c.x1)
+        z0 = math.min(z0, c.z0); z1 = math.max(z1, c.z1)
+      end
+      bands[#bands + 1] = {
+        pattern = "column",
+        x0 = x0, x1 = x1, z0 = z0, z1 = z1, y0 = y0, y1 = y1,
+      }
+    end
+  end
+  return bands
+end
+
+local function computeContinueIdx(t, claim)
+  if not t or not claim then return 1 end
+  local idx = tonumber(t.continueIdx) or tonumber(t.idx) or 1
+  if idx < 1 then idx = 1 end
+  if claim.x0 ~= nil and t.x0 ~= nil
+      and tonumber(t.x0) == tonumber(claim.x0)
+      and tonumber(t.x1) == tonumber(claim.x1)
+      and tonumber(t.z0) == tonumber(claim.z0)
+      and tonumber(t.z1) == tonumber(claim.z1) then
+    return idx
+  end
+  if claim.x0 == nil and t.x0 == nil and claim.y0 ~= nil and t.y0 ~= nil
+      and tonumber(t.y0) == tonumber(claim.y0)
+      and tonumber(t.y1) == tonumber(claim.y1) then
+    return idx
+  end
+  return 1
+end
+
+local function claimExtrasFor(t)
+  if not turtleHasClaim(t) then return nil end
+  local cidx = tonumber(t.continueIdx) or tonumber(t.idx) or 1
+  return {
+    ok = true,
+    pattern = (t.x0 ~= nil) and "column" or "layer",
+    y0 = t.y0, y1 = t.y1,
+    x0 = t.x0, x1 = t.x1, z0 = t.z0, z1 = t.z1,
+    continueIdx = cidx,
+    resume = cidx > 1,
+    epoch = rebandState.epoch,
+    adminLock = t.adminLock == true,
+  }
+end
+
+local advanceResetQueue  -- forward decl
+
+local function sendRebandMsg(id, t)
+  t = t or turtles[id]
+  if not t then return end
+  local park = rebandState.parkOffset[id] or 0
+  local extra = claimExtrasFor(t) or { ok = false, err = "no claim after reband" }
+  rednet.send(id, {
+    type = "quarry_reband",
+    epoch = rebandState.epoch,
+    reason = rebandState.reason,
+    turnOrder = rebandState.turnOrder,
+    parkOffset = park,
+    clearOrigin = { down = 1, right = 1 },
+    W = cfg.W, L = cfg.L, H = cfg.H,
+    pattern = sitePattern(),
+    maxTravel = maxTravel(), minBpc = minBpc(),
+    y0 = extra.y0, y1 = extra.y1,
+    x0 = extra.x0, x1 = extra.x1, z0 = extra.z0, z1 = extra.z1,
+    continueIdx = extra.continueIdx or 1,
+    ok = extra.ok,
+    err = extra.err,
+  }, PROTO)
+end
+
+advanceResetQueue = function()
+  if not rebandState.active then return end
+  -- Find next turtle that is home and not yet reset.
+  for _, id in ipairs(rebandState.turnOrder) do
+    if rebandState.homeReady[id] and not rebandState.resetDone[id] then
+      rebandState.currentTurn = id
+      local t = turtles[id]
+      local extra = claimExtrasFor(t) or {}
+      local park = rebandState.parkOffset[id] or 0
+      print(("[reband] reset turn → #%d (epoch %d)"):format(id, rebandState.epoch))
+      rednet.send(id, {
+        type = "quarry_reset_go",
+        epoch = rebandState.epoch,
+        parkOffset = park,
+        clearOrigin = { down = 1, right = 1 },
+        W = cfg.W, L = cfg.L, H = cfg.H,
+        pattern = sitePattern(),
+        maxTravel = maxTravel(), minBpc = minBpc(),
+        y0 = extra.y0, y1 = extra.y1,
+        x0 = extra.x0, x1 = extra.x1, z0 = extra.z0, z1 = extra.z1,
+        continueIdx = extra.continueIdx or 1,
+        ok = extra.ok ~= false,
+      }, PROTO)
+      if t then
+        t.status = "reset"
+        turtles[id] = t
+      end
+      return
+    end
+  end
+  -- All done?
+  local allDone = true
+  for _, id in ipairs(rebandState.turnOrder) do
+    if not rebandState.resetDone[id] then allDone = false; break end
+  end
+  if allDone then
+    print(("[reband] epoch %d complete — fleet mining"):format(rebandState.epoch))
+    rebandState.active = false
+    rebandState.currentTurn = nil
+    broadcastStatus()
+  end
+end
+
+local function rebandFleet(reason, triggerId)
+  if (tonumber(cfg.H) or 0) < 1 or (tonumber(cfg.W) or 0) < 1 then
+    print("[reband] skipped — site size unknown")
+    return false
+  end
+  local ids = fleetIds()
+  if #ids < 1 then return false end
+
+  rebandState.epoch = (tonumber(rebandState.epoch) or 0) + 1
+  rebandState.active = true
+  rebandState.reason = tostring(reason or "join")
+  rebandState.turnOrder = ids
+  rebandState.homeReady = {}
+  rebandState.resetDone = {}
+  rebandState.currentTurn = nil
+  rebandState.parkOffset = {}
+  for i, id in ipairs(ids) do
+    rebandState.parkOffset[id] = i - 1  -- 0 = origin turn, others park down/right
+  end
+
+  local pat = sitePattern()
+  local bands
+  if pat == "column" then
+    bands = partitionColumns(freeColumnList(), #ids)
+  else
+    bands = partitionLayerSpans(freeLayerSpans(), #ids)
+  end
+
+  print(("[reband] epoch %d  reason=%s  turtles=%d  bands=%d  trigger=#%s"):format(
+    rebandState.epoch, rebandState.reason, #ids, #bands, tostring(triggerId or "-")))
+
+  for i, id in ipairs(ids) do
+    local t = turtles[id]
+    if t then
+      local old = {
+        x0 = t.x0, x1 = t.x1, z0 = t.z0, z1 = t.z1,
+        y0 = t.y0, y1 = t.y1,
+        continueIdx = t.continueIdx, idx = t.idx,
+      }
+      -- Snapshot progress before clearing coords.
+      local claim = bands[i]
+      clearTurtleCoords(t)
+      t.adminLock = false
+      if claim then
+        if claim.pattern == "column" or claim.x0 ~= nil then
+          t.x0, t.x1, t.z0, t.z1 = claim.x0, claim.x1, claim.z0, claim.z1
+          t.y0, t.y1 = claim.y0, claim.y1
+        else
+          t.y0, t.y1 = claim.y0, claim.y1
+          t.x0, t.x1, t.z0, t.z1 = nil, nil, nil, nil
+        end
+        -- Restore identity fields for continue mapping against previous claim.
+        local tmp = {
+          x0 = old.x0, x1 = old.x1, z0 = old.z0, z1 = old.z1,
+          y0 = old.y0, y1 = old.y1,
+          continueIdx = old.continueIdx, idx = old.idx,
+        }
+        t.continueIdx = computeContinueIdx(tmp, claim)
+        t.idx = t.continueIdx
+        t.status = "homing"
+        print(("  #%d → %s  continue@%d"):format(id, claimLabel(t), t.continueIdx))
+      else
+        t.status = "idle"
+        t.continueIdx = 1
+        print(("  #%d → (no remaining work)"):format(id))
+      end
+      turtles[id] = t
+      sendRebandMsg(id, t)
+    end
+  end
+  saveCfg()
+  broadcastStatus()
+  return true
+end
+
+local function onTurtleHome(id, msg)
+  touchTurtle(id, msg or {})
+  local t = turtles[id]
+  if t then
+    t.status = "homing"
+    turtles[id] = t
+  end
+  if not rebandState.active then return end
+  if tonumber(msg and msg.epoch) and tonumber(msg.epoch) ~= rebandState.epoch then
+    return  -- stale epoch
+  end
+  rebandState.homeReady[id] = true
+  print(("[reband] #%d home (epoch %d)"):format(id, rebandState.epoch))
+  -- Start / continue turns when the current slot is free.
+  if not rebandState.currentTurn then
+    advanceResetQueue()
+  end
+end
+
+local function onTurtleResetDone(id, msg)
+  touchTurtle(id, msg or {})
+  if not rebandState.active then return end
+  if tonumber(msg and msg.epoch) and tonumber(msg.epoch) ~= rebandState.epoch then
+    return
+  end
+  rebandState.resetDone[id] = true
+  if rebandState.currentTurn == id then
+    rebandState.currentTurn = nil
+  end
+  local t = turtles[id]
+  if t then
+    t.status = turtleHasClaim(t) and "mining" or "idle"
+    turtles[id] = t
+  end
+  print(("[reband] #%d reset done"):format(id))
+  advanceResetQueue()
+  broadcastStatus()
+end
+
 local function assignClaim(id, msg)
   msg = msg or {}
   local t = touchTurtle(id, msg)
@@ -760,6 +1144,14 @@ local function assignClaim(id, msg)
       err = "site size unknown — setup WxL H or let a turtle area-dig first",
     })
   end
+
+  -- During reband, hand back the assigned claim + continueIdx (no new free grab).
+  if rebandState.active and turtleHasClaim(t) then
+    local extra = claimExtrasFor(t)
+    extra.resume = true
+    return claimPayload(extra)
+  end
+
   local pat = sitePattern()
   -- Turtle finished a claim and wants another: archive old claim, don't resume it.
   if msg.nextBand or msg.forceNew then
@@ -771,20 +1163,38 @@ local function assignClaim(id, msg)
     clearTurtleCoords(t)
     t.status = "idle"
     t.job = nil
-    t.idx, t.total = nil, nil
+    t.idx, t.total, t.continueIdx = nil, nil, nil
     persistTurtleJob(id, nil)
     turtles[id] = t
+    -- Rebalance remaining work across the fleet when someone finishes a band.
+    local ids = fleetIds()
+    if #ids > 0 then
+      rebandFleet("next_band", id)
+      t = turtles[id]
+      if turtleHasClaim(t) then
+        return claimPayload(claimExtrasFor(t))
+      end
+    end
   end
-  -- Keep the turtle's claim forever until done / clearclaims (deep digs go quiet).
+  -- Keep the turtle's claim forever until done / clearclaims / reband.
   if turtleHasClaim(t) and t.status ~= "done" then
-    return claimPayload({
-      ok = true,
-      pattern = (t.x0 ~= nil) and "column" or "layer",
-      y0 = t.y0, y1 = t.y1,
-      x0 = t.x0, x1 = t.x1, z0 = t.z0, z1 = t.z1,
-      resume = true,
-      adminLock = t.adminLock == true,
-    })
+    local extra = claimExtrasFor(t)
+    extra.resume = true
+    return claimPayload(extra)
+  end
+
+  -- First claim with an existing fleet → reband everyone (includes this turtle).
+  local others = 0
+  for oid, ot in pairs(turtles) do
+    if oid ~= id and ot.status ~= "done" then others = others + 1 end
+  end
+  if others > 0 or (turtleHasClaim(t) == false and #fleetIds() > 1) then
+    rebandFleet("claim", id)
+    t = turtles[id]
+    if turtleHasClaim(t) then
+      return claimPayload(claimExtrasFor(t))
+    end
+    return claimPayload({ ok = false, err = "no remaining work after reband" })
   end
 
   if pat == "column" then
@@ -796,7 +1206,7 @@ local function assignClaim(id, msg)
     t.y0, t.y1 = y0, y1
     t.status = "assigned"
     t.adminLock = false
-    t.idx, t.total = 1, nil
+    t.idx, t.total, t.continueIdx = 1, nil, 1
     t.job = nil
     turtles[id] = t
     print(("[claim] #%d %s → column X%d-%d Z%d-%d (full Y %d..%d)"):format(
@@ -806,6 +1216,7 @@ local function assignClaim(id, msg)
       pattern = "column",
       x0 = x0, x1 = x1, z0 = z0, z1 = z1,
       y0 = y0, y1 = y1,
+      continueIdx = 1,
       resume = false,
     })
   end
@@ -818,7 +1229,7 @@ local function assignClaim(id, msg)
   t.x0, t.x1, t.z0, t.z1 = nil, nil, nil, nil
   t.status = "assigned"
   t.adminLock = false
-  t.idx, t.total = 1, nil
+  t.idx, t.total, t.continueIdx = 1, nil, 1
   t.job = nil
   turtles[id] = t
   print(("[claim] #%d %s → Y %d..%d (%d layers)"):format(
@@ -827,6 +1238,7 @@ local function assignClaim(id, msg)
     ok = true,
     pattern = "layer",
     y0 = y0, y1 = y1,
+    continueIdx = 1,
     resume = false,
   })
 end
@@ -919,6 +1331,15 @@ local function handleMsg(id, msg)
       print(("[+] #%d %s  bpc=%s"):format(
         id, tostring(msg.name or "?"), tostring(msg.bpc or "?")))
     end
+    -- New fleet member with a sized site → reband everyone (home + reset turns).
+    if first and (t == "quarry_join" or t == "quarry_hello")
+        and (tonumber(cfg.W) or 0) >= 1 and (tonumber(cfg.H) or 0) >= 1 then
+      local n = #fleetIds()
+      if n >= 1 then
+        rebandFleet("join", id)
+        row = turtles[id]
+      end
+    end
     if shouldWelcome then
       local stored = loadStoredJob(id)
       rednet.send(id, {
@@ -933,14 +1354,25 @@ local function handleMsg(id, msg)
         job = stored,
         y0 = row.y0, y1 = row.y1,
         x0 = row.x0, x1 = row.x1, z0 = row.z0, z1 = row.z1,
+        continueIdx = row.continueIdx or row.idx or 1,
+        rebandEpoch = rebandState.epoch,
+        rebandActive = rebandState.active == true,
         hasJob = stored ~= nil,
       }, PROTO)
       row.welcomedAt = now()
       if stored then
         print(("[job] #%d can resume %s"):format(id, jobSummaryShort(stored)))
       end
+      -- If reband already sent quarry_reband, remind this turtle of its turn state.
+      if rebandState.active then
+        sendRebandMsg(id, row)
+      end
     end
     if t ~= "quarry_turtle" then broadcastStatus() end
+  elseif t == "quarry_home" then
+    onTurtleHome(id, msg)
+  elseif t == "quarry_reset_done" then
+    onTurtleResetDone(id, msg)
   elseif t == "quarry_claim_req" then
     local reply = assignClaim(id, msg)
     rednet.send(id, reply, PROTO)
@@ -948,6 +1380,8 @@ local function handleMsg(id, msg)
   elseif t == "quarry_job_req" then
     touchTurtle(id, msg)
     local reply = jobReplyFor(id)
+    reply.continueIdx = (turtles[id] and (turtles[id].continueIdx or turtles[id].idx)) or 1
+    reply.epoch = rebandState.epoch
     rednet.send(id, reply, PROTO)
     if reply.ok then
       print(("[job] #%d requested → %s"):format(id, jobSummaryShort(reply.job)))
@@ -1047,7 +1481,10 @@ local function drawBoard(out)
 
   line(4, ("online:%d  minBPC:%.1f  maxTravel:%d"):format(
     snap.online, snap.minBpc, snap.maxTravel), colors.lightGray)
-  if tostring(snap.pattern) == "column" then
+  if snap.rebandActive then
+    line(5, ("REBAND epoch %d  turn=#%s"):format(
+      tonumber(snap.rebandEpoch) or 0, tostring(snap.rebandTurn or "-")), colors.yellow or colors.orange)
+  elseif tostring(snap.pattern) == "column" then
     line(5, "claim mode COLUMN (2x2 XZ shafts, full H)", colors.lightGray)
   else
     line(5, ("claim max %d layers (%s of H)"):format(snap.maxClaim, snap.fraction), colors.lightGray)
@@ -1074,9 +1511,12 @@ local function drawBoard(out)
       and ("%d,%d,%d"):format(t.posX, t.posY or 0, t.posZ or 0) or "-"
     local col = colors.white
     if st == "SOS" then col = colors.red
+    elseif st == "homing" or st == "reset" then col = colors.yellow or colors.orange
     elseif st == "assigned" or st == "mining" then col = colors.lime
     elseif st == "done" then col = colors.lightGray
     elseif st == "stale" then col = colors.red end
+    local cidx = t.continueIdx or t.idx
+    if cidx and prog == "-" then prog = ("@" .. tostring(cidx)) end
     line(y, ("#%-3d %-10s %-5s %-4s %s %s"):format(
       t.id, band:sub(1, 10), tostring(t.bpc or "?"):sub(1, 5), prog, pos, st), col)
     y = y + 1
@@ -1094,7 +1534,8 @@ local function printHelp()
   print("  setup <W>x<L> <H> [half|third] [column|layer]")
   print("  auto                             learn size from turtle mine data")
   print("  pattern column|layer             column=2x2 XZ shafts; layer=Y bands")
-  print("  fraction half|third              max Y band per turtle (layer mode)")
+  print("  fraction half|third              max Y band size hint (layer mode)")
+  print("  reband                           split remaining work + origin reset turns")
   print("  claims                           show claimed + free regions")
   print("  clearclaims                      release ALL claims (active+done)")
   print("  clearclaims done                 clear finished claims only")
@@ -1104,7 +1545,8 @@ local function printHelp()
   print("  status | turtles | jobs | clear | broadcast")
   print("  help | exit")
   print("")
-  print("Turtles call mine/join → site assigns next free column (default) or Y band.")
+  print("On join: site rebands the fleet, turtles home, take turns dumping at origin,")
+  print("then dig from continueIdx (skips already-mined units in their claim).")
   print("Job files: " .. JOB_DIR .. "/<id>_offline_miner_job.cfg")
 end
 
@@ -1164,6 +1606,18 @@ local function handleCommand(line)
       s.siteId, s.W, s.L, s.H, s.fraction, s.pct))
     print(("online=%d  minBPC=%.1f  maxTravel=%d  claimMax=%d"):format(
       s.online, s.minBpc, s.maxTravel, s.maxClaim))
+    if s.rebandActive then
+      print(("reband ACTIVE epoch=%d  turn=#%s"):format(
+        tonumber(s.rebandEpoch) or 0, tostring(s.rebandTurn or "-")))
+    else
+      print(("reband idle (last epoch %d)"):format(tonumber(s.rebandEpoch) or 0))
+    end
+  elseif cmd == "reband" then
+    if rebandFleet("manual", nil) then
+      print("Reband broadcast — turtles should home and reset in turn.")
+    else
+      print("Reband failed (need footprint + at least one turtle).")
+    end
   elseif cmd == "turtles" then
     local s = snapshot()
     if #s.turtles == 0 then print("(none)")
