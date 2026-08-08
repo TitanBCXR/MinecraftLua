@@ -1,6 +1,6 @@
 --[[
   pastebin_install.lua  -  Pastebin bootstrap installer for the Titan system
-  Titan-Version: 1.2.3
+  Titan-Version: 1.2.4
 
   Pulls the Titan files straight from Pastebin (no in-game host needed). Upload
   each file to pastebin.com once, paste its CODE into the table below, then
@@ -37,6 +37,7 @@ local CODES = {
   ["tetris.lua"]    = "",
   ["minesweeper.lua"] = "",
   ["sandstorm.lua"] = "",
+  ["luigi_poker.lua"] = "",
   ["host.lua"]      = "",
   ["exclude.txt"]   = "",
   ["versions.lua"]  = "",
@@ -48,7 +49,7 @@ local KEEP_ALL = {
   "lib/router_hub_net.lua", "lib/router_hub_ui.lua", "lib/router_hub_cmd.lua",
   "offline_miner.lua", "offline_site.lua", "exclude.txt",
   "perimeter_sensor.lua", "perimeter_manager.lua", "tetris.lua", "minesweeper.lua",
-  "sandstorm.lua", "host.lua", "versions.lua",
+  "sandstorm.lua", "luigi_poker.lua", "host.lua", "versions.lua",
 }
 
 --==============================================================================
@@ -61,6 +62,8 @@ local GAMES = {
     files = { "minesweeper.lua" } },
   { key = "3", name = "Sandstorm (noteblock + pixel show)", run = "sandstorm.lua",
     files = { "sandstorm.lua" } },
+  { key = "4", name = "Luigi Picture Poker", run = "luigi_poker.lua",
+    files = { "luigi_poker.lua" } },
 }
 
 local ROLES = {
@@ -261,6 +264,7 @@ local LABELS = {
   ["tetris.lua"] = "Tetris",
   ["minesweeper.lua"] = "Minesweeper",
   ["sandstorm.lua"] = "Sandstorm",
+  ["luigi_poker.lua"] = "LuigiPoker",
   ["host.lua"] = "TitanHost",
 }
 local lbl = role.run and LABELS[role.run]
