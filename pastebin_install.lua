@@ -35,6 +35,7 @@ local CODES = {
   ["perimeter_sensor.lua"] = "",
   ["perimeter_manager.lua"] = "",
   ["tetris.lua"]    = "",
+  ["host.lua"]      = "",
   ["exclude.txt"]   = "",
   ["versions.lua"]  = "",
 }
@@ -44,7 +45,8 @@ local KEEP_ALL = {
   "router.lua", "router_main.lua", "router_modem.lua",
   "lib/router_hub_net.lua", "lib/router_hub_ui.lua", "lib/router_hub_cmd.lua",
   "offline_miner.lua", "offline_site.lua", "exclude.txt",
-  "perimeter_sensor.lua", "perimeter_manager.lua", "tetris.lua", "versions.lua",
+  "perimeter_sensor.lua", "perimeter_manager.lua", "tetris.lua", "host.lua",
+  "versions.lua",
 }
 
 --==============================================================================
@@ -69,8 +71,10 @@ local ROLES = {
     files = { "lib/titan.lua", "perimeter_sensor.lua" } },
   { key = "8", name = "Perimeter manager (territory board)", run = "perimeter_manager.lua",
     files = { "lib/titan.lua", "perimeter_manager.lua" } },
-  { key = "t", name = "Tetris (pocket game — standalone)", run = "tetris.lua",
-    files = { "tetris.lua" } },
+  { key = "t", name = "Tetris (pocket game + mesh tracker)", run = "tetris.lua",
+    files = { "lib/titan.lua", "tetris.lua", "versions.lua" } },
+  { key = "h", name = "Install / update host (serves files over rednet)", run = "host.lua",
+    files = { "lib/titan.lua", "host.lua", "install.lua", "versions.lua" } },
   { key = "9", name = "Everything (kept files, no auto-run)", run = nil,
     files = KEEP_ALL },
 }
@@ -218,6 +222,7 @@ local LABELS = {
   ["perimeter_sensor.lua"] = "PerimSensor",
   ["perimeter_manager.lua"] = "PerimMgr",
   ["tetris.lua"] = "Tetris",
+  ["host.lua"] = "TitanHost",
 }
 local lbl = role.run and LABELS[role.run]
 if lbl and not os.getComputerLabel() then

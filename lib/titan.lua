@@ -1,6 +1,6 @@
 --[[
   titan.lua  -  Shared library for the Titan bot network (CC: Tweaked)
-  Titan-Version: 1.2.20
+  Titan-Version: 1.2.22
 
   Provides:
     * Rednet protocol constants + message type enum
@@ -8,6 +8,7 @@
     * send / broadcast / recv wrappers with a consistent envelope
     * GPS-based turtle navigation (moveTo, goHome, heading calibration)
     * Mesh storm control: announce prefers MAIN unicast + jittered registerLoop
+    * Boot update check (host-only or GitHub via manifest.base — never hardcodes a public URL)
 
   Drop this file at:  lib/titan.lua  on EVERY computer & turtle,
   or copy it around with `pastebin`, disks, or `wget`.
@@ -1378,8 +1379,27 @@ function titan.loadVersionCatalog()
   return nil
 end
 
--- Default GitHub raw root (same as github_install.lua). Trailing slash required.
-titan.GITHUB_RAW_BASE = "https://raw.githubusercontent.com/TitanBCXR/MinecraftLua/main/"
+-- Optional GitHub raw root. Intentionally NOT hardcoded — host-only clients
+-- (e.g. Tetris tablets) must never carry a public wget URL. Set only via
+-- `.titan-install`.base (github_install) or an explicit titan.GITHUB_RAW_BASE
+-- on your private update server / MAIN.
+titan.GITHUB_RAW_BASE = nil
+
+-- Resolve GitHub raw base from manifest or explicit override. Nil if host-only.
+function titan.githubRawBase()
+  local m = titan.readManifest()
+  if m and type(m.base) == "string" and m.base ~= "" then
+    local base = m.base
+    if not base:find("/$") then base = base .. "/" end
+    return base
+  end
+  if type(titan.GITHUB_RAW_BASE) == "string" and titan.GITHUB_RAW_BASE ~= "" then
+    local base = titan.GITHUB_RAW_BASE
+    if not base:find("/$") then base = base .. "/" end
+    return base
+  end
+  return nil
+end
 
 -- HTTP GET helper for OTA / GitHub fetches (must be above fetchGithubVersions).
 local function otaHttp(url)
@@ -1393,16 +1413,10 @@ local function otaHttp(url)
   return data
 end
 
--- Fetch versions.lua from GitHub (or any raw base). Returns catalog or nil, err.
-function titan.fetchGithubVersions(base)
-  base = base or titan.GITHUB_RAW_BASE
-  if type(base) ~= "string" or base == "" then return nil, "no github base" end
-  if not base:find("/$") then base = base .. "/" end
-  local data, err = otaHttp(base .. "versions.lua?cb=" .. os.epoch("utc"))
-  if not data then return nil, err end
+local function parseVersionsData(data)
+  if not data then return nil, "empty" end
   local loader, lerr = load(data, "@versions.lua", "t", {})
   if not loader then
-    -- CraftOS sometimes exposes loadstring
     if loadstring then
       loader, lerr = loadstring(data)
       if loader then setfenv(loader, {}) end
@@ -1411,6 +1425,18 @@ function titan.fetchGithubVersions(base)
   if not loader then return nil, "parse failed: " .. tostring(lerr) end
   local ok, cat = pcall(loader)
   if not ok or type(cat) ~= "table" then return nil, "invalid versions.lua" end
+  return cat
+end
+
+-- Fetch versions.lua from a raw base URL. Returns catalog or nil, err.
+function titan.fetchGithubVersions(base)
+  base = base or titan.githubRawBase()
+  if type(base) ~= "string" or base == "" then return nil, "no github base" end
+  if not base:find("/$") then base = base .. "/" end
+  local data, err = otaHttp(base .. "versions.lua?cb=" .. os.epoch("utc"))
+  if not data then return nil, err end
+  local cat, perr = parseVersionsData(data)
+  if not cat then return nil, perr end
   return cat, base
 end
 
@@ -1711,6 +1737,206 @@ local function otaCollectUpdatePaths()
     return a < b
   end)
   return paths
+end
+
+-- Fetch remote versions.lua from the install source.
+-- opts.hostOnly = never touch HTTP / GitHub (rednet host only).
+function titan.fetchRemoteCatalog(opts)
+  opts = opts or {}
+  local m = titan.readManifest()
+  local hostOnly = opts.hostOnly or (m and m.source == "host" and m.hostOnly ~= false)
+
+  if hostOnly or (m and m.source == "host") then
+    local hostId = otaFindHost(3)
+    if not hostId then return nil, "no install host online (run host.lua)" end
+    local data, err = otaFromHost(hostId, titan.VERSIONS_FILE)
+    if not data then return nil, err end
+    return parseVersionsData(data)
+  end
+
+  if m and m.source == "github" then
+    return titan.fetchGithubVersions(m.base or titan.githubRawBase())
+  elseif m and m.source == "pastebin" then
+    local code = m.codes and m.codes[titan.VERSIONS_FILE]
+    if not code or code == "" then
+      local base = titan.githubRawBase()
+      if not base then return nil, "no pastebin versions code" end
+      return titan.fetchGithubVersions(base)
+    end
+    local data, err = otaHttp("https://pastebin.com/raw/" .. code .. "?cb=" .. os.epoch("utc"))
+    if not data then return nil, err end
+    return parseVersionsData(data)
+  end
+
+  local base = titan.githubRawBase()
+  if base then return titan.fetchGithubVersions(base) end
+  -- Last resort: look for a rednet host (no URL required).
+  local hostId = otaFindHost(3)
+  if not hostId then return nil, "no update source (host offline, no github base)" end
+  local data, err = otaFromHost(hostId, titan.VERSIONS_FILE)
+  if not data then return nil, err end
+  return parseVersionsData(data)
+end
+
+-- true, reason if any tracked package (or system) is behind remote catalog.
+function titan.packagesNeedUpdate(remoteCat)
+  if type(remoteCat) ~= "table" then return false, "no catalog" end
+  local localCat = titan.loadVersionCatalog()
+  local localSys = (localCat and localCat.system) or titan.systemVersion() or "0"
+  local remoteSys = remoteCat.system
+  if remoteSys and titan.versionCompare(localSys, remoteSys) < 0 then
+    return true, "system " .. tostring(localSys) .. " -> " .. tostring(remoteSys)
+  end
+  local remotePkgs = remoteCat.packages or {}
+  local paths = titan.readPackageList()
+  if not paths or #paths == 0 then
+    -- Fall back to whatever is on disk that remote knows about.
+    paths = {}
+    for path in pairs(remotePkgs) do
+      if fs.exists(path) then paths[#paths + 1] = path end
+    end
+  end
+  for _, path in ipairs(paths) do
+    if path ~= titan.VERSIONS_FILE then
+      local want = remotePkgs[path]
+      if want then
+        if not fs.exists(path) then
+          return true, path .. " missing"
+        end
+        local have = titan.packageVersion(path, localCat) or titan.readFileVersion(path) or "0"
+        if titan.versionCompare(have, want) < 0 then
+          return true, path .. " " .. tostring(have) .. " -> " .. tostring(want)
+        end
+      end
+    end
+  end
+  return false, "up to date"
+end
+
+-- Ensure a github install manifest exists so updateSelf can pull from GitHub.
+-- Only call this on machines that are allowed to know the raw URL.
+function titan.ensureGithubManifest(opts)
+  opts = opts or {}
+  local m = titan.readManifest()
+  if m and m.source then return m end
+  local base = opts.base or titan.githubRawBase()
+  if type(base) ~= "string" or base == "" then
+    return nil, "no github base (set opts.base or .titan-install.base)"
+  end
+  local files = opts.files
+  if type(files) ~= "table" or #files == 0 then
+    files = titan.readPackageList() or { "lib/titan.lua", "versions.lua" }
+  end
+  m = {
+    source = "github",
+    role = opts.role or "device",
+    run = opts.run,
+    files = files,
+    base = base,
+    version = titan.systemVersion(),
+  }
+  titan.writeManifest(m)
+  if not titan.readPackageList() then
+    titan.writePackageList(files)
+  end
+  return m
+end
+
+-- Host-only manifest: rednet install host, never stores a GitHub / wget URL.
+function titan.ensureHostManifest(opts)
+  opts = opts or {}
+  local files = opts.files
+  if type(files) ~= "table" or #files == 0 then
+    files = titan.readPackageList() or { "lib/titan.lua", "versions.lua" }
+  end
+  local m = titan.readManifest() or {}
+  m.source = "host"
+  m.hostOnly = true
+  m.role = opts.role or m.role or "device"
+  m.run = opts.run or m.run
+  m.files = files
+  m.version = titan.systemVersion()
+  -- Scrub any leaked URL fields from older builds / mistaken github installs.
+  m.base = nil
+  m.codes = nil
+  titan.writeManifest(m)
+  if not titan.readPackageList() then
+    titan.writePackageList(files)
+  end
+  return m
+end
+
+-- Boot-time check: if remote catalog is newer, OTA + reboot.
+-- Returns: updated(bool), detail(string)
+-- opts.hostOnly = rednet host only (no GitHub URL written or used)
+-- opts.quiet / opts.files / opts.run / opts.role for manifest seed.
+function titan.bootUpdateCheck(opts)
+  opts = opts or {}
+  if opts.hostOnly then
+    titan.ensureHostManifest(opts)
+  elseif opts.files or opts.run then
+    titan.ensureGithubManifest(opts)
+  elseif not titan.readManifest() then
+    -- Prefer host when no manifest — never invent a public URL.
+    titan.ensureHostManifest(opts)
+  end
+
+  -- Keep host-only devices scrubbed even if an old base was on disk.
+  if opts.hostOnly then
+    local m = titan.readManifest()
+    if m and (m.base or m.source == "github") then
+      titan.ensureHostManifest(opts)
+    end
+  end
+
+  local remote, err = titan.fetchRemoteCatalog({ hostOnly = opts.hostOnly })
+  if not remote then
+    return false, "check failed: " .. tostring(err or "no catalog")
+  end
+  local need, why = titan.packagesNeedUpdate(remote)
+  if not need then
+    return false, why or "up to date"
+  end
+
+  if not opts.quiet then
+    print("[OTA] Update available (" .. tostring(why) .. ")")
+    print("[OTA] Downloading from install host...")
+  end
+  local prev = titan.systemVersion()
+  local progress = opts.quiet and nil or function(path, good, msg)
+    local name = titan.packageName(path)
+    if good then print(("  ok   %-16s %s"):format(name, tostring(msg)))
+    else print(("  FAIL %-16s %s"):format(name, tostring(msg))) end
+  end
+  local ok, detail = titan.updateSelf({ onProgress = progress })
+  -- Never fall back to GitHub for host-only clients (would write the URL).
+  if not ok and not opts.hostOnly then
+    local m = titan.readManifest()
+    local base = titan.githubRawBase()
+    if m and m.source ~= "github" and base then
+      if not opts.quiet then
+        print("[OTA] " .. tostring(detail) .. " — retrying via GitHub...")
+      end
+      m.source = "github"
+      m.base = base
+      titan.writeManifest(m)
+      ok, detail = titan.updateSelf({ onProgress = progress })
+    end
+  end
+  if not ok then
+    return false, "update failed: " .. tostring(detail)
+  end
+  local pkgs = type(detail) == "table" and detail.packages or nil
+  local ver = titan.systemVersion()
+  if titan.markPendingUpdateAck then
+    titan.markPendingUpdateAck(prev, ver, pkgs)
+  end
+  if not opts.quiet then
+    print("[OTA] Updated to v" .. tostring(ver or "?") .. " — rebooting...")
+  end
+  sleep(opts.rebootDelay or 1.2)
+  os.reboot()
+  return true, "rebooting"
 end
 
 -- Re-download every package listed in the `packages` file from the install source.

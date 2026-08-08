@@ -558,7 +558,13 @@ function githubBase()
   if type(c.githubBase) == "string" and c.githubBase ~= "" then
     return c.githubBase:find("/$") and c.githubBase or (c.githubBase .. "/")
   end
-  if titanLib and titanLib.GITHUB_RAW_BASE then return titanLib.GITHUB_RAW_BASE end
+  -- Prefer .titan-install.base (github installs) — never require a URL on host-only clients.
+  if titanLib and titanLib.githubRawBase then
+    local b = titanLib.githubRawBase()
+    if b then return b end
+  elseif titanLib and titanLib.GITHUB_RAW_BASE then
+    return titanLib.GITHUB_RAW_BASE
+  end
   return DEFAULT_GH_BASE
 end
 

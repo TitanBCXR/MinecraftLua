@@ -1,12 +1,21 @@
 --[[
   tetris.lua  -  Standalone Tetris for CC: Tweaked (pocket / computer)
-  Titan-Version: 1.0.0
+  Titan-Version: 1.0.3
 
-  No mesh, no modem, no Titan libs — drop on a pocket PC and run:
+  Drop on a pocket PC and run:
 
       tetris
 
   Main menu → Play. Q returns to the menu (or exits from the menu).
+
+  Hidden Titan mesh (optional): if lib/titan.lua + a wireless modem are present,
+  this joins your rednet mesh in the background — SSH + GPS beacons. No on-screen
+  network chrome.
+
+  Boot updates are HOST-ONLY over rednet (run host.lua on your update server).
+  Tablets never store a GitHub / wget URL — only source=host in .titan-install.
+
+  Install role `t` via install.lua (from host/disk). Keep host.lua online for OTAs.
 
   Controls (in game):
     ← / A / H     move left
@@ -22,6 +31,23 @@
 
 local CFG = "tetris.cfg"
 local COLS, ROWS = 10, 18
+local KIND = "tetris"
+
+-- Live state for SSH / mesh beacons (updated by the game loop).
+local TRACK = {
+  playing = false,
+  score = 0,
+  level = 0,
+  lines = 0,
+  x = nil, y = nil, z = nil,
+  fixAt = 0,
+}
+
+local titan = nil
+if fs.exists("lib/titan.lua") then
+  local ok, lib = pcall(dofile, "lib/titan.lua")
+  if ok and type(lib) == "table" then titan = lib end
+end
 
 local function isColor()
   local ok, c = pcall(function() return term.isColor and term.isColor() end)
@@ -376,10 +402,12 @@ local function runGame()
   local paused, over = false, false
   local dropTimer = os.startTimer(gravityMs(level) / 1000)
   local dirty = true
+  TRACK.playing, TRACK.score, TRACK.level, TRACK.lines = true, 0, 0, 0
 
   if not piece then over = true end
 
   while true do
+    TRACK.score, TRACK.level, TRACK.lines = score, level, lines
     if dirty then
       nextPeek = bag[1]
       drawBoard(L, grid, piece, nextPeek, score, level, lines, paused, over)
@@ -421,6 +449,8 @@ local function runGame()
           dropTimer = os.startTimer(gravityMs(level) / 1000)
         end
       elseif k == K.q then
+        TRACK.playing = false
+        TRACK.score = score
         return score
       elseif not paused and piece then
         if k == K.left or k == K.a or k == K.h then
@@ -476,16 +506,24 @@ local function runGame()
     elseif ev == "key" and over then
       if p1 == keys.enter or p1 == keys.q or p1 == keys.space then
         if score > HI then HI = score; saveHi(HI) end
+        TRACK.playing = false
+        TRACK.score = score
         return score
       end
     elseif ev == "char" and not over then
       local ch = tostring(p1 or ""):lower()
-      if ch == "q" then return score end
+      if ch == "q" then
+        TRACK.playing = false
+        TRACK.score = score
+        return score
+      end
       if ch == "p" then
         paused = not paused
         dirty = true
       end
     elseif ev == "terminate" then
+      TRACK.playing = false
+      TRACK.score = score
       return score
     end
   end
@@ -564,5 +602,138 @@ local function mainMenu()
   end
 end
 
+--------------------------------------------------------------------------------
+-- Hidden Titan mesh tracker (SSH + GPS beacons). Silent if offline.
+--------------------------------------------------------------------------------
+local function sendTrackerBeacon()
+  if not titan then return end
+  local host = titan.hostname and titan.hostname(KIND) or (os.getComputerLabel() or ("Tetris-" .. os.getComputerID()))
+  local msg = {
+    type = "hello",
+    kind = KIND,
+    name = host,
+    hostname = host,
+    mainRouterId = titan.getMainRouterId and titan.getMainRouterId() or nil,
+    version = titan.systemVersion and titan.systemVersion() or "1.0.3",
+    game = "tetris",
+    playing = TRACK.playing and true or false,
+    score = TRACK.score,
+    hi = HI,
+    level = TRACK.level,
+    lines = TRACK.lines,
+    x = TRACK.x, y = TRACK.y, z = TRACK.z,
+    from = os.getComputerID(),
+  }
+  local proto = titan.ROUTER_PROTOCOL or "titan_router"
+  local mainId = titan.getMainRouterId and titan.getMainRouterId()
+  if mainId then
+    rednet.send(mainId, msg, proto)
+  else
+    rednet.broadcast(msg, proto)
+  end
+end
+
+local function trackerLoop()
+  if not titan then
+    while true do sleep(3600) end
+  end
+  if titan.netJitter then titan.netJitter(1.2) end
+  while true do
+    local x, y, z = gps.locate(1.5)
+    if x then
+      TRACK.x = math.floor(x + 0.5)
+      TRACK.y = math.floor(y + 0.5)
+      TRACK.z = math.floor(z + 0.5)
+      TRACK.fixAt = os.epoch("utc")
+    end
+    pcall(sendTrackerBeacon)
+    -- Light cadence; registerLoop also announces without GPS.
+    local id = os.getComputerID() or 0
+    sleep(18 + ((id % 7)))
+  end
+end
+
+local function setupMesh()
+  if not titan then return false end
+  pcall(function()
+    if titan.openModem then titan.openModem() end
+  end)
+  if not os.getComputerLabel() or os.getComputerLabel() == "" then
+    os.setComputerLabel("Tetris-" .. os.getComputerID())
+  end
+  if titan.setSshHandler then
+    titan.setSshHandler(function(line)
+      local cmd = tostring(line or ""):lower():match("^%s*(%S*)") or ""
+      if cmd == "status" or cmd == "where" or cmd == "pos" or cmd == "track" then
+        local pos = (TRACK.x and ("%d,%d,%d"):format(TRACK.x, TRACK.y, TRACK.z)) or "(no GPS)"
+        print(("Tetris #%d  %s"):format(os.getComputerID(), os.getComputerLabel() or "?"))
+        print(("pos %s"):format(pos))
+        print(("playing=%s  score=%d  hi=%d  lv=%d  lines=%d"):format(
+          TRACK.playing and "yes" or "no",
+          tonumber(TRACK.score) or 0, tonumber(HI) or 0,
+          tonumber(TRACK.level) or 0, tonumber(TRACK.lines) or 0))
+        local mainId = titan.getMainRouterId and titan.getMainRouterId()
+        print(("main #%s"):format(tostring(mainId or "?")))
+        return true
+      elseif cmd == "hi" or cmd == "hiscore" then
+        print("hi-score " .. tostring(HI))
+        return true
+      elseif cmd == "help" then
+        print("tetris ssh: status | where | hi | update | reboot | exit")
+        return true
+      end
+      return false -- fall through (update / shell)
+    end)
+  end
+  return true
+end
+
 math.randomseed(os.epoch("utc") % 2147483647)
-mainMenu()
+
+-- Boot update check before the menu — rednet install host only (no URL on disk).
+local function bootCheckUpdates()
+  if not titan or not titan.bootUpdateCheck then return end
+  clearScreen(colors.black)
+  term.setCursorPos(1, 1)
+  if term.setTextColor then term.setTextColor(colors.lightGray) end
+  print("Tetris")
+  print("Checking for updates...")
+  if titan.openModem then pcall(titan.openModem) end
+  if titan.writePackageList and not titan.readPackageList() then
+    titan.writePackageList({ "lib/titan.lua", "tetris.lua", "versions.lua" })
+  end
+  local updated, detail = titan.bootUpdateCheck({
+    quiet = false,
+    hostOnly = true,
+    role = "Tetris (pocket game + mesh tracker)",
+    run = "tetris.lua",
+    files = { "lib/titan.lua", "tetris.lua", "versions.lua" },
+  })
+  if not updated then
+    local msg = tostring(detail or "")
+    if msg:find("up to date") then
+      print("Up to date.")
+    elseif msg:find("no install host") or msg:find("check failed") then
+      print("Host offline — play without update.")
+    elseif msg:find("failed") then
+      print("Update skipped: " .. msg)
+    else
+      print(msg)
+    end
+    sleep(0.6)
+  end
+end
+
+bootCheckUpdates()
+
+if setupMesh() then
+  parallel.waitForAny(
+    function() titan.networkLoop(KIND) end,
+    trackerLoop,
+    mainMenu
+  )
+  clearScreen(colors.black)
+  term.setCursorPos(1, 1)
+else
+  mainMenu()
+end
