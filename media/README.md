@@ -1,16 +1,10 @@
 # Media
 
-## `tetris_lofi.dfpwm`
+Audio downloads were removed from Tetris to keep installs small.
 
-Retro 8-bit arrangement of **Korobeiniki** (public-domain Russian folk song)
-for the Tetris pocket game. Original synth arrangement for this repo — not a
-rip of any commercial Tetris soundtrack.
+Music is now a compact **note-block** melody inside `tetris.lua` (no `.dfpwm`
+files on the host or pocket).
 
-- **Melody:** public domain folk
-- **Arrangement / audio:** original for TitanBCXR/MinecraftLua
-- **Format:** DFPWM1a @ 48 kHz (CC: Tweaked speaker)
-- **Regenerate:** `python scripts/gen_tetris_lofi.py`
+Optional local tooling (not used by the game):
 
-Pockets download over HTTP on boot:
-
-`https://raw.githubusercontent.com/TitanBCXR/MinecraftLua/main/media/tetris_lofi.dfpwm`
+- `scripts/gen_tetris_lofi.py` — old DFPWM generator, kept only for experiments

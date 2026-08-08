@@ -1,6 +1,6 @@
 --[[
   tetris.lua  -  Standalone Tetris for CC: Tweaked (pocket / computer)
-  Titan-Version: 1.2.1
+  Titan-Version: 1.2.2
 
   Drop on a pocket PC and run:
 
@@ -15,10 +15,9 @@
   crashes with speaker music). New scores update the local top-3 and queue for
   the next boot sync. R reloads the local cache only.
 
-  Music (Noisy pocket): downloads a free retro chiptune DFPWM (Korobeiniki —
-  public-domain folk melody, our arrangement) over HTTP into tetris_lofi.dfpwm,
-  then streams it while you play. M mutes. Note-block fallback if HTTP/decode
-  fails. Mesh / leaderboard sync still need a wireless modem at boot.
+  Music (Noisy pocket): tiny note-block Korobeiniki in this script only — no
+  DFPWM / HTTP audio files. M mutes. Mesh / leaderboard sync still need a
+  wireless modem at boot.
 
   Player name: uses Advanced Peripherals Player Detector when present; otherwise
   prompts for a name after a game (saved in tetris.cfg). That name is what
@@ -69,8 +68,6 @@ local function isColor()
 end
 
 local MUSIC_ON = true -- persisted; M toggles
-local MUSIC_REV = 2 -- bump when replacing the cached DFPWM theme
-local musicRevSeen = 0
 
 local function loadCfg()
   local hi, name = 0, nil
@@ -84,7 +81,6 @@ local function loadCfg()
       name = d.playerName:match("^%s*(.-)%s*$")
     end
     if d.music == false then MUSIC_ON = false end
-    musicRevSeen = tonumber(d.musicRev) or 0
   end
   return hi, name
 end
@@ -95,7 +91,6 @@ local function saveCfg()
     hi = HI,
     playerName = PLAYER_NAME,
     music = MUSIC_ON,
-    musicRev = musicRevSeen,
   }))
   f.close()
 end
@@ -108,7 +103,7 @@ HI, PLAYER_NAME = loadCfg()
 --------------------------------------------------------------------------------
 local SPEAKER = nil
 local musicIdx = 1
--- Note-block Korobeiniki fallback (folk melody; pitches 0-24).
+-- Compact note-block Korobeiniki (folk melody). No audio files — tiny in-script data.
 local MELODY = {
   {16, 2}, {11, 1}, {12, 1}, {14, 2}, {12, 1}, {11, 1},
   {9, 2}, {9, 1}, {12, 1}, {16, 2}, {14, 1}, {12, 1},
@@ -121,14 +116,8 @@ local MELODY = {
   {12, 2}, {9, 2}, {9, 4},
   {false, 4},
 }
-local MUSIC_BEAT = 0.14 -- retro chiptune pace for note fallback
-local MUSIC_FILE = "tetris_lofi.dfpwm"
--- Retro Korobeiniki arrangement hosted with this repo (HTTP, not YouTube rips).
-local MUSIC_URL = "https://raw.githubusercontent.com/TitanBCXR/MinecraftLua/main/media/tetris_lofi.dfpwm"
-local MUSIC_MODE = "none" -- "dfpwm" | "notes" | "none"
-local musicHandle = nil
-local musicDecoder = nil
-local MUSIC_CHUNK = 16 * 1024
+local MUSIC_BEAT = 0.16
+local LEGACY_MUSIC_FILE = "tetris_lofi.dfpwm"
 
 local function refreshSpeaker()
   SPEAKER = peripheral.find("speaker")
@@ -145,9 +134,8 @@ end
 local function meshStatusLine()
   local sp = refreshSpeaker()
   local md = hasModem()
-  local track = fs.exists(MUSIC_FILE) and "retro" or "notes"
-  if sp and md then return track .. "+mesh"
-  elseif sp then return track .. " (U=modem)"
+  if sp and md then return "notes+mesh"
+  elseif sp then return "notes (U=modem)"
   elseif md then return "mesh (no speaker)"
   else return "offline"
   end
@@ -167,120 +155,28 @@ local function swapPocketUpgrade()
   return ok, err
 end
 
--- Free CC0 lofi DFPWM via HTTP (allowed domains / http.enabled on the server).
-local function ensureLofiTrack()
-  if fs.exists(MUSIC_FILE) then
-    local sz = fs.getSize(MUSIC_FILE)
-    if sz and sz > 4096 then return true, "cached" end
-  end
-  if type(http) ~= "table" or type(http.get) ~= "function" then
-    return false, "http disabled"
-  end
-  print("Downloading retro Tetris theme...")
-  local ok, res = pcall(http.get, MUSIC_URL, { ["User-Agent"] = "TitanTetris/1.2" }, true)
-  if not ok or not res then
-    return false, "download failed"
-  end
-  if type(res.getResponseCode) == "function" then
-    local code = res.getResponseCode()
-    if code and code ~= 200 then
-      res.close()
-      return false, "HTTP " .. tostring(code)
-    end
-  end
-  local data = res.readAll()
-  res.close()
-  if type(data) ~= "string" or #data < 4096 then
-    return false, "bad file"
-  end
-  local f = fs.open(MUSIC_FILE, "wb")
-  if not f then return false, "write failed" end
-  f.write(data)
-  f.close()
-  print(("Saved %s (%d KB)"):format(MUSIC_FILE, math.floor(#data / 1024)))
-  return true, "downloaded"
-end
-
-local function stopMusicStream()
+local function stopMusic()
   if SPEAKER then pcall(function() SPEAKER.stop() end) end
-  if musicHandle then pcall(function() musicHandle.close() end) end
-  musicHandle = nil
-  musicDecoder = nil
 end
 
-local function startMusicStream()
-  stopMusicStream()
-  if not MUSIC_ON or not refreshSpeaker() then
-    MUSIC_MODE = "none"
-    return false
-  end
-  if fs.exists(MUSIC_FILE) and fs.getSize(MUSIC_FILE) > 4096 then
-    local okReq, dfpwm = pcall(require, "cc.audio.dfpwm")
-    if okReq and dfpwm and dfpwm.make_decoder then
-      local h = fs.open(MUSIC_FILE, "rb")
-      if h then
-        musicHandle = h
-        musicDecoder = dfpwm.make_decoder()
-        MUSIC_MODE = "dfpwm"
-        return true
-      end
-    end
-  end
-  MUSIC_MODE = "notes"
+local function startMusic()
+  stopMusic()
   musicIdx = 1
-  return true
-end
-
--- Keep speaker buffer filled (DFPWM). Returns true if waiting on speaker_audio_empty.
-local function musicFillBuffer()
-  if not MUSIC_ON or MUSIC_MODE ~= "dfpwm" or not SPEAKER or not musicHandle or not musicDecoder then
-    return false
-  end
-  while true do
-    local chunk = musicHandle.read(MUSIC_CHUNK)
-    if not chunk or #chunk == 0 then
-      musicHandle.close()
-      musicHandle = fs.open(MUSIC_FILE, "rb")
-      if not musicHandle then
-        MUSIC_MODE = "notes"
-        return false
-      end
-      local okReq, dfpwm = pcall(require, "cc.audio.dfpwm")
-      if okReq and dfpwm and dfpwm.make_decoder then
-        musicDecoder = dfpwm.make_decoder()
-      end
-      chunk = musicHandle.read(MUSIC_CHUNK)
-      if not chunk or #chunk == 0 then return false end
-    end
-    local pcm = musicDecoder(chunk)
-    local okPlay, accepted = pcall(function() return SPEAKER.playAudio(pcm, 1.0) end)
-    if not okPlay then
-      MUSIC_MODE = "notes"
-      return false
-    end
-    if not accepted then
-      -- Buffer full — wait for speaker_audio_empty.
-      return true
-    end
-  end
+  return MUSIC_ON and refreshSpeaker()
 end
 
 local function musicStepSeconds()
   if not MUSIC_ON then return 0.5 end
   if not SPEAKER and not refreshSpeaker() then return 1.0 end
-  if MUSIC_MODE == "dfpwm" then
-    musicFillBuffer()
-    return 0.25
-  end
   local note = MELODY[musicIdx] or { false, 1 }
   musicIdx = musicIdx + 1
   if musicIdx > #MELODY then musicIdx = 1 end
   local pitch, beats = note[1], tonumber(note[2]) or 1
   if pitch ~= false and pitch ~= nil then
     pcall(function()
-      SPEAKER.playNote("guitar", 0.45, pitch)
+      SPEAKER.playNote("pling", 0.55, pitch)
       if beats >= 2 then
-        SPEAKER.playNote("bass", 0.25, math.max(0, pitch - 12))
+        SPEAKER.playNote("bass", 0.3, math.max(0, pitch - 12))
       end
     end)
   end
@@ -289,10 +185,9 @@ end
 
 local function sfxLineClear(n)
   if not MUSIC_ON or not SPEAKER then return end
-  -- Soft blip; avoid stomping DFPWM stream too hard.
   n = math.max(1, math.min(4, tonumber(n) or 1))
   pcall(function()
-    SPEAKER.playNote("hat", 0.3, 8 + n)
+    SPEAKER.playNote("hat", 0.35, 8 + n)
   end)
 end
 
@@ -854,7 +749,7 @@ local function runGame()
   if not piece then over = true end
 
   refreshSpeaker()
-  startMusicStream()
+  startMusic()
   local musicTimer = os.startTimer(MUSIC_ON and SPEAKER and 0.05 or 3600)
 
   while true do
@@ -869,10 +764,6 @@ local function runGame()
     if ev == "term_resize" then
       L = layout()
       dirty = true
-    elseif ev == "speaker_audio_empty" then
-      if not paused and not over and MUSIC_ON and MUSIC_MODE == "dfpwm" then
-        musicFillBuffer()
-      end
     elseif ev == "timer" and p1 == musicTimer then
       if not paused and not over and MUSIC_ON then
         musicTimer = os.startTimer(musicStepSeconds())
@@ -911,7 +802,7 @@ local function runGame()
         else
           dropTimer = os.startTimer(gravityMs(level) / 1000)
           if MUSIC_ON then
-            startMusicStream()
+            startMusic()
             musicTimer = os.startTimer(0.05)
           end
         end
@@ -919,15 +810,15 @@ local function runGame()
         MUSIC_ON = not MUSIC_ON
         saveCfg()
         if MUSIC_ON and SPEAKER then
-          startMusicStream()
+          startMusic()
           musicTimer = os.startTimer(0.05)
         else
-          stopMusicStream()
+          stopMusic()
         end
         dirty = true
       elseif k == K.q then
         -- Mid-game Q: abandon run (score not kept / not submitted).
-        stopMusicStream()
+        stopMusic()
         TRACK.playing = false
         TRACK.score = 0
         return 0
@@ -984,7 +875,7 @@ local function runGame()
       end
     elseif ev == "key" and over then
       if p1 == keys.enter or p1 == keys.q or p1 == keys.space then
-        stopMusicStream()
+        stopMusic()
         TRACK.playing = false
         TRACK.score = score
         return score
@@ -994,7 +885,7 @@ local function runGame()
       -- key+char for "p" does not toggle pause twice (appear broken).
       local ch = tostring(p1 or ""):lower()
       if ch == "q" then
-        stopMusicStream()
+        stopMusic()
         TRACK.playing = false
         TRACK.score = 0
         return 0
@@ -1002,14 +893,14 @@ local function runGame()
         MUSIC_ON = not MUSIC_ON
         saveCfg()
         if MUSIC_ON and SPEAKER then
-          startMusicStream()
+          startMusic()
           musicTimer = os.startTimer(0.05)
         else
-          stopMusicStream()
+          stopMusic()
         end
       end
     elseif ev == "terminate" then
-      stopMusicStream()
+      stopMusic()
       TRACK.playing = false
       TRACK.score = 0
       return 0
@@ -1165,7 +1056,7 @@ local function controlsScreen()
       { "Soft",  "S / J / ↓" },
       { "Hard",  "Space / Enter" },
       { "Pause", "P" },
-      { "Mute",  "M (retro / notes)" },
+      { "Mute",  "M (note music)" },
       { "Swap",  "U (modem <-> speaker)" },
       { "Board", "R reload local cache" },
       { "Menu",  "Q (always)" },
@@ -1347,20 +1238,8 @@ local function bootCheckUpdates()
     print(("Local board: %d player%s"):format(
       #LEADERBOARD, #LEADERBOARD == 1 and "" or "s"))
   end
-  -- HTTP music fetch does not use rednet (works with speaker-only noisy pocket).
-  do
-    if musicRevSeen < MUSIC_REV and fs.exists(MUSIC_FILE) then
-      pcall(fs.delete, MUSIC_FILE) -- drop old lofi cache for retro theme
-    end
-    local okMusic, detail = ensureLofiTrack()
-    if okMusic then
-      musicRevSeen = MUSIC_REV
-      saveCfg()
-      print("Retro theme ready (" .. tostring(detail) .. ").")
-    else
-      print("Theme download skipped (" .. tostring(detail) .. ") — note fallback.")
-    end
-  end
+  -- Drop any old downloaded DFPWM cache (music is in-script notes only now).
+  if fs.exists(LEGACY_MUSIC_FILE) then pcall(fs.delete, LEGACY_MUSIC_FILE) end
   print(meshStatusLine())
 
   if not hasModem() then
