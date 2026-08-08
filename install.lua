@@ -1,6 +1,6 @@
 --[[
   install.lua  -  Titan network installer (CC: Tweaked)
-  Titan-Version: 1.2.6
+  Titan-Version: 1.2.7
 
   Downloads the Titan bot-network system onto this device from a running
   `host.lua` on the same rednet network (no pastebin / external web host).
@@ -28,10 +28,18 @@ local KEEP_ALL = {
   "offline_miner.lua", "offline_site.lua", "exclude.txt",
   "perimeter_sensor.lua", "perimeter_manager.lua", "tetris.lua", "minesweeper.lua",
   "sandstorm.lua", "luigi_poker.lua", "slots.lua",
+  "games.lua", "games_catalog.lua",
   "host.lua", "versions.lua", "install.lua",
 }
 
+local GAMES_SUITE = {
+  "games.lua", "games_catalog.lua", "versions.lua", "lib/titan.lua",
+  "tetris.lua", "minesweeper.lua", "sandstorm.lua", "luigi_poker.lua", "slots.lua",
+}
+
 local GAMES = {
+  { key = "0", name = "Games launcher (all + auto-update)", run = "games.lua",
+    files = GAMES_SUITE },
   { key = "1", name = "Tetris (pocket / monitor + music)", run = "tetris.lua",
     files = { "lib/titan.lua", "tetris.lua", "versions.lua" } },
   { key = "2", name = "Minesweeper (pocket / monitor)", run = "minesweeper.lua",
@@ -63,7 +71,9 @@ local ROLES = {
     files = { "lib/titan.lua", "perimeter_sensor.lua" } },
   { key = "8", name = "Perimeter manager (territory board)", run = "perimeter_manager.lua",
     files = { "lib/titan.lua", "perimeter_manager.lua" } },
-  { key = "g", name = "Games...", submenu = "games" },
+  { key = "g", name = "Games launcher (all + auto-update)", run = "games.lua",
+    files = GAMES_SUITE },
+  { key = "i", name = "Install one game...", submenu = "games" },
   { key = "h", name = "Install / update host (serves files over rednet)", run = "host.lua",
     files = { "lib/titan.lua", "host.lua", "install.lua", "versions.lua" } },
   { key = "9", name = "Everything (kept files, no auto-run)", run = nil,
@@ -287,6 +297,7 @@ local LABELS = {
   ["sandstorm.lua"] = "Sandstorm",
   ["luigi_poker.lua"] = "LuigiPoker",
   ["slots.lua"] = "Slots",
+  ["games.lua"] = "Games",
   ["host.lua"] = "TitanHost",
 }
 local lbl = role.run and LABELS[role.run]
