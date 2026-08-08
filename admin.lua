@@ -1,6 +1,6 @@
 --[[
   admin.lua  -  Titan admin console for a POCKET computer ("Live" tablet)
-  Titan-Version: 1.5.6
+  Titan-Version: 1.5.7
 
   Pocket remote for the whole fleet. Keep it on you; it joins the mesh like
   every other Titan device (MAIN router + modem hops).
@@ -121,6 +121,42 @@ local function sideShortAdmin(s)
   return map[key] or tostring(s or "?"):sub(1, 2):upper()
 end
 
+local function upsertPerimeterPresent(player, side, gate, playerY, entered)
+  if type(player) ~= "string" or player == "" or player == "?" then return end
+  if type(perimeterPresent) ~= "table" then perimeterPresent = {} end
+  for i = 1, #perimeterPresent do
+    local p = perimeterPresent[i]
+    if p and p.name == player then
+      if side ~= nil then p.side = side end
+      if gate ~= nil then p.gate = gate end
+      if playerY ~= nil then
+        p.entryY = p.entryY or playerY
+        p.playerY = playerY
+      end
+      if entered ~= nil then p.entered = entered end
+      return
+    end
+  end
+  perimeterPresent[#perimeterPresent + 1] = {
+    name = player,
+    side = side,
+    gate = gate,
+    entryY = playerY,
+    playerY = playerY,
+    entered = entered or "",
+  }
+end
+
+local function removePerimeterPresent(player)
+  if type(perimeterPresent) ~= "table" or type(player) ~= "string" then return end
+  for i = #perimeterPresent, 1, -1 do
+    local p = perimeterPresent[i]
+    if p and p.name == player then
+      table.remove(perimeterPresent, i)
+    end
+  end
+end
+
 local function pushPerimeterEvent(e)
   if type(e) ~= "table" then return end
   local entry = {
@@ -129,6 +165,7 @@ local function pushPerimeterEvent(e)
     side = e.side,
     gate = e.gate,
     playerY = tonumber(e.playerY) or tonumber(e.entryY),
+    entryY = tonumber(e.entryY) or tonumber(e.playerY),
     time = e.time or "",
     ts = e.ts or e.eventTs or now(),
     managerId = tonumber(e.managerId),
@@ -137,6 +174,11 @@ local function pushPerimeterEvent(e)
   while #perimeterEvents > 40 do perimeterEvents[#perimeterEvents] = nil end
   perimeterSnapAt = now()
   if entry.managerId then perimeterManagerId = entry.managerId end
+  if entry.kind == "ENTER" then
+    upsertPerimeterPresent(entry.player, entry.side, entry.gate, entry.playerY, entry.time)
+  elseif entry.kind == "EXIT" then
+    removePerimeterPresent(entry.player)
+  end
 end
 
 local function applyPerimeterLog(msg, fromId)
@@ -153,12 +195,14 @@ local function applyPerimeterLog(msg, fromId)
     for i = 1, math.min(40, #msg.events) do
       local e = msg.events[i]
       if type(e) == "table" then
+        local yLvl = tonumber(e.playerY) or tonumber(e.entryY)
         nextLog[#nextLog + 1] = {
           kind = tostring(e.kind or "?"):upper(),
           player = e.player or "?",
           side = e.side,
           gate = e.gate,
-          playerY = tonumber(e.playerY) or tonumber(e.entryY),
+          playerY = yLvl,
+          entryY = yLvl,
           time = e.time or "",
           ts = e.ts or e.eventTs or now(),
           managerId = perimeterManagerId,
@@ -170,7 +214,8 @@ local function applyPerimeterLog(msg, fromId)
 end
 
 local function requestPerimeterStatus(timeout)
-  timeout = tonumber(timeout) or 2
+  timeout = tonumber(timeout)
+  if timeout == nil then timeout = 2 end
   local req = {
     type = MSG.PERIMETER_LOG_REQ or "perimeter_log_req",
     from = os.getComputerID(),
@@ -191,7 +236,7 @@ local function requestPerimeterStatus(timeout)
   else
     rednet.broadcast(req, PROTO_NET)
   end
-  sleep(timeout)
+  if timeout > 0 then sleep(timeout) end
   return perimeterEvents
 end
 
@@ -1299,7 +1344,7 @@ local function drawStatsBoard(L, snap)
         if y > y1 then break end
         local e = perimeterEvents[i]
         local fg = (e.kind == "ENTER") and THEME.ok or THEME.warn
-        local yLvl = e.playerY
+        local yLvl = e.playerY or e.entryY
         local line = ("%s %-5s %-8s %-3s Y%-4s %s"):format(
           tostring(e.time):sub(-8), e.kind, tostring(e.player):sub(1, 8),
           sideShortAdmin(e.side),
@@ -1366,7 +1411,7 @@ local function drawPerimeterBoard(L)
       if y > y1 then break end
       local e = perimeterEvents[i]
       local fg = (e.kind == "ENTER") and THEME.ok or THEME.warn
-      local yLvl = e.playerY
+      local yLvl = e.playerY or e.entryY
       local line = ("%s %-5s %-8s %-3s Y%-4s %s"):format(
         tostring(e.time):sub(-8), e.kind, tostring(e.player):sub(1, 8),
         sideShortAdmin(e.side),
@@ -1785,6 +1830,12 @@ local function refreshLiveBoardData(board, timeout)
   end
 end
 
+local function liveSnapInterval(board)
+  -- Gates board needs a tight poll so enter/exit Y stays current.
+  if isPerimeterLiveBoard(board) then return 2 end
+  return 8
+end
+
 local function liveView(startBoard)
   if startBoard then
     liveBoard = normalizeLiveBoard(startBoard) or liveBoard
@@ -1792,7 +1843,7 @@ local function liveView(startBoard)
   refreshLiveBoardData(liveBoard, 2)
   drawLiveBoard(liveBoard)
   local timer = os.startTimer(1)
-  local snapTimer = os.startTimer(8)
+  local snapTimer = os.startTimer(liveSnapInterval(liveBoard))
   while true do
     local ev, p1, p2 = os.pullEvent()
     if ev == "timer" and p1 == timer then
@@ -1802,12 +1853,12 @@ local function liveView(startBoard)
       if isQuarryLiveBoard(liveBoard) then
         -- keep last broadcast; optional soft refresh
       elseif isPerimeterLiveBoard(liveBoard) then
-        requestPerimeterStatus(0.4)
+        requestPerimeterStatus(0.25)
       else
         refreshBoardSnap(true)
       end
       drawLiveBoard(liveBoard)
-      snapTimer = os.startTimer(8)
+      snapTimer = os.startTimer(liveSnapInterval(liveBoard))
     elseif ev == "char" then
       local ch = tostring(p1 or ""):lower()
       if ch == "q" then break
@@ -1815,18 +1866,20 @@ local function liveView(startBoard)
         cycleLiveBoard(1)
         refreshLiveBoardData(liveBoard, 1)
         drawLiveBoard(liveBoard)
+        snapTimer = os.startTimer(liveSnapInterval(liveBoard))
       elseif ch == "p" then
         cycleLiveBoard(-1)
         refreshLiveBoardData(liveBoard, 1)
         drawLiveBoard(liveBoard)
-      elseif ch == "1" then liveBoard = "local"; drawLiveBoard(liveBoard)
-      elseif ch == "2" then liveBoard = "global"; drawLiveBoard(liveBoard)
-      elseif ch == "3" then liveBoard = "stats"; refreshLiveBoardData("stats", 1); drawLiveBoard(liveBoard)
-      elseif ch == "4" then liveBoard = "perimeter"; requestPerimeterStatus(1); drawLiveBoard(liveBoard)
-      elseif ch == "5" then liveBoard = "gps"; drawLiveBoard(liveBoard)
-      elseif ch == "6" then liveBoard = "bots"; drawLiveBoard(liveBoard)
-      elseif ch == "7" then liveBoard = "quarry"; requestQuarryStatus(2); drawLiveBoard(liveBoard)
-      elseif ch == "8" then liveBoard = "qsite"; requestQuarryStatus(2); drawLiveBoard(liveBoard)
+        snapTimer = os.startTimer(liveSnapInterval(liveBoard))
+      elseif ch == "1" then liveBoard = "local"; drawLiveBoard(liveBoard); snapTimer = os.startTimer(liveSnapInterval(liveBoard))
+      elseif ch == "2" then liveBoard = "global"; drawLiveBoard(liveBoard); snapTimer = os.startTimer(liveSnapInterval(liveBoard))
+      elseif ch == "3" then liveBoard = "stats"; refreshLiveBoardData("stats", 1); drawLiveBoard(liveBoard); snapTimer = os.startTimer(liveSnapInterval(liveBoard))
+      elseif ch == "4" then liveBoard = "perimeter"; requestPerimeterStatus(0.5); drawLiveBoard(liveBoard); snapTimer = os.startTimer(2)
+      elseif ch == "5" then liveBoard = "gps"; drawLiveBoard(liveBoard); snapTimer = os.startTimer(liveSnapInterval(liveBoard))
+      elseif ch == "6" then liveBoard = "bots"; drawLiveBoard(liveBoard); snapTimer = os.startTimer(liveSnapInterval(liveBoard))
+      elseif ch == "7" then liveBoard = "quarry"; requestQuarryStatus(2); drawLiveBoard(liveBoard); snapTimer = os.startTimer(liveSnapInterval(liveBoard))
+      elseif ch == "8" then liveBoard = "qsite"; requestQuarryStatus(2); drawLiveBoard(liveBoard); snapTimer = os.startTimer(liveSnapInterval(liveBoard))
       elseif ch == "r" then
         refreshLiveBoardData(liveBoard, 2)
         drawLiveBoard(liveBoard)
@@ -1834,6 +1887,7 @@ local function liveView(startBoard)
         cycleLiveBoard(1)
         refreshLiveBoardData(liveBoard, 1)
         drawLiveBoard(liveBoard)
+        snapTimer = os.startTimer(liveSnapInterval(liveBoard))
       end
     elseif ev == "key" then
       local K = keys
@@ -1844,10 +1898,12 @@ local function liveView(startBoard)
         cycleLiveBoard(1)
         refreshLiveBoardData(liveBoard, 1)
         drawLiveBoard(liveBoard)
+        snapTimer = os.startTimer(liveSnapInterval(liveBoard))
       elseif p1 == K.left then
         cycleLiveBoard(-1)
         refreshLiveBoardData(liveBoard, 1)
         drawLiveBoard(liveBoard)
+        snapTimer = os.startTimer(liveSnapInterval(liveBoard))
       elseif p1 == K.r then
         refreshLiveBoardData(liveBoard, 2)
         drawLiveBoard(liveBoard)
@@ -1860,6 +1916,7 @@ local function liveView(startBoard)
         if x > w / 2 then cycleLiveBoard(1) else cycleLiveBoard(-1) end
         refreshLiveBoardData(liveBoard, 1)
         drawLiveBoard(liveBoard)
+        snapTimer = os.startTimer(liveSnapInterval(liveBoard))
       end
     elseif ev == "terminate" then
       break

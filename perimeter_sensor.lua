@@ -1,6 +1,6 @@
 --[[
   perimeter_sensor.lua  -  Territory sensor (Advanced Peripherals Player Detector)
-  Titan-Version: 1.2.7
+  Titan-Version: 1.2.8
 
   Place on a computer with:
     * Advanced Peripherals Player Detector (adjacent / networked)
@@ -395,19 +395,49 @@ end
 local function playerWorldPos(name)
   if not detector or type(name) ~= "string" then return nil end
   local ok, pos = pcall(function() return detector.getPlayerPos(name) end)
-  if ok and type(pos) == "table" and pos.x and pos.z then
-    return math.floor(pos.x + 0.5), math.floor((pos.y or 0) + 0.5), math.floor(pos.z + 0.5)
-  end
-  return nil
+  if not ok or type(pos) ~= "table" then return nil end
+  local px = pos.x or pos.X or (type(pos.pos) == "table" and pos.pos.x)
+  local py = pos.y or pos.Y or (type(pos.pos) == "table" and pos.pos.y)
+  local pz = pos.z or pos.Z or (type(pos.pos) == "table" and pos.pos.z)
+  if px == nil or pz == nil then return nil end
+  -- Keep real Y (including 0 / negative); only floor when numeric.
+  px = math.floor(tonumber(px) + 0.5)
+  pz = math.floor(tonumber(pz) + 0.5)
+  if py ~= nil then py = math.floor(tonumber(py) + 0.5) end
+  return px, py, pz
 end
 
 -- Bearing from this sensor toward the player (approach direction).
+-- Always returns player coords when getPlayerPos works — even without a GPS fix
+-- (bearing may be nil, but Y must still ship for the admin Gates board).
 local function approachFromPlayer(name)
   locateGps()
   local px, py, pz = playerWorldPos(name)
-  if not px or not lastPos.x or not lastPos.z then return nil end
-  local bearing = sectorFromDelta(px - lastPos.x, pz - lastPos.z)
+  if px == nil then return nil, nil, nil, nil end
+  local bearing = nil
+  if lastPos.x ~= nil and lastPos.z ~= nil then
+    bearing = sectorFromDelta(px - lastPos.x, pz - lastPos.z)
+  end
   return bearing, px, py, pz
+end
+
+local function cachePlayerPos(name, px, py, pz)
+  if py == nil and px == nil then
+    if type(seen[name]) ~= "table" then seen[name] = true end
+    return
+  end
+  local prev = type(seen[name]) == "table" and seen[name] or {}
+  seen[name] = {
+    x = px ~= nil and px or prev.x,
+    y = py ~= nil and py or prev.y,
+    z = pz ~= nil and pz or prev.z,
+  }
+end
+
+local function cachedPlayerPos(name)
+  local c = seen[name]
+  if type(c) == "table" then return c.x, c.y, c.z end
+  return nil, nil, nil
 end
 
 -- Name / side from GPS vs manager origin (self-assign).
@@ -721,8 +751,8 @@ local function scanOnce()
 
   for name in pairs(nowSet) do
     if not seen[name] then
-      seen[name] = true
       local approach, px, py, pz = approachFromPlayer(name)
+      cachePlayerPos(name, px, py, pz)
       local via = approach or cfg.side
       print(("[%s] ENTER %s from %s at Y=%s"):format(
         os.date("%H:%M:%S") or "?", name, sideAbbrev(via),
@@ -733,12 +763,18 @@ local function scanOnce()
         playerX = px, playerY = py, playerZ = pz,
         entryY = py,
       })
+    else
+      -- Refresh last-known Y while inside (EXIT often can't getPlayerPos).
+      local px, py, pz = playerWorldPos(name)
+      if px ~= nil or py ~= nil then cachePlayerPos(name, px, py, pz) end
     end
   end
   for name in pairs(seen) do
     if not nowSet[name] then
+      local cx, cy, cz = cachedPlayerPos(name)
       seen[name] = nil
       local approach, px, py, pz = approachFromPlayer(name)
+      if py == nil then px, py, pz = px or cx, cy, pz or cz end
       local via = approach or cfg.side
       print(("[%s] EXIT  %s via %s Y=%s"):format(
         os.date("%H:%M:%S") or "?", name, sideAbbrev(via),

@@ -1,6 +1,6 @@
 --[[
   perimeter_manager.lua  -  Territory board for perimeter sensors
-  Titan-Version: 1.3.7
+  Titan-Version: 1.3.8
 
   Central display for perimeter_sensor.lua gates. Shows who is inside the
   territory, which sector they entered from (N NE E SE S SW W NW), enter time,
@@ -497,8 +497,11 @@ end
 
 local function markExit(player, side, gate, ts, timeText, playerY)
   local row = present[player]
+  -- Prefer live Y, else last known while they were inside.
+  local useY = playerY
+  if useY == nil and row then useY = row.lastY or row.entryY end
   if not row then
-    pushLog("EXIT", player, side, gate, ts, timeText, playerY)
+    pushLog("EXIT", player, side, gate, ts, timeText, useY)
     return
   end
   row.pendingExit = true
@@ -506,7 +509,7 @@ local function markExit(player, side, gate, ts, timeText, playerY)
   row.pendingGate = gate or row.lastGate
   row.pendingTs = ts or nowUtc()
   row.pendingText = formatTime(ts, timeText)
-  row.pendingY = playerY or row.lastY or row.entryY
+  row.pendingY = useY or row.lastY or row.entryY
   dirty = true
 end
 
