@@ -1,6 +1,6 @@
 --[[
   admin.lua  -  Titan admin console for a POCKET computer ("Live" tablet)
-  Titan-Version: 1.4.7
+  Titan-Version: 1.4.8
 
   Pocket remote for the whole fleet. Keep it on you; it joins the mesh like
   every other Titan device (MAIN router + modem hops).
@@ -27,11 +27,14 @@
     quarry                       — offline quarry site % / turtles (titan_quarry)
     quarry assign <id> <y0> <y1> — set turtle Y band; delivered on next check-in
     quarry unassign <id> | quarry pending
+    where <siteId> <botId>       — live GPS distance to a quarry turtle
+      (site `where <id>` also pushes a track screen / queues until login)
 
   Boots with a master-password prompt (before background loops). Deploy / SSH /
   fleet control need an unlocked session.
 
   Requires: POCKET + wireless modem, lib/titan.lua, mesh in range.
+  GPS constellation needed for the where distance screen.
   Run:  admin
 ]]
 
@@ -88,6 +91,12 @@ local quarrySnapAt = 0
 local quarryTurtles = {} -- [id] = turtle mine reports when no site board
 -- [turtleId] = { y0, y1, W, L, H, assignId, setAt, acked, ackedAt, name }
 local quarryAssigns = type(cfg.quarryAssigns) == "table" and cfg.quarryAssigns or {}
+-- where-track: live GPS → turtle (site `where` / admin `where site bot`)
+local pendingWhere = nil   -- queued until unlock
+local openWhereSoon = nil  -- unlocked: open from console UI thread
+local lastWhereMsg = nil
+local trackWhereView       -- assigned later
+local flushWhereTrack      -- assigned later
 
 local function now() return os.epoch("utc") end
 local function ago(ts) return math.floor((now() - (ts or 0)) / 1000) end
@@ -353,6 +362,21 @@ local function handle(id, msg)
     if pend and not pend.acked then
       if pend.name == nil then pend.name = q.name end
       deliverQuarryAssign(id)
+    end
+  elseif t == "quarry_where" then
+    msg.siteId = tonumber(msg.siteId) or id
+    lastWhereMsg = msg
+    if msg.ok == false then
+      print(("[where] site #%s: %s"):format(
+        tostring(msg.siteId), tostring(msg.err or "failed")))
+    elseif unlocked then
+      openWhereSoon = msg
+      print(("[where] #%s %s — track ready (opening…)"):format(
+        tostring(msg.turtleId), tostring(msg.name or "?")))
+    else
+      pendingWhere = msg
+      print(("[where] queued #%s %s — unlock to open track"):format(
+        tostring(msg.turtleId), tostring(msg.name or "?")))
     end
   elseif t == "quarry_assign_ack" then
     local tid = tonumber(msg.turtleId) or id
@@ -730,6 +754,7 @@ showLoginScreen = function(opts)
         if out.setBackgroundColor then out.setBackgroundColor(bg) end
         out.clear()
         out.setCursorPos(1, 1)
+        if flushWhereTrack then flushWhereTrack(true) end
         return true
       end
       errMsg = "Wrong password or no master online"
@@ -753,6 +778,7 @@ promptUnlockAtStart = function()
   if unlocked then return end
   if titan.sshIsAuthed and titan.sshIsAuthed() then
     unlocked = true
+    if flushWhereTrack then flushWhereTrack(true) end
     return
   end
   showLoginScreen({ title = "Sign in", once = false })
@@ -1441,6 +1467,204 @@ local function liveView(startBoard)
 end
 
 --------------------------------------------------------------------------------
+-- Where-track: live GPS distance to a quarry turtle
+--------------------------------------------------------------------------------
+local function whereBearing(x, y, z, tx, ty, tz)
+  local dx, dy, dz = (tx or 0) - (x or 0), (ty or 0) - (y or 0), (tz or 0) - (z or 0)
+  local dist = math.floor(math.sqrt(dx * dx + dy * dy + dz * dz) + 0.5)
+  local flat = math.floor(math.sqrt(dx * dx + dz * dz) + 0.5)
+  local cards = { "N", "NE", "E", "SE", "S", "SW", "W", "NW" }
+  local card = "--"
+  if dx ~= 0 or dz ~= 0 then
+    local ang = (math.deg(math.atan2(dx, -dz)) + 360) % 360
+    card = cards[(math.floor(ang / 45 + 0.5) % 8) + 1]
+  end
+  return dist, flat, math.floor(dy + 0.5), card
+end
+
+trackWhereView = function(target)
+  if type(target) ~= "table" then return end
+  if titan.sshIsAuthed and titan.sshIsAuthed() then
+    print(("[where] #%s %s  rel=%s,%s,%s  world=%s"):format(
+      tostring(target.turtleId), tostring(target.name or "?"),
+      tostring(target.posX), tostring(target.posY), tostring(target.posZ),
+      target.hasWorld and ("%s,%s,%s"):format(target.x, target.y, target.z) or "unset"))
+    return
+  end
+
+  local out = term
+  local color = termIsColor()
+  local bg = colors.black
+  local accent = color and colors.cyan or colors.white
+  local lastMe = nil
+  local timer = os.startTimer(0.4)
+
+  local function draw()
+    local w, h = out.getSize()
+    if out.setBackgroundColor then out.setBackgroundColor(bg) end
+    out.clear()
+    guiFill(out, 1, 1, w, 1, accent, colors.black)
+    guiText(out, 2, 1, " WHERE TRACK", colors.black, accent)
+    local sub = ("#%s %s"):format(tostring(target.turtleId or "?"),
+      tostring(target.name or "?"):sub(1, math.max(4, w - 14)))
+    guiText(out, math.max(2, w - #sub), 1, sub, colors.gray, accent)
+
+    local y = 3
+    local site = ("site #%s %s"):format(
+      tostring(target.siteId or "?"), tostring(target.siteName or ""):sub(1, 12))
+    guiText(out, 2, y, site:sub(1, w - 2), colors.lightGray, bg)
+    y = y + 1
+    guiText(out, 2, y, ("status %s  age %ss"):format(
+      tostring(target.status or "?"), tostring(target.age or "?")), colors.gray, bg)
+    y = y + 2
+
+    local tx, ty, tz = tonumber(target.x), tonumber(target.y), tonumber(target.z)
+    local hasWorld = target.hasWorld and tx ~= nil and ty ~= nil and tz ~= nil
+    if hasWorld then
+      guiText(out, 2, y, "TARGET (world)", color and colors.lime or colors.white, bg)
+      y = y + 1
+      guiText(out, 2, y, ("%d  %d  %d"):format(tx, ty, tz), colors.white, bg)
+    else
+      guiText(out, 2, y, "TARGET (relative quarry)", color and colors.yellow or colors.white, bg)
+      y = y + 1
+      guiText(out, 2, y, ("qx=%s qy=%s qz=%s"):format(
+        tostring(target.posX), tostring(target.posY), tostring(target.posZ)), colors.white, bg)
+      y = y + 1
+      guiText(out, 2, y, "Set site: origin x y z facing", color and colors.orange or colors.white, bg)
+      y = y + 1
+      guiText(out, 2, y, "for live GPS distance", colors.gray, bg)
+    end
+    y = y + 2
+
+    guiText(out, 2, y, "YOU (GPS)", color and colors.lightBlue or colors.white, bg)
+    y = y + 1
+    local mx, my, mz = titan.gpsFix({ timeout = 1.2, samples = 3 })
+    if mx then
+      lastMe = { x = mx, y = my, z = mz }
+      guiText(out, 2, y, ("%d  %d  %d"):format(mx, my, mz), colors.white, bg)
+      y = y + 2
+      if hasWorld then
+        local dist, flat, dy, card = whereBearing(mx, my, mz, tx, ty, tz)
+        guiFill(out, 1, y, w, 2, color and colors.gray or bg, colors.white)
+        guiText(out, 2, y, ("DISTANCE  %dm"):format(dist), colors.white, color and colors.gray or bg)
+        guiText(out, 2, y + 1, ("%dm flat  %s  dy %+d"):format(flat, card, dy),
+          colors.lightGray, color and colors.gray or bg)
+        y = y + 3
+        local closer = ""
+        if lastMe and target._lastDist and dist < target._lastDist then
+          closer = "closer"
+        elseif lastMe and target._lastDist and dist > target._lastDist then
+          closer = "farther"
+        end
+        target._lastDist = dist
+        if closer ~= "" then
+          guiText(out, 2, y, closer, closer == "closer"
+            and (color and colors.lime or colors.white)
+            or (color and colors.orange or colors.white), bg)
+        end
+      end
+    else
+      guiText(out, 2, y, "(no GPS fix — walk near hosts)", color and colors.red or colors.white, bg)
+      if lastMe then
+        y = y + 1
+        guiText(out, 2, y, ("last %d %d %d"):format(lastMe.x, lastMe.y, lastMe.z),
+          colors.gray, bg)
+      end
+    end
+
+    guiText(out, 2, h - 1, "Q back  R refresh target", colors.gray, bg)
+    guiText(out, 2, h, "Updates as you move", colors.gray, bg)
+  end
+
+  draw()
+  while true do
+    local ev, p1 = os.pullEvent()
+    if ev == "timer" and p1 == timer then
+      draw()
+      timer = os.startTimer(0.5)
+    elseif ev == "char" then
+      local ch = tostring(p1 or ""):lower()
+      if ch == "q" then break
+      elseif ch == "r" then
+        local siteId = tonumber(target.siteId)
+        local tid = tonumber(target.turtleId)
+        if siteId and tid then
+          rednet.send(siteId, {
+            type = "quarry_where_req",
+            from = os.getComputerID(),
+            turtleId = tid,
+            botId = tid,
+          }, PROTO_QUARRY)
+          sleep(0.6)
+          if lastWhereMsg and tonumber(lastWhereMsg.turtleId) == tid
+              and lastWhereMsg.ok ~= false then
+            local keepDist = target._lastDist
+            target = lastWhereMsg
+            target._lastDist = keepDist
+          end
+        end
+        draw()
+      end
+    elseif ev == "key" then
+      if p1 == keys.backspace or p1 == keys.q then break end
+    elseif ev == "terminate" then
+      break
+    end
+  end
+  drainInputEvents()
+  if out.setBackgroundColor then out.setBackgroundColor(bg) end
+  out.clear()
+  out.setCursorPos(1, 1)
+  if out.setTextColor then out.setTextColor(colors.white) end
+end
+
+flushWhereTrack = function(preferPending)
+  local msg = nil
+  if preferPending and pendingWhere then
+    msg = pendingWhere
+    pendingWhere = nil
+    openWhereSoon = nil
+  elseif openWhereSoon then
+    msg = openWhereSoon
+    openWhereSoon = nil
+  elseif unlocked and pendingWhere then
+    msg = pendingWhere
+    pendingWhere = nil
+  end
+  if msg and trackWhereView then
+    trackWhereView(msg)
+    return true
+  end
+  return false
+end
+
+local function requestWhereFromSite(siteId, botId, timeout)
+  siteId = tonumber(siteId)
+  botId = tonumber(botId)
+  if not siteId or not botId then return nil, "need siteId and botId" end
+  lastWhereMsg = nil
+  local req = {
+    type = "quarry_where_req",
+    from = os.getComputerID(),
+    turtleId = botId,
+    botId = botId,
+    siteId = siteId,
+  }
+  rednet.send(siteId, req, PROTO_QUARRY)
+  rednet.broadcast(req, PROTO_QUARRY)
+  local deadline = os.clock() + (tonumber(timeout) or 4)
+  while os.clock() < deadline do
+    local m = lastWhereMsg
+    if m and tonumber(m.turtleId) == botId then
+      if m.ok == false then return nil, m.err or "failed" end
+      return m
+    end
+    sleep(0.15)
+  end
+  return nil, "timeout (is site online?)"
+end
+
+--------------------------------------------------------------------------------
 -- SSH / connect helper
 --------------------------------------------------------------------------------
 local function doConnect(a)
@@ -1705,6 +1929,7 @@ local HELP_ENTRIES = {
   { "quarry assign <id> <y0> <y1>", "Set turtle Y; ack on next check-in" },
   { "quarry pending", "List tablet Y assigns + ack state" },
   { "quarry unassign <id>", "Drop a queued/acked Y assign" },
+  { "where <siteId> <botId>", "Live GPS distance to quarry turtle" },
   { "bots", "All known turtles" },
   { "miners", "Miner turtles only" },
   { "loaders", "Loader turtles only" },
@@ -1907,6 +2132,36 @@ local function handleCommand(a)
       end
     else
       liveView("quarry")
+    end
+
+  elseif cmd == "where" or cmd == "locatebot" or cmd == "findbot" then
+    local siteId = tonumber(tostring(a[2] or ""):match("(%d+)"))
+    local botId = findQuarryTurtleRef(a[3]) or tonumber(tostring(a[3] or ""):match("(%d+)"))
+    if not siteId or not botId then
+      print("Usage: where <siteId> <botId>")
+      print("Example: where 5 12")
+      print("Site board can also run: where 12  (pushes track here)")
+      print("Site needs: origin <x> <y> <z> [facing] for world GPS")
+    elseif titan.sshIsAuthed and titan.sshIsAuthed() then
+      local msg, err = requestWhereFromSite(siteId, botId, 4)
+      if not msg then
+        print("where failed: " .. tostring(err))
+      else
+        print(("[where] #%s %s  rel=%s,%s,%s  world=%s"):format(
+          tostring(msg.turtleId), tostring(msg.name or "?"),
+          tostring(msg.posX), tostring(msg.posY), tostring(msg.posZ),
+          msg.hasWorld and ("%s,%s,%s"):format(msg.x, msg.y, msg.z) or "unset (set site origin)"))
+      end
+    else
+      if not requireAuth() then return true end
+      print(("Requesting where from site #%d bot #%d..."):format(siteId, botId))
+      local msg, err = requestWhereFromSite(siteId, botId, 4)
+      if not msg then
+        print("where failed: " .. tostring(err))
+      else
+        openWhereSoon = nil
+        trackWhereView(msg)
+      end
     end
 
   elseif cmd == "connections" or cmd == "hosts" or cmd == "list" then
@@ -2587,7 +2842,11 @@ end
 
 local function simpleMenuLoop()
   local page = 1
+  local tick = os.startTimer(0.6)
   while cfg.mode == "simple" do
+    if flushWhereTrack() then
+      tick = os.startTimer(0.6)
+    end
     local pages = math.max(1, math.ceil(#PHONE_APPS / PHONE_PAGE))
     if page > pages then page = pages end
     if page < 1 then page = 1 end
@@ -2599,7 +2858,10 @@ local function simpleMenuLoop()
     drawPhoneHome(page, pages, tiles)
 
     local ev, p1, p2, p3 = os.pullEvent()
-    if ev == "char" then
+    if ev == "timer" and p1 == tick then
+      tick = os.startTimer(0.6)
+      -- openWhereSoon checked at loop top
+    elseif ev == "char" then
       local ch = tostring(p1 or ""):lower()
       -- E exits admin. Q must NOT exit here — live boards use Q to go back,
       -- and CC queues both key+char so a leftover Q was killing the whole script.
@@ -2652,8 +2914,9 @@ local function advancedConsoleLoop()
   print("== Titan Admin — ADVANCED ==")
   print(os.getComputerLabel() or ("#" .. os.getComputerID()))
   print("Type help  (10 cmds/page, pick a page).  mode simple  for phone UI.")
-  print("Quick:  live  |  quarry  |  connections  |  connect <name>  |  dc")
+  print("Quick:  live  |  quarry  |  where <site> <bot>  |  connections  |  dc")
   while cfg.mode == "advanced" do
+    flushWhereTrack()
     write("admin> ")
     local a = {}
     for w in tostring(read()):gmatch("%S+") do a[#a + 1] = w end

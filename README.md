@@ -7,7 +7,7 @@ A wireless dispatch system for Minecraft's **CC: Tweaked** mod:
 - **`poi.lua`** — a "point of interest" computer that marks a location by coordinates and can summon a bot.
 - **`miner.lua`** — quarry turtle: digs between two corners down to a floor Y, skipping `exclude.txt`.
 - **`offline_miner.lua`** — local quarry turtle: `mode online|offline`, solo `area` / `box` / `tunnel` / `stair`, or online site fleet (modem → join → reband/reset → mine). Dig-line facing; fuel SOS to admin + MAIN.
-- **`offline_site.lua`** — quarry site board: `column` / `layer` claims, fleet reband on join, origin reset turns, continueIdx skip of mined work, % progress for admin.
+- **`offline_site.lua`** — quarry site board: `column` / `layer` claims, fleet reband on join, origin reset turns, `origin` + `where <id>` GPS track to admin, % progress.
 - **`perimeter_sensor.lua` / `perimeter_manager.lua`** — Player Detector territory enter/exit board (N/E/S/W + timestamps).
 - **`chest_sucker.lua`** — on boot/run, suck items from adjacent chests or barrels (loot containers).
 - **`lib/titan.lua`** — shared library (protocol, messaging, navigation). Copy this onto **every** device.
@@ -579,6 +579,9 @@ setup 16x32 60 third layer
 pattern column|layer         # claim style
 fraction half|third          # layer band size hint
 reband                       # force fleet reband + origin reset turns
+origin 120 72 -45 south      # GPS of quarry 0,0,0 + facing into mine (once)
+where 12                     # push turtle coords → admin distance screen
+where #12                    # same
 claims                       # active + free regions
 clearclaims                  # free all (turtles re-pick with mine)
 clearclaims Y 0 29           # free claims overlapping that Y range
@@ -594,7 +597,14 @@ area 16x32 40                # also reports footprint (helps auto-setup)
 quarry                       # live board: claim, @pose, continue, SOS, homing/reset
 quarry assign 12 0 29        # set turtle Y band; acks on next check-in
 quarry pending
+where 5 12                   # ask site #5 for bot #12 → live GPS track screen
 ```
+
+**Where / distance track:** Turtles report quarry-relative pose (`posX/Y/Z`). Set
+`origin` on the site once (stand at turtle `0,0,0` facing into the mine; use F3
+world coords + facing) so `where` can convert to world GPS. The admin tablet
+opens a locator-style screen (your GPS vs turtle coords, live distance as you
+move). If the tablet is locked, the track queues until the next login.
 
 Progress % shows on the site monitor and admin (`live quarry` / Quarry app).
 Statuses include `homing` / `reset` / `mining`. If a turtle has **no local** job
@@ -658,8 +668,8 @@ from the install source (GitHub / pastebin / `host.lua`). Extras on disk that
 aren’t listed show as `*` and are not updated.
 
 Bump versions in `versions.lua` (and each file’s `Titan-Version:` header) when
-you ship a change; current system version is **1.5.29** (`chest_sucker` **1.0.1**,
-`offline_miner` **1.4.2**, `offline_site` **1.2.1**).
+you ship a change; current system version is **1.5.30** (`admin` **1.4.8**,
+`offline_site` **1.2.2**, `offline_miner` **1.4.2**).
 
 ---
 

@@ -1,6 +1,6 @@
 --[[
   offline_site.lua  -  Quarry site board for multi-turtle offline miners
-  Titan-Version: 1.2.1
+  Titan-Version: 1.2.2
 
   Place this computer to the LEFT of the storage chest (storage sits behind
   the turtles' origin). Attach a modem (wired to the turtles is fine, or
@@ -17,9 +17,12 @@
     * Stores each turtle's offline_miner_job.cfg under quarry_jobs/
     * Hands that job back if a turtle rejoins with no local job file
     * Relays a quarry_site snapshot to the admin tablet
+    * where <id> — send turtle world/relative pose to admin distance screen
 
   Commands:
     setup <W>x<L> <H> [half|third] [column|layer]
+    origin <x> <y> <z> [n|s|e|w|0-3]   GPS of quarry 0,0,0 + facing into mine
+    where <id>                       ping admin tablet with that turtle's coords
     auto                             unlock auto-learn from turtles
     pattern column|layer             claim style for mine/
     fraction half|third              max Y band size hint (layer mode)
@@ -55,6 +58,9 @@ local cfg = {
   pattern = "column",    -- "column" = 2×2 XZ shafts; "layer" = Y bands
   manual = false,        -- true after `setup` (still expands if turtles report larger)
   label = nil,
+  -- World GPS of quarry origin 0,0,0 and which way +Z (into mine) faces.
+  -- facing: 0=+Z/S, 1=+X/E, 2=-Z/N, 3=-X/W (same as turtle facing).
+  originX = nil, originY = nil, originZ = nil, originFacing = 0,
 }
 
 local turtles = {}  -- [id] = { name, y0, y1, x0, x1, z0, z1, dug, idx, total, continueIdx, bpc, fuel, seen, status, pos*, job }
@@ -156,6 +162,10 @@ local function loadCfg()
   cfg.W = tonumber(cfg.W) or 0
   cfg.L = tonumber(cfg.L) or 0
   cfg.H = tonumber(cfg.H) or 0
+  cfg.originX = tonumber(cfg.originX)
+  cfg.originY = tonumber(cfg.originY)
+  cfg.originZ = tonumber(cfg.originZ)
+  cfg.originFacing = math.floor(tonumber(cfg.originFacing) or 0) % 4
   completedBands = {}
   if type(cfg.completedBands) == "table" then
     for _, b in ipairs(cfg.completedBands) do
@@ -665,6 +675,9 @@ local function snapshot()
     rebandEpoch = rebandState.epoch,
     rebandActive = rebandState.active == true,
     rebandTurn = rebandState.currentTurn,
+    originSet = (cfg.originX ~= nil and cfg.originY ~= nil and cfg.originZ ~= nil),
+    originX = cfg.originX, originY = cfg.originY, originZ = cfg.originZ,
+    originFacing = cfg.originFacing,
   }
 end
 
@@ -675,6 +688,111 @@ local function broadcastStatus()
   if titan and titan.ROUTER_PROTOCOL then
     rednet.broadcast(snap, titan.ROUTER_PROTOCOL)
   end
+end
+
+local function parseFacing(raw)
+  if raw == nil or raw == "" then return 0 end
+  local s = tostring(raw):lower()
+  if s == "0" or s == "s" or s == "south" or s == "+z" or s == "z+" then return 0 end
+  if s == "1" or s == "e" or s == "east" or s == "+x" or s == "x+" then return 1 end
+  if s == "2" or s == "n" or s == "north" or s == "-z" or s == "z-" then return 2 end
+  if s == "3" or s == "w" or s == "west" or s == "-x" or s == "x-" then return 3 end
+  local n = tonumber(raw)
+  if n then return math.floor(n) % 4 end
+  return nil
+end
+
+local function facingLabel(f)
+  f = math.floor(tonumber(f) or 0) % 4
+  return ({ "south/+Z", "east/+X", "north/-Z", "west/-X" })[f + 1]
+end
+
+-- Quarry relative (+X right, +Y down, +Z forward) → world GPS.
+local function quarryToWorld(qx, qy, qz)
+  local ox, oy, oz = tonumber(cfg.originX), tonumber(cfg.originY), tonumber(cfg.originZ)
+  if ox == nil or oy == nil or oz == nil then return nil end
+  qx = tonumber(qx) or 0
+  qy = tonumber(qy) or 0
+  qz = tonumber(qz) or 0
+  local f = math.floor(tonumber(cfg.originFacing) or 0) % 4
+  -- forward (quarry +Z) and right (quarry +X) unit vectors in world XZ
+  local fx, fz, rx, rz
+  if f == 0 then fx, fz, rx, rz = 0, 1, 1, 0
+  elseif f == 1 then fx, fz, rx, rz = 1, 0, 0, -1
+  elseif f == 2 then fx, fz, rx, rz = 0, -1, -1, 0
+  else fx, fz, rx, rz = -1, 0, 0, 1 end
+  return {
+    x = ox + qx * rx + qz * fx,
+    y = oy - qy,  -- quarry +Y is down
+    z = oz + qx * rz + qz * fz,
+  }
+end
+
+local function hasOriginGps()
+  return cfg.originX ~= nil and cfg.originY ~= nil and cfg.originZ ~= nil
+end
+
+local function findTurtleRef(ref)
+  local id = tonumber(tostring(ref or ""):match("(%d+)"))
+  if id and turtles[id] then return id, turtles[id] end
+  local want = tostring(ref or ""):lower()
+  if want == "" then return nil end
+  for tid, t in pairs(turtles) do
+    if tostring(t.name or ""):lower():find(want, 1, true) then
+      return tid, t
+    end
+  end
+  return nil
+end
+
+local function buildWherePayload(turtleId, t, toId)
+  t = t or turtles[turtleId]
+  if not t then return nil end
+  local qx, qy, qz = tonumber(t.posX), tonumber(t.posY), tonumber(t.posZ)
+  local world = nil
+  if qx ~= nil then
+    world = quarryToWorld(qx, qy or 0, qz or 0)
+  end
+  return {
+    type = "quarry_where",
+    siteId = os.getComputerID(),
+    siteName = os.getComputerLabel() or ("Quarry-" .. os.getComputerID()),
+    turtleId = turtleId,
+    name = t.name or ("Turtle-" .. turtleId),
+    status = t.status,
+    -- Relative quarry pose
+    posX = qx, posY = qy, posZ = qz,
+    -- World GPS (nil if origin not set)
+    x = world and world.x or nil,
+    y = world and world.y or nil,
+    z = world and world.z or nil,
+    hasWorld = world ~= nil,
+    originSet = hasOriginGps(),
+    originFacing = cfg.originFacing,
+    age = ago(t.seen),
+    to = toId,  -- optional admin id that requested
+  }
+end
+
+local function sendWhere(turtleId, toId)
+  local t = turtles[turtleId]
+  if not t then return false, "unknown turtle" end
+  -- Ask turtle for a fresh check-in (best-effort).
+  rednet.send(turtleId, { type = "quarry_turtle_req", from = os.getComputerID() }, PROTO)
+  sleep(0.35)
+  t = turtles[turtleId] or t
+  local msg = buildWherePayload(turtleId, t, toId)
+  if not msg then return false, "no payload" end
+  if toId then
+    rednet.send(toId, msg, PROTO)
+    rednet.send(toId, msg, NET)
+  end
+  rednet.broadcast(msg, PROTO)
+  rednet.broadcast(msg, NET)
+  if titan and titan.ROUTER_PROTOCOL then
+    rednet.broadcast(msg, titan.ROUTER_PROTOCOL)
+  end
+  return true, msg
 end
 
 --------------------------------------------------------------------------------
@@ -1427,6 +1545,28 @@ local function handleMsg(id, msg)
   elseif t == "quarry_status_req" or t == "quarry_turtle_req" then
     rednet.send(id, snapshot(), PROTO)
     rednet.broadcast(snapshot(), PROTO)
+  elseif t == "quarry_where_req" then
+    local tid = tonumber(msg.turtleId) or tonumber(msg.botId) or tonumber(msg.id)
+    if not tid or not turtles[tid] then
+      rednet.send(id, {
+        type = "quarry_where",
+        ok = false,
+        err = "unknown turtle",
+        siteId = os.getComputerID(),
+        turtleId = tid,
+        to = id,
+      }, PROTO)
+    else
+      local ok, payload = sendWhere(tid, id)
+      if ok then
+        print(("[where] #%d → admin #%d  rel=%s,%s,%s  world=%s"):format(
+          tid, id,
+          tostring(payload.posX), tostring(payload.posY), tostring(payload.posZ),
+          payload.hasWorld
+            and ("%d,%d,%d"):format(payload.x, payload.y, payload.z)
+            or "(set origin first)"))
+      end
+    end
   end
 end
 
@@ -1550,6 +1690,8 @@ local function printHelp()
   print("  pattern column|layer             column=2x2 XZ shafts; layer=Y bands")
   print("  fraction half|third              max Y band size hint (layer mode)")
   print("  reband                           split remaining work + origin reset turns")
+  print("  origin <x> <y> <z> [n|s|e|w]     GPS of quarry 0,0,0 + facing into mine")
+  print("  where <id>                       send turtle coords to admin distance screen")
   print("  claims                           show claimed + free regions")
   print("  clearclaims                      release ALL claims (active+done)")
   print("  clearclaims done                 clear finished claims only")
@@ -1561,6 +1703,8 @@ local function printHelp()
   print("")
   print("On join: site rebands the fleet, turtles home, take turns dumping at origin,")
   print("then dig from continueIdx (skips already-mined units in their claim).")
+  print("Set `origin` once (stand at turtle 0,0,0 facing into mine, F3 coords) so")
+  print("`where` can send real GPS to the admin tablet.")
   print("Job files: " .. JOB_DIR .. "/<id>_offline_miner_job.cfg")
 end
 
@@ -1631,6 +1775,59 @@ local function handleCommand(line)
       print("Reband broadcast — turtles should home and reset in turn.")
     else
       print("Reband failed (need footprint + at least one turtle).")
+    end
+  elseif cmd == "origin" then
+    if not a[2] then
+      if hasOriginGps() then
+        print(("Origin GPS %d,%d,%d  facing %s (%d)"):format(
+          cfg.originX, cfg.originY, cfg.originZ,
+          facingLabel(cfg.originFacing), cfg.originFacing))
+      else
+        print("Origin not set. Stand at quarry 0,0,0 facing into the mine:")
+        print("  origin <x> <y> <z> [north|south|east|west]")
+      end
+    else
+      local x, y, z = tonumber(a[2]), tonumber(a[3]), tonumber(a[4])
+      local face = parseFacing(a[5] or a[2])
+      -- Allow: origin x y z facing   OR   origin (with GPS later)
+      if x and y and z then
+        cfg.originX, cfg.originY, cfg.originZ = math.floor(x), math.floor(y), math.floor(z)
+        if a[5] then
+          local f = parseFacing(a[5])
+          if f == nil then
+            print("Bad facing (use n/s/e/w or 0-3). Kept previous facing.")
+          else
+            cfg.originFacing = f
+          end
+        end
+        saveCfg()
+        print(("Origin set to %d,%d,%d  facing %s — `where <id>` can send world GPS."):format(
+          cfg.originX, cfg.originY, cfg.originZ, facingLabel(cfg.originFacing)))
+      else
+        print("Usage: origin <x> <y> <z> [north|south|east|west]")
+        print("Example: origin 120 72 -45 south")
+      end
+    end
+  elseif cmd == "where" then
+    local tid = findTurtleRef(a[2])
+    if not tid then
+      print("Usage: where <turtleId>   (or partial name)")
+      print("Example: where 12")
+    else
+      local ok, payload = sendWhere(tid, nil)
+      if not ok then
+        print("where failed: " .. tostring(payload))
+      else
+        print(("Sent where for #%d %s"):format(tid, tostring(payload.name)))
+        print(("  quarry @ %s,%s,%s"):format(
+          tostring(payload.posX), tostring(payload.posY), tostring(payload.posZ)))
+        if payload.hasWorld then
+          print(("  world  @ %d,%d,%d  → admin distance screen"):format(
+            payload.x, payload.y, payload.z))
+        else
+          print("  world  (unset) — run `origin <x> <y> <z> <facing>` for GPS track")
+        end
+      end
     end
   elseif cmd == "turtles" then
     local s = snapshot()
