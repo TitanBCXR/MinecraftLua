@@ -35,7 +35,7 @@ local KEEP_ALL = {
   "offline_miner.lua", "offline_site.lua", "exclude.txt",
   "perimeter_sensor.lua", "perimeter_manager.lua", "tetris.lua", "minesweeper.lua",
   "sandstorm.lua", "luigi_poker.lua", "slots.lua",
-  "games.lua", "games_catalog.lua", "host.lua", "versions.lua",
+  "games.lua", "games_catalog.lua", "games_install.lua", "host.lua", "versions.lua",
 }
 
 -- Full suite installed by the Games launcher role (keeps itself + catalog updated).

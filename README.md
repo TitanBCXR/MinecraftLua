@@ -14,8 +14,9 @@ A wireless dispatch system for Minecraft's **CC: Tweaked** mod (active packages)
 - **`sandstorm.lua`** — Darude Sandstorm note-block knockoff + desert pixel visualizer (speaker + color monitor).
 - **`luigi_poker.lua`** — Luigi Picture Poker (beat Luigi’s visible hand; pocket-first; hold/draw).
 - **`slots.lua`** — 3-reel slots (bet/spin animation, coin bank; monitor tap UI).
-- **`games.lua`** + **`games_catalog.lua`** — Games launcher: suite install/update over HTTP; launches games in speaker-only mode (no modem).
-- **`github_install.lua`** — On an advanced PC + color monitor, role select draws on the monitor (touch tiles + UP/DOWN scroll).
+- **`games.lua`** + **`games_catalog.lua`** — Games launcher: suite update over HTTP; launches games in speaker-only mode (no modem).
+- **`games_install.lua`** — **Games-only** installer (separate from the fleet installer).
+- **`github_install.lua`** — Fleet / Titan role installer (routers, quarry, admin, …).
 - **`lib/titan.lua`** — shared library (protocol, messaging, navigation).
 
 Older packages (hub/bot/poi/miner/…) live under [`archive/`](archive/) and are not in the installer menu.
@@ -65,6 +66,17 @@ wget run https://raw.githubusercontent.com/TitanBCXR/MinecraftLua/main/github_in
 
 Pick a role (Parent Center, console, admin, router, offline miner, site board,
 perimeter, or Everything). Legacy `host.lua` rednet install is in `archive/`.
+
+### Games only (separate installer)
+
+Pocket / computer games suite — **not** the fleet installer:
+
+```
+wget run https://raw.githubusercontent.com/TitanBCXR/MinecraftLua/main/games_install.lua
+```
+
+Installs the Games launcher + all games. Run `games` afterward (press **U** to
+update). No modem required; speaker for music/SFX.
 
 ### Install from GitHub
 
