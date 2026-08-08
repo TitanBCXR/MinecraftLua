@@ -1,21 +1,25 @@
 --[[
-  minesweeper.lua  -  Lightweight Minesweeper for CC: Tweaked (pocket / computer)
-  Titan-Version: 1.0.0
+  minesweeper.lua  -  Lightweight Minesweeper for CC: Tweaked
+  Titan-Version: 1.1.0
 
   Run:
 
       minesweeper
 
-  No mesh / modem required. Color pocket gets colored numbers.
+  Works on pocket PCs and advanced computers. If a monitor is attached, the
+  game draws there (keys still work on the computer). Color monitors / advanced
+  pockets get colored numbers.
 
   Controls:
-    Mouse  left = open   right = flag
+    Mouse / monitor touch  left = open   right = flag (mouse)
     Keys   arrows move cursor   Space/Enter open   F flag
            1/2/3 difficulty on menu   N new game   Q quit
 ]]
 
 local CFG = "mines.cfg"
 local BEST = {} -- [diffKey] = best seconds
+local NATIVE = term.current()
+local USING_MONITOR = false
 
 local DIFFS = {
   { key = "1", name = "Easy",   w = 9,  h = 9,  mines = 10 },
@@ -26,6 +30,51 @@ local DIFFS = {
 local function isColor()
   local ok, c = pcall(function() return term.isColor and term.isColor() end)
   return ok and c == true
+end
+
+local function attachMonitor()
+  local m = peripheral.find("monitor")
+  if not m then return false end
+  pcall(function()
+    if m.setTextScale then
+      m.setTextScale(1)
+      local w, h = m.getSize()
+      -- Prefer readable cells; shrink only if the board won't fit.
+      if h < 14 or w < 18 then m.setTextScale(0.5) end
+    end
+    if m.setBackgroundColor then m.setBackgroundColor(colors.black) end
+    m.clear()
+  end)
+  term.redirect(m)
+  USING_MONITOR = true
+  pcall(function()
+    NATIVE.setBackgroundColor(colors.black)
+    NATIVE.clear()
+    NATIVE.setCursorPos(1, 1)
+    if NATIVE.setTextColor then NATIVE.setTextColor(colors.lightGray) end
+    NATIVE.write("Minesweeper on monitor")
+    NATIVE.setCursorPos(1, 2)
+    NATIVE.write("Keys work on this PC")
+    NATIVE.setCursorPos(1, 3)
+    NATIVE.write("Touch=open  F=flag")
+  end)
+  return true
+end
+
+local function detachMonitor()
+  if USING_MONITOR then
+    pcall(term.redirect, NATIVE)
+    USING_MONITOR = false
+  end
+end
+
+-- Monitor touch -> left click so shared handlers work.
+local function pullGameEvent()
+  local ev, p1, p2, p3 = os.pullEvent()
+  if ev == "monitor_touch" then
+    return "mouse_click", 1, p2, p3
+  end
+  return ev, p1, p2, p3
 end
 
 local function loadCfg()
@@ -50,8 +99,20 @@ local function clampBoard(diff)
   local maxW, maxH = math.max(5, tw), math.max(5, th - 2)
   local w = math.min(diff.w, maxW)
   local h = math.min(diff.h, maxH)
+  -- Large advanced monitors: grow medium/hard toward the screen.
+  if maxW >= 28 and maxH >= 16 and diff.key ~= "1" then
+    if diff.key == "3" then
+      w, h = maxW, maxH
+    else
+      w = math.min(maxW, math.max(diff.w, math.floor(maxW * 0.7)))
+      h = math.min(maxH, math.max(diff.h, math.floor(maxH * 0.7)))
+    end
+  end
   local cells = w * h
-  local mines = math.min(diff.mines, math.max(1, cells - 9))
+  local density = (diff.key == "3" and 0.18) or (diff.key == "2" and 0.15) or 0.12
+  local mines = math.min(
+    math.max(diff.mines, math.floor(cells * density)),
+    math.max(1, cells - 9))
   return w, h, mines
 end
 
@@ -213,7 +274,9 @@ local function drawGame(state)
     term.setBackgroundColor(colors.black)
     term.setTextColor(colors.lightGray)
   end
-  local foot = "Spc open  F flag  N new  Q menu"
+  local foot = USING_MONITOR
+    and "Touch open  F flag  N new  Q menu"
+    or "Spc/click open  F flag  N new  Q menu"
   if state.over then
     foot = state.won and "Cleared!  N new  Q menu" or "Boom!  N new  Q menu"
   end
@@ -301,11 +364,11 @@ local function runGame(diff)
   local tick = os.startTimer(0.5)
   drawGame(state)
   while true do
-    local ev, p1, p2, p3 = os.pullEvent()
+    local ev, p1, p2, p3 = pullGameEvent()
     if ev == "timer" and p1 == tick then
       if not state.over then drawGame(state) end
       tick = os.startTimer(0.5)
-    elseif ev == "term_resize" then
+    elseif ev == "term_resize" or ev == "monitor_resize" then
       drawGame(state)
     elseif ev == "mouse_click" then
       local btn, mx, my = p1, p2, p3
@@ -394,7 +457,7 @@ local function mainMenu()
   local sel = 1
   while true do
     drawMenu(sel)
-    local ev, p1 = os.pullEvent()
+    local ev, p1, p2, p3 = pullGameEvent()
     if ev == "key" then
       if p1 == keys.up then sel = sel > 1 and sel - 1 or #DIFFS
       elseif p1 == keys.down then sel = sel < #DIFFS and sel + 1 or 1
@@ -420,6 +483,14 @@ local function mainMenu()
         term.setCursorPos(1, 1)
         return
       end
+    elseif ev == "mouse_click" then
+      -- Tap a difficulty row (y=3..5).
+      local y = p3
+      if y >= 3 and y <= 2 + #DIFFS then
+        runGame(DIFFS[y - 2])
+      end
+    elseif ev == "term_resize" or ev == "monitor_resize" then
+      -- redraw
     elseif ev == "terminate" then
       return
     end
@@ -427,4 +498,7 @@ local function mainMenu()
 end
 
 math.randomseed(os.epoch("utc") % 2147483647)
-mainMenu()
+attachMonitor()
+local ok, err = pcall(mainMenu)
+detachMonitor()
+if not ok then error(err, 0) end

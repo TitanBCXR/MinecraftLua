@@ -54,9 +54,9 @@ local KEEP_ALL = {
 -- 2) Roles -> which files they need + what to auto-run (matches the README)
 --==============================================================================
 local GAMES = {
-  { key = "1", name = "Tetris (pocket + music/mesh)", run = "tetris.lua",
+  { key = "1", name = "Tetris (pocket / monitor + music)", run = "tetris.lua",
     files = { "lib/titan.lua", "tetris.lua", "versions.lua" } },
-  { key = "2", name = "Minesweeper (lightweight pocket)", run = "minesweeper.lua",
+  { key = "2", name = "Minesweeper (pocket / monitor)", run = "minesweeper.lua",
     files = { "minesweeper.lua" } },
 }
 

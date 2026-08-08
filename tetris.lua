@@ -1,8 +1,8 @@
 --[[
   tetris.lua  -  Standalone Tetris for CC: Tweaked (pocket / computer)
-  Titan-Version: 1.2.4
+  Titan-Version: 1.2.5
 
-  Drop on a pocket PC and run:
+  Drop on a pocket PC or advanced computer and run:
 
       tetris
 
@@ -10,14 +10,17 @@
   In-game / Controls screen: Q always returns to the main menu.
   Mid-game Q abandons the run (score is not kept).
 
+  Display: if a monitor is attached, the game draws there (keys still work on
+  the computer). Advanced color monitors / pockets get colored pieces.
+
   Network: one boot sync (OTA + leaderboard) then the board is cached locally
   and the session goes fully offline — no more rednet calls (avoids pocket
   crashes with speaker music). New scores update the local top-3 and queue for
   the next boot sync. R reloads the local cache only.
 
-  Music (Noisy pocket): two in-script note tracks — calm menu bed + retro
-  Korobeiniki in-game. M mutes. Mesh / leaderboard sync still need a wireless
-  modem at boot.
+  Music (speaker / Noisy pocket): two in-script note tracks — calm menu bed +
+  retro Korobeiniki in-game. M mutes. Mesh / leaderboard sync still need a
+  wireless modem at boot.
 
   Player name: uses Advanced Peripherals Player Detector when present; otherwise
   prompts for a name after a game (saved in tetris.cfg). That name is what
@@ -62,9 +65,56 @@ if fs.exists("lib/titan.lua") then
   if ok and type(lib) == "table" then titan = lib end
 end
 
+local NATIVE = term.current()
+local USING_MONITOR = false
+
 local function isColor()
   local ok, c = pcall(function() return term.isColor and term.isColor() end)
   return ok and c == true
+end
+
+local function attachMonitor()
+  local m = peripheral.find("monitor")
+  if not m then return false end
+  pcall(function()
+    if m.setTextScale then
+      m.setTextScale(1)
+      local w, h = m.getSize()
+      -- Need room for 18-row board + HUD; shrink scale on small panels.
+      if h < 20 or w < 24 then m.setTextScale(0.5) end
+    end
+    if m.setBackgroundColor then m.setBackgroundColor(colors.black) end
+    m.clear()
+  end)
+  term.redirect(m)
+  USING_MONITOR = true
+  pcall(function()
+    NATIVE.setBackgroundColor(colors.black)
+    NATIVE.clear()
+    NATIVE.setCursorPos(1, 1)
+    if NATIVE.setTextColor then NATIVE.setTextColor(colors.lightGray) end
+    NATIVE.write("Tetris on monitor")
+    NATIVE.setCursorPos(1, 2)
+    NATIVE.write("Keys work on this PC")
+    NATIVE.setCursorPos(1, 3)
+    NATIVE.write("Touch = menu buttons")
+  end)
+  return true
+end
+
+local function detachMonitor()
+  if USING_MONITOR then
+    pcall(term.redirect, NATIVE)
+    USING_MONITOR = false
+  end
+end
+
+local function pullGameEvent()
+  local ev, p1, p2, p3 = os.pullEvent()
+  if ev == "monitor_touch" then
+    return "mouse_click", 1, p2, p3
+  end
+  return ev, p1, p2, p3
 end
 
 local MUSIC_ON = true -- persisted; M toggles
@@ -824,8 +874,8 @@ local function runGame()
       dirty = false
     end
 
-    local ev, p1, p2, p3 = os.pullEvent()
-    if ev == "term_resize" then
+    local ev, p1, p2, p3 = pullGameEvent()
+    if ev == "term_resize" or ev == "monitor_resize" then
       L = layout()
       dirty = true
     elseif ev == "timer" and p1 == musicTimer then
@@ -1143,13 +1193,15 @@ local function controlsScreen()
     end
     text(2, th, "Q  main menu", colors.gray, colors.black)
 
-    local ev, p1 = os.pullEvent()
+    local ev, p1 = pullGameEvent()
     if ev == "key" and (p1 == keys.q or p1 == keys.backspace) then
       drainInputEvents()
       return
     elseif ev == "char" and tostring(p1 or ""):lower() == "q" then
       drainInputEvents()
       return
+    elseif ev == "mouse_click" then
+      -- ignore taps; Q to leave
     elseif ev == "terminate" then
       return
     end
@@ -1219,7 +1271,7 @@ local function mainMenu()
 
   while true do
     drawMenu(playBtn, ctrlBtn)
-    local ev, p1, p2, p3 = os.pullEvent()
+    local ev, p1, p2, p3 = pullGameEvent()
     if ev == "timer" and p1 == musicTimer then
       if MUSIC_ON then
         musicTimer = os.startTimer(musicStepSeconds())
@@ -1441,6 +1493,12 @@ local function bootCheckUpdates()
 end
 
 bootCheckUpdates()
-mainMenu()
-clearScreen(colors.black)
-term.setCursorPos(1, 1)
+attachMonitor()
+local okRun, errRun = pcall(mainMenu)
+detachMonitor()
+pcall(function()
+  term.setBackgroundColor(colors.black)
+  term.clear()
+  term.setCursorPos(1, 1)
+end)
+if not okRun then error(errRun, 0) end
