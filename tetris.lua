@@ -1,6 +1,6 @@
 --[[
   tetris.lua  -  Standalone Tetris for CC: Tweaked (pocket / computer)
-  Titan-Version: 1.1.0
+  Titan-Version: 1.1.1
 
   Drop on a pocket PC and run:
 
@@ -10,10 +10,15 @@
   In-game / Controls screen: Q always returns to the main menu.
   Mid-game Q abandons the run (score is not kept).
 
+  Network: one boot sync (OTA + leaderboard) then the board is cached locally
+  and the session goes fully offline — no more rednet calls (avoids pocket
+  crashes with speaker music). New scores update the local top-3 and queue for
+  the next boot sync. R reloads the local cache only.
+
   Music: on an Advanced Noisy pocket (speaker upgrade), plays an 8-bit style
-  Korobeiniki loop while you play (M mutes). Mesh / SSH / leaderboard need a
-  wireless modem — pockets usually have only ONE upgrade, so carry a modem and
-  press U to swap (pocket.equipBack), or sync on a desk PC with both attached.
+  Korobeiniki loop while you play (M mutes). Mesh / leaderboard sync need a
+  wireless modem at boot — pockets usually have only ONE upgrade, so carry a
+  modem and press U to swap (pocket.equipBack) before restarting to sync.
 
   Player name: uses Advanced Peripherals Player Detector when present; otherwise
   prompts for a name after a game (saved in tetris.cfg). That name is what
@@ -26,6 +31,7 @@
 ]]
 
 local CFG = "tetris.cfg"
+local LB_CACHE = "tetris_lb.cfg"
 local COLS, ROWS = 10, 18
 local KIND = "tetris"
 local INSTALL_PROTO = "titan_install"
@@ -34,8 +40,11 @@ local SIDE_W = 5 -- compact HUD column (score uses K/M/B/T)
 local LB_TOP = 3 -- only show top 3 on menu
 local PLAYER_RANGE = 8
 
--- Cached host leaderboard (from last sync).
+-- Cached host leaderboard (disk + RAM). After boot sync, NET_LOCKED stops all rednet.
 local LEADERBOARD = {}
+local PENDING_SCORE = nil -- best score waiting for next boot submit
+local LB_SYNCED_AT = 0
+local NET_LOCKED = false
 local PLAYER_NAME = nil -- Minecraft / typed display name for the board
 
 -- Live state for SSH / mesh beacons (updated by the game loop).
@@ -223,7 +232,82 @@ local function formatScore(n)
   return neg .. string.format("%d.%d%s", math.floor(tenths / 10), tenths % 10, suf)
 end
 
+local function saveLbCache()
+  local f = fs.open(LB_CACHE, "w")
+  if not f then return end
+  f.write(textutils.serialize({
+    entries = LEADERBOARD,
+    pendingScore = PENDING_SCORE,
+    syncedAt = LB_SYNCED_AT,
+    playerName = PLAYER_NAME,
+  }))
+  f.close()
+end
+
+local function loadLbCache()
+  if not fs.exists(LB_CACHE) then return false end
+  local f = fs.open(LB_CACHE, "r")
+  if not f then return false end
+  local d = textutils.unserialize(f.readAll() or "")
+  f.close()
+  if type(d) ~= "table" then return false end
+  if type(d.entries) == "table" then LEADERBOARD = d.entries end
+  if d.pendingScore ~= nil then PENDING_SCORE = tonumber(d.pendingScore) end
+  LB_SYNCED_AT = tonumber(d.syncedAt) or 0
+  if type(d.playerName) == "string" and not PLAYER_NAME then
+    PLAYER_NAME = sanitizeName(d.playerName)
+  end
+  return #LEADERBOARD > 0
+end
+
+-- Merge a local score into the cached top board (no network).
+local function applyLocalScore(score, playerName)
+  score = math.floor(tonumber(score) or 0)
+  if score <= 0 then return end
+  local name = sanitizeName(playerName)
+    or sanitizeName(PLAYER_NAME)
+    or ("P" .. tostring(os.getComputerID()))
+  local me = os.getComputerID()
+  local found = false
+  for i = 1, #LEADERBOARD do
+    local e = LEADERBOARD[i]
+    if e and (tonumber(e.id) == me or tostring(e.name or ""):lower() == name:lower()) then
+      if score > (tonumber(e.score) or 0) then
+        e.score = score
+        e.name = name
+        e.id = me
+      end
+      found = true
+      break
+    end
+  end
+  if not found then
+    LEADERBOARD[#LEADERBOARD + 1] = { id = me, name = name, score = score }
+  end
+  table.sort(LEADERBOARD, function(a, b)
+    return (tonumber(a.score) or 0) > (tonumber(b.score) or 0)
+  end)
+  while #LEADERBOARD > 40 do LEADERBOARD[#LEADERBOARD] = nil end
+  PENDING_SCORE = math.max(tonumber(PENDING_SCORE) or 0, score)
+  saveLbCache()
+end
+
+local function closeAllModems()
+  for _, side in ipairs(redstone.getSides()) do
+    if peripheral.getType(side) == "modem" then
+      pcall(rednet.close, side)
+    end
+  end
+end
+
+-- After boot OTA/LB: no more rednet for this run (speaker + mesh fights crash pockets).
+local function lockNetworkOffline()
+  NET_LOCKED = true
+  closeAllModems()
+end
+
 local function findInstallHost(timeout)
+  if NET_LOCKED then return nil end
   if titan and titan.findInstallHost then
     return titan.findInstallHost(timeout or 5)
   end
@@ -250,22 +334,33 @@ local function findInstallHost(timeout)
 end
 
 -- Pull board; optionally submit a score under playerName. Returns entries or nil.
+-- Blocked once NET_LOCKED (use local cache / applyLocalScore instead).
 local function syncLeaderboard(submitScore, playerName)
+  if NET_LOCKED then
+    return (#LEADERBOARD > 0) and LEADERBOARD or nil, "offline"
+  end
+  if not hasModem() then
+    return (#LEADERBOARD > 0) and LEADERBOARD or nil, "no modem"
+  end
   local hostId = findInstallHost(5)
-  if not hostId then return nil, "no host" end
+  if not hostId then
+    return (#LEADERBOARD > 0) and LEADERBOARD or nil, "no host"
+  end
   local name = sanitizeName(playerName)
     or sanitizeName(PLAYER_NAME)
     or sanitizeName(detectNearbyPlayer())
     or ("P" .. tostring(os.getComputerID()))
   local me = os.getComputerID()
   local mainId = titan and titan.getMainRouterId and titan.getMainRouterId()
+  local score = math.floor(tonumber(submitScore) or 0)
+  if score <= 0 then score = math.floor(tonumber(PENDING_SCORE) or 0) end
   local req
-  if submitScore and (tonumber(submitScore) or 0) > 0 then
+  if score > 0 then
     req = {
       type = "tetris_lb_submit",
       playerId = me,
       name = name,
-      score = math.floor(tonumber(submitScore) or 0),
+      score = score,
       replyTo = me,
       originId = me,
       dest = hostId,
@@ -294,12 +389,14 @@ local function syncLeaderboard(submitScore, playerName)
     if type(msg) == "table" and msg.type == "tetris_lb" then
       if type(msg.entries) == "table" then
         LEADERBOARD = msg.entries
-        return LEADERBOARD
       end
+      LB_SYNCED_AT = os.epoch("utc") or os.clock()
+      if score > 0 then PENDING_SCORE = nil end
+      saveLbCache()
       return LEADERBOARD
     end
   end
-  return nil, "timeout"
+  return (#LEADERBOARD > 0) and LEADERBOARD or nil, "timeout"
 end
 
 -- SRS-ish shapes (4x4, 0-based cells as {x,y} relative)
@@ -853,10 +950,9 @@ local function afterGame(score)
     if name then PLAYER_NAME = name; saveCfg() end
   end
   saveCfg()
+  -- Offline session: update local board only (queued for next boot sync).
   if score > 0 then
-    pcall(syncLeaderboard, score, name)
-  else
-    pcall(syncLeaderboard, nil, name)
+    applyLocalScore(score, name)
   end
   drainInputEvents()
 end
@@ -920,7 +1016,8 @@ local function drawMenu(playBtn, ctrlBtn)
   text(cx, rowY, ctrlLabel, colors.black, ctrlBg)
   ctrlBtn.x, ctrlBtn.y, ctrlBtn.w, ctrlBtn.h = cx, rowY, #ctrlLabel, 1
 
-  local foot = ("Enter play  C ctrl  M mute  U swap  %s"):format(meshStatusLine())
+  local net = NET_LOCKED and "local LB" or meshStatusLine()
+  local foot = ("Enter play  C ctrl  M mute  R local  %s"):format(net)
   text(2, th, foot:sub(1, tw - 2), colors.gray, colors.black)
 end
 
@@ -942,6 +1039,7 @@ local function controlsScreen()
       { "Pause", "P" },
       { "Mute",  "M (noisy speaker)" },
       { "Swap",  "U (modem <-> speaker)" },
+      { "Board", "R reload local cache" },
       { "Menu",  "Q (always)" },
     }
     local y = 3
@@ -1031,7 +1129,8 @@ local function mainMenu()
       elseif p1 == keys.c then
         controlsScreen()
       elseif p1 == keys.r then
-        pcall(syncLeaderboard, nil, PLAYER_NAME)
+        -- Offline-safe: reload disk cache only (no rednet after boot).
+        loadLbCache()
       elseif p1 == keys.n then
         editPlayerName()
       elseif p1 == keys.m then
@@ -1070,7 +1169,7 @@ local function mainMenu()
       elseif ch == "c" then
         controlsScreen()
       elseif ch == "r" then
-        pcall(syncLeaderboard, nil, PLAYER_NAME)
+        loadLbCache()
       elseif ch == "n" then
         editPlayerName()
       elseif ch == "m" then
@@ -1107,98 +1206,29 @@ end
 --------------------------------------------------------------------------------
 -- Hidden Titan mesh tracker (SSH + GPS beacons). Silent if offline.
 --------------------------------------------------------------------------------
-local function sendTrackerBeacon()
-  if not titan then return end
-  local host = titan.hostname and titan.hostname(KIND) or (os.getComputerLabel() or ("Tetris-" .. os.getComputerID()))
-  local msg = {
-    type = "hello",
-    kind = KIND,
-    name = host,
-    hostname = host,
-    mainRouterId = titan.getMainRouterId and titan.getMainRouterId() or nil,
-    version = titan.systemVersion and titan.systemVersion() or "1.1.0",
-    game = "tetris",
-    playing = TRACK.playing and true or false,
-    score = TRACK.score,
-    hi = HI,
-    level = TRACK.level,
-    lines = TRACK.lines,
-    x = TRACK.x, y = TRACK.y, z = TRACK.z,
-    from = os.getComputerID(),
-  }
-  local proto = titan.ROUTER_PROTOCOL or "titan_router"
-  local mainId = titan.getMainRouterId and titan.getMainRouterId()
-  if mainId then
-    rednet.send(mainId, msg, proto)
-  else
-    rednet.broadcast(msg, proto)
-  end
-end
-
-local function trackerLoop()
-  if not titan then
-    while true do sleep(3600) end
-  end
-  if titan.netJitter then titan.netJitter(1.2) end
-  while true do
-    local x, y, z = gps.locate(1.5)
-    if x then
-      TRACK.x = math.floor(x + 0.5)
-      TRACK.y = math.floor(y + 0.5)
-      TRACK.z = math.floor(z + 0.5)
-      TRACK.fixAt = os.epoch("utc")
-    end
-    pcall(sendTrackerBeacon)
-    -- Light cadence; registerLoop also announces without GPS.
-    local id = os.getComputerID() or 0
-    sleep(18 + ((id % 7)))
-  end
-end
-
-local function setupMesh()
-  if not titan then return false end
-  pcall(function()
-    if titan.openModem then titan.openModem() end
-  end)
-  if not os.getComputerLabel() or os.getComputerLabel() == "" then
-    os.setComputerLabel("Tetris-" .. os.getComputerID())
-  end
-  if titan.setSshHandler then
-    titan.setSshHandler(function(line)
-      local cmd = tostring(line or ""):lower():match("^%s*(%S*)") or ""
-      if cmd == "status" or cmd == "where" or cmd == "pos" or cmd == "track" then
-        local pos = (TRACK.x and ("%d,%d,%d"):format(TRACK.x, TRACK.y, TRACK.z)) or "(no GPS)"
-        print(("Tetris #%d  %s"):format(os.getComputerID(), os.getComputerLabel() or "?"))
-        print(("pos %s"):format(pos))
-        print(("playing=%s  score=%d  hi=%d  lv=%d  lines=%d"):format(
-          TRACK.playing and "yes" or "no",
-          tonumber(TRACK.score) or 0, tonumber(HI) or 0,
-          tonumber(TRACK.level) or 0, tonumber(TRACK.lines) or 0))
-        local mainId = titan.getMainRouterId and titan.getMainRouterId()
-        print(("main #%s"):format(tostring(mainId or "?")))
-        return true
-      elseif cmd == "hi" or cmd == "hiscore" then
-        print("hi-score " .. tostring(HI))
-        return true
-      elseif cmd == "help" then
-        print("tetris ssh: status | where | hi | update | reboot | exit")
-        return true
-      end
-      return false -- fall through (update / shell)
-    end)
-  end
-  return true
-end
-
 math.randomseed(os.epoch("utc") % 2147483647)
 
--- Boot: OTA (host-only) + leaderboard sync.
+-- Boot: one network window (OTA + LB), cache to disk, then go offline.
 local function bootCheckUpdates()
   clearScreen(colors.black)
   term.setCursorPos(1, 1)
   if term.setTextColor then term.setTextColor(colors.lightGray) end
   print("Tetris")
+  loadLbCache()
+  if #LEADERBOARD > 0 then
+    print(("Local board: %d player%s"):format(
+      #LEADERBOARD, #LEADERBOARD == 1 and "" or "s"))
+  end
   print(meshStatusLine())
+
+  if not hasModem() then
+    print("No modem — using local leaderboard only.")
+    lockNetworkOffline()
+    sleep(0.55)
+    showQuitDisclaimer()
+    return
+  end
+
   -- Need modem for host OTA + leaderboard even without full mesh lib.
   if titan and titan.openModem then
     pcall(titan.openModem)
@@ -1208,6 +1238,10 @@ local function bootCheckUpdates()
         pcall(rednet.open, side)
       end
     end
+  end
+
+  if not os.getComputerLabel() or os.getComputerLabel() == "" then
+    os.setComputerLabel("Tetris-" .. os.getComputerID())
   end
 
   -- Join mesh first so host OTA can hop through MAIN / cell modems.
@@ -1258,36 +1292,35 @@ local function bootCheckUpdates()
     print("lib/titan.lua missing OTA — reinstall role t from host.")
   end
 
-  print("Syncing leaderboard...")
+  print("Syncing leaderboard (once)...")
   do
     local det = sanitizeName(detectNearbyPlayer())
     if det then PLAYER_NAME = det; saveCfg() end
   end
+  local submit = math.max(tonumber(HI) or 0, tonumber(PENDING_SCORE) or 0)
   local board, err
-  if HI > 0 and PLAYER_NAME then
-    board, err = syncLeaderboard(HI, PLAYER_NAME)
+  if submit > 0 and PLAYER_NAME then
+    board, err = syncLeaderboard(submit, PLAYER_NAME)
   else
     board, err = syncLeaderboard(nil, PLAYER_NAME)
   end
   if board then
-    print(("Leaderboard: %d player%s"):format(#board, #board == 1 and "" or "s"))
+    print(("Leaderboard: %d player%s — saved locally"):format(
+      #board, #board == 1 and "" or "s"))
   else
     print("Leaderboard offline (" .. tostring(err or "?") .. ")")
+    if #LEADERBOARD > 0 then
+      print("Using cached board.")
+    end
   end
+
+  print("Going offline for play...")
+  lockNetworkOffline()
   sleep(0.55)
   showQuitDisclaimer()
 end
 
 bootCheckUpdates()
-
-if setupMesh() then
-  parallel.waitForAny(
-    function() titan.networkLoop(KIND) end,
-    trackerLoop,
-    mainMenu
-  )
-  clearScreen(colors.black)
-  term.setCursorPos(1, 1)
-else
-  mainMenu()
-end
+mainMenu()
+clearScreen(colors.black)
+term.setCursorPos(1, 1)
