@@ -1,6 +1,6 @@
 --[[
   lib/router_hub_ui.lua  -  Titan hub monitors / boards / map (part)
-  Titan-Version: 1.4.1
+  Titan-Version: 1.4.2
 
   Loaded by router_main.lua into a shared env (setfenv). Do not run directly.
 ]]
@@ -773,10 +773,57 @@ paintUpdateAcks = function()
   return true
 end
 
+local function drawSosBoard(mon)
+  pruneSosAlerts()
+  local L = monLayout(mon)
+  clearMon(mon)
+  local accent = colors.red
+  guiBar(L, 1, "!!! TURTLE SOS — OUT OF FUEL !!!", "URGENT", accent)
+  local y = 3
+  guiText(mon, 1 + L.pad, 2, "Computer still online — bring coal to last pose", colors.white, colors.black)
+  local list = {}
+  for id, a in pairs(sosAlerts or {}) do
+    list[#list + 1] = { id = id, a = a }
+  end
+  table.sort(list, function(a, b) return a.id < b.id end)
+  if #list == 0 then
+    guiText(mon, 1 + L.pad, y, "(no active SOS)", colors.lightGray, colors.black)
+  else
+    for _, row in ipairs(list) do
+      if y >= L.h - L.footerH then break end
+      local a = row.a
+      local pos = (a.x ~= nil) and ("%s,%s,%s"):format(a.x, a.y or 0, a.z or 0) or "?"
+      guiText(mon, 1 + L.pad, y, ("#%d %s  @%s  %s"):format(
+        row.id, tostring(a.name or "?"):sub(1, 12), pos, tostring(a.reason or "fuel")),
+        colors.yellow, colors.black)
+      y = y + 1
+    end
+  end
+  if L.h >= 2 then
+    guiFooter(L, "sos")
+  end
+end
+
 drawBoards = function()
   if otaOverlay or (updateCampaign and updateCampaign.showAcks) then
     paintUpdateAcks()
     return
+  end
+
+  pruneSosAlerts()
+  if sosOverlay then
+    local n = refreshScreens()
+    if n == 0 or not displayMon then
+      -- Still paint first attached monitor for urgent SOS.
+      local names = listMonitorNames()
+      if #names > 0 then
+        displayMon, displayMonName = wrapScreen(names[1]), names[1]
+      end
+    end
+    if displayMon then
+      drawSosBoard(displayMon)
+      return
+    end
   end
 
   local n = refreshScreens()
@@ -826,7 +873,16 @@ function drawLoop()
       expireTemporaryBoards()
     end
     maybeFinishUpdateCampaign()
-    if otaOverlay or (updateCampaign and updateCampaign.showAcks) then
+    pruneSosAlerts()
+    if sosOverlay then
+      if saverActive then
+        saverActive = false
+        saverState = {}
+      end
+      pcall(drawBoards)
+      if rosterDirty then saveRoster() end
+      sleep(clampMonRate(monRate))
+    elseif otaOverlay or (updateCampaign and updateCampaign.showAcks) then
       if saverActive then
         saverActive = false
         saverState = {}

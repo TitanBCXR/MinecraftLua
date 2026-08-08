@@ -1,6 +1,6 @@
 --[[
   admin.lua  -  Titan admin console for a POCKET computer ("Live" tablet)
-  Titan-Version: 1.4.6
+  Titan-Version: 1.4.7
 
   Pocket remote for the whole fleet. Keep it on you; it joins the mesh like
   every other Titan device (MAIN router + modem hops).
@@ -251,11 +251,53 @@ local function handle(id, msg)
     while #stuck > 15 do table.remove(stuck) end
 
   elseif t == "hello" or t == "main_here" then
-    touchSystem(id, msg.name or msg.hostname or msg.label, msg.kind or "router")
+    local kind = msg.kind
+    local role = tostring(msg.role or ""):lower()
+    if t == "main_here" or role == "main" or kind == "main" then
+      kind = "main"
+    elseif role == "router" or kind == "router" then
+      kind = "extender"
+    else
+      kind = kind or msg.hostname and "device" or "device"
+    end
+    touchSystem(id, msg.name or msg.hostname or msg.label, kind)
   elseif t == "quarry_site" then
     quarrySnap = msg
     quarrySnapAt = now()
     touchSystem(id, msg.name or ("Quarry-" .. id), "quarry_site")
+  elseif t == "quarry_sos" then
+    local q = quarryTurtles[id] or {}
+    q.name = msg.name or msg.hostname or q.name or ("Turtle-" .. id)
+    q.seen = now()
+    q.sos = true
+    q.status = "sos"
+    q.fuel = msg.fuel or 0
+    if msg.posX ~= nil then
+      q.posX = tonumber(msg.posX) or q.posX
+      q.posY = tonumber(msg.posY) or q.posY
+      q.posZ = tonumber(msg.posZ) or q.posZ
+      q.lastPosAt = now()
+    end
+    q.sosReason = msg.reason or "out_of_fuel"
+    quarryTurtles[id] = q
+    touchSystem(id, q.name, "offline_miner")
+    table.insert(stuck, 1, {
+      name = ("SOS " .. tostring(q.name)),
+      x = q.posX, y = q.posY, z = q.posZ,
+      reason = q.sosReason,
+    })
+    while #stuck > 15 do table.remove(stuck) end
+    print(("[SOS] #%d %s out of fuel @ %s,%s,%s"):format(
+      id, tostring(q.name),
+      tostring(q.posX or "?"), tostring(q.posY or "?"), tostring(q.posZ or "?")))
+  elseif t == "quarry_sos_clear" then
+    local q = quarryTurtles[id]
+    if q then
+      q.sos = false
+      q.seen = now()
+      if q.status == "sos" then q.status = "idle" end
+      quarryTurtles[id] = q
+    end
   elseif t == "quarry_turtle" or t == "quarry_progress" or t == "quarry_join"
       or t == "quarry_job" or t == "quarry_done" then
     -- Direct turtle mine data (works without a site board).
@@ -270,9 +312,20 @@ local function handle(id, msg)
     q.status = msg.status or q.status
     q.y0 = tonumber(msg.y0) or q.y0
     q.y1 = tonumber(msg.y1) or q.y1
+    q.x0 = tonumber(msg.x0) or q.x0
+    q.x1 = tonumber(msg.x1) or q.x1
+    q.z0 = tonumber(msg.z0) or q.z0
+    q.z1 = tonumber(msg.z1) or q.z1
     q.W = tonumber(msg.W) or q.W
     q.L = tonumber(msg.L) or q.L
     q.H = tonumber(msg.H) or q.H
+    if msg.posX ~= nil then
+      q.posX = tonumber(msg.posX) or q.posX
+      q.posY = tonumber(msg.posY) or q.posY
+      q.posZ = tonumber(msg.posZ) or q.posZ
+      q.lastPosAt = now()
+    end
+    if msg.sos == true then q.sos = true elseif msg.sos == false then q.sos = false end
     if type(msg.job) == "table" then
       q.job = msg.job
       q.W = q.W or tonumber(msg.job.W)
@@ -285,6 +338,10 @@ local function handle(id, msg)
       q.total = tonumber(msg.job.total) or q.total
       q.y0 = tonumber(msg.job.y0) or q.y0
       q.y1 = tonumber(msg.job.y1) or q.y1
+      q.x0 = tonumber(msg.job.x0) or q.x0
+      q.x1 = tonumber(msg.job.x1) or q.x1
+      q.z0 = tonumber(msg.job.z0) or q.z0
+      q.z1 = tonumber(msg.job.z1) or q.z1
     end
     if msg.finished or msg.status == "done" or t == "quarry_done" then
       q.status = "done"
@@ -355,6 +412,9 @@ local function synthesizeQuarryFromTurtles()
       end
       list[#list + 1] = {
         id = id, name = t.name, y0 = t.y0, y1 = t.y1,
+        x0 = t.x0, x1 = t.x1, z0 = t.z0, z1 = t.z1,
+        posX = t.posX, posY = t.posY, posZ = t.posZ,
+        lastPosAt = t.lastPosAt, sos = t.sos,
         dug = t.dug, idx = t.idx, total = t.total, bpc = t.bpc,
         fuel = t.fuel, status = t.status, age = age,
         job = t.job,
@@ -760,15 +820,15 @@ local function synthesizeBoardSnap()
       status = st, seen = now(),
       homeRouter = n.homeRouter,
     }
-    if role == "main" then
+    if role == "main" or row.kind == "main" then
+      row.kind = "main"
       mainId, mainName = n.id, n.name
       if n.x then mainGps = { hosting = true, x = n.x, y = n.y, z = n.z } end
       globalRows[#globalRows + 1] = row
       gon = gon + 1
-    elseif role == "router" then
-      globalRows[#globalRows + 1] = row
-      gon = gon + 1
     else
+      -- Extender routers / modems / devices stay on LOCAL, not GLOBAL.
+      if role == "router" then row.kind = "extender" end
       localRows[#localRows + 1] = row
       lon = lon + 1
     end
@@ -1156,9 +1216,10 @@ local function drawQuarryBoard(L)
     return
   end
   local name = tostring(snap.name or ("#" .. tostring(snap.siteId or "?")))
-  guiText(out, 1 + L.pad, 2, ("%s  %dx%d × %dY  [%s]"):format(
+  guiText(out, 1 + L.pad, 2, ("%s  %dx%d × %dY  [%s/%s]"):format(
     name:sub(1, 12),
     tonumber(snap.W) or 0, tonumber(snap.L) or 0, tonumber(snap.H) or 0,
+    tostring(snap.pattern or "column"),
     tostring(snap.fraction or "?")), colors.white, colors.black)
   local pct = tonumber(snap.pct) or 0
   guiText(out, 1 + L.pad, 3, ("Progress  %d%%   %s / %s"):format(
@@ -1184,31 +1245,38 @@ local function drawQuarryBoard(L)
     tostring(snap.maxTravel or "?"),
     tostring(age or "?")), colors.lightGray, colors.black)
   local y = 7
-  guiText(out, 1 + L.pad, 6, "ID   Y-band   BPC   PROG  STATUS", colors.orange or colors.yellow, colors.black)
+  guiText(out, 1 + L.pad, 6, "ID  CLAIM    @LAST POS     ST", colors.orange or colors.yellow, colors.black)
   local list = snap.turtles or {}
   for _, t in ipairs(list) do
     if y >= L.h - L.footerH then break end
     local pend = quarryAssigns[t.id]
-    local band = (t.y0 and t.y1) and ("%d-%d"):format(t.y0, t.y1) or "-"
+    local band = "-"
+    if t.x0 ~= nil then
+      band = ("X%dZ%d"):format(t.x0, t.z0 or 0)
+    elseif t.y0 and t.y1 then
+      band = ("%d-%d"):format(t.y0, t.y1)
+    end
     if pend and not pend.acked then
       band = ("%d-%d*"):format(pend.y0, pend.y1)
-    elseif pend and pend.acked and (not t.y0) then
+    elseif pend and pend.acked and (not t.y0) and t.x0 == nil then
       band = ("%d-%d"):format(pend.y0, pend.y1)
     end
-    local prog = "-"
-    if t.total and t.total > 0 and t.idx then
-      prog = ("%d%%"):format(math.floor(100 * math.min(1, ((t.idx or 1) - 1) / t.total)))
-    end
     local st = tostring(t.status or "?")
-    if pend and not pend.acked then st = "waitAck"
+    if t.sos or st == "sos" then st = "SOS"
+    elseif pend and not pend.acked then st = "waitAck"
     elseif (t.age or 0) >= 45 then st = "stale" end
+    local last = "-"
+    if t.posX ~= nil then
+      last = ("%d,%d,%d"):format(t.posX, t.posY or 0, t.posZ or 0)
+    end
     local col = colors.white
-    if st == "mining" or st == "assigned" then col = colors.lime
+    if st == "SOS" then col = colors.red
+    elseif st == "mining" or st == "assigned" then col = colors.lime
     elseif st == "waitAck" then col = colors.orange or colors.yellow
     elseif st == "done" then col = colors.lightGray
     elseif st == "stale" then col = colors.red end
-    guiText(out, 1 + L.pad, y, ("#%-3d %-8s %-5s %-5s %s"):format(
-      t.id or 0, band, tostring(t.bpc or "?"):sub(1, 5), prog, st), col, colors.black)
+    guiText(out, 1 + L.pad, y, ("#%-3d %-7s %-12s %s"):format(
+      t.id or 0, band:sub(1, 7), last:sub(1, 12), st), col, colors.black)
     y = y + 1
   end
   if #list == 0 then
@@ -1216,7 +1284,7 @@ local function drawQuarryBoard(L)
     y = y + 1
   end
   if y < L.h - L.footerH then
-    guiText(out, 1 + L.pad, L.h - L.footerH, "assign: quarry assign <id> <y0> <y1>", colors.gray, colors.black)
+    guiText(out, 1 + L.pad, L.h - L.footerH, "last @ = relative quarry pose; SOS=out of fuel", colors.gray, colors.black)
   end
 end
 

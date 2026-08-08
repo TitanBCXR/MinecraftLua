@@ -5,19 +5,19 @@
   The console `packages` command shows these names + versions.
   Installers / OTA updates ship this file so devices know what they have.
 
-  Titan-Version: 1.5.16
+  Titan-Version: 1.5.19
 ]]
 
 return {
-  system = "1.5.16",
+  system = "1.5.19",
   packages = {
     ["lib/titan.lua"]      = "1.2.19",
     ["console.lua"]        = "1.1.8",
     ["router.lua"]         = "1.4.2",
     ["router_main.lua"]    = "1.4.1",
     ["router_modem.lua"]   = "1.4.0",
-    ["lib/router_hub_net.lua"] = "1.4.1",
-    ["lib/router_hub_ui.lua"]  = "1.4.1",
+    ["lib/router_hub_net.lua"] = "1.4.2",
+    ["lib/router_hub_ui.lua"]  = "1.4.2",
     ["lib/router_hub_cmd.lua"] = "1.4.1",
     ["host.lua"]           = "1.1.15",
     ["install.lua"]        = "1.1.19",
@@ -29,10 +29,10 @@ return {
     ["worker.lua"]         = "1.2.4",
     ["botserver.lua"]      = "1.2.5",
     ["datacenter.lua"]     = "1.2.13",
-    ["admin.lua"]          = "1.4.6",
+    ["admin.lua"]          = "1.4.7",
     ["miner.lua"]          = "1.3.1",
-    ["offline_miner.lua"]  = "1.2.6",
-    ["offline_site.lua"]   = "1.0.9",
+    ["offline_miner.lua"]  = "1.3.2",
+    ["offline_site.lua"]   = "1.1.0",
     ["loader.lua"]         = "1.0.1",
     ["marker.lua"]         = "1.1.0",
     ["storage_manager.lua"]= "1.0.4",
@@ -41,6 +41,6 @@ return {
     ["perimeter_sensor.lua"] = "1.2.2",
     ["perimeter_manager.lua"]= "1.3.1",
     ["exclude.txt"]        = "1.0.1",
-    ["versions.lua"]       = "1.5.16",
+    ["versions.lua"]       = "1.5.19",
   },
 }

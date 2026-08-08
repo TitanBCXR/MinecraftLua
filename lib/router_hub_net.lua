@@ -1,6 +1,6 @@
 --[[
   lib/router_hub_net.lua  -  Titan hub networking / roster / OTA (part)
-  Titan-Version: 1.4.1
+  Titan-Version: 1.4.2
 
   Loaded by router_main.lua into a shared env (setfenv). Do not run directly.
 ]]
@@ -23,10 +23,16 @@ function isMain() return routerRole == "main" end
 function isModemRole() return routerRole == "modem" end
 function isBackbone() return routerRole == "main" or routerRole == "router" end
 function roleKind()
-  if routerRole == "main" then return "router" end
-  if routerRole == "router" then return "router" end
+  -- GLOBAL board only lists MAIN hubs. Extenders are "extender", RF cells "modem".
+  if routerRole == "main" then return "main" end
+  if routerRole == "router" then return "extender" end
   return "modem"
 end
+
+-- Active turtle fuel SOS alerts (drawn on every MAIN monitor).
+sosAlerts = sosAlerts or {}   -- [id] = { name, x, y, z, reason, seen }
+sosOverlay = false
+SOS_FRESH_SECS = 20
 
 --------------------------------------------------------------------------------
 -- Network links: ender backbone peers + local modem cells
@@ -249,16 +255,26 @@ function handleNetControl(id, msg)
     end
     return true
   elseif t == "net_link_hello" then
-    if msg.role == "main" or msg.role == "router" or msg.kind == "router" then
+    local role = tostring(msg.role or ""):lower()
+    local kind = tostring(msg.kind or ""):lower()
+    if role == "main" or kind == "main" or msg.main == true then
       if netPeers[id] or isBackbone() then
-        netPeers[id] = netPeers[id] or { name = msg.name, kind = "router", seen = 0 }
+        netPeers[id] = netPeers[id] or { name = msg.name, kind = "main", seen = 0 }
         netPeers[id].name = msg.name or netPeers[id].name
+        netPeers[id].kind = "main"
         netPeers[id].seen = os.epoch("utc")
-        if msg.role == "main" and not isMain() then
+        if not isMain() then
           patchRouterCfg({ mainRouterId = id })
         end
       end
-    elseif msg.role == "modem" or msg.kind == "modem" then
+    elseif role == "router" or kind == "router" or kind == "extender" then
+      if netPeers[id] or isBackbone() then
+        netPeers[id] = netPeers[id] or { name = msg.name, kind = "extender", seen = 0 }
+        netPeers[id].name = msg.name or netPeers[id].name
+        netPeers[id].kind = "extender"
+        netPeers[id].seen = os.epoch("utc")
+      end
+    elseif role == "modem" or kind == "modem" then
       if isBackbone() and (netCells[id] or tonumber(msg.homeRouter) == os.getComputerID()) then
         addNetCell(id, msg.name)
       end
@@ -961,11 +977,56 @@ function runForceUpdate(scope, opts)
   end
 end
 
+function noteTurtleSos(id, msg)
+  id = tonumber(id)
+  if not id or type(msg) ~= "table" then return end
+  if msg.type == "quarry_sos_clear" or msg.sos == false then
+    sosAlerts[id] = nil
+    local any = false
+    for _ in pairs(sosAlerts) do any = true; break end
+    if not any then sosOverlay = false end
+    return
+  end
+  sosAlerts[id] = {
+    name = msg.name or msg.hostname or ("Turtle-" .. id),
+    x = tonumber(msg.posX) or tonumber(msg.x),
+    y = tonumber(msg.posY) or tonumber(msg.y),
+    z = tonumber(msg.posZ) or tonumber(msg.z),
+    reason = msg.reason or "out_of_fuel",
+    seen = os.epoch("utc"),
+  }
+  sosOverlay = true
+  -- Wake every board so the SOS is visible even if screensaver was up.
+  if SCREEN_ROLES then
+    for _, role in ipairs(SCREEN_ROLES) do
+      screenOn[role] = true
+    end
+  end
+  if boardWakeAt ~= nil then boardWakeAt = os.clock() end
+  print(("[SOS] #%d %s out of fuel @ %s,%s,%s"):format(
+    id, tostring(sosAlerts[id].name),
+    tostring(sosAlerts[id].x or "?"),
+    tostring(sosAlerts[id].y or "?"),
+    tostring(sosAlerts[id].z or "?")))
+end
+
+function pruneSosAlerts()
+  local nowMs = os.epoch("utc")
+  for id, a in pairs(sosAlerts) do
+    if not a.seen or (nowMs - a.seen) > (SOS_FRESH_SECS * 1000 * 3) then
+      sosAlerts[id] = nil
+    end
+  end
+  local any = false
+  for _ in pairs(sosAlerts) do any = true; break end
+  if not any then sosOverlay = false end
+end
+
 function claimMain()
   local rname = os.getComputerLabel() or ("Router-" .. os.getComputerID())
   local msg = {
     type = "main_claim", id = os.getComputerID(),
-    label = rname, hostname = rname, kind = "router",
+    label = rname, hostname = rname, kind = "main", role = "main", main = true,
   }
   if gpsCoords then
     msg.x, msg.y, msg.z = gpsCoords.x, gpsCoords.y, gpsCoords.z
@@ -979,15 +1040,17 @@ function broadcastFleetMap()
   local rname = os.getComputerLabel() or ("Router-" .. os.getComputerID())
   if gpsCoords then
     nodes[#nodes + 1] = {
-      id = os.getComputerID(), name = rname, kind = "router",
+      id = os.getComputerID(), name = rname, kind = "main", main = true,
       x = gpsCoords.x, y = gpsCoords.y, z = gpsCoords.z,
     }
   end
   for id, d in pairs(seen) do
-    if d.x and d.z and (d.kind == "modem" or d.kind == "router") then
+    local k = tostring(d.kind or "")
+    if d.x and d.z and (k == "modem" or k == "main" or k == "router" or k == "extender") then
       nodes[#nodes + 1] = {
         id = id, name = d.hostname or d.name or ("#" .. id),
-        kind = d.kind, x = d.x, y = d.y, z = d.z,
+        kind = (k == "router" and d.role ~= "main" and not d.main) and "extender" or k,
+        x = d.x, y = d.y, z = d.z,
       }
     end
   end
@@ -1502,36 +1565,53 @@ function rosterTouch(id, msg, kind, doAssign)
 end
 
 -- Fold a remote hub's topology into the GLOBAL roster (MAIN only).
+-- GLOBAL lists Main routers only — extenders/modems stay off that board.
 function ingestRemoteTopology(id, msg)
   if not isMain() or type(msg) ~= "table" then return end
   if id == os.getComputerID() then return end
-  local role = tostring(msg.role or msg.kind or "")
-  if role == "main" or role == "router" or msg.kind == "router" then
+  local role = tostring(msg.role or ""):lower()
+  local kind = tostring(msg.kind or ""):lower()
+  if role == "main" or kind == "main" or msg.main == true then
     rosterTouch(id, {
-      hostname = msg.name, name = msg.name, kind = "router",
+      hostname = msg.name, name = msg.name, kind = "main",
       x = msg.x, y = msg.y, z = msg.z,
-      scope = "global", remote = true, role = msg.role,
-    }, "router", false)
+      scope = "global", remote = true, role = "main", main = true,
+    }, "main", false)
+    -- Remember extender peers for mesh routing, but do NOT put them on GLOBAL.
+    for _, peer in ipairs(msg.peers or {}) do
+      local pid = tonumber(peer.id)
+      if pid and pid ~= os.getComputerID() then
+        local pkind = tostring(peer.kind or "extender"):lower()
+        if pkind == "main" then
+          rosterTouch(pid, {
+            hostname = peer.name, name = peer.name, kind = "main",
+            scope = "global", remote = true, via = id, main = true, role = "main",
+          }, "main", false)
+        else
+          rosterTouch(pid, {
+            hostname = peer.name, name = peer.name, kind = "extender",
+            scope = "local", remote = false, via = id, role = "router",
+          }, "extender", false)
+        end
+      end
+    end
     for _, cell in ipairs(msg.cells or {}) do
       local cid = tonumber(cell.id)
       if cid then
         rosterTouch(cid, {
           hostname = cell.name, name = cell.name, kind = "modem",
-          homeRouter = id, via = id, scope = "global", remote = true,
+          homeRouter = id, via = id, scope = "local",
           hub = msg.name,
         }, "modem", false)
       end
     end
-    for _, peer in ipairs(msg.peers or {}) do
-      local pid = tonumber(peer.id)
-      if pid and pid ~= os.getComputerID() then
-        rosterTouch(pid, {
-          hostname = peer.name, name = peer.name, kind = "router",
-          scope = "global", remote = true, via = id,
-        }, "router", false)
-      end
-    end
-  elseif role == "modem" or msg.kind == "modem" then
+  elseif role == "router" or kind == "router" or kind == "extender" then
+    rosterTouch(id, {
+      hostname = msg.name, name = msg.name, kind = "extender",
+      x = msg.x, y = msg.y, z = msg.z,
+      scope = "local", remote = false, role = "router",
+    }, "extender", false)
+  elseif role == "modem" or kind == "modem" then
     local home = tonumber(msg.homeRouter)
     if home == os.getComputerID() or netCells[id] then
       rosterTouch(id, {
@@ -1542,7 +1622,7 @@ function ingestRemoteTopology(id, msg)
     elseif home then
       rosterTouch(id, {
         hostname = msg.name, name = msg.name, kind = "modem",
-        homeRouter = home, scope = "global", remote = true,
+        homeRouter = home, scope = "local",
         x = msg.x, y = msg.y, z = msg.z,
       }, "modem", false)
     end
@@ -1563,6 +1643,10 @@ function directoryLoop()
     end
     local id, msg, proto = rednet.receive(nil, math.max(0.2, nextLinkHello - os.clock()))
     if type(msg) == "table" and id then
+      -- Urgent turtle fuel SOS — any protocol; show on all MAIN monitors.
+      if msg.type == "quarry_sos" or msg.type == "quarry_sos_clear" then
+        noteTurtleSos(id, msg)
+      end
       if proto == PROTO_ROUTER and handleNetControl(id, msg) then
         if msg.type == "net_link_hello" or msg.type == "net_topo" then
           ingestRemoteTopology(id, msg)
@@ -1719,40 +1803,35 @@ function isScreenRole(role)
   return false
 end
 
--- Local = this hub's RF/wired cell. Global = backbone peers + remote mesh.
+-- Local = this hub's RF/wired cell + extender peers. Global = MAIN routers only.
+function isMainDevice(id, d)
+  if not d then return false end
+  if id == os.getComputerID() then return isMain() end
+  if d.main == true then return true end
+  if tostring(d.role or ""):lower() == "main" then return true end
+  if tostring(d.kind or ""):lower() == "main" then return true end
+  return false
+end
+
 function isLocalDevice(id, d)
   if not d then return false end
+  if isMainDevice(id, d) and id ~= os.getComputerID() then return false end
   if id == os.getComputerID() then return true end
   if d.scope == "local" then return true end
-  if d.scope == "global" or d.remote then return false end
   if d.wired or isWiredFresh(id) then return true end
   if netCells[id] then return true end
   if tonumber(d.homeRouter) == os.getComputerID() then return true end
   local viaM = tonumber(d.viaModem)
   if viaM and netCells[viaM] then return true end
-  local via = tonumber(d.via)
-  if via and netPeers[via] then return false end
-  -- Backbone peer hubs are global, not local.
-  if netPeers[id] then return false end
   local k = tostring(d.kind or ""):lower()
-  if k == "router" and id ~= os.getComputerID() then return false end
+  if k == "extender" or k == "modem" or k == "device" then return true end
   -- Direct / unmarked online devices count as local to this hub.
-  return true
+  return not isMainDevice(id, d)
 end
 
 function isGlobalDevice(id, d)
-  if not d then return false end
-  if id == os.getComputerID() then return true end -- show self on global too as hub
-  if d.scope == "global" or d.remote then return true end
-  if netPeers[id] then return true end
-  local k = tostring(d.kind or ""):lower()
-  if k == "router" then return true end
-  if tonumber(d.homeRouter) and tonumber(d.homeRouter) ~= os.getComputerID() then return true end
-  local via = tonumber(d.via)
-  if via and netPeers[via] then return true end
-  local viaM = tonumber(d.viaModem)
-  if viaM and not netCells[viaM] and viaM ~= os.getComputerID() then return true end
-  return not isLocalDevice(id, d)
+  -- GLOBAL MESH = Main routers only (never extenders, modems, turtles, etc).
+  return isMainDevice(id, d)
 end
 
 function sortedIdsScoped(scope)

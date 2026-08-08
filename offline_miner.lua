@@ -1,6 +1,6 @@
 --[[
   offline_miner.lua  -  Local quarry turtle (optional site board)
-  Titan-Version: 1.2.6
+  Titan-Version: 1.3.2
 
   Place the turtle at the TOP-FRONT-LEFT corner of the dig, facing into the
   mine. That cell is origin 0,0,0:
@@ -15,21 +15,29 @@
     * Slot 15 = wireless modem
     * Pickaxe on turtle upgrade slot 2 (RIGHT) — modem only swaps with that side
       (left upgrade / chunk loader is never touched)
-    * Site computer (optional) LEFT of the storage chest — multi-turtle Y claims
+    * Site computer (optional) LEFT of the storage chest — multi-turtle claims
 
-  box / area — ALWAYS 1 Y-layer at a time (walk the plane, then drop one).
-               Never digs 2 high; no player headroom on quarry jobs.
+  box / area (solo) — ALWAYS 1 Y-layer at a time (walk the plane, then drop one).
+  Site dig mode `column` — claim a 2×2 XZ patch and dig shafts down.
+  Site dig mode `layer`  — claim a Y band across the whole footprint.
+
+  Never attack / dig other turtles — path around them (own-right: R F L F L F R).
+
+  Out of fuel: computer still runs. Swaps modem on and broadcasts SOS to the
+  admin tablet and MAIN router monitors until coal is restored.
 
   Modem (slot 15):
     Swaps only with RIGHT upgrade (slot 2 pickaxe) for site/admin check-ins:
     every depot dump, and at the end of each dig line (before next row / layer).
     join                     find site board (optional)
-    mine                     claim a Y band when a site is online
+    mine                     claim from site until none left
     site                     show site / BPC / broadcast status
 
   Job memory (offline_miner_job.cfg):
-    Progress is saved as you dig. After stop / reboot / dump, put the turtle
-    back at origin (0,0,0 facing in) and run `continue`.
+    Progress + pose are saved as you dig (also synced to the site board).
+    On reboot the turtle asks the site board for an in-progress job and
+    auto-continues when fuel allows. If fuel is only enough to reach the
+    depot, it refuels there first, then continues.
 
   Commands (sizes as WxH or WxHxD — zeros are just placeholders in the docs):
     area <W>x<L> <stopY>     width × length, dig down stopY layers from origin
@@ -39,13 +47,15 @@
     stair <W>x<steps> <up|down>
                              player-tall stepped ramp
     equip | tool | pick      equip best pickaxe from inventory (left/right)
-    continue | resume        resume saved job from origin
+    continue | resume        resume saved / site job (depot-first if low fuel)
+    mode online|offline      online = site/admin; offline = solo (no site)
     job | clearjob           show / forget saved job
     home | dump | refuel | setup | stop | status | help
 
   Optional: exclude.txt (same format as the network miner) — never break those.
 
-  Solo: no modem needed. Admin progress: modem. Multi Y-band: modem + offline_site.
+  mode offline — solo dig (area/box/…), no site board or admin check-ins.
+  mode online  — modem + site claims / admin tablet (join, mine, reboot sync).
   Run:  offline_miner
 ]]
 
@@ -85,7 +95,8 @@ local exclude = {}
 local cfg = {
   setupDone = false,
   label = nil,
-  pattern = "column",  -- "column" | "layer"
+  pattern = "column",  -- dig style: "column" | "layer"
+  mode = "online",     -- network: "online" (site/admin) | "offline" (solo)
   siteId = nil,
   pendingAssign = nil,
 }
@@ -107,6 +118,21 @@ local function normalizePattern(p)
   return nil
 end
 
+local function normalizeNetMode(m)
+  m = tostring(m or ""):lower()
+  if m == "on" or m == "online" or m == "site" or m == "net" then return "online" end
+  if m == "off" or m == "offline" or m == "solo" or m == "local" then return "offline" end
+  return nil
+end
+
+local function isOnlineMode()
+  return (normalizeNetMode(cfg.mode) or "online") == "online"
+end
+
+local function isOfflineMode()
+  return not isOnlineMode()
+end
+
 --------------------------------------------------------------------------------
 -- Config / exclude
 --------------------------------------------------------------------------------
@@ -119,6 +145,7 @@ local function loadCfg()
     for k, v in pairs(d) do cfg[k] = v end
   end
   cfg.pattern = normalizePattern(cfg.pattern) or "column"
+  cfg.mode = normalizeNetMode(cfg.mode) or "online"
 end
 
 local function saveCfg()
@@ -285,6 +312,36 @@ local function burnSomeFuel()
   coalBurned = coalBurned + burn
   return turtle.getFuelLevel()
 end
+
+-- True when tank is empty and no burnable fuel items remain.
+-- Computer still runs at 0 fuel (modem / rednet / UI); only move/dig need fuel.
+local function hasFuelItems()
+  consolidateFuelToSlot16()
+  for s = 1, 16 do
+    if turtle.getItemCount(s) > 0 then
+      turtle.select(s)
+      if selectedIsFuel() then return true end
+    end
+  end
+  return false
+end
+
+local function tankEmpty()
+  local level = turtle.getFuelLevel()
+  return level ~= "unlimited" and (not level or level < 1)
+end
+
+local function needsFuelSos()
+  if not tankEmpty() then return false end
+  if hasFuelItems() then
+    burnSomeFuel()
+    return tankEmpty()
+  end
+  return true
+end
+
+local broadcastSos
+local clearSos
 
 local function ensureFuel()
   local level = turtle.getFuelLevel()
@@ -590,21 +647,62 @@ end
 --------------------------------------------------------------------------------
 -- Pathing in local coords
 --------------------------------------------------------------------------------
+-- Other turtles are entities (not diggable). Never attack them — go around.
+local function tryStepForward(digBlocks)
+  if STOP then return false, "stop" end
+  if not ensureFuel() then
+    if needsFuelSos() and broadcastSos then broadcastSos("out_of_fuel") end
+    return false, "fuel"
+  end
+  if digBlocks then digDir("forward") end
+  if turtle.detect() then
+    -- Solid block ahead — dig only (never attack; turtles aren't blocks).
+    digDir("forward")
+  end
+  if not turtle.detect() then
+    if turtle.forward() then
+      applyForwardStep()
+      return true
+    end
+    -- No block, but can't move → entity (usually another turtle).
+    return false, "turtle"
+  end
+  return false, "blocked"
+end
+
+-- Each turtle steers to its own right: R, F, L, F, L, F, R.
+local function goAroundRight()
+  print("Turtle ahead — going around to my right...")
+  turnRight()
+  if not tryStepForward(true) then turnLeft(); return false, "bypass" end
+  turnLeft()
+  if not tryStepForward(true) then return false, "bypass" end
+  turnLeft()
+  if not tryStepForward(true) then return false, "bypass" end
+  turnRight()
+  return true
+end
+
 local function moveForward()
   if STOP then return false, "stop" end
   if not ensureFuel() then return false, "fuel" end
-  -- Exactly one block forward — dig, then a single turtle.forward().
-  for _ = 1, 8 do
-    digDir("forward")
-    if turtle.attack() then sleep(0.05) end
-    if not turtle.detect() then
-      if turtle.forward() then
-        applyForwardStep()
-        return true
-      end
+  -- Exactly one block forward — dig blocks, never attack turtles.
+  for _ = 1, 6 do
+    local ok, err = tryStepForward(true)
+    if ok then return true end
+    if err == "turtle" then
+      local around = goAroundRight()
+      if around then return true end
+      -- Both turtles may try right at once; wait and retry.
+      sleep(0.4)
+    elseif err == "fuel" or err == "stop" then
+      return false, err
+    else
+      sleep(0.05)
     end
-    sleep(0.05)
   end
+  -- Last chance: right-hand bypass once more.
+  if goAroundRight() then return true end
   return false, "blocked"
 end
 
@@ -767,10 +865,76 @@ local function saveJobFile(j)
   j.dug = dug
   j.skipped = skipped
   j.updated = os.epoch("utc")
+  -- Persist pose so a reboot can keep digging without a player re-seat.
+  j.posX, j.posY, j.posZ = pos.x, pos.y, pos.z
+  j.facing = facing
   local f = fs.open(JOB_FILE, "w")
   f.write(textutils.serialize(j))
   f.close()
   activeJob = j
+end
+
+local function restorePoseFromJob(j)
+  if type(j) ~= "table" then return false end
+  if j.posX == nil and j.posY == nil and j.posZ == nil then return false end
+  -- Turtle body still faces the pre-reboot direction — only restore odometry.
+  pos.x = math.floor(tonumber(j.posX) or 0)
+  pos.y = math.floor(tonumber(j.posY) or 0)
+  pos.z = math.floor(tonumber(j.posZ) or 0)
+  facing = math.floor(tonumber(j.facing) or 0) % 4
+  print(("Restored pose %d,%d,%d face=%d"):format(pos.x, pos.y, pos.z, facing))
+  return true
+end
+
+-- Tank fuel + estimated value of remaining fuel items (after a light top-up burn).
+local function estimateFuelUnits()
+  local level = turtle.getFuelLevel()
+  if level == "unlimited" then return math.huge end
+  consolidateFuelToSlot16()
+  burnSomeFuel()
+  level = turtle.getFuelLevel()
+  if level == "unlimited" then return math.huge end
+  local total = tonumber(level) or 0
+  for s = 1, 16 do
+    if turtle.getItemCount(s) > 0 then
+      turtle.select(s)
+      if selectedIsFuel() then
+        local d = itemDetail(s)
+        local name = d and tostring(d.name or ""):lower() or ""
+        local per = 80
+        if name:find("coal_block", 1, true) then per = 800
+        elseif name:find("lava", 1, true) then per = 1000
+        elseif name:find("blaze", 1, true) then per = 120
+        elseif name:find("dried_kelp_block", 1, true) then per = 4000
+        end
+        total = total + turtle.getItemCount(s) * per
+      end
+    end
+  end
+  turtle.select(FUEL_SLOT)
+  return total
+end
+
+-- "continue" = enough to keep mining; "depot" = only enough to reach home; "sos" = stranded.
+local function resumeFuelPlan()
+  local fuel = estimateFuelUnits()
+  local home = distHome()
+  local margin = 10
+  if fuel == math.huge then return "continue", fuel, home end
+  if home > 0 and fuel < home + margin then
+    return "sos", fuel, home
+  end
+  -- Need a comfortable surplus beyond the walk home before we dig in place.
+  if fuel >= math.max(MIN_FUEL, home + 48) then
+    return "continue", fuel, home
+  end
+  if home == 0 and fuel >= MIN_FUEL then
+    return "continue", fuel, home
+  end
+  if fuel >= home + margin then
+    return "depot", fuel, home
+  end
+  return "sos", fuel, home
 end
 
 local function clearJobFile(opts)
@@ -784,6 +948,11 @@ end
 local function jobSummary(j)
   if not j then return "(none)" end
   if j.type == "area" then
+    if j.x0 ~= nil then
+      return ("col X%d-%d Z%d-%d H=%d  step %d/%d  [%s]"):format(
+        j.x0, j.x1 or j.x0, j.z0, j.z1 or j.z0, j.H or ((j.y1 or 0) - (j.y0 or 0) + 1),
+        tonumber(j.idx) or 1, tonumber(j.total) or 0, tostring(j.status or "?"))
+    end
     if j.y0 ~= nil and j.y1 ~= nil then
       return ("area %dx%d Y%d-%d %s  step %d/%d  [%s]"):format(
         j.W or 0, j.L or j.D or 0, j.y0, j.y1, tostring(j.pattern or "layer"),
@@ -853,6 +1022,11 @@ local checkIn
 -- timeout — deep Y bands stay down until slots fill.
 local function manageInventory(resume)
   local full = inventoryFull()
+  if needsFuelSos() then
+    -- Can't walk home at 0 fuel — SOS in place (computer still runs).
+    if broadcastSos then broadcastSos("out_of_fuel") end
+    if needsFuelSos() then return false, "fuel" end
+  end
   local fuelOk = ensureFuel()
   if not full and fuelOk then return true end
   if full then
@@ -865,9 +1039,18 @@ local function manageInventory(resume)
     saveJobFile(activeJob)
   end
   local rx, ry, rz = pos.x, pos.y, pos.z
-  if not goHome() then return false, "home" end
+  if not goHome() then
+    if needsFuelSos() and broadcastSos then
+      broadcastSos("stranded_no_fuel")
+    end
+    return false, "home"
+  end
   dumpToStorage()
   suckFuelFromLeft()
+  if needsFuelSos() and broadcastSos then
+    broadcastSos("depot_empty_fuel")
+    if needsFuelSos() then return false, "fuel" end
+  end
   -- Check in at every depot so admin/site see progress + can deliver Y assigns.
   if checkIn then
     checkIn("depot", { status = "depot", resumeAt = { x = rx, y = ry, z = rz } })
@@ -916,6 +1099,25 @@ local function boxColumnUnits(W, D)
       for x = 0, W - 1 do units[#units + 1] = { x = x, z = z } end
     else
       for x = W - 1, 0, -1 do units[#units + 1] = { x = x, z = z } end
+    end
+  end
+  return units
+end
+
+-- Column claim: dig shafts only inside x0..x1 × z0..z1 (usually a 2×2).
+local function columnClaimUnits(x0, x1, z0, z1)
+  local units = {}
+  x0 = math.floor(tonumber(x0) or 0)
+  x1 = math.floor(tonumber(x1) or x0)
+  z0 = math.floor(tonumber(z0) or 0)
+  z1 = math.floor(tonumber(z1) or z0)
+  if x1 < x0 then x0, x1 = x1, x0 end
+  if z1 < z0 then z0, z1 = z1, z0 end
+  for z = z0, z1 do
+    if (z - z0) % 2 == 0 then
+      for x = x0, x1 do units[#units + 1] = { x = x, z = z } end
+    else
+      for x = x1, x0, -1 do units[#units + 1] = { x = x, z = z } end
     end
   end
   return units
@@ -1211,6 +1413,7 @@ local function sitePayload(extra)
     coal = coalBurned,
     status = (activeJob and activeJob.status) or "idle",
     hasSite = siteId ~= nil,
+    posX = pos.x, posY = pos.y, posZ = pos.z,
   }
   local j = activeJob or loadJobFile()
   if j then
@@ -1220,14 +1423,24 @@ local function sitePayload(extra)
     msg.total = j.total
     msg.y0 = j.y0 or msg.y0
     msg.y1 = j.y1 or msg.y1
+    msg.x0 = j.x0 or msg.x0
+    msg.x1 = j.x1 or msg.x1
+    msg.z0 = j.z0 or msg.z0
+    msg.z1 = j.z1 or msg.z1
+    msg.pattern = j.pattern or msg.pattern
     local W, L, H = footprintFromJob(j)
     if W then msg.W, msg.L, msg.H = W, L, H end
   elseif siteInfo then
     msg.y0 = siteInfo.y0
     msg.y1 = siteInfo.y1
+    msg.x0 = siteInfo.x0
+    msg.x1 = siteInfo.x1
+    msg.z0 = siteInfo.z0
+    msg.z1 = siteInfo.z1
     msg.W = siteInfo.W
     msg.L = siteInfo.L
     msg.H = siteInfo.H
+    msg.pattern = siteInfo.pattern
   end
   if type(extra) == "table" then
     for k, v in pairs(extra) do
@@ -1424,10 +1637,12 @@ local function pollAssignReplies(timeout)
   end
 end
 
--- Broadcast mine data for admin (always). Also unicast to site board when joined.
+-- Broadcast mine data for admin. Also unicast to site board when joined.
 -- Swaps slot-15 modem over RIGHT pickaxe only, then restores the pickaxe.
+-- Offline mode: no site/admin traffic (solo dig).
 local function publishMine(extra)
   extra = extra or {}
+  if isOfflineMode() then return false end
   local modemOk = ensureModemForComms(true)
   if not modemOk then
     modemOk = openModem()
@@ -1520,6 +1735,64 @@ checkIn = function(reason, extra)
   return ok
 end
 
+local sosActive = false
+
+-- Fuel empty: computer still runs — keep modem up and scream SOS until coal returns.
+broadcastSos = function(reason)
+  reason = reason or "out_of_fuel"
+  sosActive = true
+  if activeJob then
+    activeJob.status = "sos"
+    saveJobFile(activeJob)
+  end
+  print("========== SOS: OUT OF FUEL ==========")
+  print(("Last pose %d,%d,%d  (relative to origin)"):format(pos.x, pos.y, pos.z))
+  print("Computer stays online — broadcasting to admin + MAIN monitors.")
+  print("Put coal in slot 16 (or left chest if you can reach the turtle).")
+  while sosActive and not STOP do
+    if not needsFuelSos() then
+      clearSos()
+      print("Fuel restored — SOS cleared.")
+      return true
+    end
+    ensureModemForComms(true)
+    local msg = sitePayload({
+      sos = true,
+      urgent = true,
+      reason = reason,
+      status = "sos",
+      checkIn = "sos",
+    })
+    msg.type = "quarry_sos"
+    rednetPublish(msg)
+    -- Extra loud for router monitors that listen on titan_router.
+    rednet.broadcast(msg, PROTO_ROUTER)
+    rednet.broadcast(msg, PROTO_NET)
+    print(("[SOS] out of fuel @ %d,%d,%d"):format(pos.x, pos.y, pos.z))
+    -- Peek inventory while waiting (player may drop coal in).
+    local deadline = os.clock() + 2.5
+    while os.clock() < deadline and sosActive and not STOP do
+      if not needsFuelSos() then
+        clearSos()
+        print("Fuel restored — SOS cleared.")
+        return true
+      end
+      sleep(0.25)
+    end
+  end
+  return false
+end
+
+clearSos = function()
+  if not sosActive then return end
+  sosActive = false
+  ensureModemForComms(true)
+  local msg = sitePayload({ sos = false, status = "idle", checkIn = "sos_clear" })
+  msg.type = "quarry_sos_clear"
+  rednetPublish(msg)
+  if digging then restorePickAfterComms() end
+end
+
 -- Push offline_miner_job.cfg to site (if any) and broadcast for admin.
 siteSendJob = function(j, clearing)
   if clearing or not j then
@@ -1537,6 +1810,12 @@ end
 local function joinSite(timeout, quiet)
   timeout = tonumber(timeout) or 6
   quiet = quiet == true
+  if isOfflineMode() then
+    if not quiet then
+      print("Offline mode — site/admin disabled. Use `mode online` first.")
+    end
+    return false
+  end
   if not ensureModemForComms(quiet) then
     if not quiet then
       print("No modem in slot " .. MODEM_SLOT .. " — solo dig only (no site/admin link).")
@@ -1561,11 +1840,11 @@ local function joinSite(timeout, quiet)
       cfg.siteId = id
       saveCfg()
       if not quiet then
-        print(("Joined site #%d  %dx%d × %dY  claim=%s  minBPC=%s  maxTravel=%s"):format(
+        print(("Joined site #%d  %dx%d × %dY  mode=%s  claim=%s  maxTravel=%s"):format(
           id,
           tonumber(msg.W) or 0, tonumber(msg.L) or 0, tonumber(msg.H) or 0,
+          tostring(msg.pattern or "column"),
           tostring(msg.fraction or "?"),
-          tostring(msg.minBpc or "?"),
           tostring(msg.maxTravel or "?")))
       end
       found = true
@@ -1594,24 +1873,29 @@ local function joinSite(timeout, quiet)
   return found
 end
 
--- Pull offline_miner_job.cfg from the site board when we have none locally.
-fetchJobFromSite = function(timeout, quiet)
+-- Pull offline_miner_job.cfg from the site board.
+-- force=true: always ask the board (for reboot sync), even if a local job exists.
+-- When force, returns the site job table without overwriting local (caller merges).
+fetchJobFromSite = function(timeout, quiet, force)
   timeout = tonumber(timeout) or 5
   quiet = quiet == true
+  force = force == true
   local localJob = loadJobFile()
-  if localJob then return localJob end
-  if not ensureModemForComms(quiet) then return nil end
+  if localJob and not force then return localJob end
+  if not ensureModemForComms(quiet) then return force and nil or localJob end
   if not siteId then joinSite(math.min(timeout, 4), true) end
   if not siteId then
     if not quiet then print("No site board to fetch a job from.") end
     if digging then restorePickAfterComms() end
-    return nil
+    return force and nil or localJob
   end
   -- Welcome may already have delivered a job during joinSite.
-  localJob = loadJobFile()
-  if localJob then
-    if digging then restorePickAfterComms() end
-    return localJob
+  if not force then
+    localJob = loadJobFile()
+    if localJob then
+      if digging then restorePickAfterComms() end
+      return localJob
+    end
   end
   local req = sitePayload({})
   req.type = "quarry_job_req"
@@ -1625,14 +1909,20 @@ fetchJobFromSite = function(timeout, quiet)
       if msg.ok and type(msg.job) == "table" then
         if msg.maxTravel then maxTravel = tonumber(msg.maxTravel) or maxTravel end
         if msg.y0 ~= nil then siteInfo = siteInfo or {}; siteInfo.y0 = msg.y0; siteInfo.y1 = msg.y1 end
+        if msg.x0 ~= nil then
+          siteInfo = siteInfo or {}
+          siteInfo.x0, siteInfo.x1 = msg.x0, msg.x1
+          siteInfo.z0, siteInfo.z1 = msg.z0, msg.z1
+        end
+        if force then return msg.job end
         return adoptJob(msg.job, "site board")
       end
-      if not quiet then print("Site board has no job stored for this turtle.") end
+      if not quiet and not force then print("Site board has no job stored for this turtle.") end
       return nil
     end
   end
   if digging then restorePickAfterComms() end
-  if not quiet then print("Timed out waiting for job from site board.") end
+  if not quiet and not force then print("Timed out waiting for job from site board.") end
   return nil
 end
 
@@ -1660,23 +1950,35 @@ local function claimBand(nextBand)
       end
       maxTravel = tonumber(msg.maxTravel) or maxTravel
       siteInfo = msg
-      print(("Claimed Y %d..%d  (%d layers)%s"):format(
-        msg.y0, msg.y1, (msg.y1 - msg.y0 + 1),
-        msg.resume and " (resume)" or " (free band)"))
+      if msg.x0 ~= nil then
+        print(("Claimed column X%d-%d Z%d-%d  Y%d..%d%s"):format(
+          msg.x0, msg.x1 or msg.x0, msg.z0, msg.z1 or msg.z0,
+          msg.y0 or 0, msg.y1 or 0,
+          msg.resume and " (resume)" or " (free)"))
+      else
+        print(("Claimed Y %d..%d  (%d layers)%s"):format(
+          msg.y0, msg.y1, (msg.y1 - msg.y0 + 1),
+          msg.resume and " (resume)" or " (free band)"))
+      end
       if type(msg.free) == "table" and #msg.free > 0 then
         local parts = {}
         for _, f in ipairs(msg.free) do
-          if f.y0 and f.y1 then
+          if f.x0 ~= nil then
+            parts[#parts + 1] = ("X%d-%dZ%d-%d"):format(f.x0, f.x1 or f.x0, f.z0, f.z1 or f.z0)
+          elseif f.y0 and f.y1 then
             parts[#parts + 1] = ("%d..%d"):format(f.y0, f.y1)
           end
         end
-        if #parts > 0 then print("  Free Y on site: " .. table.concat(parts, ", ")) end
+        if #parts > 0 then print("  Free on site: " .. table.concat(parts, ", ")) end
       end
       if type(msg.claims) == "table" and #msg.claims > 0 then
         print("  Other claims:")
         for _, c in ipairs(msg.claims) do
-          if c.y0 and c.y1 and not (c.y0 == msg.y0 and c.y1 == msg.y1 and c.id == os.getComputerID()) then
-            local who = (c.kind == "done") and "done" or ("#" .. tostring(c.id or "?"))
+          local who = (c.kind == "done") and "done" or ("#" .. tostring(c.id or "?"))
+          if c.x0 ~= nil then
+            print(("    X%d-%d Z%d-%d  %s"):format(
+              c.x0, c.x1 or c.x0, c.z0, c.z1 or c.z0, who))
+          elseif c.y0 and c.y1 then
             print(("    Y %d..%d  %s"):format(c.y0, c.y1, who))
           end
         end
@@ -1765,7 +2067,7 @@ local function finishJob(ok, err)
       activeJob.status = "paused"
       saveJobFile(activeJob)
       print("Job paused: " .. tostring(err or "stop"))
-      print("Put turtle at origin 0,0,0 facing in, then: continue")
+      print("Reboot or `continue` resumes (depot-first if fuel is low).")
       print("(Or `clearjob` to forget this dig.)")
     end
   end
@@ -1783,9 +2085,24 @@ local function finishJob(ok, err)
     })
   end
   restorePickAfterComms()
-  goHome()
-  dumpToStorage()
-  suckFuelFromLeft()
+  -- Only walk home when we still have fuel; otherwise SOS stays in place.
+  if not needsFuelSos() then
+    goHome()
+    dumpToStorage()
+    suckFuelFromLeft()
+    -- Refresh saved pose to depot so reboot doesn't think we're still in the hole.
+    if activeJob then
+      saveJobFile(activeJob)
+    elseif lastJob and not ok then
+      lastJob.posX, lastJob.posY, lastJob.posZ = 0, 0, 0
+      lastJob.facing = 0
+      lastJob.status = "paused"
+      local f = fs.open(JOB_FILE, "w")
+      if f then f.write(textutils.serialize(lastJob)); f.close() end
+    end
+  elseif broadcastSos then
+    broadcastSos("paused_no_fuel")
+  end
   jobLabel = "idle"
   if ok then
     print(("Done. dug=%d skipped=%d bpc=%.1f fuel=%s"):format(
@@ -1969,7 +2286,8 @@ local function runStairJob(j)
   finishJob(true)
 end
 
-local function runSavedJob(j, fromContinue)
+-- fromOrigin: turtle is at depot/origin. inPlace: pose already restored after reboot.
+local function runSavedJob(j, fromOrigin, inPlace)
   if not j or not j.type then
     print("No saved job.")
     return
@@ -1985,10 +2303,14 @@ local function runSavedJob(j, fromContinue)
 
   local bandY0 = (j.y0 ~= nil) and math.floor(tonumber(j.y0) or 0) or nil
   local bandY1 = (j.y1 ~= nil) and math.floor(tonumber(j.y1) or 0) or bandY0
-  if bandY0 ~= nil then
+  if inPlace then
+    activeJob = j
+    print(("In-place resume @ %d,%d,%d step %s/%s"):format(
+      pos.x, pos.y, pos.z, tostring(j.idx), tostring(j.total)))
+  elseif bandY0 ~= nil then
     -- Y-band jobs: always physically enter the band before digging.
-    if fromContinue then
-      print("Continue: place at origin 0,0,0 facing in — descending to band.")
+    if fromOrigin then
+      print("Continue: at origin — descending to band.")
       assumeAtOrigin()
       suckFuelFromLeft()
     elseif pos.y < 1 then
@@ -1999,13 +2321,13 @@ local function runSavedJob(j, fromContinue)
       print(("Already at band Y=%d — starting dig."):format(bandY0))
     elseif not moveIntoBand(bandY0, bandY1, {
       force = true,
-      fromOrigin = fromContinue or (pos.y < 1),
+      fromOrigin = fromOrigin or (pos.y < 1),
     }) then
       print("Could not reach band Y=" .. bandY0)
       activeJob = nil
       return
     end
-  elseif fromContinue then
+  elseif fromOrigin then
     print("Continue: assuming turtle is at origin 0,0,0 facing into the mine.")
     assumeAtOrigin()
     suckFuelFromLeft()
@@ -2105,7 +2427,132 @@ end
 
 -- Dig one claimed Y band. Returns "done" | "paused" | "stop" | "bad".
 -- fromContinue = turtle was placed back at origin (pose reset); job idx may still resume.
-local function runClaimBand(claim, fromContinue, existingJob)
+local function runColumnClaim(claim, fromOrigin, existingJob)
+  local x0 = math.floor(tonumber(claim.x0) or 0)
+  local x1 = math.floor(tonumber(claim.x1) or x0)
+  local z0 = math.floor(tonumber(claim.z0) or 0)
+  local z1 = math.floor(tonumber(claim.z1) or z0)
+  local y0 = math.floor(tonumber(claim.y0) or 0)
+  local y1 = math.floor(tonumber(claim.y1) or 0)
+  local W = math.floor(tonumber(claim.W) or (siteInfo and siteInfo.W) or (x1 + 1))
+  local L = math.floor(tonumber(claim.L) or (siteInfo and siteInfo.L) or (z1 + 1))
+  local H = math.max(1, y1 - y0 + 1)
+  if x1 < x0 then x0, x1 = x1, x0 end
+  if z1 < z0 then z0, z1 = z1, z0 end
+  if y1 < y0 then y0, y1 = y1, y0 end
+
+  local j = existingJob
+  local units = columnClaimUnits(x0, x1, z0, z1)
+  if not j then
+    dug, skipped = 0, 0
+    j = {
+      type = "area", W = W, L = L, D = L, H = H, stopY = y1 + 1,
+      pattern = "column", site = true,
+      x0 = x0, x1 = x1, z0 = z0, z1 = z1,
+      y0 = y0, y1 = y1,
+      idx = 1, total = #units, status = "active", dug = 0, skipped = 0,
+    }
+  else
+    j.site = true
+    j.pattern = "column"
+    j.x0, j.x1, j.z0, j.z1 = x0, x1, z0, z1
+    j.y0, j.y1 = y0, y1
+    j.W, j.L, j.D, j.H = W, L, L, H
+    j.stopY = y1 + 1
+    j.total = #units
+    j.idx = math.max(1, math.min(tonumber(j.idx) or 1, #units + 1))
+  end
+
+  adminAssign = {
+    y0 = y0, y1 = y1, x0 = x0, x1 = x1, z0 = z0, z1 = z1,
+    W = W, L = L, pattern = "column",
+  }
+  cfg.pendingAssign = adminAssign
+  saveCfg()
+  siteSendJob(j)
+
+  -- Start at top of first shaft cell (or resume in place from restored pose).
+  restorePickAfterComms()
+  equipToolFromInventory(nil, true)
+  if fromOrigin then
+    assumeAtOrigin()
+    suckFuelFromLeft()
+  elseif pos.y < 1 and pos.x == 0 and pos.z == 0 then
+    suckFuelFromLeft()
+  end
+  -- If we're mid-claim with a saved idx, don't force the first cell — dig loop pathing will.
+  local startIdx = math.max(1, tonumber(j.idx) or 1)
+  if startIdx <= 1 or fromOrigin then
+    if not goTo(x0, y0, z0) then
+      print("Could not reach column claim start.")
+      return "bad"
+    end
+  end
+
+  siteReportProgress({
+    status = "mining", pattern = "column",
+    x0 = x0, x1 = x1, z0 = z0, z1 = z1, y0 = y0, y1 = y1,
+    job = j, jobFile = JOB_FILE,
+  })
+
+  STOP = false
+  digging = true
+  activeJob = j
+  j.status = "active"
+  saveJobFile(j)
+  jobLabel = jobSummary(j)
+  print(("COLUMN claim X%d-%d Z%d-%d  H=%d  resume @ %d/%d"):format(
+    x0, x1, z0, z1, H, j.idx, j.total))
+
+  for i = j.idx, #units do
+    if STOP then finishJob(false, "stop"); digging = false; return "stop" end
+    local u = units[i]
+    j.idx = i
+    saveJobFile(j)
+    if not manageInventory(true) then
+      finishJob(false, "inventory/fuel")
+      digging = false
+      return "paused"
+    end
+    if not ensurePickReady(true) then
+      finishJob(false, "no-pickaxe")
+      digging = false
+      return "bad"
+    end
+    -- Climb to y0 at this XZ, then dig the shaft.
+    if not goTo(u.x, y0, u.z) then
+      finishJob(false, "path")
+      digging = false
+      return "paused"
+    end
+    excavateHere()
+    if not digDownColumn(H) then
+      finishJob(false, "column")
+      digging = false
+      return "paused"
+    end
+    -- Back at y0 after digDownColumn.
+    j.idx = i + 1
+    saveJobFile(j)
+    checkIn("column", { status = "mining", job = j, jobFile = JOB_FILE })
+  end
+  finishJob(true)
+  digging = false
+  if STOP then return "stop" end
+  if loadJobFile() then return "paused" end
+  return "done"
+end
+
+local function runClaimBand(claim, fromOrigin, existingJob)
+  -- Column / 2×2 XZ claims from site dig mode.
+  if claim.x0 ~= nil or tostring(claim.pattern or "") == "column" then
+    if claim.x0 == nil then
+      print("Bad column claim from site (missing x0/z0).")
+      return "bad"
+    end
+    return runColumnClaim(claim, fromOrigin, existingJob)
+  end
+
   local W = math.floor(tonumber(claim.W) or 0)
   local L = math.floor(tonumber(claim.L) or 0)
   local y0 = math.floor(tonumber(claim.y0) or 0)
@@ -2116,6 +2563,9 @@ local function runClaimBand(claim, fromContinue, existingJob)
   end
   if y1 < y0 then y0, y1 = y1, y0 end
   local j = existingJob
+  local inPlace = (not fromOrigin) and existingJob ~= nil and (
+    pos.x ~= 0 or pos.y ~= 0 or pos.z ~= 0
+  )
   if not j then
     dug, skipped = 0, 0
     local units = boxBandUnits(W, L, y0, y1)
@@ -2143,16 +2593,21 @@ local function runClaimBand(claim, fromContinue, existingJob)
   cfg.pendingAssign = adminAssign
   saveCfg()
   siteSendJob(j)
-  -- Descend into the band BEFORE modem chatter so we don't sit on Y=0.
-  if not moveIntoBand(y0, y1, {
-    force = true,
-    fromOrigin = fromContinue == true or pos.y < 1,
-  }) then
-    return "bad"
+  if inPlace then
+    siteReportProgress({ status = "mining", y0 = y0, y1 = y1, job = j, jobFile = JOB_FILE })
+    runSavedJob(j, false, true)
+  else
+    -- Descend into the band BEFORE modem chatter so we don't sit on Y=0.
+    if not moveIntoBand(y0, y1, {
+      force = true,
+      fromOrigin = fromOrigin == true or pos.y < 1,
+    }) then
+      return "bad"
+    end
+    siteReportProgress({ status = "mining", y0 = y0, y1 = y1, job = j, jobFile = JOB_FILE })
+    -- Pose already correct — do not assumeAtOrigin again inside runSavedJob.
+    runSavedJob(j, false, false)
   end
-  siteReportProgress({ status = "mining", y0 = y0, y1 = y1, job = j, jobFile = JOB_FILE })
-  -- Pose already correct — do not assumeAtOrigin again inside runSavedJob.
-  runSavedJob(j, false)
   if STOP then return "stop" end
   if loadJobFile() then return "paused" end
   return "done"
@@ -2162,7 +2617,26 @@ local function claimFromAdminAssign()
   if not adminAssign and type(cfg.pendingAssign) == "table" then
     adminAssign = cfg.pendingAssign
   end
-  if not adminAssign or adminAssign.y0 == nil or adminAssign.y1 == nil then
+  if not adminAssign then return nil end
+  -- Site column mode uses 2×2 XZ claims from the board; ignore stale tablet Y assigns.
+  local sitePat = siteInfo and tostring(siteInfo.pattern or "")
+  if sitePat == "column" and adminAssign.x0 == nil then
+    return nil
+  end
+  if adminAssign.x0 ~= nil then
+    return {
+      ok = true,
+      pattern = "column",
+      x0 = adminAssign.x0, x1 = adminAssign.x1,
+      z0 = adminAssign.z0, z1 = adminAssign.z1,
+      y0 = adminAssign.y0 or 0,
+      y1 = adminAssign.y1 or math.max(0, (tonumber(adminAssign.H) or 1) - 1),
+      W = adminAssign.W, L = adminAssign.L,
+      resume = false,
+      fromAdmin = true,
+    }
+  end
+  if adminAssign.y0 == nil or adminAssign.y1 == nil then
     return nil
   end
   local W = math.floor(tonumber(adminAssign.W) or (siteInfo and siteInfo.W) or 0)
@@ -2180,6 +2654,7 @@ local function claimFromAdminAssign()
   end
   return {
     ok = true,
+    pattern = "layer",
     y0 = adminAssign.y0, y1 = adminAssign.y1,
     W = W, L = L,
     resume = false,
@@ -2187,11 +2662,17 @@ local function claimFromAdminAssign()
   }
 end
 
-local function digSiteMine()
+-- opts.fromOrigin: turtle is at depot (default: true when pose is 0,0,0).
+local function digSiteMine(opts)
+  opts = opts or {}
+  if isOfflineMode() then
+    print("Offline mode — site claims disabled. `mode online` or use `area` / `box`.")
+    return
+  end
   if not siteId then joinSite(5, true) end
   if not siteId and not adminAssign and type(cfg.pendingAssign) ~= "table" then
     print("Need a site board (`join`) or a tablet Y assign (`quarry assign`).")
-    print("Solo dig: `area <W>x<L> <stopY>`.")
+    print("Solo dig: `area <W>x<L> <stopY>`  |  or `mode offline`.")
     return
   end
 
@@ -2199,13 +2680,23 @@ local function digSiteMine()
   local prior = loadJobFile()
   if not prior and siteId then prior = fetchJobFromSite(5, true) end
 
+  local fromOrigin = opts.fromOrigin
+  if fromOrigin == nil then
+    fromOrigin = (pos.x == 0 and pos.y == 0 and pos.z == 0)
+  end
+
   local bandsDone = 0
   while not STOP do
     -- Tablet / saved assign wins over site auto-claim (prevents every bot
     -- taking Y0..N when the site still has a stale shared claim).
     local claim = claimFromAdminAssign()
     if claim then
-      print(("Using tablet/site assign Y %d..%d"):format(claim.y0, claim.y1))
+      if claim.x0 ~= nil then
+        print(("Using assign column X%d-%d Z%d-%d"):format(
+          claim.x0, claim.x1 or claim.x0, claim.z0, claim.z1 or claim.z0))
+      else
+        print(("Using tablet/site assign Y %d..%d"):format(claim.y0, claim.y1))
+      end
     elseif siteId then
       claim = claimBand(bandsDone > 0)
     end
@@ -2215,44 +2706,57 @@ local function digSiteMine()
     end
     if not claim then
       if bandsDone == 0 then
-        print("No free Y layers. Site needs `setup WxL H`, or all bands are taken/done.")
-        print("Tablet: `quarry assign <id> <y0> <y1>`  |  Site: `claims` / `clearclaims`")
+        print("No free claims. Site needs `setup WxL H`, or all regions are taken/done.")
+        print("Site: `pattern column|layer`  |  `claims` / `clearclaims`")
+        print("Tablet: `quarry assign <id> <y0> <y1>` (layer mode)")
       else
-        print("No more free Y layers — this turtle is done claiming.")
+        print("No more free claims — this turtle is done.")
       end
       return
     end
 
-    -- Remember assign so reboots / site sync keep this turtle on its band.
+    -- Remember assign so reboots / site sync keep this turtle on its claim.
     adminAssign = {
       y0 = claim.y0, y1 = claim.y1,
-      W = claim.W, L = claim.L,
+      x0 = claim.x0, x1 = claim.x1, z0 = claim.z0, z1 = claim.z1,
+      W = claim.W, L = claim.L, pattern = claim.pattern,
     }
     cfg.pendingAssign = adminAssign
     saveCfg()
     siteInfo = siteInfo or {}
     siteInfo.y0, siteInfo.y1 = claim.y0, claim.y1
+    siteInfo.x0, siteInfo.x1 = claim.x0, claim.x1
+    siteInfo.z0, siteInfo.z1 = claim.z0, claim.z1
     siteInfo.W, siteInfo.L = claim.W or siteInfo.W, claim.L or siteInfo.L
+    siteInfo.pattern = claim.pattern or siteInfo.pattern
 
     local stored = nil
-    if prior and prior.status ~= "done"
+    if prior and prior.status ~= "done" then
+      local sameCol = claim.x0 ~= nil
+        and tonumber(prior.x0) == tonumber(claim.x0)
+        and tonumber(prior.z0) == tonumber(claim.z0)
+      local sameY = claim.x0 == nil
         and tonumber(prior.y0) == tonumber(claim.y0)
-        and tonumber(prior.y1) == tonumber(claim.y1) then
-      stored = prior
-      print(("Resuming matching job for Y %d..%d"):format(claim.y0, claim.y1))
+        and tonumber(prior.y1) == tonumber(claim.y1)
+      if sameCol or sameY then
+        stored = prior
+        print("Resuming matching job for claim.")
+      end
     elseif claim.resume and siteId and not claim.fromAdmin then
       stored = fetchJobFromSite(3, true)
-      if stored and (tonumber(stored.y0) ~= tonumber(claim.y0)
-          or tonumber(stored.y1) ~= tonumber(claim.y1)) then
-        stored = nil
-      end
     end
     prior = nil
 
-    print(("Mining Y %d..%d (%d layers) — descending to band first..."):format(
-      claim.y0, claim.y1, claim.y1 - claim.y0 + 1))
-    -- fromContinue only when resuming after player put turtle at origin.
-    local r = runClaimBand(claim, stored ~= nil, stored)
+    if claim.x0 ~= nil then
+      print(("Mining column X%d-%d Z%d-%d ..."):format(
+        claim.x0, claim.x1 or claim.x0, claim.z0, claim.z1 or claim.z0))
+    else
+      print(("Mining Y %d..%d (%d layers) — descending to band first..."):format(
+        claim.y0, claim.y1, claim.y1 - claim.y0 + 1))
+    end
+    -- Only the first resumed claim uses the caller's fromOrigin; later claims start at depot.
+    local r = runClaimBand(claim, fromOrigin, stored)
+    fromOrigin = true
     if r ~= "done" then return end
     bandsDone = bandsDone + 1
     if claim.fromAdmin then
@@ -2260,34 +2764,168 @@ local function digSiteMine()
       adminAssign = nil
       saveCfg()
     end
-    print(("Finished Y %d..%d — claiming next free band..."):format(claim.y0, claim.y1))
+    print("Finished claim — requesting next free region...")
   end
 end
 
-local function continueJob()
-  local j = loadJobFile()
-  if not j then
-    print("No local " .. JOB_FILE .. " — asking site board...")
-    j = fetchJobFromSite(6, false)
+local function jobIsResumable(j)
+  if type(j) ~= "table" or not j.type then return false end
+  if j.status == "done" then return false end
+  local st = tostring(j.status or "")
+  if st == "active" or st == "paused" or st == "sos" or st == "depot" then return true end
+  local idx, total = tonumber(j.idx), tonumber(j.total)
+  return idx ~= nil and total ~= nil and idx >= 1 and idx <= total
+end
+
+-- Prefer local job; if missing/stale, take the site board copy (online mode only).
+local function resolveResumeJob(quiet)
+  local localJ = loadJobFile()
+  if localJ and localJ.status == "done" then
+    clearJobFile({ keepSite = true })
+    localJ = nil
   end
-  if j and j.y0 ~= nil and j.y1 ~= nil then
-    -- Site jobs: resume band then keep claiming more Y levels.
-    if not siteId then joinSite(4, true) end
-    print("Loaded: " .. jobSummary(j))
-    digSiteMine()
-    return
+  if isOfflineMode() then
+    if localJ and jobIsResumable(localJ) then return localJ, "local" end
+    return nil, nil
   end
-  if not j then
-    if siteId or joinSite(4, true) then
-      print("No saved job — claiming a Y band from the site...")
-      digSiteMine()
-      return
+  if not siteId then joinSite(quiet and 4 or 6, quiet == true) end
+  local siteJ = nil
+  if siteId then
+    -- Ask the board even when local exists — reboot recovery / newer progress.
+    siteJ = fetchJobFromSite(quiet and 4 or 6, true, true)
+  end
+  if siteJ and jobIsResumable(siteJ) then
+    if not localJ then
+      adoptJob(siteJ, "site board")
+      return loadJobFile() or siteJ, "site"
     end
-    print("No saved job locally or on site. Start with area / box / mine.")
-    return
+    local lu = tonumber(localJ.updated) or 0
+    local su = tonumber(siteJ.updated) or 0
+    local li = tonumber(localJ.idx) or 0
+    local si = tonumber(siteJ.idx) or 0
+    -- Prefer site when it has pose and local doesn't, or newer progress.
+    local siteHasPose = siteJ.posX ~= nil
+    local localHasPose = localJ.posX ~= nil
+    if (siteHasPose and not localHasPose) or su > lu or si > li then
+      adoptJob(siteJ, "site board")
+      return loadJobFile() or siteJ, "site"
+    end
   end
-  print("Loaded: " .. jobSummary(j))
-  runSavedJob(j, true)
+  if localJ and jobIsResumable(localJ) then return localJ, "local" end
+  if siteJ and jobIsResumable(siteJ) then
+    adoptJob(siteJ, "site board")
+    return loadJobFile() or siteJ, "site"
+  end
+  return nil, nil
+end
+
+local function depotRefuelThenReady()
+  print("Low fuel — returning to depot to refuel, then continuing...")
+  if activeJob then
+    activeJob.status = "paused"
+    saveJobFile(activeJob)
+  end
+  if not goHome() then
+    if needsFuelSos() and broadcastSos then broadcastSos("stranded_no_fuel") end
+    return false
+  end
+  dumpToStorage()
+  suckFuelFromLeft()
+  if checkIn then checkIn("depot", { status = "depot" }) end
+  if needsFuelSos() then
+    if broadcastSos then broadcastSos("depot_empty_fuel") end
+    return false
+  end
+  assumeAtOrigin()
+  return true
+end
+
+-- Shared resume path for `continue` and reboot auto-resume.
+local function continueJob(opts)
+  opts = opts or {}
+  local auto = opts.auto == true
+  local j, src = resolveResumeJob(auto)
+  if not j then
+    if isOnlineMode() and (siteId or joinSite(4, true)) then
+      if auto then
+        print("No in-progress job on site — idle.")
+        return false
+      end
+      print("No saved job — claiming from the site...")
+      digSiteMine({ fromOrigin = true })
+      return true
+    end
+    if not auto then
+      if isOfflineMode() then
+        print("No saved job. Offline mode: start with area / box / tunnel.")
+      else
+        print("No saved job locally or on site. Start with area / box / mine.")
+      end
+    end
+    return false
+  end
+
+  print((auto and "Auto-resume" or "Loaded") .. " (" .. tostring(src) .. "): " .. jobSummary(j))
+
+  local hadPose = restorePoseFromJob(j)
+  if not hadPose then
+    print("No saved pose — assuming turtle is at origin (depot).")
+    assumeAtOrigin()
+  end
+
+  local plan, fuel, home = resumeFuelPlan()
+  print(("Fuel plan=%s  est=%s  homeDist=%d"):format(
+    plan, tostring(fuel), home))
+
+  if plan == "sos" then
+    print("Not enough fuel to reach depot — SOS.")
+    if broadcastSos then broadcastSos("reboot_no_fuel") end
+    return false
+  end
+
+  local fromOrigin = false
+  local inPlace = false
+  if plan == "depot" then
+    if not depotRefuelThenReady() then return false end
+    fromOrigin = true
+    j = loadJobFile() or j
+  elseif hadPose and (pos.x ~= 0 or pos.y ~= 0 or pos.z ~= 0) then
+    inPlace = true
+    fromOrigin = false
+  else
+    fromOrigin = true
+    assumeAtOrigin()
+  end
+
+  -- Site / claimed jobs keep claiming further regions after this one finishes.
+  if isOnlineMode() and (j.site or j.y0 ~= nil or j.x0 ~= nil) then
+    if not siteId then joinSite(4, true) end
+    digSiteMine({ fromOrigin = fromOrigin })
+    return true
+  end
+
+  runSavedJob(j, fromOrigin, inPlace)
+  return true
+end
+
+-- On program start: resume mid-job (site sync only in online mode).
+local function bootAutoResume()
+  local j = loadJobFile()
+  if j and j.status == "done" then
+    clearJobFile({ keepSite = true })
+    j = nil
+  end
+  if isOfflineMode() then
+    if not j or not jobIsResumable(j) then return false end
+    print("")
+    print("Offline mode — resuming local job (no site).")
+    return continueJob({ auto = true })
+  end
+  -- Need modem/site or a local job file to consider auto-resume.
+  if not j and not siteId and not cfg.siteId then return false end
+  print("")
+  print("Checking site board for in-progress work...")
+  return continueJob({ auto = true })
 end
 
 --------------------------------------------------------------------------------
@@ -2297,31 +2935,34 @@ local function printHelp()
   print("Offline miner — origin = top-front-left, facing into mine.")
   print("  +X right   +Y down   +Z forward")
   print("")
+  print("  mode online|offline              site/admin link vs solo dig")
   print("  area <W>x<L> <stopY>             width × length, stopY layers (1 Y each)")
   print("  box <W>x<H>x<D>                  H layers down, 1 Y at a time")
   print("  tunnel <L> [W]                   player-tall (2 high) corridor")
   print("  stair <W>x<steps> <up|down>      player-tall staircase")
-  print("  join                             find optional site board (modem)")
-  print("  mine                             claim Y bands from site until none left")
+  print("  join                             find site board (online mode)")
+  print("  mine                             claim from site (online mode)")
   print("  site                             show site / BPC / mine broadcast")
+  print("  pattern column|layer             dig style hint (site uses site pattern)")
   print("  equip [left|right]               equip pick from inventory (aliases: tool, pick)")
-  print("  continue | resume                resume saved job (local or from site)")
+  print("  continue | resume                resume saved / site job (auto on reboot)")
   print("  job | clearjob                   show / forget saved job")
   print("  home | dump | refuel | setup | stop | status")
   print("")
-  print("Slot 15 = wireless modem (swaps over diamond pickaxe for site/admin).")
-  print("With a site board: each turtle claims its own Y band; when finished it")
-  print("claims another until no free layers remain. Solo: `area <W>x<L> <H>`.")
-  print("Jobs save to " .. JOB_FILE .. " while running / paused.")
-  print("Finished digs clear that file automatically. After stop: origin + continue.")
-  print("Enchanted pick: put it in inventory, then `equip` (not craft onto turtle).")
+  print("mode offline = solo (area/box), no site/admin.  mode online = join/mine.")
+  print("Slot 15 = wireless modem (RIGHT pick swap) — used in online mode.")
+  print("Reboot: resumes job; online also syncs with site (depot-first if low fuel).")
+  print("Other turtles: never attack — go around to your own right.")
+  print("Out of fuel: SOS broadcast when modem available (computer stays on).")
+  print("Jobs save pose+progress to " .. JOB_FILE .. ".")
 end
 
 local function printStatus()
   print(("pos=%d,%d,%d face=%d"):format(pos.x, pos.y, pos.z, facing))
   print(("label=%s  dug=%d skipped=%d bpc=%.1f fuel=%s"):format(
     jobLabel, dug, skipped, currentBpc(), tostring(turtle.getFuelLevel())))
-  print(("setup=%s  pattern=%s  site=%s"):format(
+  print(("mode=%s  setup=%s  pattern=%s  site=%s"):format(
+    tostring(cfg.mode or "online"),
     tostring(cfg.setupDone), tostring(cfg.pattern or "column"), tostring(siteId or "-")))
   local j = activeJob or loadJobFile()
   if j then
@@ -2348,9 +2989,17 @@ local function handleCommand(line)
   elseif cmd == "setup" then
     setupChests()
   elseif cmd == "join" then
-    joinSite(tonumber(a[2]) or 6)
+    if isOfflineMode() then
+      print("Offline mode — use `mode online` to join a site board.")
+    else
+      joinSite(tonumber(a[2]) or 6)
+    end
   elseif cmd == "mine" then
-    digSiteMine()
+    if isOfflineMode() then
+      print("Offline mode — use `area` / `box` for solo digs, or `mode online` for site claims.")
+    else
+      digSiteMine()
+    end
   elseif cmd == "site" then
     printSiteInfo()
   elseif cmd == "equip" or cmd == "tool" or cmd == "pick" or cmd == "pickaxe" then
@@ -2377,12 +3026,47 @@ local function handleCommand(line)
     print("Cleared " .. JOB_FILE)
   elseif cmd == "continue" or cmd == "resume" then
     continueJob()
-  elseif cmd == "pattern" or cmd == "mode" then
+  elseif cmd == "mode" then
+    if not a[2] then
+      print("Mode: " .. tostring(cfg.mode or "online"))
+      print("  online  — site board + admin check-ins (join / mine)")
+      print("  offline — solo dig only (area / box / tunnel / stair)")
+      print("Usage: mode online|offline")
+    else
+      -- Allow `mode column` as a friendly redirect to dig pattern.
+      local asPat = normalizePattern(a[2])
+      local m = normalizeNetMode(a[2])
+      if m then
+        cfg.mode = m
+        saveCfg()
+        if m == "offline" then
+          siteId = nil
+          print("Mode set to OFFLINE — solo dig, no site/admin.")
+          print("Use: area <W>x<L> <stopY>   or   box <W>x<H>x<D>")
+        else
+          print("Mode set to ONLINE — site/admin enabled.")
+          local hasM = ensureModemForComms(true) or openModem() or findModemInInventory() ~= nil
+          if hasM then
+            joinSite(4, false)
+          else
+            print("Put a wireless modem in slot " .. MODEM_SLOT .. ", then `join`.")
+          end
+        end
+      elseif asPat then
+        cfg.pattern = asPat
+        saveCfg()
+        print("Dig pattern set to: " .. asPat .. "  (tip: use `pattern <column|layer>`)")
+      else
+        print("Usage: mode online|offline")
+      end
+    end
+  elseif cmd == "pattern" then
     if not a[2] then
       print("Dig pattern: " .. tostring(cfg.pattern or "column"))
       print("  column — dig each vertical shaft, then move on")
       print("  layer  — mine each horizontal layer top→bottom")
       print("Usage: pattern <column|layer>")
+      print("(Network mode is separate: `mode online|offline`)")
     else
       local p = normalizePattern(a[2])
       if not p then
@@ -2473,6 +3157,7 @@ if type(cfg.pendingAssign) == "table" and cfg.pendingAssign.y0 ~= nil then
 end
 os.setComputerLabel(os.getComputerLabel() or cfg.label or ("OfflineMiner-" .. os.getComputerID()))
 cfg.label = os.getComputerLabel()
+cfg.mode = normalizeNetMode(cfg.mode) or "online"
 saveCfg()
 
 term.clear()
@@ -2480,6 +3165,7 @@ term.setCursorPos(1, 1)
 print("== Offline Miner ==")
 print("Origin: top-front-left of dig, facing in = 0,0,0")
 print("Axes: +X right | +Y down | +Z forward")
+print("Mode: " .. tostring(cfg.mode) .. "  (`mode online|offline`)")
 print("")
 
 if not cfg.setupDone then
@@ -2498,36 +3184,50 @@ if saved and saved.status == "done" then
   saved = nil
 end
 
-if cfg.siteId then
+if cfg.siteId and isOnlineMode() then
   siteId = cfg.siteId
 end
-local hasModem = ensureModemForComms(true) or openModem() or findModemInInventory() ~= nil
-if hasModem then
-  print("Modem slot " .. MODEM_SLOT .. ": swaps RIGHT pick (slot 2) only — left untouched.")
-  print("Check-in: every depot + end of each dig line. Optional site: join / mine.")
-  joinSite(2, true)
-  if not saved then
-    saved = loadJobFile()  -- may have been adopted from site welcome
+local hasModem = false
+if isOnlineMode() then
+  hasModem = ensureModemForComms(true) or openModem() or findModemInInventory() ~= nil
+  if hasModem then
+    print("ONLINE — modem slot " .. MODEM_SLOT .. " (RIGHT pick swap). join / mine for site.")
+    joinSite(2, true)
+    if not saved then
+      saved = loadJobFile()  -- may have been adopted from site welcome
+    end
+    ensureModemForComms(true)
+  else
+    print("ONLINE — no modem in slot " .. MODEM_SLOT .. ". Solo dig works; site needs a modem.")
   end
-  -- Idle with modem listening; pickaxe re-equipped when a dig starts.
-  ensureModemForComms(true)
 else
-  print("No modem in slot " .. MODEM_SLOT .. " — dig works; no site/admin link.")
+  siteId = nil
+  print("OFFLINE — solo dig only (area / box). No site/admin. `mode online` to link.")
 end
 
 if saved then
   print("")
   print("Saved job: " .. jobSummary(saved))
-  print("Place at origin facing in, then: continue")
-  print("Or `clearjob` to forget it.")
-elseif hasModem then
-  print("")
-  print("No local job — `continue` or `mine` will ask the site board.")
 end
 
-print("")
-print("Type help. Examples:  area 16x32 40   |   continue")
-print("")
+-- Reboot recovery: resume mid-job (site sync only in online mode).
+local autoStarted = false
+if saved or (isOnlineMode() and hasModem) then
+  autoStarted = bootAutoResume() == true
+end
+
+if not autoStarted then
+  if saved and loadJobFile() then
+    print("Job waiting — type `continue` (or add coal / clearjob).")
+  elseif isOnlineMode() and hasModem then
+    print("No in-progress job — `mine` or `area 16x32 40` to start.")
+  elseif isOfflineMode() then
+    print("Solo ready — example:  area 16x32 40")
+  end
+  print("")
+  print("Type help. Examples:  mode offline   |   area 16x32 40")
+  print("")
+end
 
 local function consoleLoop()
   while true do
@@ -2538,7 +3238,13 @@ local function consoleLoop()
   end
 end
 
-if hasModem then
+if autoStarted then
+  -- Dig finished or paused — drop into console (keep modem listener if present).
+  print("")
+  print("Auto-resume finished. Type help for more commands.")
+end
+
+if isOnlineMode() and hasModem then
   parallel.waitForAny(consoleLoop, mineNetLoop)
 else
   consoleLoop()

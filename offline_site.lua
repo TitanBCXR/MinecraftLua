@@ -1,6 +1,6 @@
 --[[
   offline_site.lua  -  Quarry site board for multi-turtle offline miners
-  Titan-Version: 1.0.9
+  Titan-Version: 1.1.0
 
   Place this computer to the LEFT of the storage chest (storage sits behind
   the turtles' origin). Attach a modem (wired to the turtles is fine, or
@@ -9,22 +9,24 @@
   OPTIONAL — turtles can dig and report straight to the admin tablet with no
   site board. When this board IS present it:
     * Auto-sets W×L×H from turtle mine/job data (or `setup` to lock manually)
-    * Hands out non-overlapping Y bands (max 1/2 or 1/3 of height)
+    * Dig mode `column` (default): hands out non-overlapping 2×2 XZ columns
+      (full height). Dig mode `layer`: Y bands (max 1/2 or 1/3 of height)
     * Collects BPC so every turtle knows safe travel distance
     * Stores each turtle's offline_miner_job.cfg under quarry_jobs/
     * Hands that job back if a turtle rejoins with no local job file
     * Relays a quarry_site snapshot to the admin tablet
 
   Commands:
-    setup <W>x<L> <H> [half|third]   lock footprint manually
+    setup <W>x<L> <H> [half|third] [column|layer]
     auto                             unlock auto-learn from turtles
-    fraction half|third              max Y band size per turtle
-    claims                           list claimed / free Y bands
-    clearclaims [all|done|stale|Y…]  release Y claims (see help)
+    pattern column|layer             claim style for mine/
+    fraction half|third              max Y band size (layer mode)
+    claims                           list claimed / free regions
+    clearclaims [all|done|stale|Y…]  release claims (see help)
     status | turtles | jobs | clear
     help | exit
 
-  Turtle side: offline_miner with modem (area …); `join`/`mine` for Y bands.
+  Turtle side: offline_miner with modem; `join`/`mine` for site claims.
 
   Run:  offline_site
 ]]
@@ -46,13 +48,26 @@ end
 
 local cfg = {
   W = 0, L = 0, H = 0,   -- 0 = waiting to learn from turtles
-  fraction = 0.5,        -- half of height per claim (use 1/3 via `fraction third`)
+  fraction = 0.5,        -- half of height per claim (layer mode; use 1/3 via `fraction third`)
+  pattern = "column",    -- "column" = 2×2 XZ shafts; "layer" = Y bands
   manual = false,        -- true after `setup` (still expands if turtles report larger)
   label = nil,
 }
 
-local turtles = {}  -- [id] = { name, y0, y1, dug, idx, total, bpc, fuel, seen, status, moves, coal, job }
-local completedBands = {}  -- list of { y0, y1 } finished with no active owner
+local turtles = {}  -- [id] = { name, y0, y1, x0, x1, z0, z1, dug, idx, total, bpc, fuel, seen, status, pos*, job }
+local completedBands = {}  -- list of { y0, y1 } (layer) or { x0,x1,z0,z1,y0,y1 } (column)
+
+local function normalizePattern(p)
+  p = tostring(p or ""):lower()
+  if p == "col" or p == "columns" or p == "shaft" then p = "column" end
+  if p == "layers" or p == "slice" or p == "flat" or p == "band" then p = "layer" end
+  if p == "column" or p == "layer" then return p end
+  return nil
+end
+
+local function sitePattern()
+  return normalizePattern(cfg.pattern) or "column"
+end
 
 --------------------------------------------------------------------------------
 local function now() return os.epoch("utc") end
@@ -64,6 +79,12 @@ end
 
 local function jobSummaryShort(j)
   if type(j) ~= "table" then return "(none)" end
+  if j.x0 ~= nil and j.z0 ~= nil then
+    return ("col X%d-%d Z%d-%d step %d/%d [%s]"):format(
+      tonumber(j.x0) or 0, tonumber(j.x1) or 0,
+      tonumber(j.z0) or 0, tonumber(j.z1) or 0,
+      tonumber(j.idx) or 1, tonumber(j.total) or 0, tostring(j.status or "?"))
+  end
   if j.y0 ~= nil and j.y1 ~= nil then
     return ("area Y%d-%d step %d/%d [%s]"):format(
       j.y0, j.y1, tonumber(j.idx) or 1, tonumber(j.total) or 0, tostring(j.status or "?"))
@@ -115,6 +136,7 @@ local function loadCfg()
   if cfg.fraction ~= (1 / 3) and cfg.fraction ~= (1 / 2) then
     if cfg.fraction < 0.4 then cfg.fraction = 1 / 3 else cfg.fraction = 0.5 end
   end
+  cfg.pattern = normalizePattern(cfg.pattern) or "column"
   cfg.manual = cfg.manual == true
   cfg.W = tonumber(cfg.W) or 0
   cfg.L = tonumber(cfg.L) or 0
@@ -123,8 +145,16 @@ local function loadCfg()
   if type(cfg.completedBands) == "table" then
     for _, b in ipairs(cfg.completedBands) do
       local y0, y1 = tonumber(b.y0), tonumber(b.y1)
-      if y0 and y1 then
-        completedBands[#completedBands + 1] = { y0 = y0, y1 = y1 }
+      local x0, x1 = tonumber(b.x0), tonumber(b.x1)
+      local z0, z1 = tonumber(b.z0), tonumber(b.z1)
+      if x0 and z0 then
+        completedBands[#completedBands + 1] = {
+          x0 = x0, x1 = x1 or x0, z0 = z0, z1 = z1 or z0,
+          y0 = y0 or 0, y1 = y1 or math.max(0, (tonumber(cfg.H) or 1) - 1),
+          pattern = "column",
+        }
+      elseif y0 and y1 then
+        completedBands[#completedBands + 1] = { y0 = y0, y1 = y1, pattern = "layer" }
       end
     end
   end
@@ -197,14 +227,40 @@ local function fractionLabel()
   return "half"
 end
 
+local function turtleHasClaim(t)
+  if not t then return false end
+  if t.x0 ~= nil and t.z0 ~= nil then return true end
+  return t.y0 ~= nil and t.y1 ~= nil
+end
+
+local function clearTurtleCoords(t)
+  t.y0, t.y1 = nil, nil
+  t.x0, t.x1, t.z0, t.z1 = nil, nil, nil, nil
+  t.adminLock = false
+  t.assignId = nil
+end
+
+local function claimLabel(t)
+  if not t then return "?" end
+  if t.x0 ~= nil then
+    return ("X%d-%d Z%d-%d"):format(
+      tonumber(t.x0) or 0, tonumber(t.x1) or 0,
+      tonumber(t.z0) or 0, tonumber(t.z1) or 0)
+  end
+  if t.y0 ~= nil then
+    return ("Y%d-%d"):format(tonumber(t.y0) or 0, tonumber(t.y1) or 0)
+  end
+  return "-"
+end
+
 -- Manual only (`clearclaims stale`) — never called while assigning bands.
 local function releaseStaleClaims()
   local n = 0
   for id, t in pairs(turtles) do
-    if t.y0 and t.y1 and t.status ~= "done" and ago(t.seen) >= STALE_CLAIM_SECS then
-      print(("[stale] #%d released Y %d..%d (no ping %ss)"):format(
-        id, t.y0, t.y1, tostring(ago(t.seen))))
-      t.y0, t.y1 = nil, nil
+    if turtleHasClaim(t) and t.status ~= "done" and ago(t.seen) >= STALE_CLAIM_SECS then
+      print(("[stale] #%d released %s (no ping %ss)"):format(
+        id, claimLabel(t), tostring(ago(t.seen))))
+      clearTurtleCoords(t)
       t.status = "stale"
       turtles[id] = t
       n = n + 1
@@ -213,51 +269,123 @@ local function releaseStaleClaims()
   return n
 end
 
--- Occupied Y layers (any active turtle claim + completed bands). No ping timeout.
+-- Occupied Y layers (layer mode). No ping timeout.
 local function occupiedLayers()
   local occ = {}
   local H = math.max(0, tonumber(cfg.H) or 0)
   for y = 0, H - 1 do occ[y] = false end
   for _, t in pairs(turtles) do
-    if t.y0 and t.y1 and t.status ~= "done" then
+    if t.y0 and t.y1 and t.status ~= "done" and t.x0 == nil then
       for y = t.y0, t.y1 do
         if occ[y] ~= nil then occ[y] = true end
       end
     end
   end
   for _, b in ipairs(completedBands) do
-    for y = b.y0, b.y1 do
-      if occ[y] ~= nil then occ[y] = true end
+    if b.x0 == nil and b.y0 and b.y1 then
+      for y = b.y0, b.y1 do
+        if occ[y] ~= nil then occ[y] = true end
+      end
     end
   end
   return occ
 end
 
+-- Occupied XZ cells for column mode (2×2 claims).
+local function occupiedColumns()
+  local W = math.max(0, tonumber(cfg.W) or 0)
+  local L = math.max(0, tonumber(cfg.L) or 0)
+  local occ = {}
+  for z = 0, L - 1 do
+    occ[z] = {}
+    for x = 0, W - 1 do occ[z][x] = false end
+  end
+  local function mark(x0, x1, z0, z1)
+    if not x0 or not z0 then return end
+    x1 = x1 or x0
+    z1 = z1 or z0
+    for z = z0, z1 do
+      for x = x0, x1 do
+        if occ[z] and occ[z][x] ~= nil then occ[z][x] = true end
+      end
+    end
+  end
+  for _, t in pairs(turtles) do
+    if t.status ~= "done" then mark(t.x0, t.x1, t.z0, t.z1) end
+  end
+  for _, b in ipairs(completedBands) do
+    mark(b.x0, b.x1, b.z0, b.z1)
+  end
+  return occ
+end
+
+local function xzOverlap(ax0, ax1, az0, az1, bx0, bx1, bz0, bz1)
+  if ax0 == nil or bx0 == nil then return false end
+  return overlaps(ax0, ax1, bx0, bx1) and overlaps(az0, az1, bz0, bz1)
+end
+
 local function listClaimEntries()
   local entries = {}
+  local pat = sitePattern()
   for id, t in pairs(turtles) do
-    if t.y0 and t.y1 and t.status ~= "done" then
+    if turtleHasClaim(t) and t.status ~= "done" then
       entries[#entries + 1] = {
         kind = "active",
         id = id,
         name = t.name,
+        pattern = (t.x0 ~= nil) and "column" or "layer",
         y0 = t.y0, y1 = t.y1,
+        x0 = t.x0, x1 = t.x1, z0 = t.z0, z1 = t.z1,
         stale = ago(t.seen) >= STALE_CLAIM_SECS,
         status = t.status,
       }
     end
   end
   for _, b in ipairs(completedBands) do
-    entries[#entries + 1] = { kind = "done", y0 = b.y0, y1 = b.y1 }
+    entries[#entries + 1] = {
+      kind = "done",
+      pattern = b.pattern or ((b.x0 ~= nil) and "column" or "layer"),
+      y0 = b.y0, y1 = b.y1,
+      x0 = b.x0, x1 = b.x1, z0 = b.z0, z1 = b.z1,
+    }
   end
   table.sort(entries, function(a, b)
-    if a.y0 ~= b.y0 then return a.y0 < b.y0 end
+    if (a.z0 or -1) ~= (b.z0 or -1) then return (a.z0 or -1) < (b.z0 or -1) end
+    if (a.x0 or -1) ~= (b.x0 or -1) then return (a.x0 or -1) < (b.x0 or -1) end
+    if (a.y0 or 0) ~= (b.y0 or 0) then return (a.y0 or 0) < (b.y0 or 0) end
     return (a.y1 or 0) < (b.y1 or 0)
   end)
   return entries
 end
 
 local function listFreeBands()
+  if sitePattern() == "column" then
+    local W = math.max(0, tonumber(cfg.W) or 0)
+    local L = math.max(0, tonumber(cfg.L) or 0)
+    local occ = occupiedColumns()
+    local frees, n = {}, 0
+    for z = 0, L - 1, 2 do
+      for x = 0, W - 1, 2 do
+        local free = true
+        for zz = z, math.min(z + 1, L - 1) do
+          for xx = x, math.min(x + 1, W - 1) do
+            if occ[zz] and occ[zz][xx] then free = false end
+          end
+        end
+        if free then
+          n = n + 1
+          if n <= 12 then
+            frees[#frees + 1] = {
+              x0 = x, x1 = math.min(x + 1, W - 1),
+              z0 = z, z1 = math.min(z + 1, L - 1),
+              y0 = 0, y1 = math.max(0, (tonumber(cfg.H) or 1) - 1),
+            }
+          end
+        end
+      end
+    end
+    return frees, n
+  end
   local H = math.max(0, tonumber(cfg.H) or 0)
   local occ = occupiedLayers()
   local frees = {}
@@ -296,7 +424,31 @@ local function nextFreeBand()
   return nil
 end
 
--- Release active and/or completed claims. y0/y1 nil = entire height.
+-- Next free 2×2 XZ patch (full height). Edge patches may be 1×2 / 2×1 / 1×1.
+local function nextFreeColumn()
+  local W = math.max(1, tonumber(cfg.W) or 1)
+  local L = math.max(1, tonumber(cfg.L) or 1)
+  local H = math.max(1, tonumber(cfg.H) or 1)
+  local occ = occupiedColumns()
+  for z = 0, L - 1, 2 do
+    for x = 0, W - 1, 2 do
+      local x1 = math.min(x + 1, W - 1)
+      local z1 = math.min(z + 1, L - 1)
+      local free = true
+      for zz = z, z1 do
+        for xx = x, x1 do
+          if occ[zz] and occ[zz][xx] then free = false end
+        end
+      end
+      if free then
+        return x, x1, z, z1, 0, H - 1
+      end
+    end
+  end
+  return nil
+end
+
+-- Release active and/or completed claims. y0/y1 nil = entire height (layer filter).
 local function clearClaims(mode, y0, y1)
   mode = tostring(mode or "all"):lower()
   local H = math.max(0, tonumber(cfg.H) or 0)
@@ -311,11 +463,17 @@ local function clearClaims(mode, y0, y1)
 
   if mode == "all" or mode == "active" or mode == "y" or mode == "turtle" then
     for id, t in pairs(turtles) do
-      if t.y0 and t.y1 and overlaps(t.y0, t.y1, y0, y1) then
-        print(("[unclaim] #%d Y %d..%d"):format(id, t.y0, t.y1))
-        t.y0, t.y1 = nil, nil
-        t.adminLock = false
-        t.assignId = nil
+      local hit = false
+      if turtleHasClaim(t) then
+        if mode == "all" or mode == "active" or mode == "turtle" then
+          hit = true
+        elseif t.y0 and t.y1 and overlaps(t.y0, t.y1, y0, y1) then
+          hit = true
+        end
+      end
+      if hit then
+        print(("[unclaim] #%d %s"):format(id, claimLabel(t)))
+        clearTurtleCoords(t)
         if t.status == "assigned" or t.status == "mining" then t.status = "idle" end
         turtles[id] = t
         released = released + 1
@@ -326,8 +484,14 @@ local function clearClaims(mode, y0, y1)
   if mode == "all" or mode == "done" or mode == "y" then
     local keep = {}
     for _, b in ipairs(completedBands) do
-      if overlaps(b.y0, b.y1, y0, y1) then
-        print(("[unclaim] done Y %d..%d"):format(b.y0, b.y1))
+      local hit = false
+      if mode == "all" or mode == "done" then
+        hit = true
+      elseif b.y0 and b.y1 then
+        hit = overlaps(b.y0, b.y1, y0, y1)
+      end
+      if hit then
+        print(("[unclaim] done %s"):format(claimLabel(b)))
         released = released + 1
       else
         keep[#keep + 1] = b
@@ -348,9 +512,9 @@ local function clearTurtleClaim(id)
   id = tonumber(id)
   if not id or not turtles[id] then return 0 end
   local t = turtles[id]
-  if not t.y0 then return 0 end
-  print(("[unclaim] #%d Y %d..%d"):format(id, t.y0, t.y1))
-  t.y0, t.y1 = nil, nil
+  if not turtleHasClaim(t) then return 0 end
+  print(("[unclaim] #%d %s"):format(id, claimLabel(t)))
+  clearTurtleCoords(t)
   t.status = "idle"
   turtles[id] = t
   saveCfg()
@@ -382,7 +546,9 @@ local function jobReplyFor(id)
     ok = job ~= nil,
     job = job,
     jobFile = job and turtleJobPath(id) or nil,
+    pattern = sitePattern(),
     y0 = t.y0, y1 = t.y1,
+    x0 = t.x0, x1 = t.x1, z0 = t.z0, z1 = t.z1,
     W = cfg.W, L = cfg.L, H = cfg.H,
     maxTravel = maxTravel(), minBpc = minBpc(),
   }
@@ -395,16 +561,41 @@ local function siteProgress()
   local plane = math.max(1, W * L)
   local total = math.max(1, plane * H)
   local done = 0
-  for _, b in ipairs(completedBands) do
-    done = done + plane * (b.y1 - b.y0 + 1)
-  end
-  for _, t in pairs(turtles) do
-    if t.y0 and t.y1 and t.status ~= "done" then
-      local bandCells = plane * (t.y1 - t.y0 + 1)
-      local tot = tonumber(t.total) or bandCells
-      local idx = math.max(0, (tonumber(t.idx) or 1) - 1)
-      if tot < 1 then tot = bandCells end
-      done = done + math.min(bandCells, math.floor(bandCells * (idx / tot)))
+  if sitePattern() == "column" then
+    for _, b in ipairs(completedBands) do
+      if b.x0 ~= nil then
+        local bw = (tonumber(b.x1) or b.x0) - b.x0 + 1
+        local bl = (tonumber(b.z1) or b.z0) - b.z0 + 1
+        local bh = (tonumber(b.y1) or (H - 1)) - (tonumber(b.y0) or 0) + 1
+        done = done + math.max(0, bw * bl * bh)
+      end
+    end
+    for _, t in pairs(turtles) do
+      if t.x0 ~= nil and t.status ~= "done" then
+        local bw = (tonumber(t.x1) or t.x0) - t.x0 + 1
+        local bl = (tonumber(t.z1) or t.z0) - t.z0 + 1
+        local bh = math.max(1, H)
+        local bandCells = bw * bl * bh
+        local tot = tonumber(t.total) or bandCells
+        local idx = math.max(0, (tonumber(t.idx) or 1) - 1)
+        if tot < 1 then tot = bandCells end
+        done = done + math.min(bandCells, math.floor(bandCells * (idx / tot)))
+      end
+    end
+  else
+    for _, b in ipairs(completedBands) do
+      if b.y0 and b.y1 and b.x0 == nil then
+        done = done + plane * (b.y1 - b.y0 + 1)
+      end
+    end
+    for _, t in pairs(turtles) do
+      if t.y0 and t.y1 and t.status ~= "done" and t.x0 == nil then
+        local bandCells = plane * (t.y1 - t.y0 + 1)
+        local tot = tonumber(t.total) or bandCells
+        local idx = math.max(0, (tonumber(t.idx) or 1) - 1)
+        if tot < 1 then tot = bandCells end
+        done = done + math.min(bandCells, math.floor(bandCells * (idx / tot)))
+      end
     end
   end
   local pct = math.floor(math.min(100, (done / total) * 100) + 0.5)
@@ -425,14 +616,19 @@ local function snapshot()
   for id, t in pairs(turtles) do
     list[#list + 1] = {
       id = id, name = t.name, y0 = t.y0, y1 = t.y1,
+      x0 = t.x0, x1 = t.x1, z0 = t.z0, z1 = t.z1,
+      posX = t.posX, posY = t.posY, posZ = t.posZ,
+      lastPosAt = t.lastPosAt, sos = t.sos,
       dug = t.dug, idx = t.idx, total = t.total, bpc = t.bpc,
       fuel = t.fuel, status = t.status, age = ago(t.seen),
       job = t.job,
       jobSummary = t.job and jobSummaryShort(t.job) or nil,
       jobFile = t.job and turtleJobPath(id) or nil,
+      pattern = (t.x0 ~= nil) and "column" or ((t.y0 ~= nil) and "layer" or sitePattern()),
     }
   end
   table.sort(list, function(a, b) return (a.id or 0) < (b.id or 0) end)
+  local freeList = listFreeBands()
   return {
     type = "quarry_site",
     source = "site_board",
@@ -440,14 +636,15 @@ local function snapshot()
     name = os.getComputerLabel() or ("Quarry-" .. os.getComputerID()),
     W = cfg.W, L = cfg.L, H = cfg.H,
     manual = cfg.manual == true,
+    pattern = sitePattern(),
     fraction = fractionLabel(),
-    maxClaim = maxClaimLayers(),
+    maxClaim = (sitePattern() == "column") and 4 or maxClaimLayers(),
     pct = pct, done = done, total = total,
     minBpc = minBpc(), maxTravel = maxTravel(),
     online = onlineCount(),
     turtles = list,
     claims = listClaimEntries(),
-    free = listFreeBands(),
+    free = freeList,
   }
 end
 
@@ -475,11 +672,27 @@ local function touchTurtle(id, msg)
   if msg.moves ~= nil then t.moves = tonumber(msg.moves) or t.moves end
   if msg.coal ~= nil then t.coal = tonumber(msg.coal) or t.coal end
   if msg.status then t.status = msg.status end
+  if msg.posX ~= nil then
+    t.posX = tonumber(msg.posX) or t.posX
+    t.posY = tonumber(msg.posY) or t.posY
+    t.posZ = tonumber(msg.posZ) or t.posZ
+    t.lastPosAt = now()
+  end
+  if msg.type == "quarry_sos" or msg.sos == true then
+    t.sos = true
+    t.status = "sos"
+  elseif msg.sos == false or msg.type == "quarry_sos_clear" then
+    t.sos = false
+  end
   -- Tablet/admin locks pin Y bands — don't let an old job file overwrite them.
   local locked = t.adminLock == true
   if not locked then
     if msg.y0 ~= nil then t.y0 = tonumber(msg.y0) or t.y0 end
     if msg.y1 ~= nil then t.y1 = tonumber(msg.y1) or t.y1 end
+    if msg.x0 ~= nil then t.x0 = tonumber(msg.x0) or t.x0 end
+    if msg.x1 ~= nil then t.x1 = tonumber(msg.x1) or t.x1 end
+    if msg.z0 ~= nil then t.z0 = tonumber(msg.z0) or t.z0 end
+    if msg.z1 ~= nil then t.z1 = tonumber(msg.z1) or t.z1 end
   elseif msg.y0 ~= nil and msg.y1 ~= nil
       and tonumber(msg.y0) == tonumber(t.y0) and tonumber(msg.y1) == tonumber(t.y1) then
     -- Same band — ok
@@ -495,6 +708,10 @@ local function touchTurtle(id, msg)
     if not locked then
       if msg.job.y0 ~= nil then t.y0 = tonumber(msg.job.y0) or t.y0 end
       if msg.job.y1 ~= nil then t.y1 = tonumber(msg.job.y1) or t.y1 end
+      if msg.job.x0 ~= nil then t.x0 = tonumber(msg.job.x0) or t.x0 end
+      if msg.job.x1 ~= nil then t.x1 = tonumber(msg.job.x1) or t.x1 end
+      if msg.job.z0 ~= nil then t.z0 = tonumber(msg.job.z0) or t.z0 end
+      if msg.job.z1 ~= nil then t.z1 = tonumber(msg.job.z1) or t.z1 end
     end
     if msg.job.status and not msg.status then t.status = msg.job.status end
     persistTurtleJob(id, msg.job)
@@ -508,6 +725,7 @@ local function claimPayload(extra)
   local p = {
     type = "quarry_claim",
     W = cfg.W, L = cfg.L, H = cfg.H,
+    pattern = sitePattern(),
     maxTravel = maxTravel(), minBpc = minBpc(),
     claims = listClaimEntries(),
     free = listFreeBands(),
@@ -516,6 +734,21 @@ local function claimPayload(extra)
     for k, v in pairs(extra) do p[k] = v end
   end
   return p
+end
+
+local function archiveClaim(t)
+  if not turtleHasClaim(t) then return end
+  if t.x0 ~= nil then
+    completedBands[#completedBands + 1] = {
+      pattern = "column",
+      x0 = t.x0, x1 = t.x1, z0 = t.z0, z1 = t.z1,
+      y0 = t.y0 or 0, y1 = t.y1 or math.max(0, (tonumber(cfg.H) or 1) - 1),
+    }
+  else
+    completedBands[#completedBands + 1] = {
+      pattern = "layer", y0 = t.y0, y1 = t.y1,
+    }
+  end
 end
 
 local function assignClaim(id, msg)
@@ -527,37 +760,62 @@ local function assignClaim(id, msg)
       err = "site size unknown — setup WxL H or let a turtle area-dig first",
     })
   end
-  -- Turtle finished a band and wants another: release old claim, don't resume it.
+  local pat = sitePattern()
+  -- Turtle finished a claim and wants another: archive old claim, don't resume it.
   if msg.nextBand or msg.forceNew then
-    if t.y0 and t.y1 and t.status ~= "done" then
-      completedBands[#completedBands + 1] = { y0 = t.y0, y1 = t.y1 }
-      print(("[done] #%d released Y %d..%d for next claim"):format(id, t.y0, t.y1))
+    if turtleHasClaim(t) and t.status ~= "done" then
+      archiveClaim(t)
+      print(("[done] #%d released %s for next claim"):format(id, claimLabel(t)))
       saveCfg()
     end
-    t.y0, t.y1 = nil, nil
-    t.adminLock = false
-    t.assignId = nil
+    clearTurtleCoords(t)
     t.status = "idle"
     t.job = nil
     t.idx, t.total = nil, nil
     persistTurtleJob(id, nil)
     turtles[id] = t
   end
-  -- Keep the turtle's band forever until done / clearclaims (deep digs go quiet).
-  -- Admin-locked bands always win.
-  if t.y0 and t.y1 and t.status ~= "done" then
+  -- Keep the turtle's claim forever until done / clearclaims (deep digs go quiet).
+  if turtleHasClaim(t) and t.status ~= "done" then
     return claimPayload({
       ok = true,
+      pattern = (t.x0 ~= nil) and "column" or "layer",
       y0 = t.y0, y1 = t.y1,
+      x0 = t.x0, x1 = t.x1, z0 = t.z0, z1 = t.z1,
       resume = true,
       adminLock = t.adminLock == true,
     })
   end
+
+  if pat == "column" then
+    local x0, x1, z0, z1, y0, y1 = nextFreeColumn()
+    if not x0 then
+      return claimPayload({ ok = false, err = "no free 2x2 columns" })
+    end
+    t.x0, t.x1, t.z0, t.z1 = x0, x1, z0, z1
+    t.y0, t.y1 = y0, y1
+    t.status = "assigned"
+    t.adminLock = false
+    t.idx, t.total = 1, nil
+    t.job = nil
+    turtles[id] = t
+    print(("[claim] #%d %s → column X%d-%d Z%d-%d (full Y %d..%d)"):format(
+      id, tostring(t.name), x0, x1, z0, z1, y0, y1))
+    return claimPayload({
+      ok = true,
+      pattern = "column",
+      x0 = x0, x1 = x1, z0 = z0, z1 = z1,
+      y0 = y0, y1 = y1,
+      resume = false,
+    })
+  end
+
   local y0, y1 = nextFreeBand()
   if not y0 then
     return claimPayload({ ok = false, err = "no free Y layers" })
   end
   t.y0, t.y1 = y0, y1
+  t.x0, t.x1, t.z0, t.z1 = nil, nil, nil, nil
   t.status = "assigned"
   t.adminLock = false
   t.idx, t.total = 1, nil
@@ -567,6 +825,7 @@ local function assignClaim(id, msg)
     id, tostring(t.name), y0, y1, y1 - y0 + 1))
   return claimPayload({
     ok = true,
+    pattern = "layer",
     y0 = y0, y1 = y1,
     resume = false,
   })
@@ -574,15 +833,15 @@ end
 
 local function markDone(id, msg)
   local t = touchTurtle(id, msg or {})
-  if t.y0 and t.y1 then
-    completedBands[#completedBands + 1] = { y0 = t.y0, y1 = t.y1 }
-    print(("[done] #%d finished Y %d..%d"):format(id, t.y0, t.y1))
+  if turtleHasClaim(t) then
+    archiveClaim(t)
+    print(("[done] #%d finished %s"):format(id, claimLabel(t)))
     saveCfg()
   end
   t.status = "done"
-  t.y0, t.y1 = nil, nil
+  clearTurtleCoords(t)
   t.job = nil
-  persistTurtleJob(id, nil)  -- clear so turtle can claim a fresh band
+  persistTurtleJob(id, nil)  -- clear so turtle can claim a fresh region
   turtles[id] = t
 end
 
@@ -667,11 +926,13 @@ local function handleMsg(id, msg)
         siteId = os.getComputerID(),
         name = os.getComputerLabel(),
         W = cfg.W, L = cfg.L, H = cfg.H,
+        pattern = sitePattern(),
         fraction = fractionLabel(),
-        maxClaim = maxClaimLayers(),
+        maxClaim = (sitePattern() == "column") and 4 or maxClaimLayers(),
         maxTravel = maxTravel(), minBpc = minBpc(),
         job = stored,
         y0 = row.y0, y1 = row.y1,
+        x0 = row.x0, x1 = row.x1, z0 = row.z0, z1 = row.z1,
         hasJob = stored ~= nil,
       }, PROTO)
       row.welcomedAt = now()
@@ -704,6 +965,14 @@ local function handleMsg(id, msg)
     elseif t == "quarry_job" then
       broadcastStatus()
     end
+  elseif t == "quarry_sos" or t == "quarry_sos_clear" then
+    touchTurtle(id, msg)
+    if t == "quarry_sos" then
+      print(("[SOS] #%d %s out of fuel @ %s,%s,%s"):format(
+        id, tostring(msg.name or "?"),
+        tostring(msg.posX or "?"), tostring(msg.posY or "?"), tostring(msg.posZ or "?")))
+    end
+    broadcastStatus()
   elseif t == "quarry_done" then
     markDone(id, msg)
     broadcastStatus()
@@ -746,8 +1015,8 @@ local function drawBoard(out)
     out.write(tostring(txt):sub(1, w))
   end
 
-  local title = ("QUARRY  %dx%d × %dY  [%s]"):format(
-    snap.W, snap.L, snap.H, snap.fraction)
+  local title = ("QUARRY  %dx%d × %dY  [%s/%s]"):format(
+    snap.W, snap.L, snap.H, tostring(snap.pattern or "column"), snap.fraction)
   if color then
     if out.setBackgroundColor then out.setBackgroundColor(colors.cyan) end
     if out.setTextColor then out.setTextColor(colors.black) end
@@ -778,25 +1047,38 @@ local function drawBoard(out)
 
   line(4, ("online:%d  minBPC:%.1f  maxTravel:%d"):format(
     snap.online, snap.minBpc, snap.maxTravel), colors.lightGray)
-  line(5, ("claim max %d layers (%s of H)"):format(snap.maxClaim, snap.fraction), colors.lightGray)
+  if tostring(snap.pattern) == "column" then
+    line(5, "claim mode COLUMN (2x2 XZ shafts, full H)", colors.lightGray)
+  else
+    line(5, ("claim max %d layers (%s of H)"):format(snap.maxClaim, snap.fraction), colors.lightGray)
+  end
 
   local y = 7
-  line(6, "ID   Y-band     BPC   PROG     STATUS", colors.orange or colors.yellow)
+  line(6, "ID   CLAIM      BPC   PROG  @POS / STATUS", colors.orange or colors.yellow)
   for _, t in ipairs(snap.turtles) do
     if y >= h then break end
-    local band = (t.y0 and t.y1) and ("%d-%d"):format(t.y0, t.y1) or "-"
+    local band = "-"
+    if t.x0 ~= nil then
+      band = ("X%d-%dZ%d-%d"):format(t.x0, t.x1 or t.x0, t.z0, t.z1 or t.z0)
+    elseif t.y0 and t.y1 then
+      band = ("%d-%d"):format(t.y0, t.y1)
+    end
     local prog = "-"
     if t.total and t.total > 0 and t.idx then
       prog = ("%d%%"):format(math.floor(100 * math.min(1, (t.idx - 1) / t.total)))
     end
     local st = tostring(t.status or "?")
-    if (t.age or 99) >= ONLINE_SECS then st = "stale" end
+    if t.sos then st = "SOS"
+    elseif (t.age or 99) >= ONLINE_SECS then st = "stale" end
+    local pos = (t.posX ~= nil)
+      and ("%d,%d,%d"):format(t.posX, t.posY or 0, t.posZ or 0) or "-"
     local col = colors.white
-    if st == "assigned" or st == "mining" then col = colors.lime
+    if st == "SOS" then col = colors.red
+    elseif st == "assigned" or st == "mining" then col = colors.lime
     elseif st == "done" then col = colors.lightGray
     elseif st == "stale" then col = colors.red end
-    line(y, ("#%-3d %-10s %-5s %-8s %s"):format(
-      t.id, band, tostring(t.bpc or "?"):sub(1, 5), prog, st), col)
+    line(y, ("#%-3d %-10s %-5s %-4s %s %s"):format(
+      t.id, band:sub(1, 10), tostring(t.bpc or "?"):sub(1, 5), prog, pos, st), col)
     y = y + 1
   end
   if #snap.turtles == 0 and y < h then
@@ -809,31 +1091,38 @@ end
 --------------------------------------------------------------------------------
 local function printHelp()
   print("Quarry site board — place LEFT of the storage chest (optional).")
-  print("  setup <W>x<L> <H> [half|third]   lock shared dig volume")
+  print("  setup <W>x<L> <H> [half|third] [column|layer]")
   print("  auto                             learn size from turtle mine data")
-  print("  fraction half|third              max Y band per turtle")
-  print("  claims                           show claimed + free Y bands")
-  print("  clearclaims                      release ALL Y claims (active+done)")
-  print("  clearclaims done                 clear finished bands only")
-  print("  clearclaims stale                free bands from quiet turtles (manual)")
+  print("  pattern column|layer             column=2x2 XZ shafts; layer=Y bands")
+  print("  fraction half|third              max Y band per turtle (layer mode)")
+  print("  claims                           show claimed + free regions")
+  print("  clearclaims                      release ALL claims (active+done)")
+  print("  clearclaims done                 clear finished claims only")
+  print("  clearclaims stale                free claims from quiet turtles (manual)")
   print("  clearclaims Y <y0> [y1]          clear claims overlapping Y range")
   print("  clearclaims turtle <id>          release one turtle's claim")
   print("  status | turtles | jobs | clear | broadcast")
   print("  help | exit")
   print("")
-  print("Turtles call mine/join → site assigns the next free Y band.")
+  print("Turtles call mine/join → site assigns next free column (default) or Y band.")
   print("Job files: " .. JOB_DIR .. "/<id>_offline_miner_job.cfg")
 end
 
 local function printClaims()
   local entries = listClaimEntries()
   local frees = listFreeBands()
+  print("Dig mode: " .. sitePattern())
   if #entries == 0 then
-    print("No Y claims.")
+    print("No claims.")
   else
-    print("Claimed Y bands:")
+    print("Claimed:")
     for _, e in ipairs(entries) do
-      if e.kind == "done" then
+      if e.x0 ~= nil then
+        local tag = (e.kind == "done") and "[done]" or ("#" .. tostring(e.id) .. " " .. tostring(e.name or "?"):sub(1, 10))
+        print(("  X%d-%d Z%d-%d  %s%s"):format(
+          e.x0, e.x1 or e.x0, e.z0, e.z1 or e.z0, tag,
+          e.stale and " (stale)" or ""))
+      elseif e.kind == "done" then
         print(("  Y %d..%d  [done]"):format(e.y0, e.y1))
       else
         print(("  Y %d..%d  #%d %s%s"):format(
@@ -842,7 +1131,17 @@ local function printClaims()
       end
     end
   end
-  if #frees == 0 then
+  if sitePattern() == "column" then
+    if type(frees) ~= "table" or #frees == 0 then
+      print("Free columns: (none)")
+    else
+      local parts = {}
+      for _, f in ipairs(frees) do
+        parts[#parts + 1] = ("X%d-%dZ%d-%d"):format(f.x0, f.x1, f.z0, f.z1)
+      end
+      print("Free columns (sample): " .. table.concat(parts, ", "))
+    end
+  elseif #frees == 0 then
     print("Free Y: (none)")
   else
     local parts = {}
@@ -870,10 +1169,18 @@ local function handleCommand(line)
     if #s.turtles == 0 then print("(none)")
     else
       for _, t in ipairs(s.turtles) do
-        print(("#%d %s  Y%s  bpc=%s  %s  %ss"):format(
-          t.id, tostring(t.name):sub(1, 12),
-          (t.y0 and ("%d-%d"):format(t.y0, t.y1)) or "-",
-          tostring(t.bpc or "?"), tostring(t.status or "?"), tostring(t.age or "?")))
+        local claim = "-"
+        if t.x0 ~= nil then
+          claim = ("X%d-%d Z%d-%d"):format(t.x0, t.x1 or t.x0, t.z0, t.z1 or t.z0)
+        elseif t.y0 then
+          claim = ("Y%d-%d"):format(t.y0, t.y1 or t.y0)
+        end
+        local pos = (t.posX ~= nil)
+          and (" @%d,%d,%d"):format(t.posX, t.posY or 0, t.posZ or 0) or ""
+        print(("#%d %s  %s  bpc=%s  %s  %ss%s"):format(
+          t.id, tostring(t.name):sub(1, 12), claim,
+          tostring(t.bpc or "?"), tostring(t.status or "?"), tostring(t.age or "?"),
+          pos))
         if t.jobSummary then
           print("     job: " .. t.jobSummary)
         end
@@ -968,39 +1275,57 @@ local function handleCommand(line)
     end
     saveCfg()
     print("Claim size: " .. fractionLabel() .. " (" .. maxClaimLayers() .. " layers max)")
+  elseif cmd == "pattern" or cmd == "mode" or cmd == "digmode" then
+    local p = normalizePattern(a[2])
+    if not p then
+      print("Usage: pattern column|layer   (now " .. sitePattern() .. ")")
+      print("  column = 2x2 XZ shafts through full height")
+      print("  layer  = Y-band slices across the whole footprint")
+      return true
+    end
+    cfg.pattern = p
+    turtles, completedBands = {}, {}
+    saveCfg()
+    print("Dig mode set to " .. p .. " (claims cleared — turtles re-mine).")
+    broadcastStatus()
   elseif cmd == "setup" then
     local raw = a[2]
     local W, L, H
+    local extras = {}
     if raw and tostring(raw):find("x") then
       local p = {}
       for n in tostring(raw):gmatch("(%-?%d+)") do p[#p + 1] = tonumber(n) end
       W, L = p[1], p[2]
       H = tonumber(a[3])
-      local fr = tostring(a[4] or a[3] or ""):lower()
-      if fr == "half" or fr == "third" then
-        if not tonumber(a[3]) then H = nil end
-        cfg.fraction = (fr == "third") and (1 / 3) or 0.5
-        if not H then H = tonumber(a[3]) end
-      end
-      if tostring(a[4] or ""):lower() == "half" then cfg.fraction = 0.5
-      elseif tostring(a[4] or ""):lower() == "third" then cfg.fraction = 1 / 3 end
+      for i = 3, #a do extras[#extras + 1] = tostring(a[i] or ""):lower() end
     else
       W, L, H = tonumber(a[2]), tonumber(a[3]), tonumber(a[4])
-      local fr = tostring(a[5] or ""):lower()
+      for i = 5, #a do extras[#extras + 1] = tostring(a[i] or ""):lower() end
+    end
+    for _, fr in ipairs(extras) do
       if fr == "half" then cfg.fraction = 0.5
-      elseif fr == "third" then cfg.fraction = 1 / 3 end
+      elseif fr == "third" then cfg.fraction = 1 / 3
+      else
+        local pat = normalizePattern(fr)
+        if pat then cfg.pattern = pat end
+      end
     end
     if not W or not L or not H then
-      print("Usage: setup <W>x<L> <H> [half|third]")
-      print("Example: setup 16x32 60 half")
+      print("Usage: setup <W>x<L> <H> [half|third] [column|layer]")
+      print("Example: setup 16x32 60 column")
       print("Or skip setup — turtles' area commands set the site automatically.")
     else
       cfg.W, cfg.L, cfg.H = W, L, H
+      cfg.pattern = normalizePattern(cfg.pattern) or "column"
       cfg.manual = true
       turtles, completedBands = {}, {}
       saveCfg()
-      print(("Site locked: %dx%d × %dY  claim=%s (max %d layers)"):format(
-        W, L, H, fractionLabel(), maxClaimLayers()))
+      if sitePattern() == "column" then
+        print(("Site locked: %dx%d × %dY  pattern=column (2x2 XZ claims)"):format(W, L, H))
+      else
+        print(("Site locked: %dx%d × %dY  pattern=layer claim=%s (max %d)"):format(
+          W, L, H, fractionLabel(), maxClaimLayers()))
+      end
       print("(`auto` to unlock learning from turtles again)")
       broadcastStatus()
     end
@@ -1029,8 +1354,8 @@ print("== Quarry Site Board ==")
 if (cfg.W or 0) < 1 then
   print("Footprint: waiting for turtle mine data (or `setup WxL H`)")
 else
-  print(("Footprint %dx%d × %dY  claim=%s  %s"):format(
-    cfg.W, cfg.L, cfg.H, fractionLabel(),
+  print(("Footprint %dx%d × %dY  pattern=%s  claim=%s  %s"):format(
+    cfg.W, cfg.L, cfg.H, sitePattern(), fractionLabel(),
     cfg.manual and "manual" or "auto"))
 end
 print("Place LEFT of storage. Relays jobs/progress to admin tablet.")
