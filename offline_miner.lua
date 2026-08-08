@@ -1,6 +1,6 @@
 --[[
   offline_miner.lua  -  Local quarry turtle (optional site board)
-  Titan-Version: 1.5.7
+  Titan-Version: 1.5.8
 
   Place the turtle at the TOP-FRONT-LEFT corner of the dig, facing into the
   mine. That cell is origin 0,0,0:
@@ -65,7 +65,7 @@ local WORK_RESERVE = 48      -- keep digging only with this much above home cost
 local MIN_FUEL = 200
 local TRAFFIC_Y = -1         -- cruise / traffic layer (+Y = down, so -1 is one above origin)
 -- Keep in sync with Titan-Version header (label uses major.minor → V1.5-Miner12).
-local MINER_VERSION = "1.5.7"
+local MINER_VERSION = "1.5.8"
 -- "outbound" = to cell (overtake) | "homebound" = to origin (yield) | "dig" = wait/retry
 local travelIntent = "dig"
 -- Other miners' last known quarry-relative poses (rednet). Used to tell turtle vs mob/player.
@@ -120,6 +120,10 @@ local cfg = {
   siteId = nil,
   pendingAssign = nil,
 }
+
+-- Cobalt counts enclosing-chunk locals toward nested functions' 200-local limit.
+-- Keep most late helpers on this table (not `local function`) so site dig code can load.
+local site = {}
 
 local function currentBpc()
   local work = dug + moves
@@ -1476,14 +1480,14 @@ local function cellLayerUnits(x0, x1, z0, z1, y0, y1)
   return units
 end
 
-local function gpsStubFields()
+function site.gpsStubFields()
   -- Groundwork for later constellation correction. Disabled for now so digs
   -- don't stall waiting on gps.locate; site still receives gpsOk=false.
   -- When enabling: call titanLib.gpsFix while modem is equipped (travel/check-in).
   return { gpsX = nil, gpsY = nil, gpsZ = nil, gpsOk = false }
 end
 
-local function tunnelUnits(L, W)
+function site.tunnelUnits(L, W)
   local units = {}
   for z = 0, L - 1 do
     if z % 2 == 0 or W == 1 then
@@ -1495,7 +1499,7 @@ local function tunnelUnits(L, W)
   return units
 end
 
-local function stairUnits(W, steps, dir)
+function site.stairUnits(W, steps, dir)
   local units = {}
   for s = 0, steps - 1 do
     local y = (dir == "down") and s or -s
@@ -1509,7 +1513,7 @@ end
 --------------------------------------------------------------------------------
 -- Optional quarry site board (offline_site.lua)
 --------------------------------------------------------------------------------
-local function rememberPeer(id)
+function site.rememberPeer(id)
   id = tonumber(id)
   if id and id ~= os.getComputerID() then
     knownPeers[id] = true
@@ -1517,7 +1521,7 @@ local function rememberPeer(id)
 end
 
 -- Open every modem for rednet + CraftOS hop channel so nearby routers can relay.
-local function openModem()
+function site.openModem()
   local any = false
   for _, side in ipairs(peripheral.getNames()) do
     if peripheral.getType(side) == "modem" then
@@ -1530,7 +1534,7 @@ local function openModem()
   return any
 end
 
-local function rednetIsReady()
+function site.rednetIsReady()
   for _, side in ipairs(peripheral.getNames()) do
     if peripheral.getType(side) == "modem" and rednet.isOpen(side) then
       return true
@@ -1540,7 +1544,7 @@ local function rednetIsReady()
 end
 
 -- Stagger fleet chatter so many bots don't hit the site in the same tick.
-local function netJitter(scale)
+function site.netJitter(scale)
   scale = tonumber(scale) or 1
   local id = os.getComputerID() or 0
   local frac = ((id * 37 + (moves or 0) * 13) % 1000) / 1000
@@ -1549,9 +1553,9 @@ end
 
 -- opts.light: unicast site + one PROTO broadcast (routine progress).
 -- opts.full: multi-protocol flood (join / SOS / urgent).
-local function rednetPublish(msg, opts)
+function site.rednetPublish(msg, opts)
   if type(msg) ~= "table" then return false end
-  if not openModem() and not rednetIsReady() then return false end
+  if not site.openModem() and not site.rednetIsReady() then return false end
   opts = opts or {}
   local full = opts.full == true
   local light = opts.light == true or not full
@@ -1561,7 +1565,7 @@ local function rednetPublish(msg, opts)
   msg.t = os.epoch("utc")
 
   if siteId then
-    rememberPeer(siteId)
+    site.rememberPeer(siteId)
     rednet.send(siteId, msg, PROTO_QUARRY)
   end
   rednet.broadcast(msg, PROTO_QUARRY)
@@ -1588,7 +1592,7 @@ classifyEntityAhead = function()
   if fleetTurtleInCell(ax, ay, az) then
     return "turtle"
   end
-  if not rednetIsReady() then
+  if not site.rednetIsReady() then
     return "entity"
   end
   local ping = {
@@ -1615,20 +1619,20 @@ classifyEntityAhead = function()
   return "entity"
 end
 
-local function rightDetail()
+function site.rightDetail()
   return getEquipped(PICK_SIDE)
 end
 
-local function rightHasPickaxe()
-  local d = rightDetail()
+function site.rightHasPickaxe()
+  local d = site.rightDetail()
   return d ~= nil and toolKind(d.name) == "pickaxe"
 end
 
-local function rightHasModem()
+function site.rightHasModem()
   return sideLooksLikeModem(PICK_SIDE)
 end
 
-local function findPickaxeInventorySlot()
+function site.findPickaxeInventorySlot()
   -- Prefer slot 15 (modem/pick swap parking), then any other slot.
   local order = { MODEM_SLOT }
   for s = 1, 16 do
@@ -1647,7 +1651,7 @@ local function findPickaxeInventorySlot()
   return best
 end
 
-local function parkModemInSlot15()
+function site.parkModemInSlot15()
   -- After equipping pick, modem may sit in whatever slot we selected — move to 15.
   if isModemItem(itemDetail(MODEM_SLOT)) then return true end
   for s = 1, 16 do
@@ -1672,20 +1676,20 @@ local function parkModemInSlot15()
 end
 
 -- Guarantee dig tool on RIGHT (slot 2) before mining. Detects modem-still-equipped.
-local function ensurePickReady(quiet)
-  if rightHasPickaxe() then
+function site.ensurePickReady(quiet)
+  if site.rightHasPickaxe() then
     modemSwapSide = nil
-    parkModemInSlot15()
+    site.parkModemInSlot15()
     return true
   end
 
   -- Modem still on right after a check-in — swap it off for a pickaxe.
-  if rightHasModem() then
-    local pickSlot = findPickaxeInventorySlot()
+  if site.rightHasModem() then
+    local pickSlot = site.findPickaxeInventorySlot()
     if pickSlot then
       turtle.select(pickSlot)
-      if turtle.equipRight() and rightHasPickaxe() then
-        parkModemInSlot15()
+      if turtle.equipRight() and site.rightHasPickaxe() then
+        site.parkModemInSlot15()
         modemSwapSide = nil
         return true
       end
@@ -1693,8 +1697,8 @@ local function ensurePickReady(quiet)
     -- Slot 15 empty or has pick: try equip from 15 anyway.
     if turtle.getItemCount(MODEM_SLOT) > 0 then
       turtle.select(MODEM_SLOT)
-      if turtle.equipRight() and rightHasPickaxe() then
-        parkModemInSlot15()
+      if turtle.equipRight() and site.rightHasPickaxe() then
+        site.parkModemInSlot15()
         modemSwapSide = nil
         return true
       end
@@ -1702,18 +1706,18 @@ local function ensurePickReady(quiet)
   end
 
   -- Right empty / wrong item: equip best pick from inventory onto right only.
-  local pickSlot = findPickaxeInventorySlot()
+  local pickSlot = site.findPickaxeInventorySlot()
   if pickSlot then
     turtle.select(pickSlot)
-    if turtle.equipRight() and rightHasPickaxe() then
-      parkModemInSlot15()
+    if turtle.equipRight() and site.rightHasPickaxe() then
+      site.parkModemInSlot15()
       modemSwapSide = nil
       return true
     end
   end
 
-  if equipToolFromInventory(PICK_SIDE, true) and rightHasPickaxe() then
-    parkModemInSlot15()
+  if equipToolFromInventory(PICK_SIDE, true) and site.rightHasPickaxe() then
+    site.parkModemInSlot15()
     modemSwapSide = nil
     return true
   end
@@ -1725,14 +1729,14 @@ local function ensurePickReady(quiet)
 end
 
 -- Put wireless modem on RIGHT upgrade only (slot 2 / pickaxe). Never touch left.
-local function ensureModemForComms(quiet)
+function site.ensureModemForComms(quiet)
   -- Already talking and modem is on right — mark swap so we restore the pick.
-  if rightHasModem() and openModem() then
+  if site.rightHasModem() and site.openModem() then
     modemSwapSide = PICK_SIDE
     return true
   end
   -- Modem on another side (or already open): talk without touching right pick.
-  if openModem() and not rightHasModem() and rightHasPickaxe() then
+  if site.openModem() and not site.rightHasModem() and site.rightHasPickaxe() then
     return true
   end
   if not moveModemToSlot15() and not isModemItem(itemDetail(MODEM_SLOT)) then
@@ -1741,7 +1745,7 @@ local function ensureModemForComms(quiet)
     end
     return false
   end
-  local d = rightDetail()
+  local d = site.rightDetail()
   if d and not isModemItem(d) and toolKind(d.name) ~= "pickaxe" then
     if not quiet then
       print("Right upgrade (slot 2) must be the pickaxe — won't swap a loader/other.")
@@ -1756,7 +1760,7 @@ local function ensureModemForComms(quiet)
     return false
   end
   modemSwapSide = PICK_SIDE
-  if not openModem() then
+  if not site.openModem() then
     if not quiet then print("Modem equipped but rednet failed to open.") end
     return false
   end
@@ -1764,13 +1768,13 @@ local function ensureModemForComms(quiet)
 end
 
 -- Always try to put the pickaxe back on RIGHT after comms (robust detection).
-local function restorePickAfterComms()
-  local ok = ensurePickReady(true)
+function site.restorePickAfterComms()
+  local ok = site.ensurePickReady(true)
   modemSwapSide = nil
   return ok
 end
 
-local function footprintFromJob(j)
+function site.footprintFromJob(j)
   if type(j) ~= "table" then return nil end
   local W = math.floor(tonumber(j.W) or 0)
   local L = math.floor(tonumber(j.L) or tonumber(j.D) or 0)
@@ -1782,8 +1786,8 @@ local function footprintFromJob(j)
   return W, L, H
 end
 
-local function sitePayload(extra)
-  local gps = gpsStubFields()
+function site.sitePayload(extra)
+  local gps = site.gpsStubFields()
   local msg = {
     name = os.getComputerLabel(),
     hostname = os.getComputerLabel(),
@@ -1819,7 +1823,7 @@ local function sitePayload(extra)
     msg.z1 = j.z1 or msg.z1
     msg.cellId = j.cellId or msg.cellId
     msg.pattern = j.pattern or msg.pattern
-    local W, L, H = footprintFromJob(j)
+    local W, L, H = site.footprintFromJob(j)
     if W then msg.W, msg.L, msg.H = W, L, H end
   elseif siteInfo then
     msg.y0 = siteInfo.y0 or msg.y0
@@ -1845,7 +1849,7 @@ end
 local applyingAssign = false
 
 -- Force physical descent/ascent to target relative Y (+Y = down), one Y at a time.
-local function forceGoToY(ty)
+function site.forceGoToY(ty)
   ty = math.floor(tonumber(ty) or 0)
   if ty < 0 then ty = 0 end
   while pos.y > ty do
@@ -1866,7 +1870,7 @@ local function forceGoToY(ty)
 end
 
 -- Path to the top of a Y band (0, y0, 0). Pickaxe must be equipped for digs.
-local function moveIntoBand(y0, y1, opts)
+function site.moveIntoBand(y0, y1, opts)
   opts = opts or {}
   y0 = math.floor(tonumber(y0) or 0)
   y1 = math.floor(tonumber(y1) or y0)
@@ -1875,7 +1879,7 @@ local function moveIntoBand(y0, y1, opts)
     print(("Y band %d..%d saved — finish/stop current dig, then I'll move in."):format(y0, y1))
     return false
   end
-  restorePickAfterComms()
+  site.restorePickAfterComms()
   equipToolFromInventory(nil, true)
   if not ensureFuel() then
     print("Need fuel to move into Y band.")
@@ -1900,7 +1904,7 @@ local function moveIntoBand(y0, y1, opts)
     ok, err = goTo(0, saveY, 0)
   end
   if ok then
-    ok, err = forceGoToY(y0)
+    ok, err = site.forceGoToY(y0)
   end
   if ok and (pos.x ~= 0 or pos.z ~= 0) then
     ok, err = goTo(0, y0, 0)
@@ -1921,7 +1925,7 @@ local function moveIntoBand(y0, y1, opts)
 end
 
 -- Apply admin-tablet Y band; ack back to the tablet (and broadcast).
-local function applyQuarryAssign(msg, fromId)
+function site.applyQuarryAssign(msg, fromId)
   if applyingAssign then return false end
   if type(msg) ~= "table" then return false end
   local tid = tonumber(msg.turtleId)
@@ -1981,7 +1985,7 @@ local function applyQuarryAssign(msg, fromId)
     -- Idle check-ins are almost always from the depot. If pose already claims
     -- we're at y0 without having just moved, reset and force a real descent.
     local needOrigin = (pos.y == y0 and y0 > 0) or (pos.y < 1)
-    moved = moveIntoBand(y0, y1, { fromOrigin = needOrigin })
+    moved = site.moveIntoBand(y0, y1, { fromOrigin = needOrigin })
   end
 
   local ack = {
@@ -1996,12 +2000,12 @@ local function applyQuarryAssign(msg, fromId)
     posY = pos.y,
     status = digging and "mining" or (moved or alreadyThere) and "at_band" or "assigned",
   }
-  rememberPeer(fromId)
-  rememberPeer(msg.from)
+  site.rememberPeer(fromId)
+  site.rememberPeer(msg.from)
   if fromId then rednet.send(fromId, ack, PROTO_QUARRY) end
   local adminId = tonumber(msg.from)
   if adminId and adminId ~= fromId then rednet.send(adminId, ack, PROTO_QUARRY) end
-  rednetPublish(ack)
+  site.rednetPublish(ack)
   print(("\n[admin] Y assign %d..%d — acked%s"):format(
     y0, y1,
     digging and " (move after current dig)" or (moved and " — moved in") or ""))
@@ -2009,16 +2013,16 @@ local function applyQuarryAssign(msg, fromId)
   return true
 end
 
-local function pollAssignReplies(timeout)
+function site.pollAssignReplies(timeout)
   timeout = tonumber(timeout) or 0.75
   local deadline = os.clock() + timeout
   while os.clock() < deadline do
     local id, msg = rednet.receive(PROTO_QUARRY, math.max(0.05, deadline - os.clock()))
     if id and type(msg) == "table" then
-      rememberPeer(id)
+      site.rememberPeer(id)
       local t = tostring(msg.type or "")
       if t == "quarry_assign" then
-        applyQuarryAssign(msg, id)
+        site.applyQuarryAssign(msg, id)
       elseif t == "quarry_welcome" then
         if not siteId then
           siteId = id
@@ -2027,7 +2031,7 @@ local function pollAssignReplies(timeout)
           cfg.siteId = id
           saveCfg()
         end
-        rememberPeer(id)
+        site.rememberPeer(id)
       end
     end
   end
@@ -2036,19 +2040,19 @@ end
 -- Broadcast mine data for admin. Also unicast to site board when joined.
 -- Swaps slot-15 modem over RIGHT pickaxe only, then restores the pickaxe.
 -- Offline mode: no site/admin traffic (solo dig).
-local function publishMine(extra)
+function site.publishMine(extra)
   extra = extra or {}
   if isOfflineMode() then return false end
-  local modemOk = ensureModemForComms(true)
+  local modemOk = site.ensureModemForComms(true)
   if not modemOk then
-    modemOk = openModem()
+    modemOk = site.openModem()
   end
-  if not modemOk or not rednetIsReady() then
+  if not modemOk or not site.rednetIsReady() then
     print("[rednet] check-in FAILED — modem not open")
     return false
   end
 
-  local base = sitePayload(extra)
+  local base = site.sitePayload(extra)
   if adminAssign then
     base.y0 = adminAssign.y0
     base.y1 = adminAssign.y1
@@ -2064,9 +2068,9 @@ local function publishMine(extra)
   if siteType ~= "quarry_turtle" then
     bcast.siteType = siteType
   end
-  if not rednetPublish(bcast, { light = true }) then
+  if not site.rednetPublish(bcast, { light = true }) then
     print("[rednet] broadcast FAILED")
-    if digging then ensurePickReady(true) end
+    if digging then site.ensurePickReady(true) end
     return false
   end
 
@@ -2085,32 +2089,32 @@ local function publishMine(extra)
 
   -- Listen briefly for tablet Y assign + ack it (shorter while digging).
   local listen = tonumber(extra.listen) or (digging and 0.35 or 0.75)
-  pollAssignReplies(listen)
+  site.pollAssignReplies(listen)
   -- While mining, ALWAYS re-equip pick on right before the next dig step.
   if digging then
-    if not restorePickAfterComms() then
+    if not site.restorePickAfterComms() then
       print("WARN: pickaxe not on right after check-in — retrying...")
       sleep(0.05)
-      ensurePickReady(false)
+      site.ensurePickReady(false)
     end
   end
   return true
 end
 
-local function siteSend(msgType, extra)
+function site.siteSend(msgType, extra)
   if not siteId then
     -- No board — still publish so admin tablet can see us.
-    return publishMine(extra)
+    return site.publishMine(extra)
   end
   extra = extra or {}
   extra._siteType = msgType
-  return publishMine(extra)
+  return site.publishMine(extra)
 end
 
-local function siteReportProgress(extra)
+function site.siteReportProgress(extra)
   extra = extra or {}
   extra._siteType = "quarry_progress"
-  return publishMine(extra)
+  return site.publishMine(extra)
 end
 
 -- Named check-in helper (depot / end of dig line / layer) — always over rednet.
@@ -2122,12 +2126,12 @@ checkIn = function(reason, extra)
   if activeJob then extra.job = activeJob; extra.jobFile = JOB_FILE end
   print(("[check-in] %s @ %d,%d,%d (rednet)"):format(
     tostring(reason), pos.x, pos.y, pos.z))
-  local ok = publishMine(extra)
+  local ok = site.publishMine(extra)
   if not ok then
     print("[check-in] rednet send failed — will retry next line/depot")
   end
   -- Belt-and-suspenders: verify pick before returning to the dig line.
-  if digging and not ensurePickReady(true) then
+  if digging and not site.ensurePickReady(true) then
     print("Pickaxe missing after check-in — cannot dig until RIGHT has a pick.")
   end
   return ok
@@ -2170,8 +2174,8 @@ broadcastSos = function(reason, extra)
       print("Fuel restored — SOS cleared.")
       return true
     end
-    ensureModemForComms(true)
-    local msg = sitePayload({
+    site.ensureModemForComms(true)
+    local msg = site.sitePayload({
       sos = true,
       urgent = true,
       reason = reason,
@@ -2182,7 +2186,7 @@ broadcastSos = function(reason, extra)
       suggestX = sx, suggestY = sy, suggestZ = sz,
     })
     msg.type = "quarry_sos"
-    rednetPublish(msg, { full = true })
+    site.rednetPublish(msg, { full = true })
     print(("[SOS] %s @ %d,%d,%d  suggest refuel ~%d,%d,%d"):format(
       reason, pos.x, pos.y, pos.z, sx, sy, sz))
     local deadline = os.clock() + 2.5
@@ -2203,28 +2207,28 @@ end
 clearSos = function()
   if not sosActive then return end
   sosActive = false
-  ensureModemForComms(true)
-  local msg = sitePayload({ sos = false, status = "idle", checkIn = "sos_clear" })
+  site.ensureModemForComms(true)
+  local msg = site.sitePayload({ sos = false, status = "idle", checkIn = "sos_clear" })
   msg.type = "quarry_sos_clear"
-  rednetPublish(msg, { full = true })
-  if digging then restorePickAfterComms() end
+  site.rednetPublish(msg, { full = true })
+  if digging then site.restorePickAfterComms() end
 end
 
 -- Push offline_miner_job.cfg to site (if any) and broadcast for admin.
 siteSendJob = function(j, clearing)
   if clearing or not j then
-    return publishMine({
+    return site.publishMine({
       _siteType = "quarry_job",
       clearJob = true, job = false, status = "idle",
     })
   end
-  return publishMine({
+  return site.publishMine({
     _siteType = "quarry_job",
     job = j, jobFile = JOB_FILE, status = j.status or "active",
   })
 end
 
-local function joinSite(timeout, quiet)
+function site.joinSite(timeout, quiet)
   timeout = tonumber(timeout) or 6
   quiet = quiet == true
   if isOfflineMode() then
@@ -2233,18 +2237,18 @@ local function joinSite(timeout, quiet)
     end
     return false
   end
-  if not ensureModemForComms(quiet) then
+  if not site.ensureModemForComms(quiet) then
     if not quiet then
       print("No modem in slot " .. MODEM_SLOT .. " — solo dig only (no site/admin link).")
     end
     return false
   end
-  netJitter(1.2)
-  local joinMsg = sitePayload({})
+  site.netJitter(1.2)
+  local joinMsg = site.sitePayload({})
   joinMsg.type = "quarry_join"
   -- Ask site to include our stored job if we have none locally.
   joinMsg.wantJob = loadJobFile() == nil
-  rednetPublish(joinMsg, { full = true })
+  site.rednetPublish(joinMsg, { full = true })
   local deadline = os.clock() + timeout
   local found = false
   local welcomed = nil
@@ -2254,7 +2258,7 @@ local function joinSite(timeout, quiet)
       local mt = tostring(msg.type or "")
       if mt == "quarry_welcome" then
         siteId = id
-        rememberPeer(id)
+        site.rememberPeer(id)
         siteInfo = msg
         maxTravel = tonumber(msg.maxTravel) or maxTravel
         cfg.siteId = id
@@ -2273,7 +2277,7 @@ local function joinSite(timeout, quiet)
         break
       elseif mt == "quarry_reband" or mt == "quarry_reset_go" then
         siteId = siteId or id
-        rememberPeer(id)
+        site.rememberPeer(id)
         handleQuarryNetMsg(id, msg)
         found = true
       end
@@ -2290,13 +2294,13 @@ local function joinSite(timeout, quiet)
     adoptJob(welcomed.job, "site welcome")
   end
   -- Report once while modem is still equipped.
-  local base = sitePayload({ _siteType = found and "quarry_join" or "quarry_progress" })
+  local base = site.sitePayload({ _siteType = found and "quarry_join" or "quarry_progress" })
   local bcast = {}
   for k, v in pairs(base) do bcast[k] = v end
   bcast.type = "quarry_turtle"
   rednet.broadcast(bcast, PROTO_QUARRY)
   rednet.broadcast(bcast, "titan_net")
-  if digging then restorePickAfterComms() end
+  if digging then site.restorePickAfterComms() end
   return found
 end
 
@@ -2309,22 +2313,22 @@ fetchJobFromSite = function(timeout, quiet, force)
   force = force == true
   local localJob = loadJobFile()
   if localJob and not force then return localJob end
-  if not ensureModemForComms(quiet) then return force and nil or localJob end
-  if not siteId then joinSite(math.min(timeout, 4), true) end
+  if not site.ensureModemForComms(quiet) then return force and nil or localJob end
+  if not siteId then site.joinSite(math.min(timeout, 4), true) end
   if not siteId then
     if not quiet then print("No site board to fetch a job from.") end
-    if digging then restorePickAfterComms() end
+    if digging then site.restorePickAfterComms() end
     return force and nil or localJob
   end
   -- Welcome may already have delivered a job during joinSite.
   if not force then
     localJob = loadJobFile()
     if localJob then
-      if digging then restorePickAfterComms() end
+      if digging then site.restorePickAfterComms() end
       return localJob
     end
   end
-  local req = sitePayload({})
+  local req = site.sitePayload({})
   req.type = "quarry_job_req"
   req.wantJob = true
   rednet.send(siteId, req, PROTO_QUARRY)
@@ -2332,7 +2336,7 @@ fetchJobFromSite = function(timeout, quiet, force)
   while os.clock() < deadline do
     local id, msg = rednet.receive(PROTO_QUARRY, math.max(0.05, deadline - os.clock()))
     if id == siteId and type(msg) == "table" and msg.type == "quarry_job_reply" then
-      if digging then restorePickAfterComms() end
+      if digging then site.restorePickAfterComms() end
       if msg.ok and type(msg.job) == "table" then
         if msg.maxTravel then maxTravel = tonumber(msg.maxTravel) or maxTravel end
         if msg.y0 ~= nil then siteInfo = siteInfo or {}; siteInfo.y0 = msg.y0; siteInfo.y1 = msg.y1 end
@@ -2348,18 +2352,18 @@ fetchJobFromSite = function(timeout, quiet, force)
       return nil
     end
   end
-  if digging then restorePickAfterComms() end
+  if digging then site.restorePickAfterComms() end
   if not quiet and not force then print("Timed out waiting for job from site board.") end
   return nil
 end
 
-local function claimCell(nextCell)
+function site.claimCell(nextCell)
   if not siteId then
-    if not joinSite() then return nil end
+    if not site.joinSite() then return nil end
   end
-  if not ensureModemForComms() then return nil end
-  netJitter(1.5)
-  local req = sitePayload({})
+  if not site.ensureModemForComms() then return nil end
+  site.netJitter(1.5)
+  local req = site.sitePayload({})
   req.type = "quarry_cell_req"
   if nextCell then
     req.nextCell = true
@@ -2376,12 +2380,12 @@ local function claimCell(nextCell)
           and (msg.type == "quarry_cell" or msg.type == "quarry_claim") then
         if not msg.ok then
           print("Cell claim failed: " .. tostring(msg.err or "unknown"))
-          if digging then restorePickAfterComms() end
+          if digging then site.restorePickAfterComms() end
           return nil
         end
         if msg.x0 == nil or msg.z0 == nil then
           print("Bad cell (missing XZ) — update site board.")
-          if digging then restorePickAfterComms() end
+          if digging then site.restorePickAfterComms() end
           return nil
         end
         maxTravel = tonumber(msg.maxTravel) or maxTravel
@@ -2397,26 +2401,26 @@ local function claimCell(nextCell)
     end
     if claim then break end
     print(("Cell claim timeout (try %d/3) — backing off..."):format(attempt))
-    netJitter(1)
+    site.netJitter(1)
     sleep(0.4 * attempt)
   end
-  if digging then restorePickAfterComms() end
+  if digging then site.restorePickAfterComms() end
   if not claim then print("Cell claim timed out.") end
   return claim
 end
 
 -- Back-compat alias
-local function claimBand(nextBand)
-  return claimCell(nextBand)
+function site.claimBand(nextBand)
+  return site.claimCell(nextBand)
 end
 
-local function printSiteInfo()
+function site.printSiteInfo()
   if not siteId and cfg.siteId then siteId = cfg.siteId end
   print(("siteId=%s  bpc=%.1f  moves=%d coal=%d  maxTravel=%s"):format(
     tostring(siteId or "(none — admin via broadcast)"),
     currentBpc(), moves, coalBurned, tostring(maxTravel or "-")))
   local j = activeJob or loadJobFile()
-  local W, L, H = footprintFromJob(j)
+  local W, L, H = site.footprintFromJob(j)
   if W then
     print(("mine data: %dx%d × %dY (from job)"):format(W, L, H))
   end
@@ -2437,7 +2441,7 @@ handleQuarryNetMsg = function(id, msg)
   local t = tostring(msg.type or "")
   if t == "quarry_pose" then
     -- Answer pose pings so a blocked bot can tell turtle vs mob/player.
-    if not msg.reply and rednetIsReady() then
+    if not msg.reply and site.rednetIsReady() then
       rednet.send(id, {
         type = "quarry_pose",
         reply = true,
@@ -2471,9 +2475,9 @@ handleQuarryNetMsg = function(id, msg)
       print(("\n[reband] reset turn (epoch %d)"):format(rebandEpoch))
     end
   elseif t == "quarry_assign" then
-    if not digging then applyQuarryAssign(msg, id) end
+    if not digging then site.applyQuarryAssign(msg, id) end
   elseif t == "quarry_turtle_req" or t == "quarry_status_req" then
-    if not digging then publishMine() end
+    if not digging then site.publishMine() end
   elseif t == "quarry_welcome" then
     siteId = id
     siteInfo = msg
@@ -2528,17 +2532,17 @@ handleQuarryNetMsg = function(id, msg)
   end
 end
 
-local function mineNetLoop()
+function site.mineNetLoop()
   local last = 0
   while true do
-    if not digging then ensureModemForComms(true) end
+    if not digging then site.ensureModemForComms(true) end
     local id, msg = rednet.receive(PROTO_QUARRY, digging and 0.4 or 2)
     if id and type(msg) == "table" then
-      rememberPeer(id)
+      site.rememberPeer(id)
       handleQuarryNetMsg(id, msg)
     end
     if not digging and (os.clock() - last) >= 12 then
-      if activeJob or loadJobFile() then publishMine() end
+      if activeJob or loadJobFile() then site.publishMine() end
       last = os.clock()
     end
   end
@@ -2547,7 +2551,7 @@ end
 --------------------------------------------------------------------------------
 -- Jobs
 --------------------------------------------------------------------------------
-local function finishJob(ok, err)
+function site.finishJob(ok, err)
   local wasSite = activeJob and activeJob.site
   local y0 = activeJob and activeJob.y0
   local y1 = activeJob and activeJob.y1
@@ -2573,18 +2577,18 @@ local function finishJob(ok, err)
   end
   digging = false
   if ok then
-    publishMine({
+    site.publishMine({
       _siteType = "quarry_done",
       status = "done", finished = true, y0 = y0, y1 = y1,
       job = lastJob, jobFile = JOB_FILE,
     })
   else
-    publishMine({
+    site.publishMine({
       _siteType = "quarry_progress",
       status = "paused", job = activeJob or lastJob, jobFile = JOB_FILE,
     })
   end
-  restorePickAfterComms()
+  site.restorePickAfterComms()
   -- Only walk home when we still have fuel; otherwise SOS stays in place.
   if not needsFuelSos() then
     goHome()
@@ -2610,7 +2614,7 @@ local function finishJob(ok, err)
   end
 end
 
-local function runBoxJob(j)
+function site.runBoxJob(j)
   if j.type == "area" then normalizeAreaJob(j) end
   local W, H, D = j.W, j.H, j.D
   -- Quarry jobs are ALWAYS true 1-Y-layer passes (never column / never 2-high).
@@ -2655,24 +2659,24 @@ local function runBoxJob(j)
   local layerCount = (j.y0 ~= nil and j.y1 ~= nil) and (j.y1 - j.y0 + 1) or H
   local floor = digFloorY(j)
   for i = j.idx, #units do
-    if STOP then finishJob(false, "stop"); return end
+    if STOP then site.finishJob(false, "stop"); return end
     local u = units[i]
     local nextU = units[i + 1]
     if floor ~= nil and u.y > floor then
       print(("Abort: work unit Y=%d past claim floor Y=%d"):format(u.y, floor))
-      finishJob(false, "past-band")
+      site.finishJob(false, "past-band")
       return
     end
     j.idx = i
     saveJobFile(j)
-    if not manageInventory(true) then finishJob(false, "inventory/fuel"); return end
+    if not manageInventory(true) then site.finishJob(false, "inventory/fuel"); return end
 
     -- Drop exactly one Y when the work-list advances to the next layer.
     -- Stay in place (no trip back to 0,0) — just dig down into the next layer.
     if lastY ~= -999 and u.y > lastY then
       while pos.y < u.y do
         if floor ~= nil and pos.y >= floor then break end
-        if not moveDown() then finishJob(false, "layer drop"); return end
+        if not moveDown() then site.finishJob(false, "layer drop"); return end
       end
       print(("  layer Y=%d  (%d layers in band)"):format(u.y, layerCount))
     elseif lastY == -999 then
@@ -2682,17 +2686,17 @@ local function runBoxJob(j)
     lastZ = u.z
 
     -- Never path/dig with the modem still equipped on slot 2.
-    if not ensurePickReady(true) then
-      finishJob(false, "no-pickaxe")
+    if not site.ensurePickReady(true) then
+      site.finishJob(false, "no-pickaxe")
       return
     end
 
     -- One cell at a time along the dig line — keep facing travel dir (no spin).
-    if not goTo(u.x, u.y, u.z) then finishJob(false, "path"); return end
+    if not goTo(u.x, u.y, u.z) then site.finishJob(false, "path"); return end
     if pos.x ~= u.x or pos.y ~= u.y or pos.z ~= u.z then
       print(("Pose mismatch at unit %d: at %d,%d,%d want %d,%d,%d"):format(
         i, pos.x, pos.y, pos.z, u.x, u.y, u.z))
-      finishJob(false, "pose")
+      site.finishJob(false, "pose")
       return
     end
     excavateHere()
@@ -2703,20 +2707,20 @@ local function runBoxJob(j)
     -- Check-in only at layer changes (not every row — modem swap kills speed).
     if nextU and nextU.y ~= u.y then
       checkIn("layer", { status = "mining", job = j, jobFile = JOB_FILE })
-      if not ensurePickReady(true) then
-        finishJob(false, "no-pickaxe")
+      if not site.ensurePickReady(true) then
+        site.finishJob(false, "no-pickaxe")
         return
       end
     end
   end
-  finishJob(true)
+  site.finishJob(true)
 end
 
-local function runTunnelJob(j)
+function site.runTunnelJob(j)
   -- Player-tall corridor: dig path + clear the block above (2 high).
   local L, W = j.L, j.W or 1
   j.H = 2
-  local units = tunnelUnits(L, W)
+  local units = site.tunnelUnits(L, W)
   j.total = #units
   j.idx = math.max(1, tonumber(j.idx) or 1)
   j.status = "active"
@@ -2728,22 +2732,22 @@ local function runTunnelJob(j)
   print(("TUNNEL L=%d W=%d (player height 2)  resume @ %d/%d"):format(L, W, j.idx, j.total))
 
   for i = j.idx, #units do
-    if STOP then finishJob(false, "stop"); return end
+    if STOP then site.finishJob(false, "stop"); return end
     local u = units[i]
     j.idx = i
     saveJobFile(j)
-    if not manageInventory(true) then finishJob(false, "inventory/fuel"); return end
-    if not goTo(u.x, 0, u.z) then finishJob(false, "path"); return end
+    if not manageInventory(true) then site.finishJob(false, "inventory/fuel"); return end
+    if not goTo(u.x, 0, u.z) then site.finishJob(false, "path"); return end
     clearPlayerHeadroom()
     j.idx = i + 1
     saveJobFile(j)
   end
-  finishJob(true)
+  site.finishJob(true)
 end
 
-local function runStairJob(j)
+function site.runStairJob(j)
   local W, steps, dir = j.W, j.steps, j.dir
-  local units = stairUnits(W, steps, dir)
+  local units = site.stairUnits(W, steps, dir)
   j.total = #units
   j.idx = math.max(1, tonumber(j.idx) or 1)
   j.status = "active"
@@ -2756,36 +2760,36 @@ local function runStairJob(j)
     W, steps, dir, j.idx, j.total))
 
   for i = j.idx, #units do
-    if STOP then finishJob(false, "stop"); return end
+    if STOP then site.finishJob(false, "stop"); return end
     local u = units[i]
     j.idx = i
     saveJobFile(j)
-    if not manageInventory(true) then finishJob(false, "inventory/fuel"); return end
-    if not goTo(u.x, u.y, u.z) then finishJob(false, "path"); return end
+    if not manageInventory(true) then site.finishJob(false, "inventory/fuel"); return end
+    if not goTo(u.x, u.y, u.z) then site.finishJob(false, "path"); return end
     -- Player-tall tread: clear above + the step below.
     clearPlayerHeadroom()
     digDir("down")
     -- After last cell of a step, step forward/up/down toward next step
     local nextU = units[i + 1]
     if nextU and nextU.step ~= u.step then
-      if not goTo(0, u.y, u.z) then finishJob(false, "stair edge"); return end
+      if not goTo(0, u.y, u.z) then site.finishJob(false, "stair edge"); return end
       turnTo(0)
-      if not moveForward() then finishJob(false, "forward"); return end
+      if not moveForward() then site.finishJob(false, "forward"); return end
       clearPlayerHeadroom()
       if dir == "down" then
-        if not moveDown() then finishJob(false, "down"); return end
+        if not moveDown() then site.finishJob(false, "down"); return end
       else
-        if not moveUp() then finishJob(false, "up"); return end
+        if not moveUp() then site.finishJob(false, "up"); return end
       end
     end
     j.idx = i + 1
     saveJobFile(j)
   end
-  finishJob(true)
+  site.finishJob(true)
 end
 
 -- fromOrigin: turtle is at depot/origin. inPlace: pose already restored after reboot.
-local function runSavedJob(j, fromOrigin, inPlace)
+function site.runSavedJob(j, fromOrigin, inPlace)
   if not j or not j.type then
     print("No saved job.")
     return
@@ -2796,7 +2800,7 @@ local function runSavedJob(j, fromOrigin, inPlace)
     return
   end
   STOP = false
-  restorePickAfterComms()
+  site.restorePickAfterComms()
   equipToolFromInventory(nil, true)
 
   local bandY0 = (j.y0 ~= nil) and math.floor(tonumber(j.y0) or 0) or nil
@@ -2817,7 +2821,7 @@ local function runSavedJob(j, fromOrigin, inPlace)
     activeJob = j
     if pos.x == 0 and pos.z == 0 and pos.y == bandY0 then
       print(("Already at band Y=%d — starting dig."):format(bandY0))
-    elseif not moveIntoBand(bandY0, bandY1, {
+    elseif not site.moveIntoBand(bandY0, bandY1, {
       force = true,
       fromOrigin = fromOrigin or (pos.y < 1),
     }) then
@@ -2834,24 +2838,24 @@ local function runSavedJob(j, fromOrigin, inPlace)
   end
 
   -- Soft-join site if present; publish footprint, then dig with pickaxe equipped.
-  if not siteId then joinSite(2, true) end
-  publishMine({ _siteType = "quarry_job", job = j, status = "active" })
-  restorePickAfterComms()
+  if not siteId then site.joinSite(2, true) end
+  site.publishMine({ _siteType = "quarry_job", job = j, status = "active" })
+  site.restorePickAfterComms()
   equipToolFromInventory(nil, true)
   digging = true
   if j.type == "box" or j.type == "area" then
-    runBoxJob(j)
+    site.runBoxJob(j)
   elseif j.type == "tunnel" then
-    runTunnelJob(j)
+    site.runTunnelJob(j)
   elseif j.type == "stair" then
-    runStairJob(j)
+    site.runStairJob(j)
   else
     print("Unknown job type: " .. tostring(j.type))
   end
   digging = false
 end
 
-local function digBox(W, H, D, opts)
+function site.digBox(W, H, D, opts)
   opts = opts or {}
   W, H, D = math.floor(W), math.floor(H), math.floor(D)
   if W < 1 or H < 1 or D < 1 then
@@ -2864,12 +2868,12 @@ local function digBox(W, H, D, opts)
     type = "box", W = W, H = H, D = D, pattern = "layer",
     idx = 1, total = #units, status = "active", dug = 0, skipped = 0,
   }
-  runSavedJob(j, false)
+  site.runSavedJob(j, false)
 end
 
 -- Area: width × length footprint, dig stopY one-high layers down from origin.
 -- Example: area 16x32 40   → 16 right, 32 forward, 40 layers of 1 Y each
-local function digArea(W, L, stopY, opts)
+function site.digArea(W, L, stopY, opts)
   opts = opts or {}
   W = math.floor(tonumber(W) or 0)
   L = math.floor(tonumber(L) or 0)
@@ -2887,11 +2891,11 @@ local function digArea(W, L, stopY, opts)
     H = stopY, D = L, pattern = "layer",
     idx = 1, total = #units, status = "active", dug = 0, skipped = 0,
   }
-  runSavedJob(j, false)
+  site.runSavedJob(j, false)
 end
 
 -- Tunnel is always player-tall (2 high). Usage: tunnel <L> [W]
-local function digTunnel(L, W)
+function site.digTunnel(L, W)
   L = math.floor(tonumber(L) or 0)
   W = math.floor(tonumber(W) or 1)
   if L < 1 or W < 1 then
@@ -2899,15 +2903,15 @@ local function digTunnel(L, W)
     return
   end
   dug, skipped = 0, 0
-  local units = tunnelUnits(L, W)
+  local units = site.tunnelUnits(L, W)
   local j = {
     type = "tunnel", L = L, H = 2, W = W,
     idx = 1, total = #units, status = "active", dug = 0, skipped = 0,
   }
-  runSavedJob(j, false)
+  site.runSavedJob(j, false)
 end
 
-local function digStair(W, steps, dir)
+function site.digStair(W, steps, dir)
   W, steps = math.floor(W), math.floor(steps)
   dir = tostring(dir or "down"):lower()
   if (dir ~= "up" and dir ~= "down") or W < 1 or steps < 1 then
@@ -2915,26 +2919,26 @@ local function digStair(W, steps, dir)
     return
   end
   dug, skipped = 0, 0
-  local units = stairUnits(W, steps, dir)
+  local units = site.stairUnits(W, steps, dir)
   local j = {
     type = "stair", W = W, steps = steps, dir = dir,
     idx = 1, total = #units, status = "active", dug = 0, skipped = 0,
   }
-  runSavedJob(j, false)
+  site.runSavedJob(j, false)
 end
 
 --------------------------------------------------------------------------------
 -- Online fleet reband / origin reset
 --------------------------------------------------------------------------------
-local function waitForModemOnline(quiet)
+function site.waitForModemOnline(quiet)
   if isOfflineMode() then return true end
-  if ensureModemForComms(true) then return true end
+  if site.ensureModemForComms(true) then return true end
   if not quiet then
     print("ONLINE — waiting for a wireless modem in inventory (slot " .. MODEM_SLOT .. ")...")
   end
   while not STOP do
-    if moveModemToSlot15() or parkModemInSlot15() or findModemInInventory() then
-      if ensureModemForComms(true) then
+    if moveModemToSlot15() or site.parkModemInSlot15() or findModemInInventory() then
+      if site.ensureModemForComms(true) then
         print("Modem ready in slot " .. MODEM_SLOT .. ".")
         return true
       end
@@ -2945,7 +2949,7 @@ local function waitForModemOnline(quiet)
 end
 
 -- Park clear of origin: down (+Y) then right (+X), repeated by parkOffset.
-local function clearOriginCorridor(parkOffset)
+function site.clearOriginCorridor(parkOffset)
   parkOffset = math.max(0, math.floor(tonumber(parkOffset) or 0))
   if parkOffset < 1 then return true end
   print(("Clearing origin — park down/right ×%d"):format(parkOffset))
@@ -2963,7 +2967,7 @@ local function clearOriginCorridor(parkOffset)
   return true
 end
 
-local function claimFromRebandMsg(msg)
+function site.claimFromRebandMsg(msg)
   if type(msg) ~= "table" then return nil end
   if msg.ok == false and msg.x0 == nil and msg.y0 == nil then return nil end
   local cidx = math.max(1, math.floor(tonumber(msg.continueIdx) or 1))
@@ -2993,9 +2997,9 @@ local function claimFromRebandMsg(msg)
   return nil
 end
 
-local function sendRebandHome(epoch, park)
-  ensureModemForComms(true)
-  local homeMsg = sitePayload({
+function site.sendRebandHome(epoch, park)
+  site.ensureModemForComms(true)
+  local homeMsg = site.sitePayload({
     _siteType = "quarry_home",
     status = "homing",
     epoch = epoch,
@@ -3010,13 +3014,13 @@ end
 
 -- Return home, wait for reset turn, depot keep-list, adopt claim+continueIdx.
 -- Returns claim table or nil.
-local function processRebandCycle()
+function site.processRebandCycle()
   local rb = pendingReband
   if not rb then return nil end
   pendingReband = nil
   local epoch = tonumber(rb.epoch) or rebandEpoch
   rebandEpoch = epoch
-  rebandClaim = claimFromRebandMsg(rb)
+  rebandClaim = site.claimFromRebandMsg(rb)
   rebandPhase = "homing"
 
   digging = false
@@ -3029,7 +3033,7 @@ local function processRebandCycle()
   local park = math.max(0, math.floor(tonumber(rb.parkOffset) or 0))
 
   -- Dig home with pickaxe; skip pathing when already at origin.
-  restorePickAfterComms()
+  site.restorePickAfterComms()
   equipToolFromInventory(nil, true)
   if pos.x == 0 and pos.y == 0 and pos.z == 0 then
     print(("REBAND epoch %d — already at origin"):format(epoch))
@@ -3043,11 +3047,11 @@ local function processRebandCycle()
   end
 
   if park > 0 then
-    clearOriginCorridor(park)
+    site.clearOriginCorridor(park)
   end
 
   rebandPhase = "waiting_reset"
-  sendRebandHome(epoch, park)
+  site.sendRebandHome(epoch, park)
   print(("REBAND epoch %d — home, waiting for reset turn..."):format(epoch))
 
   -- Wait for our reset turn; re-ping site periodically (in case home was missed).
@@ -3056,7 +3060,7 @@ local function processRebandCycle()
   while os.clock() < deadline do
     if pendingReband and tonumber(pendingReband.epoch) and tonumber(pendingReband.epoch) > epoch then
       rebandPhase = nil
-      return processRebandCycle()
+      return site.processRebandCycle()
     end
     -- Drop same-epoch spam so digSiteMine doesn't restart this cycle.
     if pendingReband and tonumber(pendingReband.epoch) == epoch then
@@ -3070,20 +3074,20 @@ local function processRebandCycle()
       print("Reset turn — dump / adopt claim")
 
       if park > 0 then
-        restorePickAfterComms()
+        site.restorePickAfterComms()
         goHome()
       end
       if turtle.detect() then
-        clearOriginCorridor(1)
+        site.clearOriginCorridor(1)
         goHome()
       end
 
       dumpToStorage()
       suckFuelFromLeft()
       equipToolFromInventory(nil, true)
-      ensurePickReady(true)
+      site.ensurePickReady(true)
 
-      local claim = claimFromRebandMsg(go) or rebandClaim
+      local claim = site.claimFromRebandMsg(go) or rebandClaim
       rebandClaim = claim
       if claim then
         adminAssign = {
@@ -3098,8 +3102,8 @@ local function processRebandCycle()
         for k, v in pairs(claim) do siteInfo[k] = v end
       end
 
-      ensureModemForComms(true)
-      local doneMsg = sitePayload({
+      site.ensureModemForComms(true)
+      local doneMsg = site.sitePayload({
         _siteType = "quarry_reset_done",
         status = "mining",
         epoch = epoch,
@@ -3111,14 +3115,14 @@ local function processRebandCycle()
       doneMsg.type = "quarry_reset_done"
       if siteId then rednet.send(siteId, doneMsg, PROTO_QUARRY) end
       rednet.broadcast(doneMsg, PROTO_QUARRY)
-      restorePickAfterComms()
+      site.restorePickAfterComms()
       pendingReband = nil
       rebandPhase = nil
       return claim
     end
 
     if (os.clock() - lastPing) >= 5 then
-      sendRebandHome(epoch, park)
+      site.sendRebandHome(epoch, park)
       lastPing = os.clock()
     end
     sleep(0.25)
@@ -3128,10 +3132,6 @@ local function processRebandCycle()
   rebandPhase = nil
   return rebandClaim
 end
-
--- Site / resume helpers live on one table so the main chunk stays under Lua's
--- 200-local limit (each `local function` at file scope counts).
-local site = {}
 
 -- Dig one claimed Y band. Returns "done" | "paused" | "stop" | "bad".
 -- fromContinue = turtle was placed back at origin (pose reset); job idx may still resume.
@@ -3186,7 +3186,7 @@ function site.runColumnClaim(claim, fromOrigin, existingJob)
   siteSendJob(j)
 
   -- Start at top of first shaft cell (or resume in place from restored pose).
-  restorePickAfterComms()
+  site.restorePickAfterComms()
   equipToolFromInventory(nil, true)
   if fromOrigin then
     assumeAtOrigin()
@@ -3203,7 +3203,7 @@ function site.runColumnClaim(claim, fromOrigin, existingJob)
     end
   end
 
-  siteReportProgress({
+  site.siteReportProgress({
     status = "mining", pattern = "column",
     x0 = x0, x1 = x1, z0 = z0, z1 = z1, y0 = y0, y1 = y1,
     job = j, jobFile = JOB_FILE,
@@ -3219,29 +3219,29 @@ function site.runColumnClaim(claim, fromOrigin, existingJob)
     x0, x1, z0, z1, H, j.idx, j.total))
 
   for i = j.idx, #units do
-    if STOP then finishJob(false, "stop"); digging = false; return "stop" end
+    if STOP then site.finishJob(false, "stop"); digging = false; return "stop" end
     local u = units[i]
     j.idx = i
     saveJobFile(j)
     if not manageInventory(true) then
-      finishJob(false, "inventory/fuel")
+      site.finishJob(false, "inventory/fuel")
       digging = false
       return "paused"
     end
-    if not ensurePickReady(true) then
-      finishJob(false, "no-pickaxe")
+    if not site.ensurePickReady(true) then
+      site.finishJob(false, "no-pickaxe")
       digging = false
       return "bad"
     end
     -- Climb to y0 at this XZ, then dig the shaft.
     if not goTo(u.x, y0, u.z) then
-      finishJob(false, "path")
+      site.finishJob(false, "path")
       digging = false
       return "paused"
     end
     excavateHere()
     if not digDownColumn(H) then
-      finishJob(false, "column")
+      site.finishJob(false, "column")
       digging = false
       return "paused"
     end
@@ -3250,7 +3250,7 @@ function site.runColumnClaim(claim, fromOrigin, existingJob)
     saveJobFile(j)
     checkIn("column", { status = "mining", job = j, jobFile = JOB_FILE })
   end
-  finishJob(true)
+  site.finishJob(true)
   digging = false
   if STOP then return "stop" end
   if loadJobFile() then return "paused" end
@@ -3318,19 +3318,19 @@ function site.runClaimBand(claim, fromOrigin, existingJob)
   saveCfg()
   siteSendJob(j)
   if inPlace then
-    siteReportProgress({ status = "mining", y0 = y0, y1 = y1, job = j, jobFile = JOB_FILE })
-    runSavedJob(j, false, true)
+    site.siteReportProgress({ status = "mining", y0 = y0, y1 = y1, job = j, jobFile = JOB_FILE })
+    site.runSavedJob(j, false, true)
   else
     -- Descend into the band BEFORE modem chatter so we don't sit on Y=0.
-    if not moveIntoBand(y0, y1, {
+    if not site.moveIntoBand(y0, y1, {
       force = true,
       fromOrigin = fromOrigin == true or pos.y < 1,
     }) then
       return "bad"
     end
-    siteReportProgress({ status = "mining", y0 = y0, y1 = y1, job = j, jobFile = JOB_FILE })
+    site.siteReportProgress({ status = "mining", y0 = y0, y1 = y1, job = j, jobFile = JOB_FILE })
     -- Pose already correct — do not assumeAtOrigin again inside runSavedJob.
-    runSavedJob(j, false, false)
+    site.runSavedJob(j, false, false)
   end
   if STOP then return "stop" end
   if loadJobFile() then return "paused" end
@@ -3398,8 +3398,8 @@ function site.claimFromAdminAssign()
 end
 
 function site.sendTyped(typeName, extra)
-  ensureModemForComms(true)
-  local msg = sitePayload(extra or {})
+  site.ensureModemForComms(true)
+  local msg = site.sitePayload(extra or {})
   msg.type = typeName
   if siteId then
     rednet.send(siteId, msg, PROTO_QUARRY)
@@ -3439,7 +3439,7 @@ function site.verifyCellClear(box, startIdx)
     if pendingReband then return false, "reband", i end
     local u = units[i]
     if not manageInventory(true) then return false, "inventory", i end
-    if not ensurePickReady(true) then return false, "no-pickaxe", i end
+    if not site.ensurePickReady(true) then return false, "no-pickaxe", i end
     if not site.inActiveCellXZ(2) and (pos.x ~= u.x or pos.z ~= u.z) then
       return false, "perimeter", i
     end
@@ -3522,7 +3522,7 @@ function site.runCellClaim(claim, existingJob)
   end
 
   -- Travel with modem on.
-  ensureModemForComms(true)
+  site.ensureModemForComms(true)
   if pos.x ~= 0 or pos.y ~= 0 or pos.z ~= 0 then
     print("Returning to origin before cell travel...")
     goHome()
@@ -3569,7 +3569,7 @@ function site.runCellClaim(claim, existingJob)
     beforeSettle = function()
       site.sendTyped("quarry_arrive_cell", { status = "arrive", cellId = claim.cellId })
       announced = true
-      restorePickAfterComms()
+      site.restorePickAfterComms()
       equipToolFromInventory(nil, true)
     end,
   }) then
@@ -3587,7 +3587,7 @@ function site.runCellClaim(claim, existingJob)
   print(("Arrived cell #%s — layer dig Y%d..%d"):format(
     tostring(claim.cellId or "?"), y0, y1))
 
-  restorePickAfterComms()
+  site.restorePickAfterComms()
   equipToolFromInventory(nil, true)
   STOP = false
   digging = true
@@ -3602,9 +3602,9 @@ function site.runCellClaim(claim, existingJob)
     for i = j.idx, #units do
       if pendingReturnHome then
         print("Pose fault — returning home.")
-        finishJob(false, "return_home")
+        site.finishJob(false, "return_home")
         digging = false
-        ensureModemForComms(true)
+        site.ensureModemForComms(true)
         goHome()
         site.sendTyped("quarry_progress", {
           status = "homing", reason = pendingReturnHome, cellId = claim.cellId,
@@ -3613,12 +3613,12 @@ function site.runCellClaim(claim, existingJob)
         return "stop"
       end
       if pendingReband then
-        finishJob(false, "reband")
+        site.finishJob(false, "reband")
         digging = false
         return "stop"
       end
       if STOP then
-        finishJob(false, "stop")
+        site.finishJob(false, "stop")
         digging = false
         return "stop"
       end
@@ -3630,9 +3630,9 @@ function site.runCellClaim(claim, existingJob)
       -- Stay inside cell perimeter (XZ).
       if not site.inActiveCellXZ(2) and (pos.x ~= u.x or pos.z ~= u.z) then
         print(("Outside cell perimeter @ %d,%d — abort."):format(pos.x, pos.z))
-        finishJob(false, "perimeter")
+        site.finishJob(false, "perimeter")
         digging = false
-        ensureModemForComms(true)
+        site.ensureModemForComms(true)
         goHome()
         site.sendTyped("quarry_progress", { status = "homing", reason = "perimeter" })
         return "stop"
@@ -3640,14 +3640,14 @@ function site.runCellClaim(claim, existingJob)
 
       if not manageInventory(true) then
         -- manageInventory already went home; keep modem for return trip.
-        ensureModemForComms(true)
+        site.ensureModemForComms(true)
         digging = false
         -- Resume same cell after dump.
         print("Resuming same cell after dump/refuel...")
         return site.runCellClaim(claim, loadJobFile())
       end
-      if not ensurePickReady(true) then
-        finishJob(false, "no-pickaxe")
+      if not site.ensurePickReady(true) then
+        site.finishJob(false, "no-pickaxe")
         digging = false
         return "bad"
       end
@@ -3655,7 +3655,7 @@ function site.runCellClaim(claim, existingJob)
       if lastY ~= -999 and u.y > lastY then
         while pos.y < u.y do
           if not moveDown() then
-            finishJob(false, "layer drop")
+            site.finishJob(false, "layer drop")
             digging = false
             return "paused"
           end
@@ -3667,15 +3667,15 @@ function site.runCellClaim(claim, existingJob)
       lastY = u.y
 
       if not goTo(u.x, u.y, u.z) then
-        finishJob(false, "path")
+        site.finishJob(false, "path")
         digging = false
         return "paused"
       end
       if not site.inActiveCellXZ(0) then
         print("Left cell while pathing — abort.")
-        finishJob(false, "perimeter")
+        site.finishJob(false, "perimeter")
         digging = false
-        ensureModemForComms(true)
+        site.ensureModemForComms(true)
         goHome()
         return "stop"
       end
@@ -3706,10 +3706,10 @@ function site.runCellClaim(claim, existingJob)
     j.verifyIdx = vAt or j.verifyIdx or 1
     j.status = "paused"
     saveJobFile(j)
-    finishJob(false, "verify:" .. tostring(vErr))
+    site.finishJob(false, "verify:" .. tostring(vErr))
     digging = false
     if vErr == "return_home" or vErr == "perimeter" then
-      ensureModemForComms(true)
+      site.ensureModemForComms(true)
       goHome()
       site.sendTyped("quarry_progress", {
         status = "homing", reason = tostring(vErr), cellId = claim.cellId,
@@ -3726,9 +3726,9 @@ function site.runCellClaim(claim, existingJob)
   end
 
   -- Only now tell the site the cell is complete (finishJob → quarry_done).
-  finishJob(true)
+  site.finishJob(true)
   digging = false
-  ensureModemForComms(true)
+  site.ensureModemForComms(true)
   goHome()
   dumpToStorage()
   suckFuelFromLeft()
@@ -3749,8 +3749,8 @@ function site.digSiteMine(opts)
     print("Offline mode — site claims disabled. `mode online` or use `area` / `box`.")
     return
   end
-  if not waitForModemOnline(false) then return end
-  if not siteId then joinSite(5, true) end
+  if not site.waitForModemOnline(false) then return end
+  if not siteId then site.joinSite(5, true) end
   if not siteId then
     print("Need a site board (`join`). Solo dig: `area` / `box` or `mode offline`.")
     return
@@ -3762,7 +3762,7 @@ function site.digSiteMine(opts)
   local cellsDone = 0
   while true do
     if pendingReturnHome then
-      ensureModemForComms(true)
+      site.ensureModemForComms(true)
       goHome()
       site.sendTyped("quarry_progress", { status = "homing", reason = pendingReturnHome })
       pendingReturnHome = nil
@@ -3773,7 +3773,7 @@ function site.digSiteMine(opts)
       -- Recall-only reband: home, ping site, keep/reclaim cell.
       local rb = pendingReband
       pendingReband = nil
-      ensureModemForComms(true)
+      site.ensureModemForComms(true)
       goHome()
       site.sendTyped("quarry_home", {
         status = "homing", epoch = rb.epoch, recallOnly = true,
@@ -3802,7 +3802,7 @@ function site.digSiteMine(opts)
       }
     end
     if not claim then
-      claim = claimCell(cellsDone > 0)
+      claim = site.claimCell(cellsDone > 0)
     end
     if not claim then
       if cellsDone == 0 then
@@ -3872,7 +3872,7 @@ function site.resolveResumeJob(quiet)
     if localJ and site.jobIsResumable(localJ) then return localJ, "local" end
     return nil, nil
   end
-  if not siteId then joinSite(quiet and 4 or 6, quiet == true) end
+  if not siteId then site.joinSite(quiet and 4 or 6, quiet == true) end
   local siteJ = nil
   if siteId then
     -- Ask the board even when local exists — reboot recovery / newer progress.
@@ -3930,7 +3930,7 @@ function site.continueJob(opts)
   local auto = opts.auto == true
   -- Online + site: board owns pattern + unique bands. digSiteMine asks the
   -- site, then resumes a local job only when it matches that claim.
-  if isOnlineMode() and (siteId or joinSite(4, true)) then
+  if isOnlineMode() and (siteId or site.joinSite(4, true)) then
     local j = loadJobFile()
     local sitePat = normalizePattern(siteInfo and siteInfo.pattern)
       or normalizePattern(cfg.pattern)
@@ -3994,12 +3994,12 @@ function site.continueJob(opts)
 
   -- Site / claimed jobs keep claiming further regions after this one finishes.
   if isOnlineMode() and (j.site or j.y0 ~= nil or j.x0 ~= nil) then
-    if not siteId then joinSite(4, true) end
+    if not siteId then site.joinSite(4, true) end
     site.digSiteMine({ fromOrigin = fromOrigin })
     return true
   end
 
-  runSavedJob(j, fromOrigin, inPlace)
+  site.runSavedJob(j, fromOrigin, inPlace)
   return true
 end
 
@@ -4026,7 +4026,7 @@ end
 --------------------------------------------------------------------------------
 -- Console
 --------------------------------------------------------------------------------
-local function printHelp()
+function site.printHelp()
   print("Offline miner — origin = top-front-left, facing into mine.")
   print("  +X right   +Y down   +Z forward")
   print("")
@@ -4053,7 +4053,7 @@ local function printHelp()
   print("Jobs save pose+progress to " .. JOB_FILE .. ".")
 end
 
-local function printStatus()
+function site.printStatus()
   print(("pos=%d,%d,%d face=%d"):format(pos.x, pos.y, pos.z, facing))
   print(("label=%s  dug=%d skipped=%d bpc=%.1f fuel=%s"):format(
     jobLabel, dug, skipped, currentBpc(), tostring(turtle.getFuelLevel())))
@@ -4068,7 +4068,7 @@ local function printStatus()
   end
 end
 
-local function handleCommand(line)
+function site.handleCommand(line)
   local a = {}
   for w in tostring(line or ""):gmatch("%S+") do a[#a + 1] = w end
   local cmd = (a[1] or ""):lower()
@@ -4076,9 +4076,9 @@ local function handleCommand(line)
   if cmd == "" then
     return true
   elseif cmd == "help" or cmd == "?" then
-    printHelp()
+    site.printHelp()
   elseif cmd == "status" then
-    printStatus()
+    site.printStatus()
   elseif cmd == "stop" then
     STOP = true
     print("Stop requested — job will be saved for `continue`.")
@@ -4088,7 +4088,7 @@ local function handleCommand(line)
     if isOfflineMode() then
       print("Offline mode — use `mode online` to join a site board.")
     else
-      joinSite(tonumber(a[2]) or 6)
+      site.joinSite(tonumber(a[2]) or 6)
     end
   elseif cmd == "mine" then
     if isOfflineMode() then
@@ -4097,7 +4097,7 @@ local function handleCommand(line)
       site.digSiteMine()
     end
   elseif cmd == "site" then
-    printSiteInfo()
+    site.printSiteInfo()
   elseif cmd == "equip" or cmd == "tool" or cmd == "pick" or cmd == "pickaxe" then
     equipToolFromInventory(a[2])
   elseif cmd == "dump" then
@@ -4139,9 +4139,9 @@ local function handleCommand(line)
           print("Use: area <W>x<L> <stopY>   or   box <W>x<H>x<D>")
         else
           print("Mode set to ONLINE — site/admin enabled.")
-          local hasM = ensureModemForComms(true) or openModem() or findModemInInventory() ~= nil
+          local hasM = site.ensureModemForComms(true) or site.openModem() or findModemInInventory() ~= nil
           if hasM then
-            joinSite(4, false)
+            site.joinSite(4, false)
           else
             print("Put a wireless modem in slot " .. MODEM_SLOT .. ", then `join`.")
           end
@@ -4176,7 +4176,7 @@ local function handleCommand(line)
     local d = parseDims(a, 2)
     local stopY = nil
     if d and d[1] and d[2] and d[3] and not tostring(a[2] or ""):find("x") then
-      digArea(d[1], d[2], d[3])
+      site.digArea(d[1], d[2], d[3])
     elseif d and d[1] and d[2] then
       for i = 3, #a do
         local t = tostring(a[i]):lower()
@@ -4190,7 +4190,7 @@ local function handleCommand(line)
         print("Usage: area <W>x<L> <stopY>")
         print("Example: area 16x32 40   (40 layers of 1 Y each)")
       else
-        digArea(d[1], d[2], stopY)
+        site.digArea(d[1], d[2], stopY)
       end
     else
       print("Usage: area <W>x<L> <stopY>")
@@ -4202,7 +4202,7 @@ local function handleCommand(line)
     if not d or not d[1] or not d[2] or not d[3] then
       print("Usage: box <W>x<H>x<D>   (H = 1-high layers down)")
     else
-      digBox(d[1], d[2], d[3])
+      site.digBox(d[1], d[2], d[3])
     end
   elseif cmd == "tunnel" then
     -- tunnel 32          → L=32 W=1
@@ -4214,7 +4214,7 @@ local function handleCommand(line)
     else
       local L = d[1]
       local W = d[2] or tonumber(a[3]) or 1
-      digTunnel(L, W)
+      site.digTunnel(L, W)
     end
   elseif cmd == "stair" then
     local d = parseDims(a, 2)
@@ -4226,7 +4226,7 @@ local function handleCommand(line)
     if not d or not d[1] or not d[2] or not dir then
       print("Usage: stair <W>x<steps> <up|down>")
     else
-      digStair(d[1], d[2], dir)
+      site.digStair(d[1], d[2], dir)
     end
   elseif cmd == "exit" or cmd == "quit" then
     return "exit"
@@ -4245,7 +4245,7 @@ if not turtle then
 end
 
 -- Label: V{major}.{minor}-Miner{computerId}  e.g. V1.4-Miner0
-local function minerVersionLabel()
+function site.minerVersionLabel()
   local maj, min = tostring(MINER_VERSION):match("^(%d+)%.(%d+)")
   if not maj then
     maj, min = "0", "0"
@@ -4253,8 +4253,8 @@ local function minerVersionLabel()
   return ("V%s.%s-Miner%d"):format(maj, min, os.getComputerID())
 end
 
-local function applyMinerLabel()
-  local label = minerVersionLabel()
+function site.applyMinerLabel()
+  local label = site.minerVersionLabel()
   os.setComputerLabel(label)
   cfg.label = label
   return label
@@ -4265,7 +4265,7 @@ loadExclude()
 if type(cfg.pendingAssign) == "table" and cfg.pendingAssign.y0 ~= nil then
   adminAssign = cfg.pendingAssign
 end
-applyMinerLabel()
+site.applyMinerLabel()
 cfg.mode = normalizeNetMode(cfg.mode) or "online"
 saveCfg()
 
@@ -4301,19 +4301,19 @@ local hasModem = false
 local autoStarted = false
 if isOnlineMode() then
   print("ONLINE — waiting for modem, then site join / reband / mine.")
-  hasModem = waitForModemOnline(false)
+  hasModem = site.waitForModemOnline(false)
   if hasModem then
     print("ONLINE — modem slot " .. MODEM_SLOT .. " (RIGHT pick swap).")
-    joinSite(6, false)
+    site.joinSite(6, false)
     if not saved then
       saved = loadJobFile()
     end
-    ensureModemForComms(true)
+    site.ensureModemForComms(true)
     -- Join-time reband / resume / start site mine (same dig engine as offline).
     print("Starting online site loop (reband → reset → mine)...")
     parallel.waitForAny(function()
       if pendingReband then
-        processRebandCycle()
+        site.processRebandCycle()
       elseif saved then
         local ok = site.bootAutoResume()
         if ok then autoStarted = true; return end
@@ -4350,11 +4350,11 @@ if not autoStarted then
   print("")
 end
 
-local function consoleLoop()
+function site.consoleLoop()
   while true do
     write("mine> ")
     local line = read()
-    local r = handleCommand(line)
+    local r = site.handleCommand(line)
     if r == "exit" then return end
   end
 end
@@ -4367,7 +4367,7 @@ end
 if isOnlineMode() and hasModem then
   parallel.waitForAny(consoleLoop, mineNetLoop)
 else
-  consoleLoop()
+  site.consoleLoop()
 end
 
 print("Offline miner stopped.")
