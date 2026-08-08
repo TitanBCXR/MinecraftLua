@@ -1,21 +1,18 @@
 --[[
   tetris.lua  -  Standalone Tetris for CC: Tweaked (pocket / computer)
-  Titan-Version: 1.0.3
+  Titan-Version: 1.0.4
 
   Drop on a pocket PC and run:
 
       tetris
 
-  Main menu → Play. Q returns to the menu (or exits from the menu).
+  Main menu shows the shared host leaderboard + Play. Q quits.
 
   Hidden Titan mesh (optional): if lib/titan.lua + a wireless modem are present,
-  this joins your rednet mesh in the background — SSH + GPS beacons. No on-screen
-  network chrome.
+  this joins your rednet mesh in the background — SSH + GPS beacons.
 
-  Boot updates are HOST-ONLY over rednet (run host.lua on your update server).
-  Tablets never store a GitHub / wget URL — only source=host in .titan-install.
-
-  Install role `t` via install.lua (from host/disk). Keep host.lua online for OTAs.
+  Boot: host-only OTA + leaderboard sync (run host.lua on your update server).
+  Scores submit to the host on boot and after each game.
 
   Controls (in game):
     ← / A / H     move left
@@ -32,6 +29,12 @@
 local CFG = "tetris.cfg"
 local COLS, ROWS = 10, 18
 local KIND = "tetris"
+local INSTALL_PROTO = "titan_install"
+local SIDE_W = 5 -- compact HUD column (score uses K/M/B/T)
+local LB_TOP = 8 -- rows shown on menu
+
+-- Cached host leaderboard (from last sync).
+local LEADERBOARD = {}
 
 -- Live state for SSH / mesh beacons (updated by the game loop).
 local TRACK = {
@@ -70,6 +73,75 @@ local function saveHi(hi)
 end
 
 local HI = loadHi()
+
+-- Compact score: 999 → 999, 1400 → 1.4K, 14000 → 14K, etc.
+local function formatScore(n)
+  n = math.floor(tonumber(n) or 0)
+  local neg = ""
+  if n < 0 then neg, n = "-", -n end
+  if n < 1000 then return neg .. tostring(n) end
+  local div, suf
+  if n >= 1e12 then div, suf = 1e12, "T"
+  elseif n >= 1e9 then div, suf = 1e9, "B"
+  elseif n >= 1e6 then div, suf = 1e6, "M"
+  else div, suf = 1e3, "K" end
+  local v = n / div
+  if v >= 100 then
+    return neg .. tostring(math.floor(v + 0.5)) .. suf
+  end
+  if v >= 10 then
+    return neg .. tostring(math.floor(v + 0.5)) .. suf
+  end
+  local tenths = math.floor(v * 10 + 0.5)
+  if tenths % 10 == 0 then
+    return neg .. tostring(math.floor(tenths / 10)) .. suf
+  end
+  return neg .. string.format("%d.%d%s", math.floor(tenths / 10), tenths % 10, suf)
+end
+
+local function findInstallHost(timeout)
+  timeout = tonumber(timeout) or 3
+  rednet.broadcast({ type = "discover" }, INSTALL_PROTO)
+  local deadline = os.clock() + timeout
+  while os.clock() < deadline do
+    local id, msg = rednet.receive(INSTALL_PROTO, deadline - os.clock())
+    if id and type(msg) == "table" and msg.type == "host_here" then
+      return id, msg
+    end
+  end
+  return nil
+end
+
+-- Pull board; optionally submit local best. Returns entries table or nil.
+local function syncLeaderboard(submitScore)
+  local hostId = findInstallHost(2.5)
+  if not hostId then return nil, "no host" end
+  local name = os.getComputerLabel() or ("Tetris-" .. os.getComputerID())
+  local req
+  if submitScore and (tonumber(submitScore) or 0) > 0 then
+    req = {
+      type = "tetris_lb_submit",
+      playerId = os.getComputerID(),
+      name = name,
+      score = math.floor(tonumber(submitScore) or 0),
+    }
+  else
+    req = { type = "tetris_lb_get" }
+  end
+  rednet.send(hostId, req, INSTALL_PROTO)
+  local deadline = os.clock() + 3
+  while os.clock() < deadline do
+    local id, msg = rednet.receive(INSTALL_PROTO, deadline - os.clock())
+    if id == hostId and type(msg) == "table" and msg.type == "tetris_lb" then
+      if type(msg.entries) == "table" then
+        LEADERBOARD = msg.entries
+        return LEADERBOARD
+      end
+      return LEADERBOARD
+    end
+  end
+  return nil, "timeout"
+end
 
 -- SRS-ish shapes (4x4, 0-based cells as {x,y} relative)
 local SHAPES = {
@@ -246,14 +318,17 @@ local function layout()
   local tw, th = term.getSize()
   local cellW = 1
   local boardW = COLS * cellW + 2 -- borders
-  local boardH = ROWS + 2
   -- Shrink visible rows if screen is short (still play full logic; scroll top)
-  local visRows = math.min(ROWS, th - 2)
-  local ox = math.max(1, math.floor((tw - boardW - 12) / 2))
-  if tw < boardW + 10 then ox = 1 end
+  local visRows = math.min(ROWS, math.max(8, th - 2))
+  -- Leave a slim HUD column on the right (SIDE_W), not a wide score box.
+  local totalW = boardW + 1 + SIDE_W
+  local ox = math.max(1, math.floor((tw - totalW) / 2) + 1)
+  if ox + totalW - 1 > tw then ox = 1 end
   local oy = math.max(1, math.floor((th - (visRows + 2)) / 2))
+  local px = ox + boardW + 1
+  if px + SIDE_W - 1 > tw then px = math.max(1, tw - SIDE_W + 1) end
   return {
-    tw = tw, th = th, ox = ox, oy = oy,
+    tw = tw, th = th, ox = ox, oy = oy, px = px,
     cellW = cellW, boardW = boardW, visRows = visRows,
     color = isColor(),
   }
@@ -339,24 +414,24 @@ local function drawBoard(L, grid, piece, nextKind, score, level, lines, paused, 
     end
   end
 
-  -- Side panel
-  local px = L.ox + bw + 3
-  if px + 8 > L.tw then px = math.max(1, L.tw - 9) end
-  local py = L.oy
-  text(px, py, "TETRIS", L.color and colors.cyan or colors.white, colors.black)
-  text(px, py + 2, "SCORE", colors.lightGray, colors.black)
-  text(px, py + 3, tostring(score), colors.white, colors.black)
-  text(px, py + 5, "HI", colors.lightGray, colors.black)
-  text(px, py + 6, tostring(math.max(HI, score)), colors.yellow, colors.black)
-  text(px, py + 8, "LV " .. tostring(level), colors.lime, colors.black)
-  text(px, py + 9, "LN " .. tostring(lines), colors.lightGray, colors.black)
-  text(px, py + 11, "NEXT", colors.lightGray, colors.black)
+  -- Slim HUD (right of well) — short labels + truncated scores
+  local px, py = L.px, L.oy
+  local sc = formatScore(score):sub(1, SIDE_W)
+  local hi = formatScore(math.max(HI, score)):sub(1, SIDE_W)
+  text(px, py, "TET", L.color and colors.cyan or colors.white, colors.black)
+  text(px, py + 1, sc, colors.white, colors.black)
+  text(px, py + 2, "HI", colors.lightGray, colors.black)
+  text(px, py + 3, hi, colors.yellow, colors.black)
+  text(px, py + 5, ("L%-3s"):format(tostring(level)):sub(1, SIDE_W), colors.lime, colors.black)
+  text(px, py + 6, ("n%-3s"):format(tostring(lines)):sub(1, SIDE_W), colors.lightGray, colors.black)
   if nextKind then
+    text(px, py + 8, "NXT", colors.lightGray, colors.black)
     if L.color then
-      fill(px, py + 12, 4, 2, PIECE_COLOR[nextKind] or colors.white, colors.black)
-      text(px, py + 12, " " .. nextKind .. " ", colors.black, PIECE_COLOR[nextKind] or colors.white)
+      fill(px, py + 9, math.min(SIDE_W, 3), 1, PIECE_COLOR[nextKind] or colors.white, colors.black)
+      text(px, py + 9, (" %s "):format(nextKind):sub(1, SIDE_W),
+        colors.black, PIECE_COLOR[nextKind] or colors.white)
     else
-      text(px, py + 12, nextKind, colors.white, colors.black)
+      text(px, py + 9, tostring(nextKind):sub(1, SIDE_W), colors.white, colors.black)
     end
   end
 
@@ -369,7 +444,7 @@ local function drawBoard(L, grid, piece, nextKind, score, level, lines, paused, 
   end
 
   if L.th >= L.oy + L.visRows + 3 then
-    text(1, L.th, "Arrows move  Up rotate  Spc drop  P pause  Q menu",
+    text(1, L.th, "Arrows  Up=rot  Spc=drop  P  Q",
       colors.gray, colors.black)
   end
 end
@@ -530,34 +605,68 @@ local function runGame()
 end
 
 --------------------------------------------------------------------------------
--- Main menu
+-- Main menu (leaderboard + play)
 --------------------------------------------------------------------------------
+local function afterGame(score)
+  score = tonumber(score) or 0
+  if score > HI then
+    HI = score
+    saveHi(HI)
+  end
+  if score > 0 then
+    pcall(syncLeaderboard, math.max(score, HI))
+  else
+    pcall(syncLeaderboard, HI > 0 and HI or nil)
+  end
+end
+
 local function drawMenu(playBtn)
   local tw, th = term.getSize()
   local color = isColor()
   clearScreen(colors.black)
 
-  local title = "TETRIS"
   local accent = color and colors.cyan or colors.white
-  local headerH = 3
-  fill(1, 1, tw, headerH, accent, colors.black)
-  text(math.max(2, math.floor((tw - #title) / 2) + 1), 2, title, colors.black, accent)
+  fill(1, 1, tw, 1, accent, colors.black)
+  text(2, 1, "TETRIS", colors.black, accent)
+  local you = ("you " .. formatScore(HI)):sub(1, tw - 10)
+  text(math.max(2, tw - #you), 1, you, colors.black, accent)
 
-  text(math.max(2, math.floor((tw - 14) / 2) + 1), headerH + 2,
-    "Pocket edition", colors.lightGray, colors.black)
-  text(math.max(2, math.floor((tw - 12) / 2) + 1), headerH + 3,
-    "Hi  " .. tostring(HI), colors.yellow, colors.black)
+  local y = 3
+  text(2, y, "#  NAME         SCORE", color and colors.lightGray or colors.white, colors.black)
+  y = y + 1
+  local shown = 0
+  local myId = os.getComputerID()
+  if #LEADERBOARD == 0 then
+    text(2, y, "(no scores yet — be #1)", colors.gray, colors.black)
+    y = y + 1
+  else
+    local maxRows = math.max(1, th - 7)
+    for i = 1, math.min(LB_TOP, #LEADERBOARD, maxRows) do
+      local e = LEADERBOARD[i]
+      local name = tostring(e.name or ("#" .. tostring(e.id))):sub(1, 12)
+      local sc = formatScore(e.score or 0)
+      local line = ("%-2d %-12s %5s"):format(i, name, sc)
+      local fg = colors.white
+      if tonumber(e.id) == myId then
+        fg = color and colors.lime or colors.white
+      elseif i == 1 then
+        fg = colors.yellow
+      end
+      text(2, y, line:sub(1, tw - 2), fg, colors.black)
+      y = y + 1
+      shown = shown + 1
+    end
+  end
 
   local label = "  PLAY  "
   local bx = math.max(2, math.floor((tw - #label) / 2) + 1)
-  local by = math.min(th - 3, headerH + 6)
+  local by = math.min(th - 2, y + 1)
   local btnBg = color and colors.lime or colors.white
   fill(bx, by, #label, 1, btnBg, colors.black)
   text(bx, by, label, colors.black, btnBg)
   playBtn.x, playBtn.y, playBtn.w, playBtn.h = bx, by, #label, 1
 
-  text(2, th - 1, "Enter / click Play", colors.gray, colors.black)
-  text(2, th, "Q quit", colors.gray, colors.black)
+  text(2, th, "Enter play  R refresh  Q quit", colors.gray, colors.black)
 end
 
 local function mainMenu()
@@ -568,7 +677,9 @@ local function mainMenu()
     if ev == "key" then
       if p1 == keys.enter or p1 == keys.space or p1 == keys.p then
         local score = runGame()
-        if score and score > HI then HI = score; saveHi(HI) end
+        afterGame(score)
+      elseif p1 == keys.r then
+        pcall(syncLeaderboard, HI > 0 and HI or nil)
       elseif p1 == keys.q then
         clearScreen(colors.black)
         term.setCursorPos(1, 1)
@@ -584,17 +695,19 @@ local function mainMenu()
         return
       elseif ch == "p" then
         local score = runGame()
-        if score and score > HI then HI = score; saveHi(HI) end
+        afterGame(score)
+      elseif ch == "r" then
+        pcall(syncLeaderboard, HI > 0 and HI or nil)
       end
     elseif ev == "mouse_click" then
       local x, y = p2, p3
       if x >= playBtn.x and x < playBtn.x + playBtn.w
           and y >= playBtn.y and y < playBtn.y + playBtn.h then
         local score = runGame()
-        if score and score > HI then HI = score; saveHi(HI) end
+        afterGame(score)
       end
     elseif ev == "term_resize" then
-      -- redraw next loop
+      -- redraw
     elseif ev == "terminate" then
       clearScreen(colors.black)
       return
@@ -614,7 +727,7 @@ local function sendTrackerBeacon()
     name = host,
     hostname = host,
     mainRouterId = titan.getMainRouterId and titan.getMainRouterId() or nil,
-    version = titan.systemVersion and titan.systemVersion() or "1.0.3",
+    version = titan.systemVersion and titan.systemVersion() or "1.0.4",
     game = "tetris",
     playing = TRACK.playing and true or false,
     score = TRACK.score,
@@ -690,38 +803,57 @@ end
 
 math.randomseed(os.epoch("utc") % 2147483647)
 
--- Boot update check before the menu — rednet install host only (no URL on disk).
+-- Boot: OTA (host-only) + leaderboard sync.
 local function bootCheckUpdates()
-  if not titan or not titan.bootUpdateCheck then return end
   clearScreen(colors.black)
   term.setCursorPos(1, 1)
   if term.setTextColor then term.setTextColor(colors.lightGray) end
   print("Tetris")
-  print("Checking for updates...")
-  if titan.openModem then pcall(titan.openModem) end
-  if titan.writePackageList and not titan.readPackageList() then
-    titan.writePackageList({ "lib/titan.lua", "tetris.lua", "versions.lua" })
-  end
-  local updated, detail = titan.bootUpdateCheck({
-    quiet = false,
-    hostOnly = true,
-    role = "Tetris (pocket game + mesh tracker)",
-    run = "tetris.lua",
-    files = { "lib/titan.lua", "tetris.lua", "versions.lua" },
-  })
-  if not updated then
-    local msg = tostring(detail or "")
-    if msg:find("up to date") then
-      print("Up to date.")
-    elseif msg:find("no install host") or msg:find("check failed") then
-      print("Host offline — play without update.")
-    elseif msg:find("failed") then
-      print("Update skipped: " .. msg)
-    else
-      print(msg)
+  -- Need modem for host OTA + leaderboard even without full mesh lib.
+  if titan and titan.openModem then
+    pcall(titan.openModem)
+  else
+    for _, side in ipairs(redstone.getSides()) do
+      if peripheral.getType(side) == "modem" and not rednet.isOpen(side) then
+        pcall(rednet.open, side)
+      end
     end
-    sleep(0.6)
   end
+
+  if titan and titan.bootUpdateCheck then
+    print("Checking for updates...")
+    if titan.writePackageList and not titan.readPackageList() then
+      titan.writePackageList({ "lib/titan.lua", "tetris.lua", "versions.lua" })
+    end
+    local updated, detail = titan.bootUpdateCheck({
+      quiet = false,
+      hostOnly = true,
+      role = "Tetris (pocket game + mesh tracker)",
+      run = "tetris.lua",
+      files = { "lib/titan.lua", "tetris.lua", "versions.lua" },
+    })
+    if not updated then
+      local msg = tostring(detail or "")
+      if msg:find("up to date") then
+        print("Up to date.")
+      elseif msg:find("no install host") or msg:find("check failed") then
+        print("Host offline — play without update.")
+      elseif msg:find("failed") then
+        print("Update skipped: " .. msg)
+      else
+        print(msg)
+      end
+    end
+  end
+
+  print("Syncing leaderboard...")
+  local board, err = syncLeaderboard(HI > 0 and HI or nil)
+  if board then
+    print(("Leaderboard: %d player%s"):format(#board, #board == 1 and "" or "s"))
+  else
+    print("Leaderboard offline (" .. tostring(err or "?") .. ")")
+  end
+  sleep(0.55)
 end
 
 bootCheckUpdates()
