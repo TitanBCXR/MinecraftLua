@@ -1,6 +1,6 @@
 --[[
   pastebin_install.lua  -  Pastebin bootstrap installer for the Titan system
-  Titan-Version: 1.1.19
+  Titan-Version: 1.1.20
 
   Pulls the Titan files straight from Pastebin (no in-game host needed). Upload
   each file to pastebin.com once, paste its CODE into the table below, then
@@ -40,6 +40,7 @@ local CODES = {
   ["miner.lua"]     = "",
   ["offline_miner.lua"] = "",
   ["offline_site.lua"] = "",
+  ["chest_sucker.lua"] = "",
   ["loader.lua"]    = "",
   ["marker.lua"]    = "",
   ["storage_manager.lua"] = "",
@@ -93,12 +94,15 @@ local ROLES = {
     files = { "lib/titan.lua", "perimeter_sensor.lua" } },
   { key = "19", name = "Perimeter manager (territory board)", run = "perimeter_manager.lua",
     files = { "lib/titan.lua", "perimeter_manager.lua" } },
-  { key = "20", name = "Everything (all files, no auto-run)", run = nil,
+  { key = "20", name = "Chest sucker (pull from adjacent chests)", run = "chest_sucker.lua",
+    files = { "chest_sucker.lua" } },
+  { key = "21", name = "Everything (all files, no auto-run)", run = nil,
     files = { "lib/titan.lua", "hub.lua", "bot.lua", "poi.lua", "worker.lua", "botserver.lua",
               "datacenter.lua", "console.lua", "admin.lua", "gpshost.lua", "locator.lua",
               "router.lua", "router_main.lua", "router_modem.lua",
               "lib/router_hub_net.lua", "lib/router_hub_ui.lua", "lib/router_hub_cmd.lua",
-              "miner.lua", "offline_miner.lua", "offline_site.lua", "loader.lua", "marker.lua", "storage_manager.lua",
+              "miner.lua", "offline_miner.lua", "offline_site.lua", "chest_sucker.lua",
+              "loader.lua", "marker.lua", "storage_manager.lua",
               "perimeter_sensor.lua", "perimeter_manager.lua",
               "exclude.txt", "versions.lua" } },
 }
@@ -244,6 +248,7 @@ local LABELS = {
   ["locator.lua"] = "Locator", ["router.lua"] = "Router", ["miner.lua"] = "Miner",
   ["offline_miner.lua"] = "OfflineMiner",
   ["offline_site.lua"] = "QuarrySite",
+  ["chest_sucker.lua"] = "ChestSucker",
   ["loader.lua"] = "Loader", ["marker.lua"] = "SiteMarker",
   ["storage_manager.lua"] = "StorageManager",
 }

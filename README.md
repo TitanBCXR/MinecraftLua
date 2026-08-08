@@ -9,6 +9,7 @@ A wireless dispatch system for Minecraft's **CC: Tweaked** mod:
 - **`offline_miner.lua`** — local quarry turtle: `mode online|offline`, solo `area` / `box` / `tunnel` / `stair`, or online site fleet (modem → join → reband/reset → mine). Dig-line facing; fuel SOS to admin + MAIN.
 - **`offline_site.lua`** — quarry site board: `column` / `layer` claims, fleet reband on join, origin reset turns, continueIdx skip of mined work, % progress for admin.
 - **`perimeter_sensor.lua` / `perimeter_manager.lua`** — Player Detector territory enter/exit board (N/E/S/W + timestamps).
+- **`chest_sucker.lua`** — on boot/run, suck items from any adjacent chest (any side / up / down).
 - **`lib/titan.lua`** — shared library (protocol, messaging, navigation). Copy this onto **every** device.
 
 ```
@@ -109,6 +110,7 @@ Each device needs:
 | Miner turtle      | `miner.lua`, `lib/titan.lua`, `exclude.txt` |
 | Offline miner     | `offline_miner.lua`, `exclude.txt` (optional) |
 | Quarry site board | `offline_site.lua`, `lib/titan.lua` (+ modem) |
+| Chest sucker      | `chest_sucker.lua`                            |
 | Each POI computer | `poi.lua`, `lib/titan.lua`                 |
 
 (The **Install host** runs `host.lua` and serves everything else over rednet;
@@ -656,8 +658,8 @@ from the install source (GitHub / pastebin / `host.lua`). Extras on disk that
 aren’t listed show as `*` and are not updated.
 
 Bump versions in `versions.lua` (and each file’s `Titan-Version:` header) when
-you ship a change; current system version is **1.5.27** (`offline_miner` **1.4.2**,
-`offline_site` **1.2.1**).
+you ship a change; current system version is **1.5.28** (`chest_sucker` **1.0.0**,
+`offline_miner` **1.4.2**, `offline_site` **1.2.1**).
 
 ---
 
