@@ -1,6 +1,6 @@
 --[[
   tetris.lua  -  Standalone Tetris for CC: Tweaked (pocket / computer)
-  Titan-Version: 1.2.0
+  Titan-Version: 1.2.1
 
   Drop on a pocket PC and run:
 
@@ -15,10 +15,10 @@
   crashes with speaker music). New scores update the local top-3 and queue for
   the next boot sync. R reloads the local cache only.
 
-  Music (Noisy pocket): downloads a free CC0 lofi DFPWM loop over HTTP into
-  tetris_lofi.dfpwm (no rednet), then streams it while you play. M mutes.
-  Falls back to a slow note-block lullaby if HTTP/speaker decode is unavailable.
-  Mesh / leaderboard sync still need a wireless modem at boot.
+  Music (Noisy pocket): downloads a free retro chiptune DFPWM (Korobeiniki —
+  public-domain folk melody, our arrangement) over HTTP into tetris_lofi.dfpwm,
+  then streams it while you play. M mutes. Note-block fallback if HTTP/decode
+  fails. Mesh / leaderboard sync still need a wireless modem at boot.
 
   Player name: uses Advanced Peripherals Player Detector when present; otherwise
   prompts for a name after a game (saved in tetris.cfg). That name is what
@@ -69,6 +69,8 @@ local function isColor()
 end
 
 local MUSIC_ON = true -- persisted; M toggles
+local MUSIC_REV = 2 -- bump when replacing the cached DFPWM theme
+local musicRevSeen = 0
 
 local function loadCfg()
   local hi, name = 0, nil
@@ -82,6 +84,7 @@ local function loadCfg()
       name = d.playerName:match("^%s*(.-)%s*$")
     end
     if d.music == false then MUSIC_ON = false end
+    musicRevSeen = tonumber(d.musicRev) or 0
   end
   return hi, name
 end
@@ -92,6 +95,7 @@ local function saveCfg()
     hi = HI,
     playerName = PLAYER_NAME,
     music = MUSIC_ON,
+    musicRev = musicRevSeen,
   }))
   f.close()
 end
@@ -104,18 +108,22 @@ HI, PLAYER_NAME = loadCfg()
 --------------------------------------------------------------------------------
 local SPEAKER = nil
 local musicIdx = 1
--- Slow note-block lullaby fallback (not the copyrighted Tetris theme).
+-- Note-block Korobeiniki fallback (folk melody; pitches 0-24).
 local MELODY = {
-  {11, 2}, {14, 2}, {16, 3}, {14, 2}, {11, 2}, {9, 3},
-  {false, 1},
-  {9, 2}, {11, 2}, {14, 3}, {16, 2}, {14, 2}, {11, 4},
+  {16, 2}, {11, 1}, {12, 1}, {14, 2}, {12, 1}, {11, 1},
+  {9, 2}, {9, 1}, {12, 1}, {16, 2}, {14, 1}, {12, 1},
+  {11, 2}, {11, 1}, {12, 1}, {14, 2}, {16, 2},
+  {12, 2}, {9, 2}, {9, 4},
   {false, 2},
-  {7, 2}, {9, 2}, {11, 3}, {9, 2}, {7, 2}, {4, 4},
-  {false, 2},
+  {14, 2}, {17, 1}, {21, 2}, {19, 1}, {17, 1},
+  {16, 3}, {12, 1}, {16, 2}, {14, 1}, {12, 1},
+  {11, 2}, {11, 1}, {12, 1}, {14, 2}, {16, 2},
+  {12, 2}, {9, 2}, {9, 4},
+  {false, 4},
 }
-local MUSIC_BEAT = 0.32 -- lofi-ish tempo for note fallback
+local MUSIC_BEAT = 0.14 -- retro chiptune pace for note fallback
 local MUSIC_FILE = "tetris_lofi.dfpwm"
--- Original CC0 loop hosted with this repo (HTTP, not rednet / not YouTube).
+-- Retro Korobeiniki arrangement hosted with this repo (HTTP, not YouTube rips).
 local MUSIC_URL = "https://raw.githubusercontent.com/TitanBCXR/MinecraftLua/main/media/tetris_lofi.dfpwm"
 local MUSIC_MODE = "none" -- "dfpwm" | "notes" | "none"
 local musicHandle = nil
@@ -137,7 +145,7 @@ end
 local function meshStatusLine()
   local sp = refreshSpeaker()
   local md = hasModem()
-  local track = fs.exists(MUSIC_FILE) and "lofi" or "notes"
+  local track = fs.exists(MUSIC_FILE) and "retro" or "notes"
   if sp and md then return track .. "+mesh"
   elseif sp then return track .. " (U=modem)"
   elseif md then return "mesh (no speaker)"
@@ -168,7 +176,7 @@ local function ensureLofiTrack()
   if type(http) ~= "table" or type(http.get) ~= "function" then
     return false, "http disabled"
   end
-  print("Downloading CC0 lofi track...")
+  print("Downloading retro Tetris theme...")
   local ok, res = pcall(http.get, MUSIC_URL, { ["User-Agent"] = "TitanTetris/1.2" }, true)
   if not ok or not res then
     return false, "download failed"
@@ -1157,7 +1165,7 @@ local function controlsScreen()
       { "Soft",  "S / J / ↓" },
       { "Hard",  "Space / Enter" },
       { "Pause", "P" },
-      { "Mute",  "M (lofi / notes)" },
+      { "Mute",  "M (retro / notes)" },
       { "Swap",  "U (modem <-> speaker)" },
       { "Board", "R reload local cache" },
       { "Menu",  "Q (always)" },
@@ -1341,11 +1349,16 @@ local function bootCheckUpdates()
   end
   -- HTTP music fetch does not use rednet (works with speaker-only noisy pocket).
   do
+    if musicRevSeen < MUSIC_REV and fs.exists(MUSIC_FILE) then
+      pcall(fs.delete, MUSIC_FILE) -- drop old lofi cache for retro theme
+    end
     local okMusic, detail = ensureLofiTrack()
     if okMusic then
-      print("Lofi track ready (" .. tostring(detail) .. ").")
+      musicRevSeen = MUSIC_REV
+      saveCfg()
+      print("Retro theme ready (" .. tostring(detail) .. ").")
     else
-      print("Lofi download skipped (" .. tostring(detail) .. ") — note fallback.")
+      print("Theme download skipped (" .. tostring(detail) .. ") — note fallback.")
     end
   end
   print(meshStatusLine())
