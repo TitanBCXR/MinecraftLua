@@ -1,6 +1,6 @@
 --[[
   lib/router_hub_cmd.lua  -  Titan hub console / boot (part)
-  Titan-Version: 1.4.2
+  Titan-Version: 1.4.3
 
   Loaded by router_main.lua into a shared env (setfenv). Do not run directly.
 ]]
@@ -51,6 +51,7 @@ function handleRouterCommand(a)
         print("  routes = keep MAIN/home; hard/all = also forget MAIN + name")
       end
       print("ssh <id|label> [cmd] - remote shell (full device commands)")
+      print("say <id|label> <msg> - print on that device's screen")
       print("exit")
   elseif cmd == "role" then
       print(("Role: %s  (id #%d)"):format(routerRole, os.getComputerID()))
@@ -685,6 +686,22 @@ function handleRouterCommand(a)
         for i = 3, #a do parts[#parts + 1] = a[i] end
         local cmdline = #parts > 0 and table.concat(parts, " ") or nil
         titanLib.sshConnect(target, cmdline)
+      end
+  elseif cmd == "say" then
+      if not a[2] or not a[3] then
+        print("Usage: say <id|label> <message>")
+      elseif not titanLib or not titanLib.say then
+        print("say needs a newer lib/titan.lua on this router (run update).")
+      else
+        local target = a[2]
+        local parts = {}
+        for i = 3, #a do parts[#parts + 1] = a[i] end
+        local ok, err = titanLib.say(target, table.concat(parts, " "))
+        if ok then
+          print("Said to " .. tostring(target) .. ".")
+        else
+          printError("say: " .. tostring(err))
+        end
       end
   elseif cmd == "exit" or cmd == "quit" then
     return "exit"

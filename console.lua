@@ -1,6 +1,6 @@
 --[[
   console.lua  -  Basic terminal commands for a CC: Tweaked device
-  Titan-Version: 1.1.8
+  Titan-Version: 1.1.9
 
   A tiny, self-contained command console you can run on any computer or turtle.
   It gives you a handful of everyday commands (files, labels, GPS, fuel, movement)
@@ -353,6 +353,28 @@ def("ssh", "remote shell (jumps via modems): ssh <id|label> [command...]", funct
   local target = table.remove(a, 1)
   local cmdline = #a > 0 and table.concat(a, " ") or nil
   titanLib.sshConnect(target, cmdline)
+end)
+
+def("say", "print a message on another device: say <id|label> <message...>", function(a)
+  openModems()
+  if not a[1] or not a[2] then
+    print("Usage: say <computer id or label> <message>")
+    print("  say 3 Hello there")
+    print("  say Admin Need fuel at the quarry")
+    return
+  end
+  if not titanLib or not titanLib.say then
+    printError("say needs lib/titan.lua (re-install via Titan installer, or copy lib/).")
+    return
+  end
+  local target = table.remove(a, 1)
+  local message = table.concat(a, " ")
+  local ok, err = titanLib.say(target, message)
+  if ok then
+    print("Said to " .. tostring(target) .. ".")
+  else
+    printError("say: " .. tostring(err))
+  end
 end)
 
 def("reboot", "restart this device", function() os.reboot() end)

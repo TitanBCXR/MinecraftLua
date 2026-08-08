@@ -1,6 +1,6 @@
 --[[
   titan.lua  -  Shared library for the Titan bot network (CC: Tweaked)
-  Titan-Version: 1.2.25
+  Titan-Version: 1.2.26
 
   Provides:
     * Rednet protocol constants + message type enum
@@ -738,6 +738,7 @@ end
 --
 -- From console/admin/router:  ssh <id|label>           interactive session
 --                             ssh <id|label> <command>  one-shot remote exec
+--                             say <id|label> <message>  print on that device's screen
 --
 -- Jump: if the target is out of direct range, SSH hops through modem/router
 -- shells (proxy sessions) until it reaches the destination — same idea as
@@ -746,6 +747,7 @@ end
 -- Every device running titan.networkLoop (or sshHostLoop) hosts a shell.
 -- Remote lines run the device's registered app commands (if any), then CraftOS
 -- shell / turtle builtins. `reboot` acks then os.reboot; `exit` disconnects.
+-- `say` is display-only (no password); it prints on term.native().
 --------------------------------------------------------------------------------
 titan.SSH_PROTOCOL = "titan_ssh"
 titan.SSH_MAX_JUMPS = 8
@@ -782,7 +784,24 @@ local function sshNewToken()
 end
 
 local function sshIsClientReply(t)
-  return t == "ssh_pong" or t == "ssh_ok" or t == "ssh_deny" or t == "ssh_result"
+  return t == "ssh_pong" or t == "ssh_ok" or t == "ssh_deny"
+      or t == "ssh_result" or t == "ssh_say_ack"
+end
+
+-- Print a Say message on the real local screen (not a redirected monitor/SSH capture).
+local function sshPrintSay(from, text)
+  local native = (term.native and term.native()) or term
+  local prev = (term.current and term.current()) or nil
+  local redirected = prev and native and prev ~= native
+  if redirected then term.redirect(native) end
+  pcall(function()
+    if term.setTextColor then term.setTextColor(colors.yellow) end
+    print("")
+    write("[Say from " .. tostring(from) .. "] ")
+    if term.setTextColor then term.setTextColor(colors.white) end
+    print(tostring(text))
+  end)
+  if redirected then term.redirect(prev) end
 end
 
 -- Wait for a client-bound reply. Also pumps rednet so nested jump dials work
@@ -1179,6 +1198,14 @@ function titan.sshHostLoop(kind)
         })
       end
 
+    elseif msg.type == "ssh_say" then
+      local text = tostring(msg.text or msg.message or "")
+      local from = tostring(msg.fromName or msg.name or msg.from or id)
+      if text ~= "" then
+        sshPrintSay(from, text)
+      end
+      sshSend(id, { type = "ssh_say_ack", ok = text ~= "" })
+
     elseif msg.type == "ssh_open" then
       if type(msg.password) ~= "string" or not titan.checkPassword(msg.password) then
         sshSend(id, { type = "ssh_deny", reason = "auth failed (need master password + Parent Center online)" })
@@ -1258,6 +1285,40 @@ function titan.sshHostLoop(kind)
       if msg.token then sshSessions[msg.token] = nil end
     end
   end
+end
+
+-- Display-only: print `message` on the target device's native screen.
+-- targetRef = computer id or label (same resolve rules as ssh). No password.
+-- Returns true or false, err.
+function titan.say(targetRef, message, timeout)
+  timeout = timeout or 3
+  local text = tostring(message or "")
+  if text == "" then return false, "empty message" end
+  pcall(titan.openModem)
+
+  local targetId = tonumber(targetRef) or titan.sshResolve(targetRef, timeout)
+  if not targetId then return false, "target not found: " .. tostring(targetRef) end
+
+  local fromName = titan.hostname(sshKind)
+  if targetId == os.getComputerID() then
+    sshPrintSay(fromName, text)
+    return true
+  end
+
+  sshSend(targetId, {
+    type = "ssh_say",
+    text = text,
+    from = os.getComputerID(),
+    fromName = fromName,
+    name = fromName,
+  })
+  local _, ack = sshClientWait(timeout, function(sid, m)
+    return sid == targetId and type(m) == "table" and m.type == "ssh_say_ack"
+  end)
+  if not ack then
+    return false, "no response from #" .. tostring(targetId) .. " (offline / out of range?)"
+  end
+  return true
 end
 
 -- Client: open a session (prompts for master password). Returns token, hostMsg or nil, err.

@@ -1,6 +1,6 @@
 --[[
   admin.lua  -  Titan admin console for a POCKET computer ("Live" tablet)
-  Titan-Version: 1.5.7
+  Titan-Version: 1.5.8
 
   Pocket remote for the whole fleet. Keep it on you; it joins the mesh like
   every other Titan device (MAIN router + modem hops).
@@ -15,6 +15,7 @@
   Advanced commands:
     connections | hosts | list   - who is reachable for SSH
     connect | ssh <id|label>     - remote shell (full device commands)
+    say <id|label> <message>     - print on that device's screen
     link                         - network topology (routers + modems)
     link <a> <b>                 - peer two routers OR attach modem->router
     link auto                    - GPS auto: peer routers, modems->nearest hub
@@ -2407,6 +2408,7 @@ local HELP_ENTRIES = {
   { "link auto", "Auto peer routers / attach modems" },
   { "link <a> <b>", "Peer or attach by role" },
   { "connect <id>", "SSH shell (alias: ssh)" },
+  { "say <id> <msg>", "Print message on device screen" },
   { "goto <id> x y z", "Send turtle to coords" },
   { "return|park <id>", "Send turtle home / park" },
   { "refuel <id>", "Ask turtle to refuel" },
@@ -2699,6 +2701,27 @@ local function handleCommand(a)
 
   elseif cmd == "connect" or cmd == "ssh" or cmd == "c" then
     return doConnect(a)
+
+  elseif cmd == "say" then
+    if not a[2] or not a[3] then
+      print("Usage: say <id|label> <message>")
+      print("  say 3 Hello there")
+      print("  say Admin Need fuel at the quarry")
+      return true
+    end
+    if not titan.say then
+      print("say needs a newer lib/titan.lua (run update).")
+      return true
+    end
+    local target = a[2]
+    local parts = {}
+    for i = 3, #a do parts[#parts + 1] = a[i] end
+    local ok, err = titan.say(target, table.concat(parts, " "))
+    if ok then
+      print("Said to " .. tostring(target) .. ".")
+    else
+      printError("say: " .. tostring(err))
+    end
 
   elseif cmd == "dc" or cmd == "center" or cmd == "datacenter" or cmd == "parent" then
     local id, row = findByKind("datacenter")

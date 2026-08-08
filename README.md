@@ -652,6 +652,7 @@ packages remove <name> remove from the `packages` file
 packages update       download every package listed in `packages`
 update [-y]           same as `packages update` (`-y` reboots without asking)
 ssh <id|label> [cmd...]   remote shell (master password)
+say <id|label> <message>  print on that device's screen (no password)
 reboot|shutdown   power control
 exit | quit       leave the console
 ```
@@ -674,7 +675,7 @@ drop stale local jobs. Archived packages are under `archive/` (not in installers
 
 ---
 
-# Remote shell (`ssh`)
+# Remote shell (`ssh`) / `say`
 
 Rednet "SSH" to any Titan device on the mesh (bots, workers, miners, routers,
 Parent Center, etc.). Gated by the **Parent Center master password**.
@@ -683,12 +684,18 @@ Parent Center, etc.). Gated by the **Parent Center master password**.
 ssh 12                 interactive session on computer #12
 ssh Miner-5            by label (partial match ok)
 ssh Worker-3 ls        one-shot: run `ls` remotely and print output
+say 12 Hello           print on computer #12's screen
+say Admin Need fuel    by label (partial match ok)
 ```
 
-On the far side, each line runs through that computer's CraftOS `shell` (output
-captured and sent back). Type `exit` to disconnect. Every program using
+`say` is display-only (no password). The target must be running Titan mesh /
+`networkLoop` so it can receive the message; it prints on that device's native
+screen as `[Say from <you>] <message>`.
+
+On the far side, each SSH line runs through that computer's CraftOS `shell`
+(output captured and sent back). Type `exit` to disconnect. Every program using
 `titan.networkLoop` hosts an SSH endpoint; console/admin/router also have an
-`ssh` client command.
+`ssh` / `say` client command.
 
 On a **turtle** you also get:
 
