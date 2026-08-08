@@ -1,12 +1,13 @@
 --[[
   titan.lua  -  Shared library for the Titan bot network (CC: Tweaked)
-  Titan-Version: 1.2.19
+  Titan-Version: 1.2.20
 
   Provides:
     * Rednet protocol constants + message type enum
     * Modem discovery / open helpers (wireless + wired)
     * send / broadcast / recv wrappers with a consistent envelope
     * GPS-based turtle navigation (moveTo, goHome, heading calibration)
+    * Mesh storm control: announce prefers MAIN unicast + jittered registerLoop
 
   Drop this file at:  lib/titan.lua  on EVERY computer & turtle,
   or copy it around with `pastebin`, disks, or `wget`.
@@ -418,14 +419,31 @@ function titan.systemVersion()
   return (cat and cat.system) or nil
 end
 
-function titan.announce(kind)
+-- Stagger fleet chatter by computer id (same idea as quarry / router hubs).
+function titan.netJitter(scale)
+  scale = tonumber(scale) or 1
+  if scale <= 0 then return end
+  local id = os.getComputerID() or 0
+  sleep((((id * 37) % 1000) / 1000) * scale)
+end
+
+-- opts.flood = true → force broadcast. Default: unicast MAIN when known (less RF storm);
+-- broadcast when MAIN unknown so hop routers can still discover the device.
+function titan.announce(kind, opts)
+  opts = opts or {}
   if type(kind) == "string" and kind ~= "" then lastAnnounceKind = kind end
   local host = titan.hostname(lastAnnounceKind)
-  rednet.broadcast({
+  local msg = {
     type = "hello", kind = lastAnnounceKind, name = host, hostname = host,
     mainRouterId = titan.getMainRouterId(),
     version = titan.systemVersion(),
-  }, titan.ROUTER_PROTOCOL)
+  }
+  local mainId = titan.getMainRouterId()
+  if mainId and not opts.flood then
+    rednet.send(mainId, msg, titan.ROUTER_PROTOCOL)
+  else
+    rednet.broadcast(msg, titan.ROUTER_PROTOCOL)
+  end
 end
 
 -- After a successful OTA, leave a flag so the next boot can ACK the main router.
@@ -564,8 +582,9 @@ end
 
 -- Announce periodically AND listen for OTA update / forced reauth from main router.
 function titan.registerLoop(kind, period)
-  period = period or 20
-  -- Re-auth immediately on boot / after OTA reboot.
+  period = tonumber(period) or 35
+  -- Re-auth immediately on boot / after OTA reboot (stagger so fleets don't sync-thump).
+  titan.netJitter(1.5)
   print("[net] Re-authenticating with the network...")
   local ok, detail = titan.reauth(kind)
   if ok then
@@ -584,14 +603,22 @@ function titan.registerLoop(kind, period)
   -- If this boot follows a fleet OTA, ACK the main router.
   titan.reportUpdatedIfPending(kind)
 
-  local nextAnnounce = os.clock() + period
+  local nextAnnounce = os.clock() + period + (((os.getComputerID() or 0) % 10))
   while true do
     if os.clock() >= nextAnnounce then
       titan.announce(kind)
       nextAnnounce = os.clock() + period
     end
-    local id, msg = rednet.receive(titan.ROUTER_PROTOCOL, math.max(0.2, nextAnnounce - os.clock()))
-    if type(msg) == "table" then
+    local id, msg = rednet.receive(titan.ROUTER_PROTOCOL, 0.4)
+    local batch = {}
+    if type(msg) == "table" and id then batch[#batch + 1] = { id, msg } end
+    for _ = 1, 12 do
+      local id2, msg2 = rednet.receive(titan.ROUTER_PROTOCOL, 0)
+      if not id2 then break end
+      if type(msg2) == "table" then batch[#batch + 1] = { id2, msg2 } end
+    end
+    for bi = 1, #batch do
+      id, msg = batch[bi][1], batch[bi][2]
       -- Optional app hook (e.g. locator radar) — runs before built-in handlers.
       if type(titan.onRouterMessage) == "function" then
         pcall(titan.onRouterMessage, id, msg)
@@ -600,6 +627,7 @@ function titan.registerLoop(kind, period)
         titan.setMainRouterId(id)
       elseif msg.type == "reauth" then
         print("[net] Re-auth requested by router #" .. tostring(id))
+        titan.netJitter(1)
         titan.reauth(kind)
       elseif msg.type == "update" then
         print("")

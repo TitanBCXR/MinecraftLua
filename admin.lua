@@ -1,6 +1,6 @@
 --[[
   admin.lua  -  Titan admin console for a POCKET computer ("Live" tablet)
-  Titan-Version: 1.5.2
+  Titan-Version: 1.5.4
 
   Pocket remote for the whole fleet. Keep it on you; it joins the mesh like
   every other Titan device (MAIN router + modem hops).
@@ -418,7 +418,16 @@ local function listenerLoop()
   titan.broadcast(MSG.PING, {})
   while true do
     local id, msg = titan.recv(1)
-    if msg then handle(id, msg) end
+    local batch = {}
+    if msg and id then batch[#batch + 1] = { id, msg } end
+    for _ = 1, 12 do
+      local id2, msg2 = titan.recv(0)
+      if not msg2 then break end
+      batch[#batch + 1] = { id2, msg2 }
+    end
+    for bi = 1, #batch do
+      handle(batch[bi][1], batch[bi][2])
+    end
   end
 end
 
@@ -491,8 +500,19 @@ end
 local function quarryListenerLoop()
   while true do
     local id, msg = rednet.receive(PROTO_QUARRY, 2)
+    local batch = {}
     if id and type(msg) == "table" and msg.type then
-      handle(id, msg)
+      batch[#batch + 1] = { id, msg }
+    end
+    for _ = 1, 16 do
+      local id2, msg2 = rednet.receive(PROTO_QUARRY, 0)
+      if not id2 then break end
+      if type(msg2) == "table" and msg2.type then
+        batch[#batch + 1] = { id2, msg2 }
+      end
+    end
+    for bi = 1, #batch do
+      handle(batch[bi][1], batch[bi][2])
     end
   end
 end
@@ -644,6 +664,25 @@ local function termIsColor()
   return ok and c == true
 end
 
+-- Modern dark operator-console palette (CC 16-color). Row fills only — no per-cell FX.
+local THEME = {
+  bg = colors.black,
+  panel = colors.gray,
+  bar = colors.gray,
+  accent = colors.cyan,
+  accentWarm = colors.orange,
+  accentFg = colors.black,
+  text = colors.white,
+  muted = colors.lightGray,
+  dim = colors.gray,
+  ok = colors.lime,
+  warn = colors.yellow,
+  bad = colors.red,
+  zebra = colors.gray,
+  colHeader = colors.lightGray,
+  colHeaderFg = colors.black,
+}
+
 local function termLayout()
   local w, h = term.getSize()
   local color = termIsColor()
@@ -661,8 +700,8 @@ local function termLayout()
 end
 
 local function guiFill(out, x, y, w, h, bg, fg)
-  bg = bg or colors.black
-  fg = fg or colors.white
+  bg = bg or THEME.bg
+  fg = fg or THEME.text
   for row = y, y + h - 1 do
     out.setCursorPos(x, row)
     if out.setBackgroundColor then out.setBackgroundColor(bg) end
@@ -676,10 +715,36 @@ local function guiText(out, x, y, txt, fg, bg)
   local w = select(1, out.getSize())
   if x > w then return end
   txt = tostring(txt or "")
-  if out.setBackgroundColor then out.setBackgroundColor(bg or colors.black) end
-  if out.setTextColor then out.setTextColor(fg or colors.white) end
+  if out.setBackgroundColor then out.setBackgroundColor(bg or THEME.bg) end
+  if out.setTextColor then out.setTextColor(fg or THEME.text) end
   out.setCursorPos(x, y)
   out.write(txt:sub(1, math.max(0, w - x + 1)))
+end
+
+local function themeClear(out, colorOk)
+  out = out or term
+  if colorOk == nil then colorOk = termIsColor() end
+  local bg = colorOk and THEME.bg or colors.black
+  if out.setBackgroundColor then out.setBackgroundColor(bg) end
+  if out.setTextColor then out.setTextColor(THEME.text) end
+  out.clear()
+end
+
+local function themeBar(L, y, title, subtitle, accent)
+  local out, w = L.out, L.w
+  accent = accent or THEME.accent
+  if L.color then
+    guiFill(out, 1, y, w, 1, accent, THEME.accentFg)
+    guiText(out, 2, y, title, THEME.accentFg, accent)
+    if subtitle and L.tier ~= "tiny" and #title + #subtitle + 4 < w then
+      guiText(out, math.max(1, w - #subtitle), y, subtitle, THEME.panel, accent)
+    end
+  else
+    guiText(out, 1, y, title, THEME.text, THEME.bg)
+    if subtitle and L.tier ~= "tiny" then
+      guiText(out, math.max(1, w - #subtitle + 1), y, subtitle, THEME.muted, THEME.bg)
+    end
+  end
 end
 
 --------------------------------------------------------------------------------
@@ -700,14 +765,13 @@ showLoginScreen = function(opts)
     local w, h = term.getSize()
     local color = termIsColor()
     local out = term
-    local bg = colors.black
-    local accent = color and colors.cyan or colors.white
-    local panel = color and colors.gray or colors.black
-    local btnBg = color and colors.lime or colors.white
-    local btnFg = colors.black
+    local bg = THEME.bg
+    local accent = color and THEME.accent or colors.white
+    local panel = color and THEME.panel or THEME.bg
+    local btnBg = color and THEME.ok or colors.white
+    local btnFg = THEME.accentFg
 
-    if out.setBackgroundColor then out.setBackgroundColor(bg) end
-    out.clear()
+    themeClear(out, color)
 
     -- Header band
     local headerH = math.min(4, math.max(2, math.floor(h * 0.22)))
@@ -717,26 +781,31 @@ showLoginScreen = function(opts)
       guiText(out, 2, 2, " Admin Tablet", btnFg, accent)
     end
     if headerH >= 3 then
-      guiText(out, 2, 3, " " .. (opts.title or "Sign in"), color and colors.black or btnFg, accent)
+      guiText(out, 2, 3, " " .. (opts.title or "Sign in"), btnFg, accent)
+    end
+
+    -- Soft panel under header (color only)
+    if color and headerH + 1 <= h then
+      guiFill(out, 1, headerH + 1, w, 1, THEME.bar, THEME.muted)
     end
 
     local y = headerH + 2
     local label = os.getComputerLabel() or ("#" .. os.getComputerID())
-    guiText(out, 2, y, "Device  " .. label:sub(1, w - 10), colors.lightGray, bg)
+    guiText(out, 2, y, "Device  " .. label:sub(1, w - 10), THEME.muted, bg)
     y = y + 2
 
-    guiText(out, 2, y, "Master password", colors.white, bg)
+    guiText(out, 2, y, "Master password", THEME.text, bg)
     y = y + 1
 
     -- Password field
     local fieldX, fieldW = 2, math.max(10, w - 2)
     local fieldY = y
-    guiFill(out, fieldX, fieldY, fieldW, 1, panel, colors.white)
-    guiText(out, fieldX, fieldY, " ", colors.white, panel)
+    guiFill(out, fieldX, fieldY, fieldW, 1, panel, THEME.text)
+    guiText(out, fieldX, fieldY, " ", THEME.text, panel)
 
     y = fieldY + 2
     if errMsg then
-      guiText(out, 2, y, errMsg:sub(1, w - 2), colors.red, bg)
+      guiText(out, 2, y, errMsg:sub(1, w - 2), THEME.bad, bg)
       y = y + 1
     end
 
@@ -747,38 +816,35 @@ showLoginScreen = function(opts)
     guiFill(out, btnX, btnY, #btnLabel, 1, btnBg, btnFg)
     guiText(out, btnX, btnY, btnLabel, btnFg, btnBg)
 
-    guiText(out, 2, h - 1, "Parent Center + master floppy online", colors.gray, bg)
-    guiText(out, 2, h, "Type password, then Enter", colors.gray, bg)
+    guiText(out, 2, h - 1, "Parent Center + master floppy online", THEME.dim, bg)
+    guiText(out, 2, h, "Type password, then Enter", THEME.dim, bg)
 
     -- Read password in the field
     if out.setBackgroundColor then out.setBackgroundColor(panel) end
-    if out.setTextColor then out.setTextColor(colors.white) end
+    if out.setTextColor then out.setTextColor(THEME.text) end
     out.setCursorPos(fieldX, fieldY)
     local pw = read("*")
     if pw and pw ~= "" then
       if titan.checkPassword(pw) then
         unlocked = true
-        if out.setBackgroundColor then out.setBackgroundColor(bg) end
-        out.clear()
-        guiFill(out, 1, 1, w, h, color and colors.green or bg, colors.white)
-        guiText(out, 2, math.floor(h / 2), "Unlocked", colors.white, color and colors.green or bg)
+        themeClear(out, color)
+        guiFill(out, 1, 1, w, h, color and THEME.ok or bg, THEME.text)
+        guiText(out, 2, math.floor(h / 2), "Unlocked",
+          color and THEME.accentFg or THEME.text, color and THEME.ok or bg)
         sleep(0.45)
-        if out.setBackgroundColor then out.setBackgroundColor(bg) end
-        out.clear()
+        themeClear(out, color)
         out.setCursorPos(1, 1)
         if flushWhereTrack then flushWhereTrack(true) end
         return true
       end
       errMsg = "Wrong password or no master online"
       if once then
-        if out.setBackgroundColor then out.setBackgroundColor(bg) end
-        out.clear()
+        themeClear(out, color)
         out.setCursorPos(1, 1)
         return false
       end
     elseif once then
-      if out.setBackgroundColor then out.setBackgroundColor(bg) end
-      out.clear()
+      themeClear(out, color)
       out.setCursorPos(1, 1)
       return false
     end
@@ -797,39 +863,26 @@ promptUnlockAtStart = function()
 end
 
 local function guiBar(L, y, title, subtitle, accent)
-  local out, w = L.out, L.w
-  accent = accent or colors.cyan
-  if L.color then
-    guiFill(out, 1, y, w, 1, accent, colors.black)
-    guiText(out, 2, y, title, colors.black, accent)
-    if subtitle and L.tier ~= "tiny" and #title + #subtitle + 4 < w then
-      guiText(out, math.max(1, w - #subtitle), y, subtitle, colors.gray, accent)
-    end
-  else
-    guiText(out, 1, y, title, colors.white, colors.black)
-    if subtitle and L.tier ~= "tiny" then
-      guiText(out, math.max(1, w - #subtitle + 1), y, subtitle, colors.lightGray, colors.black)
-    end
-  end
+  themeBar(L, y, title, subtitle, accent)
 end
 
 local function guiChip(out, x, y, label, fg, bg, colorOk)
   label = " " .. tostring(label) .. " "
   if colorOk then
-    guiText(out, x, y, label, fg or colors.white, bg or colors.gray)
+    guiText(out, x, y, label, fg or THEME.text, bg or THEME.panel)
   else
     local bare = tostring(label):match("^%s*(.-)%s*$") or tostring(label)
-    guiText(out, x, y, "[" .. bare .. "]", fg or colors.white, colors.black)
+    guiText(out, x, y, "[" .. bare .. "]", fg or THEME.text, THEME.bg)
     return x + #bare + 3
   end
   return x + #label + 1
 end
 
 local function statusColorOf(st)
-  if st == "ONLINE" or st == "ON" then return colors.lime end
-  if st == "WIRED" or st == "WR" then return colors.cyan end
-  if st == "OFFLINE" or st == "OFF" then return colors.red end
-  return colors.yellow
+  if st == "ONLINE" or st == "ON" then return THEME.ok end
+  if st == "WIRED" or st == "WR" then return THEME.accent end
+  if st == "OFFLINE" or st == "OFF" then return THEME.bad end
+  return THEME.warn
 end
 
 local function formatUptime(sec)
@@ -935,19 +988,19 @@ local function drawStatusChips(L, y, on, off, unk)
   local out, w = L.out, L.w
   if L.tier == "tiny" then
     guiText(out, 1, y, ("ON:%d OFF:%d ?:%d"):format(on or 0, off or 0, unk or 0),
-      colors.white, colors.black)
+      THEME.text, THEME.bg)
     return
   end
   if L.color then
-    guiFill(out, 1, y, w, 1, colors.black, colors.white)
+    guiFill(out, 1, y, w, 1, THEME.bg, THEME.text)
     local x = 1
-    x = guiChip(out, x, y, "ON " .. tostring(on or 0), colors.black, colors.lime, true)
-    x = guiChip(out, x, y, "OFF " .. tostring(off or 0), colors.white, colors.red, true)
-    guiChip(out, x, y, "? " .. tostring(unk or 0), colors.black, colors.yellow, true)
+    x = guiChip(out, x, y, "ON " .. tostring(on or 0), THEME.accentFg, THEME.ok, true)
+    x = guiChip(out, x, y, "OFF " .. tostring(off or 0), THEME.text, THEME.bad, true)
+    guiChip(out, x, y, "? " .. tostring(unk or 0), THEME.accentFg, THEME.warn, true)
   else
     guiText(out, 1, y,
       ("ONLINE:%d  OFFLINE:%d  UNKNOWN:%d"):format(on or 0, off or 0, unk or 0),
-      colors.white, colors.black)
+      THEME.text, THEME.bg)
   end
 end
 
@@ -956,7 +1009,7 @@ local function drawRosterBoard(L, scope, snap)
   local rows = (scope == "global") and (snap.globalRows or {}) or (snap.localRows or {})
   local counts = (scope == "global") and (snap.globalCounts or {}) or (snap.localCounts or {})
   local title = (scope == "global") and "GLOBAL MESH" or "LOCAL NETWORK"
-  local accent = (scope == "global") and (colors.orange or colors.yellow) or (colors.cyan or colors.lightBlue)
+  local accent = (scope == "global") and THEME.accentWarm or THEME.accent
   local y = 1
   local src = snap.synth and "scan" or ("#" .. tostring(snap.id or "?"))
   guiBar(L, y, title, src, accent)
@@ -969,10 +1022,10 @@ local function drawRosterBoard(L, scope, snap)
     local meta = ("peers %d  cells %d"):format(
       tonumber(snap.peers) or 0, tonumber(snap.cells) or 0)
     if L.color then
-      guiFill(out, 1, y, w, 1, colors.gray, colors.white)
-      guiText(out, 2, y, meta, colors.white, colors.gray)
+      guiFill(out, 1, y, w, 1, THEME.panel, THEME.text)
+      guiText(out, 2, y, meta, THEME.text, THEME.panel)
     else
-      guiText(out, 1, y, meta, colors.lightGray, colors.black)
+      guiText(out, 1, y, meta, THEME.muted, THEME.bg)
     end
     y = y + 1
   end
@@ -984,8 +1037,8 @@ local function drawRosterBoard(L, scope, snap)
     local hdr = L.tier == "tiny" and "ID ST HOST"
       or (showKind and ("%-" .. idW .. "s %-8s %-6s HOST"):format("ID", "STATUS", "KIND")
           or ("%-" .. idW .. "s %-8s HOST"):format("ID", "STATUS"))
-    local hbg = L.color and colors.lightGray or colors.black
-    local hfg = L.color and colors.black or colors.lightGray
+    local hbg = L.color and THEME.colHeader or THEME.bg
+    local hfg = L.color and THEME.colHeaderFg or THEME.muted
     if L.color then guiFill(out, 1, y, w, 1, hbg, hfg) end
     guiText(out, 1 + L.pad, y, hdr, hfg, hbg)
     y = y + 1
@@ -1010,9 +1063,9 @@ local function drawRosterBoard(L, scope, snap)
       host = host .. " →#" .. tostring(r.homeRouter)
     end
     local age = (r.seen and r.seen > 0) and (ago(r.seen) .. "s") or "-"
-    local bg = colors.black
-    if L.color and ((y - listStart) % 2 == 1) then bg = colors.gray end
-    if L.color then guiFill(out, 1, y, w, 1, bg, colors.white) end
+    local bg = THEME.bg
+    if L.color and ((y - listStart) % 2 == 1) then bg = THEME.zebra end
+    if L.color then guiFill(out, 1, y, w, 1, bg, THEME.text) end
 
     local x = 1 + L.pad
     local sc = statusColorOf(status)
@@ -1020,7 +1073,7 @@ local function drawRosterBoard(L, scope, snap)
     x = x + idW + 1
     if L.color and L.tier ~= "tiny" then
       local chip = ("%-8s"):format(stShort)
-      local chipFg = (status == "OFFLINE") and colors.white or colors.black
+      local chipFg = (status == "OFFLINE") and THEME.text or THEME.accentFg
       guiText(out, x, y, chip, chipFg, sc)
       x = x + 9
     else
@@ -1029,16 +1082,16 @@ local function drawRosterBoard(L, scope, snap)
     end
     if showKind then
       local kw = (w >= 40) and 8 or 6
-      local kindCol = (status == "WIRED") and colors.cyan
-        or ((r.remote or scope == "global") and (colors.orange or colors.yellow) or colors.white)
+      local kindCol = (status == "WIRED") and THEME.accent
+        or ((r.remote or scope == "global") and THEME.accentWarm or THEME.text)
       guiText(out, x, y, ("%-" .. kw .. "s"):format(tostring(r.kind or "?"):sub(1, kw)), kindCol, bg)
       x = x + kw + 1
     end
     local room = w - x - (showAge and (#age + 1) or 0) - L.pad
     if room < 1 then room = math.max(0, w - x) end
-    guiText(out, x, y, host:sub(1, room), colors.white, bg)
+    guiText(out, x, y, host:sub(1, room), THEME.text, bg)
     if showAge then
-      guiText(out, w - #age + 1 - L.pad, y, age, colors.lightGray, bg)
+      guiText(out, w - #age + 1 - L.pad, y, age, THEME.muted, bg)
     end
     y = y + 1
   end
@@ -1046,30 +1099,30 @@ local function drawRosterBoard(L, scope, snap)
     local empty = (scope == "global")
       and "(no remote hubs — link peer)"
       or "(no local devices — link modem)"
-    guiText(out, 1 + L.pad, y, empty, colors.gray, colors.black)
+    guiText(out, 1 + L.pad, y, empty, THEME.dim, THEME.bg)
   end
 end
 
 local function drawStatsBoard(L, snap)
   local out, w, h = L.out, L.w, L.h
   local st = snap.stats or {}
-  local cyan = colors.cyan or colors.lightBlue
+  local accent = THEME.accent
   local y = 1
-  guiBar(L, y, "STATS", ("#%s"):format(tostring(snap.id or "?")), cyan)
+  guiBar(L, y, "STATS", ("#%s"):format(tostring(snap.id or "?")), accent)
   y = y + 1
   if y < h then
     drawStatusChips(L, y, st.online, st.offline, st.unknown)
     y = y + 1
   end
   local cards = {
-    { "ROLE", tostring(st.role or "?"):upper(), colors.white },
-    { "HOST", tostring(st.hostname or "?"):sub(1, 16), colors.lightGray },
-    { "UP", formatUptime(st.uptimeSec), colors.white },
+    { "ROLE", tostring(st.role or "?"):upper(), THEME.text },
+    { "HOST", tostring(st.hostname or "?"):sub(1, 16), THEME.muted },
+    { "UP", formatUptime(st.uptimeSec), THEME.text },
     { "MODEMS", ("%s rf:%s wire:%s"):format(
-        tostring(st.modems or 0), tostring(st.rf or 0), tostring(st.wire or 0)), colors.white },
-    { "RELAY", tostring(st.relayed or 0), cyan },
-    { "WIRED", tostring(st.wired or 0), cyan },
-    { "MEM", tostring(st.remembered or 0), colors.white },
+        tostring(st.modems or 0), tostring(st.rf or 0), tostring(st.wire or 0)), THEME.text },
+    { "RELAY", tostring(st.relayed or 0), accent },
+    { "WIRED", tostring(st.wired or 0), accent },
+    { "MEM", tostring(st.remembered or 0), THEME.text },
   }
   local y1 = h - L.footerH
   if L.color and L.tier ~= "tiny" and w >= 28 then
@@ -1077,10 +1130,10 @@ local function drawStatsBoard(L, snap)
     local i = 1
     while i <= #cards and y <= y1 do
       local a, b = cards[i], cards[i + 1]
-      guiFill(out, 1, y, w, 1, colors.gray, colors.white)
-      guiText(out, 1, y, (" %s %s"):format(a[1], a[2]):sub(1, colW), a[3], colors.gray)
+      guiFill(out, 1, y, w, 1, THEME.panel, THEME.text)
+      guiText(out, 1, y, (" %s %s"):format(a[1], a[2]):sub(1, colW), a[3], THEME.panel)
       if b then
-        guiText(out, colW + 2, y, (" %s %s"):format(b[1], b[2]):sub(1, colW), b[3], colors.gray)
+        guiText(out, colW + 2, y, (" %s %s"):format(b[1], b[2]):sub(1, colW), b[3], THEME.panel)
         i = i + 2
       else
         i = i + 1
@@ -1090,16 +1143,16 @@ local function drawStatsBoard(L, snap)
   else
     for _, c in ipairs(cards) do
       if y > y1 then break end
-      guiText(out, 1 + L.pad, y, ("%s: %s"):format(c[1], c[2]), c[3], colors.black)
+      guiText(out, 1 + L.pad, y, ("%s: %s"):format(c[1], c[2]), c[3], THEME.bg)
       y = y + 1
     end
   end
   if y <= y1 then
     if L.color then
-      guiFill(out, 1, y, w, 1, colors.lightGray, colors.black)
-      guiText(out, 2, y, "BY KIND", colors.black, colors.lightGray)
+      guiFill(out, 1, y, w, 1, THEME.colHeader, THEME.colHeaderFg)
+      guiText(out, 2, y, "BY KIND", THEME.colHeaderFg, THEME.colHeader)
     else
-      guiText(out, 1, y, "By kind:", colors.lightGray, colors.black)
+      guiText(out, 1, y, "By kind:", THEME.muted, THEME.bg)
     end
     y = y + 1
   end
@@ -1112,15 +1165,15 @@ local function drawStatsBoard(L, snap)
     local n = kinds[k]
     if L.color and w >= 24 then
       local barW = math.max(1, math.min(w - 14, n))
-      guiText(out, 1 + L.pad, y, ("%-10s %3d "):format(k:sub(1, 10), n), colors.white, colors.black)
-      guiText(out, 16 + L.pad, y, string.rep(" ", barW), colors.black, cyan)
+      guiText(out, 1 + L.pad, y, ("%-10s %3d "):format(k:sub(1, 10), n), THEME.text, THEME.bg)
+      guiText(out, 16 + L.pad, y, string.rep(" ", barW), THEME.accentFg, accent)
     else
-      guiText(out, 1 + L.pad, y, ("%-10s %d"):format(k, n), colors.white, colors.black)
+      guiText(out, 1 + L.pad, y, ("%-10s %d"):format(k, n), THEME.text, THEME.bg)
     end
     y = y + 1
   end
   if #keys == 0 and y <= y1 then
-    guiText(out, 1 + L.pad, y, "(none)", colors.gray, colors.black)
+    guiText(out, 1 + L.pad, y, "(none)", THEME.dim, THEME.bg)
   end
 end
 
@@ -1128,41 +1181,41 @@ local function drawGpsBoard(L, snap)
   local out, w, h = L.out, L.w, L.h
   local g = snap.gps or {}
   local y = 1
-  guiBar(L, y, "GPS", g.hosting and "HOSTING" or "IDLE", colors.yellow)
+  guiBar(L, y, "GPS", g.hosting and "HOSTING" or "IDLE", THEME.warn)
   y = y + 1
   local y1 = h - L.footerH
   local function put(txt, c, bg)
     if y > y1 then return end
-    if L.color and bg then guiFill(out, 1, y, w, 1, bg, c or colors.white) end
-    guiText(out, 1 + L.pad, y, txt, c or colors.white, bg or colors.black)
+    if L.color and bg then guiFill(out, 1, y, w, 1, bg, c or THEME.text) end
+    guiText(out, 1 + L.pad, y, txt, c or THEME.text, bg or THEME.bg)
     y = y + 1
   end
   if g.hosting then
     if L.color then
-      put(" MAIN HOSTING ", colors.black, colors.lime)
+      put(" MAIN HOSTING ", THEME.accentFg, THEME.ok)
       if L.tier == "tiny" then
-        put(("%s,%s,%s"):format(g.x, g.y, g.z), colors.white, colors.gray)
+        put(("%s,%s,%s"):format(g.x, g.y, g.z), THEME.text, THEME.panel)
       else
-        put(("  X %-6s  Y %-6s  Z %-6s"):format(g.x, g.y, g.z), colors.white, colors.gray)
+        put(("  X %-6s  Y %-6s  Z %-6s"):format(g.x, g.y, g.z), THEME.text, THEME.panel)
       end
     else
-      put("Hosting: YES", colors.lime)
-      put(("X: %s  Y: %s  Z: %s"):format(g.x, g.y, g.z), colors.white)
+      put("Hosting: YES", THEME.ok)
+      put(("X: %s  Y: %s  Z: %s"):format(g.x, g.y, g.z), THEME.text)
     end
   else
     put(L.color and " NOT HOSTING " or "Hosting: NO",
-      L.color and colors.white or colors.red,
-      L.color and colors.red or colors.black)
-    put("Set on MAIN: gpshost <x> <y> <z>", colors.lightGray)
+      L.color and THEME.text or THEME.bad,
+      L.color and THEME.bad or THEME.bg)
+    put("Set on MAIN: gpshost <x> <y> <z>", THEME.muted)
   end
-  if L.tier ~= "tiny" then put("", colors.white) end
-  put("Tablet locate", colors.lightGray, L.color and colors.gray or nil)
+  if L.tier ~= "tiny" then put("", THEME.text) end
+  put("Tablet locate", THEME.muted, L.color and THEME.panel or nil)
   local lx, ly, lz = gps.locate(0.3)
   if lx then
     lx = math.floor(lx + 0.5); ly = math.floor(ly + 0.5); lz = math.floor(lz + 0.5)
-    put(("  %d, %d, %d"):format(lx, ly, lz), colors.lime)
+    put(("  %d, %d, %d"):format(lx, ly, lz), THEME.ok)
   else
-    put("  (no fix — need 4 hosts)", colors.orange or colors.yellow)
+    put("  (no fix — need 4 hosts)", THEME.accentWarm)
   end
 end
 
@@ -1180,20 +1233,20 @@ local function drawBotsBoard(L)
     end
   end
   local y = 1
-  guiBar(L, y, "BOTS", unlocked and "UNLOCKED" or "locked", colors.yellow)
+  guiBar(L, y, "BOTS", unlocked and "UNLOCKED" or "locked", THEME.warn)
   y = y + 1
   local summary = ("bots:%d B:%d G:%d M:%d L:%d site:%d"):format(
     total, build, gath, mine, load, mark)
   if L.color then
-    guiFill(out, 1, y, w, 1, colors.gray, colors.white)
-    guiText(out, 2, y, summary, colors.lime, colors.gray)
+    guiFill(out, 1, y, w, 1, THEME.panel, THEME.text)
+    guiText(out, 2, y, summary, THEME.ok, THEME.panel)
   else
-    guiText(out, 1, y, summary, colors.lime, colors.black)
+    guiText(out, 1, y, summary, THEME.ok, THEME.bg)
   end
   y = y + 1
   if y < h then
-    local hbg = L.color and colors.lightGray or colors.black
-    local hfg = L.color and colors.black or colors.orange or colors.yellow
+    local hbg = L.color and THEME.colHeader or THEME.bg
+    local hfg = L.color and THEME.colHeaderFg or THEME.accentWarm
     if L.color then guiFill(out, 1, y, w, 1, hbg, hfg) end
     guiText(out, 1 + L.pad, y, "ID   NAME         TYPE     STATE", hfg, hbg)
     y = y + 1
@@ -1207,10 +1260,10 @@ local function drawBotsBoard(L)
     if y > y1 then break end
     local b = bots[id]
     if ago(b.seen) < 30 then
-      local bg = colors.black
-      if L.color and ((y - listStart) % 2 == 1) then bg = colors.gray end
-      if L.color then guiFill(out, 1, y, w, 1, bg, colors.white) end
-      local fg = (b.state == "idle" or b.state == "parked") and colors.white or colors.cyan
+      local bg = THEME.bg
+      if L.color and ((y - listStart) % 2 == 1) then bg = THEME.zebra end
+      if L.color then guiFill(out, 1, y, w, 1, bg, THEME.text) end
+      local fg = (b.state == "idle" or b.state == "parked") and THEME.text or THEME.accent
       local line = ("#%-3d %-12s %-8s %-8s"):format(
         id, tostring(b.name or "?"):sub(1, 12),
         tostring(b.botType or "?"):sub(1, 8),
@@ -1223,9 +1276,9 @@ local function drawBotsBoard(L)
   local np = 0
   for _, wrow in pairs(pending) do if ago(wrow.seen) < 20 then np = np + 1 end end
   if np > 0 and y <= y1 then
-    guiText(out, 1 + L.pad, y, ("+%d awaiting deploy"):format(np), colors.orange or colors.yellow, colors.black)
+    guiText(out, 1 + L.pad, y, ("+%d awaiting deploy"):format(np), THEME.accentWarm, THEME.bg)
   elseif y == listStart and y <= y1 then
-    guiText(out, 1 + L.pad, y, "(no live bots)", colors.gray, colors.black)
+    guiText(out, 1 + L.pad, y, "(no live bots)", THEME.dim, THEME.bg)
   end
 end
 
@@ -1238,19 +1291,19 @@ local function drawQuarryBoard(L)
   elseif snap and snap.turtles and snap.turtles[1] then
     age = snap.turtles[1].age
   end
-  guiFill(out, 1, 1, L.w, L.h, colors.black, colors.white)
+  guiFill(out, 1, 1, L.w, L.h, THEME.bg, THEME.text)
   local title = (snap and snap.source == "turtles") and "QUARRY (turtles)" or "QUARRY SITE"
   if L.color then
-    guiFill(out, 1, 1, L.w, 1, colors.cyan, colors.black)
-    guiText(out, 1 + L.pad, 1, " " .. title, colors.black, colors.cyan)
+    guiFill(out, 1, 1, L.w, 1, THEME.accent, THEME.accentFg)
+    guiText(out, 1 + L.pad, 1, " " .. title, THEME.accentFg, THEME.accent)
   else
-    guiText(out, 1, 1, title, colors.yellow, colors.black)
+    guiText(out, 1, 1, title, THEME.warn, THEME.bg)
   end
   if not snap then
-    guiText(out, 1 + L.pad, 3, "Waiting for offline miners...", colors.lightGray, colors.black)
-    guiText(out, 1 + L.pad, 4, "Turtle modem: area dig broadcasts progress", colors.gray, colors.black)
-    guiText(out, 1 + L.pad, 5, "Optional site board stores jobs + Y claims", colors.gray, colors.black)
-    guiText(out, 1 + L.pad, 7, "Press r to request status", colors.gray, colors.black)
+    guiText(out, 1 + L.pad, 3, "Waiting for offline miners...", THEME.muted, THEME.bg)
+    guiText(out, 1 + L.pad, 4, "Turtle modem: area dig broadcasts progress", THEME.dim, THEME.bg)
+    guiText(out, 1 + L.pad, 5, "Optional site board stores jobs + Y claims", THEME.dim, THEME.bg)
+    guiText(out, 1 + L.pad, 7, "Press r to request status", THEME.dim, THEME.bg)
     return
   end
   local name = tostring(snap.name or ("#" .. tostring(snap.siteId or "?")))
@@ -1260,21 +1313,21 @@ local function drawQuarryBoard(L)
   guiText(out, 1 + L.pad, 2, ("%s  %dx%d × %dY  [%s]"):format(
     name:sub(1, 12),
     tonumber(snap.W) or 0, tonumber(snap.L) or 0, tonumber(snap.H) or 0,
-    modeTxt), colors.white, colors.black)
+    modeTxt), THEME.text, THEME.bg)
   local pct = tonumber(snap.pct) or 0
   guiText(out, 1 + L.pad, 3, ("Progress  %d%%   cells %s / %s"):format(
-    pct, tostring(snap.done or "?"), tostring(snap.total or "?")), colors.lime, colors.black)
+    pct, tostring(snap.done or "?"), tostring(snap.total or "?")), THEME.ok, THEME.bg)
   if L.h > 6 then
     local barW = math.max(4, L.w - 2 - L.pad)
     local fill = math.floor(barW * math.min(1, pct / 100))
     out.setCursorPos(1 + L.pad, 4)
     if L.color then
-      out.setBackgroundColor(colors.gray)
+      out.setBackgroundColor(THEME.panel)
       out.write(string.rep(" ", barW))
       out.setCursorPos(1 + L.pad, 4)
-      out.setBackgroundColor(colors.lime)
+      out.setBackgroundColor(THEME.ok)
       out.write(string.rep(" ", fill))
-      out.setBackgroundColor(colors.black)
+      out.setBackgroundColor(THEME.bg)
     else
       out.write("[" .. string.rep("#", fill) .. string.rep("-", barW - fill) .. "]")
     end
@@ -1284,10 +1337,17 @@ local function drawQuarryBoard(L)
     tostring(snap.cellsFree or "?"),
     tostring(snap.cellsAssigned or "?"),
     tostring(snap.cellsComplete or "?"),
-    tostring(age or "?")), colors.lightGray, colors.black)
+    tostring(age or "?")), THEME.muted, THEME.bg)
   local y = 7
-  guiText(out, 1 + L.pad, 6, "ID  CELL     @REL / WORLD     ST", colors.orange or colors.yellow, colors.black)
+  if L.color then
+    guiFill(out, 1, 6, L.w, 1, THEME.colHeader, THEME.colHeaderFg)
+    guiText(out, 1 + L.pad, 6, "ID  CELL     @REL / WORLD     ST",
+      THEME.colHeaderFg, THEME.colHeader)
+  else
+    guiText(out, 1 + L.pad, 6, "ID  CELL     @REL / WORLD     ST", THEME.accentWarm, THEME.bg)
+  end
   local list = snap.turtles or {}
+  local listStart = y
   for _, t in ipairs(list) do
     if y >= L.h - L.footerH then break end
     local band = t.cellId and ("C" .. tostring(t.cellId)) or "-"
@@ -1304,24 +1364,27 @@ local function drawQuarryBoard(L)
         last = last .. "/" .. tostring(math.floor(t.wx))
       end
     end
-    local col = colors.white
-    if st == "SOS" then col = colors.red
-    elseif st == "mining" or st == "assigned" or st == "arrive" then col = colors.lime
-    elseif st == "travel" then col = colors.yellow
-    elseif st == "homing" then col = colors.orange or colors.yellow
-    elseif st == "done" then col = colors.lightGray
-    elseif st == "stale" then col = colors.red end
+    local col = THEME.text
+    if st == "SOS" then col = THEME.bad
+    elseif st == "mining" or st == "assigned" or st == "arrive" then col = THEME.ok
+    elseif st == "travel" then col = THEME.warn
+    elseif st == "homing" then col = THEME.accentWarm
+    elseif st == "done" then col = THEME.muted
+    elseif st == "stale" then col = THEME.bad end
+    local rowBg = THEME.bg
+    if L.color and ((y - listStart) % 2 == 1) then rowBg = THEME.zebra end
+    if L.color then guiFill(out, 1, y, L.w, 1, rowBg, col) end
     guiText(out, 1 + L.pad, y, ("#%-3d %-7s %-14s %s"):format(
-      t.id or 0, band:sub(1, 7), last:sub(1, 14), st), col, colors.black)
+      t.id or 0, band:sub(1, 7), last:sub(1, 14), st), col, rowBg)
     y = y + 1
   end
   if #list == 0 then
-    guiText(out, 1 + L.pad, y, "(no turtles joined yet)", colors.gray, colors.black)
+    guiText(out, 1 + L.pad, y, "(no turtles joined yet)", THEME.dim, THEME.bg)
     y = y + 1
   end
   if y < L.h - L.footerH then
     guiText(out, 1 + L.pad, L.h - L.footerH,
-      "→ site board layout   cell fleet; SOS=out of fuel", colors.gray, colors.black)
+      "→ site board layout   cell fleet; SOS=out of fuel", THEME.dim, THEME.bg)
   end
 end
 
@@ -1335,37 +1398,44 @@ local function drawQuarrySiteBoard(L)
   elseif snap and snap.turtles and snap.turtles[1] then
     age = snap.turtles[1].age
   end
-  guiFill(out, 1, 1, L.w, L.h, colors.black, colors.white)
+  guiFill(out, 1, 1, L.w, L.h, THEME.bg, THEME.text)
   local title = ("QUARRY  %dx%d × %dY  cells@%s"):format(
     tonumber(snap and snap.W) or 0,
     tonumber(snap and snap.L) or 0,
     tonumber(snap and snap.H) or 0,
     tostring((snap and snap.cellSize) or "?"))
   if L.color then
-    guiFill(out, 1, 1, L.w, 1, colors.cyan, colors.black)
-    guiText(out, 1 + L.pad, 1, " " .. title:sub(1, L.w - 2), colors.black, colors.cyan)
+    guiFill(out, 1, 1, L.w, 1, THEME.accent, THEME.accentFg)
+    guiText(out, 1 + L.pad, 1, " " .. title:sub(1, L.w - 2), THEME.accentFg, THEME.accent)
   else
-    guiText(out, 1, 1, title, colors.yellow, colors.black)
+    guiText(out, 1, 1, title, THEME.warn, THEME.bg)
   end
   if not snap then
-    guiText(out, 1 + L.pad, 3, "Waiting for site board / miners...", colors.lightGray, colors.black)
-    guiText(out, 1 + L.pad, 4, "← back to quarry stats    r refresh", colors.gray, colors.black)
+    guiText(out, 1 + L.pad, 3, "Waiting for site board / miners...", THEME.muted, THEME.bg)
+    guiText(out, 1 + L.pad, 4, "← back to quarry stats    r refresh", THEME.dim, THEME.bg)
     return
   end
   guiText(out, 1 + L.pad, 2, ("Progress %d%%  cells %s/%s  free=%s asg=%s"):format(
     tonumber(snap.pct) or 0,
     tostring(snap.done or "?"), tostring(snap.total or "?"),
     tostring(snap.cellsFree or "?"), tostring(snap.cellsAssigned or "?")),
-    colors.lime, colors.black)
+    THEME.ok, THEME.bg)
   guiText(out, 1 + L.pad, 3, ("Online %s  travel≤%s  origin=%s  %ss"):format(
     tostring(snap.online or 0),
     tostring(snap.maxTravel or "?"),
     (snap.originSet and "set") or "unset",
-    tostring(age or "?")), colors.lightGray, colors.black)
+    tostring(age or "?")), THEME.muted, THEME.bg)
 
   local y = 5
-  guiText(out, 1 + L.pad, 4, "ID  Name         Cell     Rel XYZ      World",
-    colors.orange or colors.yellow, colors.black)
+  if L.color then
+    guiFill(out, 1, 4, L.w, 1, THEME.colHeader, THEME.colHeaderFg)
+    guiText(out, 1 + L.pad, 4, "ID  Name         Cell     Rel XYZ      World",
+      THEME.colHeaderFg, THEME.colHeader)
+  else
+    guiText(out, 1 + L.pad, 4, "ID  Name         Cell     Rel XYZ      World",
+      THEME.accentWarm, THEME.bg)
+  end
+  local listStart = y
   for _, t in ipairs(snap.turtles or {}) do
     if y >= L.h - L.footerH then break end
     local rel = (t.posX ~= nil)
@@ -1374,27 +1444,30 @@ local function drawQuarrySiteBoard(L)
       and ("%d,%d,%d"):format(t.wx, t.wy or 0, t.wz or 0) or "-"
     local cell = t.cellId and ("C" .. tostring(t.cellId)) or "-"
     local st = tostring(t.status or "?")
-    local col = colors.white
-    if t.sos or st == "sos" then col = colors.red
-    elseif st == "travel" then col = colors.yellow
-    elseif st == "mining" or st == "arrive" or st == "assigned" then col = colors.lime
-    elseif st == "homing" then col = colors.orange or colors.yellow
-    elseif (t.age or 0) >= 45 then col = colors.red end
+    local col = THEME.text
+    if t.sos or st == "sos" then col = THEME.bad
+    elseif st == "travel" then col = THEME.warn
+    elseif st == "mining" or st == "arrive" or st == "assigned" then col = THEME.ok
+    elseif st == "homing" then col = THEME.accentWarm
+    elseif (t.age or 0) >= 45 then col = THEME.bad end
+    local rowBg = THEME.bg
+    if L.color and ((y - listStart) % 2 == 1) then rowBg = THEME.zebra end
+    if L.color then guiFill(out, 1, y, L.w, 1, rowBg, col) end
     guiText(out, 1 + L.pad, y, ("#%-3d %-12s %-8s %-12s %s"):format(
       t.id or 0,
       tostring(t.name or "?"):sub(1, 12),
       cell:sub(1, 8),
       rel:sub(1, 12),
-      world), col, colors.black)
+      world), col, rowBg)
     y = y + 1
   end
   if #(snap.turtles or {}) == 0 then
-    guiText(out, 1 + L.pad, y, "(no turtles online)", colors.gray, colors.black)
+    guiText(out, 1 + L.pad, y, "(no turtles online)", THEME.dim, THEME.bg)
     y = y + 1
   end
   if y < L.h - L.footerH then
     guiText(out, 1 + L.pad, L.h - L.footerH,
-      "← quarry stats   site monitor layout", colors.gray, colors.black)
+      "← quarry stats   site monitor layout", THEME.dim, THEME.bg)
   end
 end
 
@@ -1406,24 +1479,22 @@ local function drawLiveFooter(L, board)
   local right = (" %s %dx%d"):format(mode, w, h)
   local left = (" %s  %s"):format(board, (L.tier == "tiny") and "q=back" or "←/→ tabs  q back")
   if L.color then
-    guiFill(out, 1, h, w, 1, colors.gray, colors.white)
-    guiText(out, 1, h, left, colors.white, colors.gray)
+    guiFill(out, 1, h, w, 1, THEME.bar, THEME.text)
+    guiText(out, 1, h, left, THEME.text, THEME.bar)
     if L.tier ~= "tiny" then
-      guiText(out, math.max(1, w - #tabs - #right), h, tabs .. right, colors.lightGray, colors.gray)
+      guiText(out, math.max(1, w - #tabs - #right), h, tabs .. right, THEME.muted, THEME.bar)
     else
-      guiText(out, math.max(1, w - #right + 1), h, right, colors.lightGray, colors.gray)
+      guiText(out, math.max(1, w - #right + 1), h, right, THEME.muted, THEME.bar)
     end
   else
-    guiText(out, 1, h, (left .. " " .. tabs .. right):sub(1, w), colors.gray, colors.black)
+    guiText(out, 1, h, (left .. " " .. tabs .. right):sub(1, w), THEME.dim, THEME.bg)
   end
 end
 
 local function drawLiveBoard(board)
   board = board or liveBoard
   local L = termLayout()
-  if L.out.setBackgroundColor then L.out.setBackgroundColor(colors.black) end
-  if L.out.setTextColor then L.out.setTextColor(colors.white) end
-  L.out.clear()
+  themeClear(L.out, L.color)
   if board == "quarry" then
     drawQuarryBoard(L)
   elseif board == "qsite" then
@@ -1495,7 +1566,7 @@ local function liveView(startBoard)
   end
   drawLiveBoard(liveBoard)
   local timer = os.startTimer(1)
-  local snapTimer = os.startTimer(3)
+  local snapTimer = os.startTimer(8)
   while true do
     local ev, p1, p2 = os.pullEvent()
     if ev == "timer" and p1 == timer then
@@ -1508,7 +1579,7 @@ local function liveView(startBoard)
         refreshBoardSnap(true)
       end
       drawLiveBoard(liveBoard)
-      snapTimer = os.startTimer(3)
+      snapTimer = os.startTimer(8)
     elseif ev == "char" then
       local ch = tostring(p1 or ""):lower()
       if ch == "q" then break
@@ -2879,21 +2950,26 @@ local function drawPhoneHome(page, pages, tiles)
   local w, h = term.getSize()
   local color = termIsColor()
   local out = term
-  local bg = colors.black
-  if out.setBackgroundColor then out.setBackgroundColor(bg) end
-  out.clear()
+  local bg = THEME.bg
+  themeClear(out, color)
 
-  -- Status bar
-  local barBg = color and colors.gray or colors.black
-  local barFg = colors.white
+  -- Status bar (accent brand + muted clock)
+  local barBg = color and THEME.bar or THEME.bg
+  local barFg = THEME.text
   guiFill(out, 1, 1, w, 1, barBg, barFg)
-  local title = "Titan"
+  if color then
+    guiText(out, 2, 1, "Titan", THEME.accent, barBg)
+  else
+    guiText(out, 2, 1, "Titan", barFg, barBg)
+  end
   local clock = textutils.formatTime(os.time(), true)
-  guiText(out, 2, 1, title, barFg, barBg)
-  guiText(out, math.max(2, w - #clock), 1, clock, colors.lightGray, barBg)
+  guiText(out, math.max(2, w - #clock), 1, clock, THEME.muted, barBg)
 
   local label = os.getComputerLabel() or ("#" .. os.getComputerID())
-  guiText(out, 2, 2, label:sub(1, w - 2), colors.lightGray, bg)
+  if color then
+    guiFill(out, 1, 2, w, 1, THEME.bg, THEME.muted)
+  end
+  guiText(out, 2, 2, label:sub(1, w - 2), THEME.muted, bg)
 
   -- App grid (2 columns)
   local cols = (w >= 30) and 3 or 2
@@ -2913,21 +2989,25 @@ local function drawPhoneHome(page, pages, tiles)
     local x = 2 + col * (tileW + gap)
     local y = startY + row * tileH
     if y + tileH - 1 >= h - 2 then break end
-    local abg = color and (app.bg or colors.blue) or colors.gray
-    local afg = colors.white
+    local abg = color and (app.bg or colors.blue) or THEME.panel
+    local afg = THEME.text
     if abg == colors.yellow or abg == colors.lime or abg == colors.white then
-      afg = colors.black
+      afg = THEME.accentFg
     end
     if abg == colors.black then
-      abg = color and colors.gray or colors.black
+      abg = color and THEME.panel or THEME.bg
     end
     guiFill(out, x, y, tileW, tileH - 1, abg, afg)
     local num = tostring(i % 10)
     if i == 10 then num = "0" end
     guiText(out, x + 1, y, num .. " " .. tostring(app.name):sub(1, tileW - 3), afg, abg)
     if tileH >= 3 then
-      guiText(out, x + 1, y + 1, tostring(app.sub or ""):sub(1, tileW - 2),
-        color and colors.lightGray or afg, abg)
+      -- Dimmer subtitle: lightGray on colored tiles reads as secondary label.
+      local subFg = color and THEME.muted or afg
+      if abg == colors.yellow or abg == colors.lime or abg == colors.white then
+        subFg = colors.gray
+      end
+      guiText(out, x + 1, y + 1, tostring(app.sub or ""):sub(1, tileW - 2), subFg, abg)
     end
     app._x, app._y, app._w, app._h = x, y, tileW, tileH - 1
   end
@@ -2936,9 +3016,9 @@ local function drawPhoneHome(page, pages, tiles)
   local dockY = h
   local pageTxt = ("<%d/%d>"):format(page, pages)
   guiFill(out, 1, dockY, w, 1, barBg, barFg)
-  guiText(out, 2, dockY, pageTxt, colors.lightGray, barBg)
+  guiText(out, 2, dockY, pageTxt, THEME.muted, barBg)
   local dock = "N/P page  E exit"
-  guiText(out, math.max(2, w - #dock), dockY, dock, colors.white, barBg)
+  guiText(out, math.max(2, w - #dock), dockY, dock, THEME.text, barBg)
 end
 
 local function phoneHitApp(tiles, x, y)
@@ -3081,16 +3161,18 @@ if not fs.exists(CFG_FILE) then
   local w, h = term.getSize()
   local color = termIsColor()
   local out = term
-  if out.setBackgroundColor then out.setBackgroundColor(colors.black) end
-  out.clear()
-  local accent = color and colors.cyan or colors.white
-  guiFill(out, 1, 1, w, 2, accent, colors.black)
-  guiText(out, 2, 1, " Choose your UI", colors.black, accent)
-  guiText(out, 2, 4, "1  Phone home   (apps — recommended)", colors.white, colors.black)
-  guiText(out, 2, 5, "   Tap tiles, swipe pages", colors.lightGray, colors.black)
-  guiText(out, 2, 7, "2  Terminal     (commands + help pages)", colors.white, colors.black)
-  guiText(out, 2, 8, "   Power users / SSH", colors.lightGray, colors.black)
-  guiText(out, 2, h, "Pick 1 or 2  [default 1]", colors.gray, colors.black)
+  themeClear(out, color)
+  local accent = color and THEME.accent or colors.white
+  guiFill(out, 1, 1, w, 2, accent, THEME.accentFg)
+  guiText(out, 2, 1, " Choose your UI", THEME.accentFg, accent)
+  if color then
+    guiFill(out, 1, 3, w, 1, THEME.bar, THEME.muted)
+  end
+  guiText(out, 2, 4, "1  Phone home   (apps — recommended)", THEME.text, THEME.bg)
+  guiText(out, 2, 5, "   Tap tiles, swipe pages", THEME.muted, THEME.bg)
+  guiText(out, 2, 7, "2  Terminal     (commands + help pages)", THEME.text, THEME.bg)
+  guiText(out, 2, 8, "   Power users / SSH", THEME.muted, THEME.bg)
+  guiText(out, 2, h, "Pick 1 or 2  [default 1]", THEME.dim, THEME.bg)
   write("")
   term.setCursorPos(2, h - 1)
   local pick = tonumber(read())
@@ -3100,10 +3182,9 @@ end
 
 do
   local w, h = term.getSize()
-  if term.setBackgroundColor then term.setBackgroundColor(colors.black) end
-  term.clear()
+  themeClear(term, termIsColor())
   guiText(term, 2, math.max(1, math.floor(h / 2)),
-    "Starting " .. cfg.mode .. "…", colors.lightGray, colors.black)
+    "Starting " .. cfg.mode .. "…", THEME.muted, THEME.bg)
   sleep(0.35)
 end
 

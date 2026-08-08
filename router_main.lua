@@ -1,6 +1,6 @@
 --[[
   router_main.lua  -  Titan MAIN / ROUTER hub runtime (CC: Tweaked)
-  Titan-Version: 1.4.1
+  Titan-Version: 1.4.2
 
   Hub roles (loaded by router.lua when role is main or router):
 

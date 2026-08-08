@@ -1,6 +1,6 @@
 --[[
   offline_miner.lua  -  Local quarry turtle (optional site board)
-  Titan-Version: 1.5.3
+  Titan-Version: 1.5.6
 
   Place the turtle at the TOP-FRONT-LEFT corner of the dig, facing into the
   mine. That cell is origin 0,0,0:
@@ -23,6 +23,7 @@
     * Claim one cell (target 20×20 XZ, full H, layer dig)
     * Modem ON while traveling; check-in leave_origin + arrive_cell
     * Surface hops: up 1 → cross XZ → down into cell (modem can't dig sideways)
+    * Traffic: only other miners trigger overtake/yield; other entities → wait
     * Dig full height one Y layer at a time; stay inside cell perimeter
     * Final full-cell verify walk before site cell_done (no false completes)
     * Home → cell_done → next free cell (same up-over-down hop)
@@ -30,7 +31,8 @@
     * If stranded short of depot → SOS admin with coords + suggested refuel spot
     * GPS correction hooks stubbed (relative pose for now)
 
-  Never attack / dig other turtles — path around them (own-right: R F L F L F R).
+  Never attack entities (no turtle.attack*). Dig blocks only.
+  Fleet turtle ahead → traffic rules; any other entity → wait until clear.
 
   Out of fuel: computer still runs. Swaps modem on and broadcasts SOS to the
   admin tablet and MAIN router monitors until coal is restored.
@@ -61,8 +63,14 @@ local PICK_SIDE = "right"  -- turtle upgrade slot 2 — never touch left (loader
 local HOME_MARGIN = 24       -- spare fuel on arrival at depot
 local WORK_RESERVE = 48      -- keep digging only with this much above home cost
 local MIN_FUEL = 200
+local TRAFFIC_Y = -1         -- cruise / traffic layer (+Y = down, so -1 is one above origin)
 -- Keep in sync with Titan-Version header (label uses major.minor → V1.5-Miner12).
-local MINER_VERSION = "1.5.0"
+local MINER_VERSION = "1.5.6"
+-- "outbound" = to cell (overtake) | "homebound" = to origin (yield) | "dig" = wait/retry
+local travelIntent = "dig"
+-- Other miners' last known quarry-relative poses (rednet). Used to tell turtle vs mob/player.
+local fleetPoses = {}  -- [computerId] = { x, y, z, at }
+local FLEET_POSE_MAX_AGE_MS = 15000
 local STOP = false
 local PROTO_QUARRY = "titan_quarry"
 local PROTO_NET = "titan_net"
@@ -691,16 +699,19 @@ end
 --------------------------------------------------------------------------------
 -- Pathing in local coords
 --------------------------------------------------------------------------------
--- Other turtles are entities (not diggable). Never attack them — go around.
+local function setTravelIntent(intent)
+  travelIntent = intent or "dig"
+end
+
+-- Dig solid blocks only — NEVER attack entities.
 local function tryStepForward(digBlocks)
   if STOP then return false, "stop" end
   if not ensureFuel() then
     if needsFuelSos() and broadcastSos then broadcastSos("out_of_fuel") end
     return false, "fuel"
   end
-  if digBlocks then digDir("forward") end
-  if turtle.detect() then
-    -- Solid block ahead — dig only (never attack; turtles aren't blocks).
+  if digBlocks and turtle.detect() then
+    -- Solid block ahead — dig only (never attack; entities aren't blocks).
     digDir("forward")
   end
   if not turtle.detect() then
@@ -708,64 +719,53 @@ local function tryStepForward(digBlocks)
       applyForwardStep()
       return true
     end
-    -- No block, but can't move → entity (usually another turtle).
-    return false, "turtle"
+    -- No block, but can't move → entity (turtle, player, mob, …).
+    return false, "entity"
   end
   return false, "blocked"
 end
 
--- Each turtle steers to its own right: R, F, L, F, L, F, R.
-local function goAroundRight()
-  print("Turtle ahead — going around to my right...")
-  turnRight()
-  if not tryStepForward(true) then turnLeft(); return false, "bypass" end
-  turnLeft()
-  if not tryStepForward(true) then return false, "bypass" end
-  turnLeft()
-  if not tryStepForward(true) then return false, "bypass" end
-  turnRight()
-  return true
+local function noteFleetPose(id, msg)
+  id = tonumber(id)
+  if not id or id == os.getComputerID() then return end
+  if type(msg) ~= "table" then return end
+  local x = tonumber(msg.posX)
+  local z = tonumber(msg.posZ)
+  if x == nil or z == nil then return end
+  fleetPoses[id] = {
+    x = math.floor(x),
+    y = math.floor(tonumber(msg.posY) or 0),
+    z = math.floor(z),
+    at = os.epoch("utc"),
+  }
 end
 
-local function moveForward()
-  if STOP then return false, "stop" end
-  if not ensureFuel() then return false, "fuel" end
-  -- Exactly one block forward — dig blocks, never attack turtles.
-  for _ = 1, 6 do
-    local ok, err = tryStepForward(true)
-    if ok then return true end
-    if err == "turtle" then
-      local around = goAroundRight()
-      if around then return true end
-      -- Both turtles may try right at once; wait and retry.
-      sleep(0.4)
-    elseif err == "fuel" or err == "stop" then
-      return false, err
-    else
-      sleep(0.05)
-    end
-  end
-  -- Last chance: right-hand bypass once more.
-  if goAroundRight() then return true end
-  return false, "blocked"
+local function cellAhead()
+  local x, y, z = pos.x, pos.y, pos.z
+  if facing == 0 then z = z + 1
+  elseif facing == 1 then x = x + 1
+  elseif facing == 2 then z = z - 1
+  else x = x - 1 end
+  return x, y, z
 end
 
-local function moveUp()
-  if STOP then return false, "stop" end
-  if not ensureFuel() then return false, "fuel" end
-  for _ = 1, 8 do
-    digDir("up")
-    if not turtle.detectUp() then
-      if turtle.up() then
-        pos.y = pos.y - 1
-        moves = moves + 1
-        return true
+local function fleetTurtleInCell(x, y, z)
+  local now = os.epoch("utc")
+  for id, p in pairs(fleetPoses) do
+    if p.at and (now - p.at) <= FLEET_POSE_MAX_AGE_MS then
+      if p.x == x and p.z == z and math.abs((p.y or 0) - y) <= 1 then
+        return id
       end
     end
-    sleep(0.05)
   end
-  return false, "blocked"
+  return nil
 end
+
+-- Filled after rednet helpers exist. Returns "turtle" | "entity".
+local classifyEntityAhead
+
+-- Forward decls: traffic helpers call these; moveForward calls the helpers.
+local moveUp, moveDown, overtakeOnTraffic, waitForEntityClear
 
 -- Deepest allowed turtle Y for the active job (+Y = down). Nil = no clamp.
 local function digFloorY(j)
@@ -777,7 +777,25 @@ local function digFloorY(j)
   return nil
 end
 
-local function moveDown()
+moveUp = function()
+  if STOP then return false, "stop" end
+  if not ensureFuel() then return false, "fuel" end
+  for _ = 1, 8 do
+    digDir("up")
+    if not turtle.detectUp() then
+      if turtle.up() then
+        pos.y = pos.y - 1
+        moves = moves + 1
+        return true
+      end
+    end
+    -- Entity above (another turtle) — never attack; wait briefly.
+    sleep(0.05)
+  end
+  return false, "blocked"
+end
+
+moveDown = function()
   if STOP then return false, "stop" end
   local floor = digFloorY()
   if floor ~= nil and pos.y >= floor then
@@ -794,6 +812,87 @@ local function moveDown()
       end
     end
     sleep(0.05)
+  end
+  return false, "blocked"
+end
+
+-- Outbound (to cell): hop over the other bot, then settle on traffic layer (Y=-1).
+overtakeOnTraffic = function()
+  print("Turtle ahead — outbound overtake (up, F2, down to traffic)...")
+  local yBefore = pos.y
+  if not moveUp() then return false, "up" end
+  local ok1, err1 = tryStepForward(true)
+  if not ok1 then
+    while pos.y < yBefore do
+      if not moveDown() then break end
+    end
+    while pos.y > yBefore do
+      if not moveUp() then break end
+    end
+    return false, err1 or "overtake"
+  end
+  tryStepForward(true)  -- second block past; ok if another bot blocks
+  -- Settle onto traffic layer (one above origin dig surface).
+  local guard = 0
+  while pos.y ~= TRAFFIC_Y and guard < 64 do
+    guard = guard + 1
+    if pos.y < TRAFFIC_Y then
+      if not moveDown() then break end
+    else
+      if not moveUp() then break end
+    end
+  end
+  return true
+end
+
+-- Wait until whatever is ahead moves (mobs/players, or homebound turtle yield).
+waitForEntityClear = function(label)
+  print(("%s ahead — waiting..."):format(label or "Entity"))
+  for _ = 1, 60 do
+    if STOP then return false, "stop" end
+    sleep(0.5)
+    local ok, err = tryStepForward(true)
+    if ok then return true end
+    if err == "fuel" or err == "stop" then return false, err end
+    if err ~= "entity" then return false, err or "blocked" end
+  end
+  return false, "entity"
+end
+
+local function moveForward()
+  if STOP then return false, "stop" end
+  if not ensureFuel() then return false, "fuel" end
+  -- Dig blocks only — never turtle.attack*.
+  for _ = 1, 8 do
+    local ok, err = tryStepForward(true)
+    if ok then return true end
+    if err == "entity" then
+      local kind = (classifyEntityAhead and classifyEntityAhead()) or "entity"
+      if kind == "turtle" and travelIntent == "outbound" then
+        if overtakeOnTraffic() then return true end
+        sleep(0.35)
+      elseif kind == "turtle" and travelIntent == "homebound" then
+        local wok, werr = waitForEntityClear("Turtle")
+        if wok then return true end
+        if werr == "fuel" or werr == "stop" then return false, werr end
+      else
+        -- Non-turtle entity, or dig mode: wait for it to leave.
+        local wok, werr = waitForEntityClear(kind == "turtle" and "Turtle" or "Entity")
+        if wok then return true end
+        if werr == "fuel" or werr == "stop" then return false, werr end
+      end
+    elseif err == "fuel" or err == "stop" then
+      return false, err
+    else
+      sleep(0.05)
+    end
+  end
+  local kind = (classifyEntityAhead and classifyEntityAhead()) or "entity"
+  if kind == "turtle" and travelIntent == "outbound" and overtakeOnTraffic() then
+    return true
+  end
+  if waitForEntityClear(kind == "turtle" and "Turtle" or "Entity") then
+    return true
   end
   return false, "blocked"
 end
@@ -884,17 +983,25 @@ end
 local function goToViaAir(tx, ty, tz, opts)
   opts = opts or {}
   local clear = math.max(1, math.floor(tonumber(opts.clear) or 1))
+  local prevIntent = travelIntent
+  if opts.intent then setTravelIntent(opts.intent) end
   tx = math.floor(tonumber(tx) or 0)
   ty = math.floor(tonumber(ty) or 0)
   tz = math.floor(tonumber(tz) or 0)
 
+  local function finish(ok, err)
+    setTravelIntent(prevIntent)
+    return ok, err
+  end
+
   if pos.x == tx and pos.y == ty and pos.z == tz then
     if opts.faceForward then faceForward() end
-    return true
+    return finish(true)
   end
   -- Same column — just climb/drop (no sideways tunnel needed).
   if pos.x == tx and pos.z == tz then
-    return goTo(tx, ty, tz, opts)
+    local ok, err = goTo(tx, ty, tz, opts)
+    return finish(ok, err)
   end
 
   local top = math.min(pos.y, ty)
@@ -902,22 +1009,22 @@ local function goToViaAir(tx, ty, tz, opts)
 
   if pos.y ~= cruiseY then
     local ok, err = goTo(pos.x, cruiseY, pos.z)
-    if not ok then return false, err or "climb" end
+    if not ok then return finish(false, err or "climb") end
   end
   if pos.x ~= tx or pos.z ~= tz then
     local ok, err = goTo(tx, cruiseY, tz)
-    if not ok then return false, err or "cross" end
+    if not ok then return finish(false, err or "cross") end
   end
   if type(opts.beforeSettle) == "function" then
     opts.beforeSettle()
   end
   if pos.y ~= ty then
     local ok, err = goTo(tx, ty, tz, opts)
-    if not ok then return false, err or "settle" end
+    if not ok then return finish(false, err or "settle") end
   elseif opts.faceForward then
     faceForward()
   end
-  return true
+  return finish(true)
 end
 
 -- Clear this voxel: walk-in already dug the floor block; catch gravel/sand + ceiling.
@@ -1152,8 +1259,9 @@ end
 
 local function goHome()
   jobLabel = "home"
-  -- Up → over → down so we don't tunnel sideways at Y=0 (often with modem on).
-  local ok, err = goToViaAir(0, 0, 0, { clear = 1 })
+  -- Up → over → down; homebound yields if another turtle is in the way.
+  local ok, err = goToViaAir(0, 0, 0, { clear = 1, intent = "homebound" })
+  setTravelIntent("dig")
   -- Resting pose into the mine — only forced here at origin.
   turnTo(0)
   return ok, err
@@ -1242,9 +1350,11 @@ local function manageInventory(resume)
   if resume then
     print(("Resuming @ %d,%d,%d"):format(rx, ry, rz))
     -- Pick should already be on (dig path); air-hop back into the work pose.
-    if not goToViaAir(rx, ry, rz, { clear = 1 }) then
+    if not goToViaAir(rx, ry, rz, { clear = 1, intent = "outbound" }) then
+      setTravelIntent("dig")
       return false, "resume"
     end
+    setTravelIntent("dig")
     if activeJob then
       activeJob.status = "active"
       saveJobFile(activeJob)
@@ -1429,27 +1539,80 @@ local function rednetIsReady()
   return false
 end
 
--- Fire check-in / mine updates on all Titan rednet protocols + known peers.
-local function rednetPublish(msg)
+-- Stagger fleet chatter so many bots don't hit the site in the same tick.
+local function netJitter(scale)
+  scale = tonumber(scale) or 1
+  local id = os.getComputerID() or 0
+  local frac = ((id * 37 + (moves or 0) * 13) % 1000) / 1000
+  sleep(frac * scale)
+end
+
+-- opts.light: unicast site + one PROTO broadcast (routine progress).
+-- opts.full: multi-protocol flood (join / SOS / urgent).
+local function rednetPublish(msg, opts)
   if type(msg) ~= "table" then return false end
   if not openModem() and not rednetIsReady() then return false end
+  opts = opts or {}
+  local full = opts.full == true
+  local light = opts.light == true or not full
   msg.from = msg.from or os.getComputerID()
   msg.turtleId = msg.turtleId or os.getComputerID()
   msg.name = msg.name or os.getComputerLabel()
   msg.t = os.epoch("utc")
 
-  rednet.broadcast(msg, PROTO_QUARRY)
-  rednet.broadcast(msg, PROTO_NET)
-  rednet.broadcast(msg, PROTO_ROUTER)
-
   if siteId then
     rememberPeer(siteId)
+    rednet.send(siteId, msg, PROTO_QUARRY)
   end
-  for id in pairs(knownPeers) do
-    rednet.send(id, msg, PROTO_QUARRY)
-    rednet.send(id, msg, PROTO_NET)
+  rednet.broadcast(msg, PROTO_QUARRY)
+
+  if full then
+    rednet.broadcast(msg, PROTO_NET)
+    rednet.broadcast(msg, PROTO_ROUTER)
+    for id in pairs(knownPeers) do
+      if id ~= siteId then
+        rednet.send(id, msg, PROTO_QUARRY)
+        rednet.send(id, msg, PROTO_NET)
+      end
+    end
+  elseif light and not siteId then
+    -- No site yet — keep a light mesh presence for admin tablets.
+    rednet.broadcast(msg, PROTO_NET)
   end
   return true
+end
+
+-- CC can't inspect entities — classify via recent fleet poses on the cell ahead.
+classifyEntityAhead = function()
+  local ax, ay, az = cellAhead()
+  if fleetTurtleInCell(ax, ay, az) then
+    return "turtle"
+  end
+  if not rednetIsReady() then
+    return "entity"
+  end
+  local ping = {
+    type = "quarry_pose",
+    turtleId = os.getComputerID(),
+    name = os.getComputerLabel(),
+    posX = pos.x, posY = pos.y, posZ = pos.z,
+    facing = facing,
+    status = travelIntent,
+  }
+  rednet.broadcast(ping, PROTO_QUARRY)
+  local deadline = os.clock() + 0.45
+  while os.clock() < deadline do
+    local id, msg = rednet.receive(PROTO_QUARRY, math.max(0.05, deadline - os.clock()))
+    if id and type(msg) == "table" then
+      noteFleetPose(id, msg)
+      local tid = tonumber(msg.turtleId)
+      if tid then noteFleetPose(tid, msg) end
+    end
+  end
+  if fleetTurtleInCell(ax, ay, az) then
+    return "turtle"
+  end
+  return "entity"
 end
 
 local function rightDetail()
@@ -1893,29 +2056,31 @@ local function publishMine(extra)
   base.posX, base.posY, base.posZ = pos.x, pos.y, pos.z
   base.checkIn = extra.checkIn or base.checkIn
 
-  -- Admin tablet listens for quarry_turtle; site board wants progress/job types.
+  -- One light update: site unicast + single PROTO broadcast (avoids fleet storms).
   local bcast = {}
   for k, v in pairs(base) do bcast[k] = v end
   bcast.type = "quarry_turtle"
-  if not rednetPublish(bcast) then
+  local siteType = extra._siteType or "quarry_progress"
+  if siteType ~= "quarry_turtle" then
+    bcast.siteType = siteType
+  end
+  if not rednetPublish(bcast, { light = true }) then
     print("[rednet] broadcast FAILED")
     if digging then ensurePickReady(true) end
     return false
   end
 
-  if siteId or next(knownPeers) then
+  -- Typed message for the site board only (progress / job / leave / arrive).
+  if siteId and siteType ~= "quarry_turtle" then
     local uni = {}
     for k, v in pairs(base) do uni[k] = v end
-    uni.type = extra._siteType or "quarry_progress"
-    rednetPublish(uni)
+    uni.type = siteType
+    rednet.send(siteId, uni, PROTO_QUARRY)
   end
 
-  local nPeers = 0
-  for _ in pairs(knownPeers) do nPeers = nPeers + 1 end
   if extra.checkIn then
-    print(("[rednet] sent %s → quarry/net/router%s"):format(
-      tostring(extra.checkIn),
-      (nPeers > 0) and (" +" .. nPeers .. " peers") or ""))
+    print(("[rednet] sent %s → site#%s + quarry"):format(
+      tostring(extra.checkIn), tostring(siteId or "-")))
   end
 
   -- Listen briefly for tablet Y assign + ack it (shorter while digging).
@@ -2017,9 +2182,7 @@ broadcastSos = function(reason, extra)
       suggestX = sx, suggestY = sy, suggestZ = sz,
     })
     msg.type = "quarry_sos"
-    rednetPublish(msg)
-    rednet.broadcast(msg, PROTO_ROUTER)
-    rednet.broadcast(msg, PROTO_NET)
+    rednetPublish(msg, { full = true })
     print(("[SOS] %s @ %d,%d,%d  suggest refuel ~%d,%d,%d"):format(
       reason, pos.x, pos.y, pos.z, sx, sy, sz))
     local deadline = os.clock() + 2.5
@@ -2043,7 +2206,7 @@ clearSos = function()
   ensureModemForComms(true)
   local msg = sitePayload({ sos = false, status = "idle", checkIn = "sos_clear" })
   msg.type = "quarry_sos_clear"
-  rednetPublish(msg)
+  rednetPublish(msg, { full = true })
   if digging then restorePickAfterComms() end
 end
 
@@ -2076,11 +2239,12 @@ local function joinSite(timeout, quiet)
     end
     return false
   end
+  netJitter(1.2)
   local joinMsg = sitePayload({})
   joinMsg.type = "quarry_join"
   -- Ask site to include our stored job if we have none locally.
   joinMsg.wantJob = loadJobFile() == nil
-  rednetPublish(joinMsg)
+  rednetPublish(joinMsg, { full = true })
   local deadline = os.clock() + timeout
   local found = false
   local welcomed = nil
@@ -2194,45 +2358,47 @@ local function claimCell(nextCell)
     if not joinSite() then return nil end
   end
   if not ensureModemForComms() then return nil end
+  netJitter(1.5)
   local req = sitePayload({})
   req.type = "quarry_cell_req"
   if nextCell then
     req.nextCell = true
     req.forceNew = true
   end
-  rednet.send(siteId, req, PROTO_QUARRY)
-  -- Compat with boards that only listen for claim_req
-  local req2 = {}
-  for k, v in pairs(req) do req2[k] = v end
-  req2.type = "quarry_claim_req"
-  rednet.send(siteId, req2, PROTO_QUARRY)
 
-  local deadline = os.clock() + 8
   local claim = nil
-  while os.clock() < deadline do
-    local id, msg = rednet.receive(PROTO_QUARRY, math.max(0.05, deadline - os.clock()))
-    if id == siteId and type(msg) == "table"
-        and (msg.type == "quarry_cell" or msg.type == "quarry_claim") then
-      if not msg.ok then
-        print("Cell claim failed: " .. tostring(msg.err or "unknown"))
-        if digging then restorePickAfterComms() end
-        return nil
+  for attempt = 1, 3 do
+    rednet.send(siteId, req, PROTO_QUARRY)
+    local deadline = os.clock() + (4 + attempt)
+    while os.clock() < deadline do
+      local id, msg = rednet.receive(PROTO_QUARRY, math.max(0.05, deadline - os.clock()))
+      if id == siteId and type(msg) == "table"
+          and (msg.type == "quarry_cell" or msg.type == "quarry_claim") then
+        if not msg.ok then
+          print("Cell claim failed: " .. tostring(msg.err or "unknown"))
+          if digging then restorePickAfterComms() end
+          return nil
+        end
+        if msg.x0 == nil or msg.z0 == nil then
+          print("Bad cell (missing XZ) — update site board.")
+          if digging then restorePickAfterComms() end
+          return nil
+        end
+        maxTravel = tonumber(msg.maxTravel) or maxTravel
+        siteInfo = msg
+        print(("Claimed cell #%s  X%d-%d Z%d-%d  Y%d..%d%s"):format(
+          tostring(msg.cellId or "?"),
+          msg.x0, msg.x1 or msg.x0, msg.z0, msg.z1 or msg.z0,
+          msg.y0 or 0, msg.y1 or 0,
+          msg.resume and " (resume)" or ""))
+        claim = msg
+        break
       end
-      if msg.x0 == nil or msg.z0 == nil then
-        print("Bad cell (missing XZ) — update site board.")
-        if digging then restorePickAfterComms() end
-        return nil
-      end
-      maxTravel = tonumber(msg.maxTravel) or maxTravel
-      siteInfo = msg
-      print(("Claimed cell #%s  X%d-%d Z%d-%d  Y%d..%d%s"):format(
-        tostring(msg.cellId or "?"),
-        msg.x0, msg.x1 or msg.x0, msg.z0, msg.z1 or msg.z0,
-        msg.y0 or 0, msg.y1 or 0,
-        msg.resume and " (resume)" or ""))
-      claim = msg
-      break
     end
+    if claim then break end
+    print(("Cell claim timeout (try %d/3) — backing off..."):format(attempt))
+    netJitter(1)
+    sleep(0.4 * attempt)
   end
   if digging then restorePickAfterComms() end
   if not claim then print("Cell claim timed out.") end
@@ -2265,8 +2431,25 @@ end
 -- Listen for site/admin even while digging (reband must interrupt).
 handleQuarryNetMsg = function(id, msg)
   if type(msg) ~= "table" then return end
+  noteFleetPose(id, msg)
+  local tid = tonumber(msg.turtleId)
+  if tid then noteFleetPose(tid, msg) end
   local t = tostring(msg.type or "")
-  if t == "quarry_reband" then
+  if t == "quarry_pose" then
+    -- Answer pose pings so a blocked bot can tell turtle vs mob/player.
+    if not msg.reply and rednetIsReady() then
+      rednet.send(id, {
+        type = "quarry_pose",
+        reply = true,
+        turtleId = os.getComputerID(),
+        name = os.getComputerLabel(),
+        posX = pos.x, posY = pos.y, posZ = pos.z,
+        facing = facing,
+        status = travelIntent,
+      }, PROTO_QUARRY)
+    end
+    return
+  elseif t == "quarry_reband" then
     local ep = tonumber(msg.epoch) or 0
     -- Ignore duplicate same-epoch spam while already homing / waiting for turn.
     if rebandPhase and ep > 0 and ep <= (tonumber(rebandEpoch) or 0) then
@@ -3214,9 +3397,11 @@ local function siteSendTyped(typeName, extra)
   ensureModemForComms(true)
   local msg = sitePayload(extra or {})
   msg.type = typeName
-  if siteId then rednet.send(siteId, msg, PROTO_QUARRY) end
-  rednet.broadcast(msg, PROTO_QUARRY)
-  rednet.broadcast(msg, PROTO_NET)
+  if siteId then
+    rednet.send(siteId, msg, PROTO_QUARRY)
+  else
+    rednet.broadcast(msg, PROTO_QUARRY)
+  end
 end
 
 local function inActiveCellXZ(slack)
@@ -3270,9 +3455,9 @@ local function verifyCellClear(box, startIdx)
       activeJob.phase = "verify"
       activeJob.verifyIdx = i + 1
       activeJob.status = "verify"
-      if i % 8 == 0 then saveJobFile(activeJob) end
+      if i % 16 == 0 then saveJobFile(activeJob) end
     end
-    if i % 8 == 0 and checkIn then
+    if i % 16 == 0 and checkIn then
       checkIn("cell", {
         status = "verify", cellId = box.cellId,
         verifyIdx = i, total = #units,
@@ -3372,9 +3557,11 @@ local function runCellClaim(claim, existingJob)
     tostring(claim.cellId or "?"), x0, x1, z0, z1))
 
   -- Modem can't dig: climb 1, cross above dig surface, announce, pick, drop in.
+  -- Outbound traffic: overtake other bots (up, F2, down to traffic layer).
   local announced = false
   if not goToViaAir(x0, 0, z0, {
     clear = 1,
+    intent = "outbound",
     beforeSettle = function()
       siteSendTyped("quarry_arrive_cell", { status = "arrive", cellId = claim.cellId })
       announced = true
@@ -3382,10 +3569,12 @@ local function runCellClaim(claim, existingJob)
       equipToolFromInventory(nil, true)
     end,
   }) then
+    setTravelIntent("dig")
     print("Could not reach cell corner.")
     siteSendTyped("quarry_progress", { status = "paused", cellId = claim.cellId })
     return "bad"
   end
+  setTravelIntent("dig")
   -- Origin cell / already-there: no settle hop, still announce while modem is up.
   if not announced then
     siteSendTyped("quarry_arrive_cell", { status = "arrive", cellId = claim.cellId })
@@ -3489,7 +3678,7 @@ local function runCellClaim(claim, existingJob)
       excavateHere()
       j.idx = i + 1
       saveJobFile(j)
-      if i % 8 == 0 then
+      if i % 16 == 0 then
         checkIn("cell", { status = "mining", cellId = claim.cellId, job = j })
       end
     end
@@ -3854,7 +4043,7 @@ local function printHelp()
   print("mode offline = solo (area/box), no site/admin.  mode online = join/mine.")
   print("Slot 15 = wireless modem (RIGHT pick swap) — used in online mode.")
   print("Reboot: resumes job; online also syncs with site (depot-first if low fuel).")
-  print("Other turtles: never attack — go around to your own right.")
+  print("Traffic: other miners → overtake/yield; other entities → wait. Never attack.")
   print("Fuel: returns to depot while still able to reach it; mid-path chests OK.")
   print("If short of home trip: SOS admin with coords + suggested refuel spot.")
   print("Jobs save pose+progress to " .. JOB_FILE .. ".")

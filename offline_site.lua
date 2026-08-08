@@ -1,6 +1,6 @@
 --[[
   offline_site.lua  -  Quarry site board (XZ cell fleet)
-  Titan-Version: 1.3.2
+  Titan-Version: 1.3.3
 
   Place LEFT of the storage chest (storage behind turtle origin). Modem required.
   Attach a **monitor** for the live status board — the computer terminal stays
@@ -12,6 +12,7 @@
     * One bot per cell; digs full H one Y-layer at a time inside the cell
     * Bot check-ins: leave_origin, arrive_cell, progress, cell_done
     * Site tracks quarry-relative + world pose (origin GPS); GPS turtle fix later
+    * Fleet net: debounced status/cfg flushes; claim dedupe (avoids freeze under load)
 
   Commands:
     setup <W>x<L> <H> [cellSize]
@@ -34,6 +35,10 @@ local ONLINE_SECS = 45
 local POSE_SLACK = 2
 local CELL_TARGET = 20
 local CELL_MIN = 4
+local STATUS_MIN_MS = 1500   -- min gap between full status broadcasts
+local CFG_MIN_MS = 2000      -- debounce routine cfg writes
+local CLAIM_DEDUPE_MS = 900  -- ignore dual cell_req+claim_req from same bot
+local JOB_PERSIST_MS = 5000  -- throttle per-turtle job file writes
 
 local titan = nil
 if fs.exists("lib/titan.lua") then
@@ -57,6 +62,13 @@ local recallState = {
   homeReady = {},
   reason = nil,
 }
+local statusDirty = false
+local statusLastFlush = 0
+local cfgDirty = false
+local cfgLastFlush = 0
+local claimHandledAt = {}   -- [turtleId] = utc ms
+local jobPersistAt = {}     -- [turtleId] = utc ms
+local jobPersistIdx = {}    -- [turtleId] = last idx written
 
 local function now() return os.epoch("utc") end
 local function ago(ts) return math.floor((now() - (ts or 0)) / 1000) end
@@ -202,10 +214,31 @@ local function cellLabel(c)
     tonumber(c.z0) or 0, tonumber(c.z1) or 0)
 end
 
-local function saveCfg()
+local function saveCfgNow()
   local f = fs.open(CFG, "w")
   f.write(textutils.serialize(cfg))
   f.close()
+  cfgDirty = false
+  cfgLastFlush = now()
+end
+
+local function markCfgDirty()
+  cfgDirty = true
+end
+
+local function flushCfg(force)
+  if force then
+    saveCfgNow()
+    return
+  end
+  if not cfgDirty then return end
+  if (now() - cfgLastFlush) < CFG_MIN_MS then return end
+  saveCfgNow()
+end
+
+-- Back-compat name used throughout; routine callers should prefer markCfgDirty.
+local function saveCfg()
+  saveCfgNow()
 end
 
 local function loadCfg()
@@ -266,17 +299,30 @@ local function jobSummaryShort(j)
     tostring(j.type or "?"), tonumber(j.idx) or 1, tonumber(j.total) or 0, tostring(j.status or "?"))
 end
 
-local function persistTurtleJob(id, job)
+local function persistTurtleJob(id, job, force)
   if not fs.exists(JOB_DIR) then fs.makeDir(JOB_DIR) end
   local path = turtleJobPath(id)
   if type(job) ~= "table" then
     if fs.exists(path) then pcall(fs.delete, path) end
+    jobPersistAt[id] = nil
+    jobPersistIdx[id] = nil
+    return
+  end
+  local idx = tonumber(job.idx) or 0
+  local st = tostring(job.status or "")
+  local important = force
+    or st == "done" or st == "paused" or st == "sos" or st == "verify"
+  local lastAt = jobPersistAt[id] or 0
+  local lastIdx = jobPersistIdx[id]
+  if not important and lastIdx == idx and (now() - lastAt) < JOB_PERSIST_MS then
     return
   end
   local f = fs.open(path, "w")
   if not f then return end
   f.write(textutils.serialize(job))
   f.close()
+  jobPersistAt[id] = now()
+  jobPersistIdx[id] = idx
 end
 
 local function loadStoredJob(id)
@@ -699,13 +745,30 @@ local function snapshot()
   }
 end
 
-local function broadcastStatus()
-  local snap = snapshot()
-  rednet.broadcast(snap, PROTO)
-  rednet.broadcast(snap, NET)
-  if titan and titan.ROUTER_PROTOCOL then
-    rednet.broadcast(snap, titan.ROUTER_PROTOCOL)
+local function markStatusDirty()
+  statusDirty = true
+end
+
+-- force=true: send now (claims/SOS/clear). Else debounce to STATUS_MIN_MS.
+local function broadcastStatus(force)
+  if force == true then
+    statusDirty = false
+    statusLastFlush = now()
+    local snap = snapshot()
+    rednet.broadcast(snap, PROTO)
+    rednet.broadcast(snap, NET)
+    if titan and titan.ROUTER_PROTOCOL then
+      rednet.broadcast(snap, titan.ROUTER_PROTOCOL)
+    end
+    return
   end
+  markStatusDirty()
+end
+
+local function flushStatus()
+  if not statusDirty then return end
+  if (now() - statusLastFlush) < STATUS_MIN_MS then return end
+  broadcastStatus(true)
 end
 
 local function parseFacing(raw)
@@ -815,7 +878,7 @@ local function recallFleet(reason)
   end
   rednet.broadcast(msg, PROTO)
   print(("[reband] epoch %d recall (%s)"):format(recallState.epoch, recallState.reason))
-  broadcastStatus()
+  broadcastStatus(true)
   return true
 end
 
@@ -866,21 +929,27 @@ local function handleMsg(id, msg)
       }, PROTO)
       row.welcomedAt = now()
     end
-    if t ~= "quarry_turtle" then broadcastStatus() end
+    if t ~= "quarry_turtle" then markStatusDirty() end
 
   elseif t == "quarry_claim_req" or t == "quarry_cell_req" then
+    -- Miners used to send both types at once — only handle one per window.
+    local last = claimHandledAt[id] or 0
+    if (now() - last) < CLAIM_DEDUPE_MS then
+      return
+    end
+    claimHandledAt[id] = now()
     touchTurtle(id, msg)
     local reply = assignCell(id, {
       forceNew = msg.nextBand or msg.forceNew or msg.nextCell,
     })
+    flushCfg(true)
     reply.type = "quarry_cell"
-    -- Also send as quarry_claim for older miners during transition.
     local legacy = {}
     for k, v in pairs(reply) do legacy[k] = v end
     legacy.type = "quarry_claim"
     rednet.send(id, reply, PROTO)
     rednet.send(id, legacy, PROTO)
-    broadcastStatus()
+    broadcastStatus(true)
 
   elseif t == "quarry_leave_origin" then
     local row = touchTurtle(id, msg)
@@ -888,25 +957,27 @@ local function handleMsg(id, msg)
     turtles[id] = row
     print(("[travel] #%d left origin → cell %s"):format(
       id, tostring(row.cellId or "?")))
-    broadcastStatus()
+    markStatusDirty()
 
   elseif t == "quarry_arrive_cell" then
     local row = touchTurtle(id, msg)
     row.status = "mining"
     turtles[id] = row
     print(("[arrive] #%d at cell %s"):format(id, tostring(row.cellId or "?")))
-    broadcastStatus()
+    markStatusDirty()
 
   elseif t == "quarry_cell_done" then
     markCellDone(id, msg)
+    flushCfg(true)
     local nextC = assignCell(id, { forceNew = true })
+    flushCfg(true)
     nextC.type = "quarry_cell"
     rednet.send(id, nextC, PROTO)
     local legacy = {}
     for k, v in pairs(nextC) do legacy[k] = v end
     legacy.type = "quarry_claim"
     rednet.send(id, legacy, PROTO)
-    broadcastStatus()
+    broadcastStatus(true)
 
   elseif t == "quarry_home" then
     touchTurtle(id, msg)
@@ -919,9 +990,13 @@ local function handleMsg(id, msg)
       if all then
         recallState.active = false
         print(("[reband] epoch %d complete — fleet home"):format(recallState.epoch))
+        broadcastStatus(true)
+      else
+        markStatusDirty()
       end
+    else
+      markStatusDirty()
     end
-    broadcastStatus()
 
   elseif t == "quarry_reset_done" then
     touchTurtle(id, msg)
@@ -930,7 +1005,7 @@ local function handleMsg(id, msg)
       row.status = cellForTurtle(id) and "mining" or "idle"
       turtles[id] = row
     end
-    broadcastStatus()
+    markStatusDirty()
 
   elseif t == "quarry_job_req" then
     touchTurtle(id, msg)
@@ -953,9 +1028,11 @@ local function handleMsg(id, msg)
     touchTurtle(id, msg)
     if msg.status == "done" or msg.finished or msg.cellDone then
       markCellDone(id, msg)
-      broadcastStatus()
-    elseif t == "quarry_job" then
-      broadcastStatus()
+      flushCfg(true)
+      broadcastStatus(true)
+    else
+      -- Pose/progress updates: monitor redraws from memory; mesh broadcast debounced.
+      markStatusDirty()
     end
 
   elseif t == "quarry_sos" or t == "quarry_sos_clear" then
@@ -970,15 +1047,16 @@ local function handleMsg(id, msg)
           tostring(msg.suggestX), tostring(msg.suggestY or -1), tostring(msg.suggestZ)))
       end
     end
-    broadcastStatus()
+    broadcastStatus(true)
 
   elseif t == "quarry_done" then
     markCellDone(id, msg)
-    broadcastStatus()
+    flushCfg(true)
+    broadcastStatus(true)
 
   elseif t == "quarry_status_req" or t == "quarry_turtle_req" then
     rednet.send(id, snapshot(), PROTO)
-    rednet.broadcast(snapshot(), PROTO)
+    -- Don't also flood-broadcast a second full snapshot for every req.
 
   elseif t == "quarry_where_req" then
     local tid = tonumber(msg.turtleId) or tonumber(msg.botId) or tonumber(msg.id)
@@ -1135,7 +1213,7 @@ local function handleCommand(line)
   elseif cmd == "clear" or cmd == "clearminers" then
     wipeMinerData(cmd)
     print("Cleared turtle registry / jobs. Cells kept (assigned→free).")
-    broadcastStatus()
+    broadcastStatus(true)
   elseif cmd == "clearcells" then
     for _, c in ipairs(cfg.cells or {}) do
       c.status = "free"
@@ -1149,7 +1227,7 @@ local function handleCommand(line)
     saveCfg()
     broadcastFleetClear("clearcells")
     print("All cells free.")
-    broadcastStatus()
+    broadcastStatus(true)
   elseif cmd == "cellsize" then
     local n = tonumber(a[2])
     if not n or n < 1 then
@@ -1159,7 +1237,7 @@ local function handleCommand(line)
       buildCellGrid({ cellSize = cfg.cellSize, autoSize = false, keepDone = true })
       saveCfg()
       print(("Cell size %d — %d cells"):format(cfg.cellSize, #cfg.cells))
-      broadcastStatus()
+      broadcastStatus(true)
     end
   elseif cmd == "origin" then
     if not a[2] then
@@ -1218,10 +1296,10 @@ local function handleCommand(line)
       broadcastFleetClear("setup")
       print(("Site locked %dx%d × %dY  cellSize=%d  cells=%d"):format(
         W, L, H, cfg.cellSize, #cfg.cells))
-      broadcastStatus()
+      broadcastStatus(true)
     end
   elseif cmd == "broadcast" or cmd == "push" then
-    broadcastStatus()
+    broadcastStatus(true)
     print("Status broadcast.")
   elseif cmd == "exit" or cmd == "quit" then
     return "exit"
@@ -1279,11 +1357,22 @@ end
 
 local function netLoop()
   while true do
-    local id, msg = rednet.receive(PROTO, 1)
+    local id, msg = rednet.receive(PROTO, 0.4)
     if id and type(msg) == "table" then
       local ok, err = pcall(handleMsg, id, msg)
       if not ok then print("[net err] " .. tostring(err)) end
+      -- Drain a short burst so join/claim storms don't stall the event queue.
+      for _ = 1, 12 do
+        local id2, msg2 = rednet.receive(PROTO, 0)
+        if not id2 then break end
+        if type(msg2) == "table" then
+          ok, err = pcall(handleMsg, id2, msg2)
+          if not ok then print("[net err] " .. tostring(err)) end
+        end
+      end
     end
+    flushCfg(false)
+    flushStatus()
   end
 end
 

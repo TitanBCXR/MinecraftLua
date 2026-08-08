@@ -1,6 +1,6 @@
 --[[
   lib/router_hub_ui.lua  -  Titan hub monitors / boards / map (part)
-  Titan-Version: 1.4.2
+  Titan-Version: 1.4.3
 
   Loaded by router_main.lua into a shared env (setfenv). Do not run directly.
 ]]
@@ -923,15 +923,24 @@ function rosterSaveLoop()
 end
 
 -- Periodically nudge the network so devices that booted before us also register.
+-- Stagger claim/map so MAIN doesn't double-flood every tick.
 function pingLoop()
+  local n = 0
   while true do
+    n = n + 1
     rednet.broadcast({ type = "ping" }, "titan_net")
-    rednet.broadcast({ type = "ping" }, "titan_dc")
-    if isMain() then
-      claimMain()
-      broadcastFleetMap()
+    if n % 2 == 0 then
+      rednet.broadcast({ type = "ping" }, "titan_dc")
     end
-    sleep(15)
+    if isMain() then
+      if n % 2 == 1 then
+        claimMain()
+      else
+        broadcastFleetMap(true)
+      end
+    end
+    if flushNetTraffic then flushNetTraffic() end
+    sleep(20)
   end
 end
 
@@ -1049,22 +1058,27 @@ function modemLoop()
       homeRouter = homeRouterId,
     }
     if x then msg.x, msg.y, msg.z = x, y, z end
-    -- Prefer home router (local hub), then MAIN, then broadcast.
+    -- Prefer home router (local hub), then MAIN; broadcast only if neither known.
     local hub = hubId()
-    if hub then rednet.send(hub, msg, PROTO_ROUTER) end
-    if mainId and mainId ~= hub then rednet.send(mainId, msg, PROTO_ROUTER) end
+    local sent = false
+    if hub then rednet.send(hub, msg, PROTO_ROUTER); sent = true end
+    if mainId and mainId ~= hub then rednet.send(mainId, msg, PROTO_ROUTER); sent = true end
     for peerId in pairs(netPeers) do
       rednet.send(peerId, msg, PROTO_ROUTER)
+      sent = true
     end
-    rednet.broadcast(msg, PROTO_ROUTER)
-    broadcastNetHello()
+    if not sent then
+      rednet.broadcast(msg, PROTO_ROUTER)
+    end
+    markNetHelloDirty()
     if not mainId or (os.clock() - mainSeenAt) > MAIN_STALE then
-      rednet.broadcast({
-        type = "hop_find_main", from = os.getComputerID(),
-        name = name, hostname = name,
-      }, PROTO_ROUTER)
       if hub then
         rednet.send(hub, {
+          type = "hop_find_main", from = os.getComputerID(),
+          name = name, hostname = name,
+        }, PROTO_ROUTER)
+      else
+        rednet.broadcast({
           type = "hop_find_main", from = os.getComputerID(),
           name = name, hostname = name,
         }, PROTO_ROUTER)
@@ -1073,14 +1087,17 @@ function modemLoop()
   end
 
   local function findMain()
-    rednet.broadcast({ type = "where_main", name = os.getComputerLabel() }, PROTO_ROUTER)
-    rednet.broadcast({
-      type = "hop_find_main", from = os.getComputerID(),
-      name = os.getComputerLabel(),
-    }, PROTO_ROUTER)
     local hub = hubId()
     if hub then
       rednet.send(hub, { type = "where_main", name = os.getComputerLabel() }, PROTO_ROUTER)
+    elseif mainId then
+      rednet.send(mainId, { type = "where_main", name = os.getComputerLabel() }, PROTO_ROUTER)
+    else
+      rednet.broadcast({ type = "where_main", name = os.getComputerLabel() }, PROTO_ROUTER)
+      rednet.broadcast({
+        type = "hop_find_main", from = os.getComputerID(),
+        name = os.getComputerLabel(),
+      }, PROTO_ROUTER)
     end
   end
 
@@ -1095,12 +1112,24 @@ function modemLoop()
   if homeRouterId then
     print("[link] Home router #" .. tostring(homeRouterId))
   end
+  -- Stagger boot chatter by computer id (same idea as quarry miners).
+  sleep(((os.getComputerID() * 37) % 1000) / 1000)
   findMain()
   announce()
-  local nextAnn = os.clock() + 20
+  broadcastNetHello(true)
+  local nextAnn = os.clock() + 25
   while true do
-    if os.clock() >= nextAnn then announce(); nextAnn = os.clock() + 20 end
-    local id, msg = rednet.receive(PROTO_ROUTER, math.max(0.2, nextAnn - os.clock()))
+    if os.clock() >= nextAnn then announce(); nextAnn = os.clock() + 25 end
+    local id, msg = rednet.receive(PROTO_ROUTER, 0.4)
+    local batch = {}
+    if type(msg) == "table" and id then batch[#batch + 1] = { id, msg } end
+    for _ = 1, 12 do
+      local id2, msg2 = rednet.receive(PROTO_ROUTER, 0)
+      if not id2 then break end
+      if type(msg2) == "table" then batch[#batch + 1] = { id2, msg2 } end
+    end
+    for bi = 1, #batch do
+      id, msg = batch[bi][1], batch[bi][2]
     if type(msg) ~= "table" or not id then
       -- ignore
     elseif handleNetControl(id, msg) then
@@ -1108,7 +1137,7 @@ function modemLoop()
     elseif msg.type == "main_claim" or msg.type == "main_here" then
       rememberMain(id, msg)
       handleAssign(msg)
-      announce()
+      -- Don't re-announce on every claim (causes mesh storms).
 
     elseif msg.type == "here" then
       rememberMain(id, msg)
@@ -1201,6 +1230,8 @@ function modemLoop()
         print("[OTA] No titan updateSelf — rebooting..."); sleep(1); os.reboot()
       end
     end
+    end -- batch
+    if flushNetTraffic then flushNetTraffic() end
   end
 end
 

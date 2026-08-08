@@ -1,6 +1,6 @@
 --[[
   lib/router_hub_cmd.lua  -  Titan hub console / boot (part)
-  Titan-Version: 1.4.1
+  Titan-Version: 1.4.2
 
   Loaded by router_main.lua into a shared env (setfenv). Do not run directly.
 ]]
@@ -103,7 +103,7 @@ function handleRouterCommand(a)
       local sub = (a[2] or ""):lower()
       if sub == "" or sub == "status" or sub == "show" then
         printNetLinks()
-        broadcastNetHello()
+        broadcastNetHello(true)
       elseif sub == "peer" or sub == "router" then
         local id = tonumber(a[3])
         if not id then
@@ -119,7 +119,7 @@ function handleRouterCommand(a)
               name = os.getComputerLabel(),
               role = routerRole,
             }, PROTO_ROUTER)
-            broadcastNetHello()
+            broadcastNetHello(true)
             print(("Linked backbone peer #%d"):format(id))
           end
         end
@@ -138,7 +138,7 @@ function handleRouterCommand(a)
               withName = os.getComputerLabel(),
               name = os.getComputerLabel(),
             }, PROTO_ROUTER)
-            broadcastNetHello()
+            broadcastNetHello(true)
             print(("Home router set to #%d"):format(id))
           end
         end
@@ -156,7 +156,7 @@ function handleRouterCommand(a)
               with = os.getComputerID(),
               withName = os.getComputerLabel(),
             }, PROTO_ROUTER)
-            broadcastNetHello()
+            broadcastNetHello(true)
             print(("Attached modem cell #%d"):format(id))
           end
         end
@@ -170,7 +170,7 @@ function handleRouterCommand(a)
         homeRouterId = nil; saveNetLinks()
         print("Cleared home router.")
       elseif sub == "hello" or sub == "announce" then
-        broadcastNetHello()
+        broadcastNetHello(true)
         print("Announced links on mesh.")
       else
         print("Usage: link | link peer <id> | link home <id> | link modem <id>")

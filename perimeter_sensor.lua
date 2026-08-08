@@ -1,6 +1,6 @@
 --[[
   perimeter_sensor.lua  -  Territory edge sensor (Advanced Peripherals Player Detector)
-  Titan-Version: 1.2.2
+  Titan-Version: 1.2.3
 
   Place on a computer at a perimeter gate with:
     * Advanced Peripherals Player Detector (adjacent / networked)
@@ -51,23 +51,25 @@ local managerId = nil          -- perimeter manager computer id (direct or via m
 local otaBusy = false
 local broadcastHello -- forward decl (used by self-assign)
 
--- Deliver a perimeter payload over broadcast + directed manager + main-router hop.
-local function deliverPerimeter(msg)
+-- Deliver a perimeter payload: manager unicast when known, else broadcast;
+-- one MAIN hop on router protocol (avoids 3–4× floods per hello/pulse).
+local function deliverPerimeter(msg, opts)
+  opts = opts or {}
   if type(msg) ~= "table" then return end
   msg.from = os.getComputerID()
   msg.sensorId = msg.sensorId or os.getComputerID()
   msg.originId = msg.originId or os.getComputerID()
-  rednet.broadcast(msg, P)
-  if managerId and managerId ~= os.getComputerID() then
+  if managerId and managerId ~= os.getComputerID() and not opts.flood then
     rednet.send(managerId, msg, P)
+  else
+    rednet.broadcast(msg, P)
   end
   local mainId = titan.getMainRouterId and titan.getMainRouterId()
-  if mainId and mainId ~= os.getComputerID() then
+  if mainId and mainId ~= os.getComputerID() and mainId ~= managerId then
     local hop = {}
     for k, v in pairs(msg) do hop[k] = v end
     hop.hop = true
     hop.originId = os.getComputerID()
-    rednet.send(mainId, hop, P)
     -- Router protocol so MAIN's directory loop always sees it for forwarding.
     rednet.send(mainId, hop, titan.ROUTER_PROTOCOL or "titan_router")
   end
@@ -290,6 +292,7 @@ end
 
 broadcastHello = function(extra)
   locateGps()
+  local flood = false
   local payload = {
     type = MSG.PERIMETER_HELLO or "perimeter_hello",
     kind = "sensor",
@@ -302,9 +305,12 @@ broadcastHello = function(extra)
     wantAssign = (cfg.side == nil) or (extra and extra.wantAssign),
   }
   if type(extra) == "table" then
-    for k, v in pairs(extra) do payload[k] = v end
+    flood = not not extra.flood
+    for k, v in pairs(extra) do
+      if k ~= "flood" then payload[k] = v end
+    end
   end
-  deliverPerimeter(payload)
+  deliverPerimeter(payload, { flood = flood })
 end
 
 local function requestAssign()
@@ -610,68 +616,85 @@ local function scanLoop()
 end
 
 local function helloLoop()
+  if titan.netJitter then titan.netJitter(1.5) else sleep((((os.getComputerID() or 0) % 10) / 10)) end
   local n = 0
   while true do
     n = n + 1
-    broadcastHello({ wantAssign = (cfg.side == nil) or (n % 4 == 1) })
-    if cfg.side == nil and lastPos.x then
+    -- Flood only until a manager is known (mesh discovery).
+    broadcastHello({
+      wantAssign = (cfg.side == nil) or (n % 6 == 1),
+      flood = not managerId,
+    })
+    if cfg.side == nil and lastPos.x and (n % 2 == 1) then
       requestAssign()
     end
-    if not managerId or (n % 3 == 0) then
+    if not managerId or (n % 4 == 0) then
       requestManagerViaRouter()
     end
-    sleep(15)
+    sleep(28)
+  end
+end
+
+local function handleNetMsg(id, msg, proto)
+  local routerProto = titan.ROUTER_PROTOCOL or "titan_router"
+  if type(msg) ~= "table" then return end
+  local t = msg.type
+  if t == MSG.PERIMETER_CONFIG or t == "perimeter_config" then
+    local target = msg.sensorId or msg.id or msg.to
+    if target == nil or tonumber(target) == os.getComputerID()
+        or target == "*" or target == "all" then
+      if id then rememberManager(id, { kind = "manager" }) end
+      applyConfig(msg)
+    end
+  elseif t == MSG.PERIMETER_UPDATE or t == "perimeter_update" then
+    local target = msg.sensorId or msg.id or msg.to
+    if target == nil or tonumber(target) == os.getComputerID()
+        or target == "*" or target == "all" then
+      runForcedUpdate(id, "Manager force-update", { reboot = true })
+    end
+  elseif (t == MSG.PERIMETER_HELLO or t == "perimeter_hello")
+      and (msg.kind == "manager" or msg.kind == "perimeter_manager") then
+    rememberManager(id, msg)
+    if msg.origin then
+      selfAssignFromOrigin(msg.origin)
+    end
+    if not cfg.side then requestAssign() end
+  elseif (t == MSG.PERIMETER_ROSTER or t == "perimeter_roster")
+      or (proto == routerProto and t == "perimeter_roster") then
+    local managers = msg.managers or {}
+    if #managers > 0 then
+      rememberManager(managers[1].id, { kind = "manager" })
+      print("Manager via router: #" .. tostring(managerId))
+    end
+  elseif t == MSG.PERIMETER_FWD or t == "perimeter_fwd" then
+    local payload = msg.payload
+    if type(payload) == "table" then
+      local target = payload.sensorId or payload.id or payload.to or msg.dest
+      if target == nil or tonumber(target) == os.getComputerID()
+          or target == "*" or target == "all" then
+        local pt = payload.type
+        if pt == MSG.PERIMETER_CONFIG or pt == "perimeter_config" then
+          applyConfig(payload)
+        elseif pt == MSG.PERIMETER_UPDATE or pt == "perimeter_update" then
+          runForcedUpdate(id, "Manager force-update (hop)", { reboot = true })
+        end
+      end
+    end
   end
 end
 
 local function netLoop()
-  local routerProto = titan.ROUTER_PROTOCOL or "titan_router"
   while true do
     local id, msg, proto = rednet.receive(nil, 1)
-    if type(msg) == "table" then
-      local t = msg.type
-      if t == MSG.PERIMETER_CONFIG or t == "perimeter_config" then
-        local target = msg.sensorId or msg.id or msg.to
-        if target == nil or tonumber(target) == os.getComputerID()
-            or target == "*" or target == "all" then
-          if id then rememberManager(id, { kind = "manager" }) end
-          applyConfig(msg)
-        end
-      elseif t == MSG.PERIMETER_UPDATE or t == "perimeter_update" then
-        local target = msg.sensorId or msg.id or msg.to
-        if target == nil or tonumber(target) == os.getComputerID()
-            or target == "*" or target == "all" then
-          runForcedUpdate(id, "Manager force-update", { reboot = true })
-        end
-      elseif (t == MSG.PERIMETER_HELLO or t == "perimeter_hello")
-          and (msg.kind == "manager" or msg.kind == "perimeter_manager") then
-        rememberManager(id, msg)
-        if msg.origin then
-          selfAssignFromOrigin(msg.origin)
-        end
-        if not cfg.side then requestAssign() end
-      elseif (t == MSG.PERIMETER_ROSTER or t == "perimeter_roster")
-          or (proto == routerProto and t == "perimeter_roster") then
-        local managers = msg.managers or {}
-        if #managers > 0 then
-          rememberManager(managers[1].id, { kind = "manager" })
-          print("Manager via router: #" .. tostring(managerId))
-        end
-      elseif t == MSG.PERIMETER_FWD or t == "perimeter_fwd" then
-        local payload = msg.payload
-        if type(payload) == "table" then
-          local target = payload.sensorId or payload.id or payload.to or msg.dest
-          if target == nil or tonumber(target) == os.getComputerID()
-              or target == "*" or target == "all" then
-            local pt = payload.type
-            if pt == MSG.PERIMETER_CONFIG or pt == "perimeter_config" then
-              applyConfig(payload)
-            elseif pt == MSG.PERIMETER_UPDATE or pt == "perimeter_update" then
-              runForcedUpdate(id, "Manager force-update (hop)", { reboot = true })
-            end
-          end
-        end
-      end
+    local batch = {}
+    if type(msg) == "table" and id then batch[#batch + 1] = { id, msg, proto } end
+    for _ = 1, 12 do
+      local id2, msg2, proto2 = rednet.receive(nil, 0)
+      if not id2 then break end
+      if type(msg2) == "table" then batch[#batch + 1] = { id2, msg2, proto2 } end
+    end
+    for bi = 1, #batch do
+      handleNetMsg(batch[bi][1], batch[bi][2], batch[bi][3])
     end
   end
 end

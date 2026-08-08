@@ -1,8 +1,11 @@
 --[[
   lib/router_hub_net.lua  -  Titan hub networking / roster / OTA (part)
-  Titan-Version: 1.4.2
+  Titan-Version: 1.4.3
 
   Loaded by router_main.lua into a shared env (setfenv). Do not run directly.
+
+  Fleet net: debounced net_link_hello / fleet_map flushes + burst drain on
+  the directory receive loop (same storm-control approach as quarry site).
 ]]
 
 function loadRouterCfg()
@@ -191,16 +194,45 @@ function printNetLinks()
   end
 end
 
-function broadcastNetHello()
+-- Debounce topology hellos / fleet maps so link storms don't melt the mesh.
+NET_HELLO_MIN_MS = 2000
+FLEET_MAP_MIN_MS = 4000
+netHelloDirty = false
+netHelloLastFlush = 0
+fleetMapDirty = false
+fleetMapLastFlush = 0
+
+function markNetHelloDirty()
+  netHelloDirty = true
+end
+
+function markFleetMapDirty()
+  fleetMapDirty = true
+end
+
+-- force=true send now; otherwise mark dirty for flushNetTraffic().
+function broadcastNetHello(force)
+  if force ~= true then
+    netHelloDirty = true
+    return
+  end
+  netHelloDirty = false
+  netHelloLastFlush = os.epoch("utc")
   local snap = netLinkSnapshot()
   snap.type = "net_link_hello"
   rednet.broadcast(snap, PROTO_ROUTER)
   for id in pairs(netPeers) do
     rednet.send(id, snap, PROTO_ROUTER)
   end
-  if homeRouterId then
+  if homeRouterId and not netPeers[homeRouterId] then
     rednet.send(homeRouterId, snap, PROTO_ROUTER)
   end
+end
+
+function flushNetHello()
+  if not netHelloDirty then return end
+  if (os.epoch("utc") - netHelloLastFlush) < NET_HELLO_MIN_MS then return end
+  broadcastNetHello(true)
 end
 
 -- Deliver a payload toward dest via backbone peers / local cells.
@@ -1035,7 +1067,14 @@ function claimMain()
 end
 
 -- Broadcast known router/modem positions for the pocket locator radar.
-function broadcastFleetMap()
+-- force=true send now; otherwise debounce via flushFleetMap().
+function broadcastFleetMap(force)
+  if force ~= true then
+    fleetMapDirty = true
+    return
+  end
+  fleetMapDirty = false
+  fleetMapLastFlush = os.epoch("utc")
   local nodes = {}
   local rname = os.getComputerLabel() or ("Router-" .. os.getComputerID())
   if gpsCoords then
@@ -1059,6 +1098,17 @@ function broadcastFleetMap()
     x = gpsCoords and gpsCoords.x, y = gpsCoords and gpsCoords.y,
     z = gpsCoords and gpsCoords.z, nodes = nodes,
   }, PROTO_ROUTER)
+end
+
+function flushFleetMap()
+  if not fleetMapDirty then return end
+  if (os.epoch("utc") - fleetMapLastFlush) < FLEET_MAP_MIN_MS then return end
+  broadcastFleetMap(true)
+end
+
+function flushNetTraffic()
+  flushNetHello()
+  flushFleetMap()
 end
 
 function isWiredFresh(id)
@@ -1633,16 +1683,30 @@ function directoryLoop()
   rednet.broadcast({ type = "ping" }, "titan_net")
   rednet.broadcast({ type = "ping" }, "titan_dc")
   claimMain()
-  broadcastFleetMap()
-  broadcastNetHello()
-  local nextLinkHello = os.clock() + 25
+  broadcastFleetMap(true)
+  broadcastNetHello(true)
+  local nextLinkHello = os.clock() + 35
   while true do
     if os.clock() >= nextLinkHello then
-      broadcastNetHello()
-      nextLinkHello = os.clock() + 25
+      broadcastNetHello(true)
+      nextLinkHello = os.clock() + 35
     end
-    local id, msg, proto = rednet.receive(nil, math.max(0.2, nextLinkHello - os.clock()))
+    local id, msg, proto = rednet.receive(nil, 0.4)
+    -- Drain a short burst so hello/claim storms don't stall the event queue.
+    local batch = {}
     if type(msg) == "table" and id then
+      batch[#batch + 1] = { id, msg, proto }
+    end
+    for _ = 1, 16 do
+      local id2, msg2, proto2 = rednet.receive(nil, 0)
+      if not id2 then break end
+      if type(msg2) == "table" then
+        batch[#batch + 1] = { id2, msg2, proto2 }
+      end
+    end
+    for bi = 1, #batch do
+      id, msg, proto = batch[bi][1], batch[bi][2], batch[bi][3]
+      local ok, err = pcall(function()
       -- Urgent turtle fuel SOS — any protocol; show on all MAIN monitors.
       if msg.type == "quarry_sos" or msg.type == "quarry_sos_clear" then
         noteTurtleSos(id, msg)
@@ -1711,7 +1775,7 @@ function directoryLoop()
           reply.type = "main_here"
           rednet.send(id, reply, PROTO_ROUTER)
         elseif msg.type == "map_req" then
-          broadcastFleetMap()
+          broadcastFleetMap(true)
         end
 
       elseif proto == PROTO_ROUTER and (msg.type == "perimeter_roster_req"
@@ -1774,7 +1838,10 @@ function directoryLoop()
         local kind = classify(msg)
         if kind then rosterTouch(id, msg, kind, false) end
       end
-    end
+      end) -- pcall per batch message
+      if not ok then print("[net err] " .. tostring(err)) end
+    end -- batch
+    flushNetTraffic()
   end
 end
 

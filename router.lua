@@ -1,6 +1,6 @@
 --[[
   router.lua  -  Titan network router bootstrap (CC: Tweaked)
-  Titan-Version: 1.4.2
+  Titan-Version: 1.4.4
 
   Detects this computer's role from router.cfg (or asks once), ensures the
   matching runtime file is installed, then runs it:
@@ -33,13 +33,13 @@ local HUB_PARTS = {
 
 -- Minimum versions — bootstrap re-fetches if local is older / missing header.
 local MIN_VER = {
-  ["router.lua"] = "1.4.2",
-  ["router_main.lua"] = "1.4.1",
-  ["router_modem.lua"] = "1.4.0",
-  ["lib/router_hub_net.lua"] = "1.4.1",
-  ["lib/router_hub_ui.lua"] = "1.4.1",
-  ["lib/router_hub_cmd.lua"] = "1.4.1",
-  ["lib/titan.lua"] = "1.2.19",
+  ["router.lua"] = "1.4.4",
+  ["router_main.lua"] = "1.4.2",
+  ["router_modem.lua"] = "1.4.1",
+  ["lib/router_hub_net.lua"] = "1.4.3",
+  ["lib/router_hub_ui.lua"] = "1.4.3",
+  ["lib/router_hub_cmd.lua"] = "1.4.2",
+  ["lib/titan.lua"] = "1.2.20",
 }
 
 --------------------------------------------------------------------------------

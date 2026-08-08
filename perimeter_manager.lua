@@ -1,6 +1,6 @@
 --[[
   perimeter_manager.lua  -  Territory board for perimeter sensors
-  Titan-Version: 1.3.1
+  Titan-Version: 1.3.2
 
   Central display for perimeter_sensor.lua gates. Shows who is inside the
   territory, which sector they entered from (N NE E SE S SW W NW), enter time,
@@ -444,7 +444,6 @@ local function sendConfig(targetId, fields)
   else
     local id = tonumber(targetId)
     rednet.send(id, msg, P)
-    rednet.broadcast(msg, P) -- mesh hop friendly
     hopViaMainRouter(id, msg)
   end
 end
@@ -798,7 +797,8 @@ local function forceUpdatePerimeter(opts)
   end
 end
 
-local function broadcastManagerHello()
+local function broadcastManagerHello(opts)
+  opts = opts or {}
   local payload = {
     type = MSG.PERIMETER_HELLO or "perimeter_hello",
     kind = "manager",
@@ -807,10 +807,10 @@ local function broadcastManagerHello()
     defaultRange = cfg.defaultRange or DEFAULT_SENSOR_RANGE,
     from = os.getComputerID(),
   }
+  -- Sensors need a PROTO broadcast for discovery; MAIN only needs one hop.
   rednet.broadcast(payload, P)
   local mainId = titan.getMainRouterId and titan.getMainRouterId()
-  if mainId then
-    rednet.send(mainId, payload, P)
+  if mainId and not opts.skipMain then
     rednet.send(mainId, payload, titan.ROUTER_PROTOCOL or "titan_router")
   end
 end
@@ -1208,7 +1208,16 @@ local function netLoop()
   while true do
     -- Any protocol: titan_net alerts + titan_router hops/roster.
     local id, msg = rednet.receive(nil, 0.5)
-    if msg then handleMsg(id, msg) end
+    local batch = {}
+    if type(msg) == "table" and id then batch[#batch + 1] = { id, msg } end
+    for _ = 1, 16 do
+      local id2, msg2 = rednet.receive(nil, 0)
+      if not id2 then break end
+      if type(msg2) == "table" then batch[#batch + 1] = { id2, msg2 } end
+    end
+    for bi = 1, #batch do
+      handleMsg(batch[bi][1], batch[bi][2])
+    end
   end
 end
 
@@ -1221,10 +1230,11 @@ local function tickLoop()
 end
 
 local function meshSyncLoop()
+  if titan.netJitter then titan.netJitter(1.5) else sleep((((os.getComputerID() or 0) % 10) / 10)) end
   while true do
     broadcastManagerHello()
     requestRouterRoster()
-    sleep(20)
+    sleep(35)
   end
 end
 

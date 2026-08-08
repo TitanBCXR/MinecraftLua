@@ -1,9 +1,12 @@
 --[[
   router_modem.lua  -  Titan MODEM cell runtime (CC: Tweaked)
-  Titan-Version: 1.4.0
+  Titan-Version: 1.4.1
 
   Short-range RF repeater cell. Loaded by router.lua when role=modem.
   Prefer: run `router` (detects role and auto-installs this file).
+
+  Fleet net: debounced net_link_hello + lighter announce / burst drain
+  (same storm-control approach as quarry site + hub routers).
 
 ]]
 
@@ -258,16 +261,32 @@ local function printNetLinks()
   end
 end
 
-local function broadcastNetHello()
+local NET_HELLO_MIN_MS = 2000
+local netHelloDirty = false
+local netHelloLastFlush = 0
+
+local function broadcastNetHello(force)
+  if force ~= true then
+    netHelloDirty = true
+    return
+  end
+  netHelloDirty = false
+  netHelloLastFlush = os.epoch("utc")
   local snap = netLinkSnapshot()
   snap.type = "net_link_hello"
   rednet.broadcast(snap, PROTO_ROUTER)
   for id in pairs(netPeers) do
     rednet.send(id, snap, PROTO_ROUTER)
   end
-  if homeRouterId then
+  if homeRouterId and not netPeers[homeRouterId] then
     rednet.send(homeRouterId, snap, PROTO_ROUTER)
   end
+end
+
+local function flushNetHello()
+  if not netHelloDirty then return end
+  if (os.epoch("utc") - netHelloLastFlush) < NET_HELLO_MIN_MS then return end
+  broadcastNetHello(true)
 end
 
 -- Deliver a payload toward dest via backbone peers / local cells.
@@ -924,22 +943,25 @@ local function modemLoop()
       homeRouter = homeRouterId,
     }
     if x then msg.x, msg.y, msg.z = x, y, z end
-    -- Prefer home router (local hub), then MAIN, then broadcast.
+    -- Prefer home/MAIN unicast; broadcast only if nothing to target.
     local hub = hubId()
-    if hub then rednet.send(hub, msg, PROTO_ROUTER) end
-    if mainId and mainId ~= hub then rednet.send(mainId, msg, PROTO_ROUTER) end
+    local sent = false
+    if hub then rednet.send(hub, msg, PROTO_ROUTER); sent = true end
+    if mainId and mainId ~= hub then rednet.send(mainId, msg, PROTO_ROUTER); sent = true end
     for peerId in pairs(netPeers) do
       rednet.send(peerId, msg, PROTO_ROUTER)
+      sent = true
     end
-    rednet.broadcast(msg, PROTO_ROUTER)
-    broadcastNetHello()
+    if not sent then rednet.broadcast(msg, PROTO_ROUTER) end
+    broadcastNetHello()  -- debounced
     if not mainId or (os.clock() - mainSeenAt) > MAIN_STALE then
-      rednet.broadcast({
-        type = "hop_find_main", from = os.getComputerID(),
-        name = name, hostname = name,
-      }, PROTO_ROUTER)
       if hub then
         rednet.send(hub, {
+          type = "hop_find_main", from = os.getComputerID(),
+          name = name, hostname = name,
+        }, PROTO_ROUTER)
+      else
+        rednet.broadcast({
           type = "hop_find_main", from = os.getComputerID(),
           name = name, hostname = name,
         }, PROTO_ROUTER)
@@ -948,14 +970,17 @@ local function modemLoop()
   end
 
   local function findMain()
-    rednet.broadcast({ type = "where_main", name = os.getComputerLabel() }, PROTO_ROUTER)
-    rednet.broadcast({
-      type = "hop_find_main", from = os.getComputerID(),
-      name = os.getComputerLabel(),
-    }, PROTO_ROUTER)
     local hub = hubId()
     if hub then
       rednet.send(hub, { type = "where_main", name = os.getComputerLabel() }, PROTO_ROUTER)
+    elseif mainId then
+      rednet.send(mainId, { type = "where_main", name = os.getComputerLabel() }, PROTO_ROUTER)
+    else
+      rednet.broadcast({ type = "where_main", name = os.getComputerLabel() }, PROTO_ROUTER)
+      rednet.broadcast({
+        type = "hop_find_main", from = os.getComputerID(),
+        name = os.getComputerLabel(),
+      }, PROTO_ROUTER)
     end
   end
 
@@ -970,12 +995,23 @@ local function modemLoop()
   if homeRouterId then
     print("[link] Home router #" .. tostring(homeRouterId))
   end
+  sleep(((os.getComputerID() * 37) % 1000) / 1000)
   findMain()
   announce()
-  local nextAnn = os.clock() + 20
+  broadcastNetHello(true)
+  local nextAnn = os.clock() + 25
   while true do
-    if os.clock() >= nextAnn then announce(); nextAnn = os.clock() + 20 end
-    local id, msg = rednet.receive(PROTO_ROUTER, math.max(0.2, nextAnn - os.clock()))
+    if os.clock() >= nextAnn then announce(); nextAnn = os.clock() + 25 end
+    local id, msg = rednet.receive(PROTO_ROUTER, 0.4)
+    local batch = {}
+    if type(msg) == "table" and id then batch[#batch + 1] = { id, msg } end
+    for _ = 1, 12 do
+      local id2, msg2 = rednet.receive(PROTO_ROUTER, 0)
+      if not id2 then break end
+      if type(msg2) == "table" then batch[#batch + 1] = { id2, msg2 } end
+    end
+    for bi = 1, #batch do
+      id, msg = batch[bi][1], batch[bi][2]
     if type(msg) ~= "table" or not id then
       -- ignore
     elseif handleNetControl(id, msg) then
@@ -983,7 +1019,7 @@ local function modemLoop()
     elseif msg.type == "main_claim" or msg.type == "main_here" then
       rememberMain(id, msg)
       handleAssign(msg)
-      announce()
+      -- Don't re-announce on every claim (mesh storm).
 
     elseif msg.type == "here" then
       rememberMain(id, msg)
@@ -1076,6 +1112,8 @@ local function modemLoop()
         print("[OTA] No titan updateSelf — rebooting..."); sleep(1); os.reboot()
       end
     end
+    end -- batch
+    flushNetHello()
   end
 end
 
@@ -1209,7 +1247,7 @@ local function handleRouterCommand(a)
       local sub = (a[2] or ""):lower()
       if sub == "" or sub == "status" or sub == "show" then
         printNetLinks()
-        broadcastNetHello()
+        broadcastNetHello(true)
       elseif sub == "peer" or sub == "router" then
         local id = tonumber(a[3])
         if not id then
@@ -1225,7 +1263,7 @@ local function handleRouterCommand(a)
               name = os.getComputerLabel(),
               role = routerRole,
             }, PROTO_ROUTER)
-            broadcastNetHello()
+            broadcastNetHello(true)
             print(("Linked backbone peer #%d"):format(id))
           end
         end
@@ -1244,7 +1282,7 @@ local function handleRouterCommand(a)
               withName = os.getComputerLabel(),
               name = os.getComputerLabel(),
             }, PROTO_ROUTER)
-            broadcastNetHello()
+            broadcastNetHello(true)
             print(("Home router set to #%d"):format(id))
           end
         end
@@ -1262,7 +1300,7 @@ local function handleRouterCommand(a)
               with = os.getComputerID(),
               withName = os.getComputerLabel(),
             }, PROTO_ROUTER)
-            broadcastNetHello()
+            broadcastNetHello(true)
             print(("Attached modem cell #%d"):format(id))
           end
         end
@@ -1276,7 +1314,7 @@ local function handleRouterCommand(a)
         homeRouterId = nil; saveNetLinks()
         print("Cleared home router.")
       elseif sub == "hello" or sub == "announce" then
-        broadcastNetHello()
+        broadcastNetHello(true)
         print("Announced links on mesh.")
       else
         print("Usage: link | link peer <id> | link home <id> | link modem <id>")

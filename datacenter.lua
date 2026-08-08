@@ -1,6 +1,6 @@
 --[[
   datacenter.lua  -  Titan Data Center (CC: Tweaked)   [ single, self-contained script ]
-  Titan-Version: 1.2.13
+  Titan-Version: 1.2.14
 
   ONE script that every computer/terminal in your data center runs. It works out
   its own role automatically:
@@ -1155,8 +1155,13 @@ local function serviceLoop()
   end
 end
 
+-- Filled once lib/titan.lua loads (prefer announce + MAIN poke over raw floods).
+local dcNetAnnounce = nil
+
 -- Register ourselves with the master periodically.
 local function registerLoop()
+  -- Stagger Parent Center hellos so they don't sync-thump with the fleet.
+  sleep((((os.getComputerID() or 0) * 37) % 1000) / 1000 * 1.5)
   while true do
     if isLocalMaster() then
       registry[os.getComputerID()] = { name = station.name, seen = os.epoch("utc"), master = true }
@@ -1166,10 +1171,14 @@ local function registerLoop()
     end
     -- Announce to the network router's directory (always share hostname).
     local host = station.name or os.getComputerLabel() or ("ParentCenter-" .. os.getComputerID())
-    rednet.broadcast({
-      type = "hello", kind = "datacenter", name = host, hostname = host,
-    }, "titan_router")
-    sleep(15)
+    if type(dcNetAnnounce) == "function" then
+      dcNetAnnounce(host)
+    else
+      rednet.broadcast({
+        type = "hello", kind = "datacenter", name = host, hostname = host,
+      }, "titan_router")
+    end
+    sleep(30)
   end
 end
 
@@ -1177,8 +1186,16 @@ end
 -- the live bot roster (builder / gatherer / miner status + assignments).
 local function botLoop()
   while true do
-    local id, msg = rednet.receive(NET_PROTOCOL)
-    if type(msg) == "table" and id then
+    local id, msg = rednet.receive(NET_PROTOCOL, 1)
+    local batch = {}
+    if type(msg) == "table" and id then batch[#batch + 1] = { id, msg } end
+    for _ = 1, 16 do
+      local id2, msg2 = rednet.receive(NET_PROTOCOL, 0)
+      if not id2 then break end
+      if type(msg2) == "table" then batch[#batch + 1] = { id2, msg2 } end
+    end
+    for bi = 1, #batch do
+      id, msg = batch[bi][1], batch[bi][2]
       if msg.type == "bot_register" or msg.type == "status" or msg.type == "register"
           or msg.type == "pong" then
         local b = netbots[id] or {}
@@ -1447,6 +1464,15 @@ local tasks = { serviceLoop, registerLoop, displayLoop, botLoop, uiLoop, relayLo
 local dcTitan = nil
 if fs.exists("lib/titan.lua") then
   dcTitan = dofile("lib/titan.lua")
+  dcNetAnnounce = function(host)
+    if dcTitan.announce then
+      dcTitan.announce("datacenter")
+    else
+      rednet.broadcast({
+        type = "hello", kind = "datacenter", name = host, hostname = host,
+      }, "titan_router")
+    end
+  end
   -- SSH already checked the master password — run admin commands directly.
   -- Needs lib/titan.lua >= 1.2.8.
   if dcTitan.setSshHandler then
@@ -1484,28 +1510,38 @@ if fs.exists("lib/titan.lua") then
       dcTitan.reportUpdatedIfPending("datacenter")
     end
     while true do
-      local id, msg = rednet.receive("titan_router")
-      if type(msg) == "table" and msg.type == "update" and id ~= os.getComputerID()
-          and not otaBusy and dcTitan.updateSelf then
-        otaBusy = true
-        print("")
-        print(("[OTA] Fleet update from router #%s (v%s) — downloading..."):format(
-          tostring(id), tostring(msg.targetVersion or "?")))
-        local prev = dcTitan.systemVersion and dcTitan.systemVersion() or nil
-        local ok, detail = dcTitan.updateSelf()
-        if ok then
-          local pkgs = type(detail) == "table" and detail.packages or nil
-          if dcTitan.markPendingUpdateAck then
-            dcTitan.markPendingUpdateAck(prev, msg.targetVersion, pkgs)
+      local id, msg = rednet.receive("titan_router", 1)
+      local batch = {}
+      if type(msg) == "table" and id then batch[#batch + 1] = { id, msg } end
+      for _ = 1, 12 do
+        local id2, msg2 = rednet.receive("titan_router", 0)
+        if not id2 then break end
+        if type(msg2) == "table" then batch[#batch + 1] = { id2, msg2 } end
+      end
+      for bi = 1, #batch do
+        id, msg = batch[bi][1], batch[bi][2]
+        if msg.type == "update" and id ~= os.getComputerID()
+            and not otaBusy and dcTitan.updateSelf then
+          otaBusy = true
+          print("")
+          print(("[OTA] Fleet update from router #%s (v%s) — downloading..."):format(
+            tostring(id), tostring(msg.targetVersion or "?")))
+          local prev = dcTitan.systemVersion and dcTitan.systemVersion() or nil
+          local ok, detail = dcTitan.updateSelf()
+          if ok then
+            local pkgs = type(detail) == "table" and detail.packages or nil
+            if dcTitan.markPendingUpdateAck then
+              dcTitan.markPendingUpdateAck(prev, msg.targetVersion, pkgs)
+            end
+            print("[OTA] Updated. Rebooting (will ACK main)..."); sleep(2); os.reboot()
+          else
+            print("[OTA] Failed: " .. tostring(detail))
+            rednet.send(id, {
+              type = "update_fail", version = prev, err = tostring(detail),
+              name = station.name, hostname = station.name, kind = "datacenter",
+            }, "titan_router")
+            otaBusy = false
           end
-          print("[OTA] Updated. Rebooting (will ACK main)..."); sleep(2); os.reboot()
-        else
-          print("[OTA] Failed: " .. tostring(detail))
-          rednet.send(id, {
-            type = "update_fail", version = prev, err = tostring(detail),
-            name = station.name, hostname = station.name, kind = "datacenter",
-          }, "titan_router")
-          otaBusy = false
         end
       end
     end
