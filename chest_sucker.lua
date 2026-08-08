@@ -1,14 +1,14 @@
 --[[
-  chest_sucker.lua  -  On boot, suck items from any adjacent chest
-  Titan-Version: 1.0.0
+  chest_sucker.lua  -  On boot, suck items from adjacent chests / barrels
+  Titan-Version: 1.0.1
 
-  Place the turtle next to a chest (any side, above, or below).
+  Place the turtle next to a chest or barrel (any side, above, or below).
   Run once, or put in startup.lua:
 
     shell.run("chest_sucker.lua")
 
-  Matches any block whose name contains "chest" (chest, trapped_chest,
-  ender_chest, modded *chest*, etc.).
+  Matches blocks whose name contains "chest" or "barrel"
+  (loot chests, trapped_chest, barrel, modded variants, etc.).
 ]]
 
 if not turtle then
@@ -16,10 +16,11 @@ if not turtle then
   return
 end
 
-local function isChest(info)
+local function isLootContainer(info)
   if type(info) ~= "table" then return false end
   local name = tostring(info.name or info.id or ""):lower()
   return name:find("chest", 1, true) ~= nil
+      or name:find("barrel", 1, true) ~= nil
 end
 
 local function suckAll(suckFn)
@@ -33,11 +34,17 @@ end
 
 local total = 0
 
+local function labelFor(info)
+  local name = tostring(info.name or "container"):lower()
+  if name:find("barrel", 1, true) then return "Barrel" end
+  return "Chest"
+end
+
 -- Down
 do
   local ok, info = turtle.inspectDown()
-  if ok and isChest(info) then
-    print("Chest below — sucking...")
+  if ok and isLootContainer(info) then
+    print(labelFor(info) .. " below — sucking...")
     total = total + suckAll(turtle.suckDown)
   end
 end
@@ -45,8 +52,8 @@ end
 -- Up
 do
   local ok, info = turtle.inspectUp()
-  if ok and isChest(info) then
-    print("Chest above — sucking...")
+  if ok and isLootContainer(info) then
+    print(labelFor(info) .. " above — sucking...")
     total = total + suckAll(turtle.suckUp)
   end
 end
@@ -54,8 +61,8 @@ end
 -- Four horizontal sides
 for side = 1, 4 do
   local ok, info = turtle.inspect()
-  if ok and isChest(info) then
-    print(("Chest in front — sucking (facing %d)..."):format(side))
+  if ok and isLootContainer(info) then
+    print(("%s in front — sucking..."):format(labelFor(info)))
     total = total + suckAll(turtle.suck)
   end
   turtle.turnRight()
@@ -64,5 +71,5 @@ end
 if total > 0 then
   print(("Done — took %d stack(s)."):format(total))
 else
-  print("No adjacent chest with items (or inventory full).")
+  print("No adjacent chest/barrel with items (or inventory full).")
 end

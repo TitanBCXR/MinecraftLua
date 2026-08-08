@@ -62,7 +62,7 @@ local ROLES = {
     files = { "lib/titan.lua", "perimeter_sensor.lua" } },
   { key = "19", name = "Perimeter manager (territory board)", run = "perimeter_manager.lua",
     files = { "lib/titan.lua", "perimeter_manager.lua" } },
-  { key = "20", name = "Chest sucker (pull from adjacent chests)", run = "chest_sucker.lua",
+  { key = "20", name = "Chest sucker (pull from adjacent chests/barrels)", run = "chest_sucker.lua",
     files = { "chest_sucker.lua" } },
   { key = "21", name = "Install host (share files to others)", run = "host.lua",
     files = { "lib/titan.lua", "hub.lua", "bot.lua", "poi.lua", "worker.lua", "botserver.lua",
