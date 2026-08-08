@@ -13,6 +13,7 @@ A wireless dispatch system for Minecraft's **CC: Tweaked** mod (active packages)
 - **`minesweeper.lua`** — Minesweeper for pocket / advanced PC + monitor (no modem; monitor bottom half = Open/Flag touch pad).
 - **`sandstorm.lua`** — Darude Sandstorm note-block knockoff + desert pixel visualizer (speaker + color monitor).
 - **`luigi_poker.lua`** — Luigi Picture Poker (SMB3-style hold/draw, coin payouts; monitor tap UI).
+- **`slots.lua`** — 3-reel slots (bet/spin animation, coin bank; monitor tap UI).
 - **`github_install.lua`** — On an advanced PC + color monitor, role select draws on the monitor (touch tiles + UP/DOWN scroll).
 - **`lib/titan.lua`** — shared library (protocol, messaging, navigation).
 
@@ -96,7 +97,7 @@ Each device needs (active installer roles):
 | Offline miner     | `offline_miner.lua`, `lib/titan.lua`, `exclude.txt` |
 | Quarry site board | `offline_site.lua`, `lib/titan.lua` (+ modem) |
 | Perimeter sensor/manager | `perimeter_*.lua`, `lib/titan.lua`  |
-| Games (submenu **g**) | `tetris` / `minesweeper` / `sandstorm` / `luigi_poker` (+ titan for Tetris) |
+| Games (submenu **g**) | `tetris` / `minesweeper` / `sandstorm` / `luigi_poker` / `slots` (+ titan for Tetris) |
 
 Keep `lib/titan.lua` in a `lib` folder next to the program. Older roles are in
 [`archive/`](archive/).

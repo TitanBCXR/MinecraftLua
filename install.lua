@@ -1,6 +1,6 @@
 --[[
   install.lua  -  Titan network installer (CC: Tweaked)
-  Titan-Version: 1.2.4
+  Titan-Version: 1.2.5
 
   Downloads the Titan bot-network system onto this device from a running
   `host.lua` on the same rednet network (no pastebin / external web host).
@@ -27,7 +27,7 @@ local KEEP_ALL = {
   "lib/router_hub_net.lua", "lib/router_hub_ui.lua", "lib/router_hub_cmd.lua",
   "offline_miner.lua", "offline_site.lua", "exclude.txt",
   "perimeter_sensor.lua", "perimeter_manager.lua", "tetris.lua", "minesweeper.lua",
-  "sandstorm.lua", "luigi_poker.lua",
+  "sandstorm.lua", "luigi_poker.lua", "slots.lua",
   "host.lua", "versions.lua", "install.lua",
 }
 
@@ -40,6 +40,8 @@ local GAMES = {
     files = { "sandstorm.lua" } },
   { key = "4", name = "Luigi Picture Poker", run = "luigi_poker.lua",
     files = { "luigi_poker.lua" } },
+  { key = "5", name = "Slots (3-reel)", run = "slots.lua",
+    files = { "slots.lua" } },
 }
 
 local ROLES = {
@@ -284,6 +286,7 @@ local LABELS = {
   ["minesweeper.lua"] = "Mines",
   ["sandstorm.lua"] = "Sandstorm",
   ["luigi_poker.lua"] = "LuigiPoker",
+  ["slots.lua"] = "Slots",
   ["host.lua"] = "TitanHost",
 }
 local lbl = role.run and LABELS[role.run]
