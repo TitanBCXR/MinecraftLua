@@ -1,6 +1,6 @@
 --[[
   titan.lua  -  Shared library for the Titan bot network (CC: Tweaked)
-  Titan-Version: 1.2.22
+  Titan-Version: 1.2.23
 
   Provides:
     * Rednet protocol constants + message type enum
@@ -9,6 +9,7 @@
     * GPS-based turtle navigation (moveTo, goHome, heading calibration)
     * Mesh storm control: announce prefers MAIN unicast + jittered registerLoop
     * Boot update check (host-only or GitHub via manifest.base — never hardcodes a public URL)
+    * Host OTA / install discover over the titan_router mesh (not RF-local only)
 
   Drop this file at:  lib/titan.lua  on EVERY computer & turtle,
   or copy it around with `pastebin`, disks, or `wget`.
@@ -1664,28 +1665,119 @@ local function otaWriteFile(path, data)
   local f = fs.open(path, "w"); f.write(data); f.close()
 end
 
-local function otaFindHost(timeout)
-  rednet.broadcast({ type = "discover" }, "titan_install")
-  local deadline = os.clock() + (timeout or 3)
+titan.INSTALL_PROTOCOL = "titan_install"
+
+local function otaRememberHost(id)
+  id = tonumber(id)
+  if not id then return end
+  local c = titan.readNetCfg()
+  c.installHostId = id
+  titan.writeNetCfg(c)
+end
+
+local function otaCachedHost()
+  local c = titan.readNetCfg()
+  return tonumber(c.installHostId)
+end
+
+-- Find install host: local titan_install RF first, then titan_router mesh via MAIN.
+function titan.findInstallHost(timeout)
+  timeout = tonumber(timeout) or 5
+  pcall(function()
+    if titan.openModem then titan.openModem() end
+  end)
+  local me = os.getComputerID()
+  local mainId = titan.getMainRouterId()
+  if not mainId then
+    mainId = select(1, titan.findMainRouter(2))
+  end
+
+  rednet.broadcast({ type = "discover" }, titan.INSTALL_PROTOCOL)
+  rednet.broadcast({
+    type = "install_discover", originId = me, from = me,
+  }, titan.ROUTER_PROTOCOL)
+  if mainId then
+    rednet.send(mainId, {
+      type = "install_discover", originId = me, from = me,
+    }, titan.ROUTER_PROTOCOL)
+    rednet.send(mainId, { type = "install_where", from = me }, titan.ROUTER_PROTOCOL)
+  end
+
+  local deadline = os.clock() + timeout
   while os.clock() < deadline do
-    local id, msg = rednet.receive("titan_install", deadline - os.clock())
-    if id == nil then break end
-    if type(msg) == "table" and msg.type == "host_here" then return id, msg end
+    local id, msg, proto = rednet.receive(nil, deadline - os.clock())
+    if type(msg) == "table" then
+      if msg.type == "host_here" and (proto == titan.INSTALL_PROTOCOL or proto == nil) then
+        otaRememberHost(id)
+        return id, msg
+      elseif msg.type == "install_host_here" then
+        local hostId = tonumber(msg.hostId) or id
+        if hostId then
+          otaRememberHost(hostId)
+          return hostId, msg
+        end
+      end
+    end
+  end
+
+  local cached = otaCachedHost()
+  if cached then
+    return cached, { type = "install_host_here", hostId = cached, cached = true }
   end
   return nil
 end
 
-local function otaFromHost(hostId, path)
-  rednet.send(hostId, { type = "get", path = path }, "titan_install")
-  local deadline = os.clock() + 6
+local function otaFindHost(timeout)
+  return titan.findInstallHost(timeout)
+end
+
+-- Pull one file from the install host (direct RF + mesh hop through MAIN).
+function titan.fetchFromInstallHost(hostId, path, timeout)
+  hostId = tonumber(hostId)
+  if not hostId or not path then return nil, "bad args" end
+  timeout = tonumber(timeout) or 8
+  local me = os.getComputerID()
+  local mainId = titan.getMainRouterId()
+  local req = {
+    type = "install_get",
+    path = path,
+    replyTo = me,
+    originId = me,
+    dest = hostId,
+    hostId = hostId,
+    from = me,
+  }
+  rednet.send(hostId, { type = "get", path = path }, titan.INSTALL_PROTOCOL)
+  rednet.send(hostId, req, titan.ROUTER_PROTOCOL)
+  if mainId then
+    rednet.send(mainId, req, titan.ROUTER_PROTOCOL)
+    rednet.send(mainId, {
+      type = "install_fwd",
+      dest = hostId,
+      payload = req,
+      replyTo = me,
+      from = me,
+    }, titan.ROUTER_PROTOCOL)
+  end
+
+  local deadline = os.clock() + timeout
   while os.clock() < deadline do
-    local id, msg = rednet.receive("titan_install", deadline - os.clock())
-    if id == hostId and type(msg) == "table" and msg.type == "file" and msg.path == path then
-      if msg.ok and msg.data then return msg.data end
-      return nil, "missing on host"
+    local id, msg, proto = rednet.receive(nil, deadline - os.clock())
+    if type(msg) == "table" and msg.path == path then
+      if msg.type == "file" and (proto == titan.INSTALL_PROTOCOL or id == hostId or msg.ok ~= nil) then
+        if msg.ok and msg.data then return msg.data end
+        return nil, "missing on host"
+      elseif msg.type == "install_file" then
+        if msg.ok and msg.data then return msg.data end
+        return nil, "missing on host"
+      end
     end
   end
   return nil, "timeout"
+end
+
+local function otaFromHost(hostId, path)
+  return titan.fetchFromInstallHost(hostId, path, 8)
 end
 
 local function otaBuildGetter(m)
@@ -1700,7 +1792,7 @@ local function otaBuildGetter(m)
       return otaHttp("https://pastebin.com/raw/" .. code .. "?cb=" .. os.epoch("utc"))
     end
   elseif m.source == "host" then
-    local hostId, hostMsg = otaFindHost(3)
+    local hostId, hostMsg = otaFindHost(5)
     if not hostId then return nil, "no install host online (run host.lua on the install computer)" end
     local hostFiles = {}
     if hostMsg and type(hostMsg.files) == "table" then
@@ -1747,7 +1839,7 @@ function titan.fetchRemoteCatalog(opts)
   local hostOnly = opts.hostOnly or (m and m.source == "host" and m.hostOnly ~= false)
 
   if hostOnly or (m and m.source == "host") then
-    local hostId = otaFindHost(3)
+    local hostId = otaFindHost(5)
     if not hostId then return nil, "no install host online (run host.lua)" end
     local data, err = otaFromHost(hostId, titan.VERSIONS_FILE)
     if not data then return nil, err end
@@ -1771,7 +1863,7 @@ function titan.fetchRemoteCatalog(opts)
   local base = titan.githubRawBase()
   if base then return titan.fetchGithubVersions(base) end
   -- Last resort: look for a rednet host (no URL required).
-  local hostId = otaFindHost(3)
+  local hostId = otaFindHost(5)
   if not hostId then return nil, "no update source (host offline, no github base)" end
   local data, err = otaFromHost(hostId, titan.VERSIONS_FILE)
   if not data then return nil, err end

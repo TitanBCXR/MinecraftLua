@@ -1,6 +1,6 @@
 --[[
   router_modem.lua  -  Titan MODEM cell runtime (CC: Tweaked)
-  Titan-Version: 1.4.1
+  Titan-Version: 1.4.2
 
   Short-range RF repeater cell. Loaded by router.lua when role=modem.
   Prefer: run `router` (detects role and auto-installs this file).
@@ -426,6 +426,83 @@ local function handleNetControl(id, msg)
       else
         netHopDeliver(dest, payload, msg.ttl)
       end
+    end
+    return true
+  end
+  return false
+end
+
+-- Bridge host.lua install / OTA (+ tetris LB) across cell -> home -> backbone.
+local installFwdSeen = {}
+local function installFwdDedup(key, ttl)
+  local tnow = os.clock()
+  if installFwdSeen[key] and installFwdSeen[key] > tnow then return false end
+  installFwdSeen[key] = tnow + (ttl or 4)
+  return true
+end
+
+local function handleInstallMesh(id, msg)
+  if type(msg) ~= "table" or type(msg.type) ~= "string" then return false end
+  local t = msg.type
+  if t ~= "install_discover" and t ~= "install_where" and t ~= "install_get"
+      and t ~= "install_file" and t ~= "install_host_here" and t ~= "install_fwd"
+      and t ~= "tetris_lb_get" and t ~= "tetris_lb_submit" and t ~= "tetris_lb" then
+    return false
+  end
+
+  local hub = homeRouterId
+  if not hub then
+    local c = loadRouterCfg() or {}
+    hub = tonumber(c.homeRouter) or tonumber(c.mainRouterId)
+  end
+  if t == "install_fwd" then
+    local dest = tonumber(msg.dest) or tonumber(msg.replyTo)
+    local payload = msg.payload
+    local key = "fwd|" .. tostring(dest) .. "|" .. tostring(payload and payload.type)
+      .. "|" .. tostring(payload and payload.path) .. "|" .. tostring(payload and payload.replyTo)
+    if not installFwdDedup(key, 3) then return true end
+    if dest then rednet.send(dest, payload, PROTO_ROUTER) end
+    if hub then rednet.send(hub, msg, PROTO_ROUTER) end
+    if dest then netHopDeliver(dest, payload, msg.ttl) end
+    return true
+  end
+
+  if t == "install_discover" or t == "install_where" then
+    local origin = tonumber(msg.originId) or tonumber(msg.replyTo) or id
+    if not installFwdDedup(t .. "|" .. tostring(origin), 2) then return true end
+    if hub then
+      rednet.send(hub, {
+        type = t, originId = origin, replyTo = origin, from = id, hop = true,
+      }, PROTO_ROUTER)
+    end
+    return true
+  end
+
+  if t == "install_get" or t == "tetris_lb_get" or t == "tetris_lb_submit" then
+    local dest = tonumber(msg.dest) or tonumber(msg.hostId)
+    local origin = tonumber(msg.replyTo) or tonumber(msg.originId) or id
+    msg.replyTo, msg.originId, msg.dest = origin, origin, dest
+    local key = t .. "|" .. tostring(dest) .. "|" .. tostring(origin) .. "|" .. tostring(msg.path or "")
+    if not installFwdDedup(key, 3) then return true end
+    if dest then rednet.send(dest, msg, PROTO_ROUTER) end
+    if hub then
+      rednet.send(hub, {
+        type = "install_fwd", dest = dest, payload = msg, replyTo = origin, from = id,
+      }, PROTO_ROUTER)
+    end
+    return true
+  end
+
+  if t == "install_file" or t == "install_host_here" or t == "tetris_lb" then
+    local dest = tonumber(msg.replyTo) or tonumber(msg.originId) or tonumber(msg.dest)
+    if not dest then return true end
+    local key = t .. "|" .. tostring(dest) .. "|" .. tostring(msg.path or msg.hostId or "")
+    if not installFwdDedup(key, 3) then return true end
+    rednet.send(dest, msg, PROTO_ROUTER)
+    if hub then
+      rednet.send(hub, {
+        type = "install_fwd", dest = dest, payload = msg, replyTo = dest, from = id,
+      }, PROTO_ROUTER)
     end
     return true
   end
@@ -1014,6 +1091,8 @@ local function modemLoop()
       id, msg = batch[bi][1], batch[bi][2]
     if type(msg) ~= "table" or not id then
       -- ignore
+    elseif handleInstallMesh(id, msg) then
+      -- host OTA / tetris LB bridged to home router
     elseif handleNetControl(id, msg) then
       -- topology / link / hop
     elseif msg.type == "main_claim" or msg.type == "main_here" then

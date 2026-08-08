@@ -1,24 +1,30 @@
 --[[
   host.lua  -  Titan install / update host + Tetris leaderboard (CC: Tweaked)
-  Titan-Version: 1.2.3
+  Titan-Version: 1.2.4
 
   Run this on ONE computer that already has the Titan files (your "update
   server"). It serves those files over rednet so pockets and other devices can
   install / OTA without storing any GitHub / wget URL on the clients.
 
+  File serving uses both:
+    * titan_install  — direct / local RF
+    * titan_router   — mesh hops through your MAIN / extender / modem cells
+
   Tetris leaderboard lives on a floppy disk in an attached disk drive
   (tetris_leaderboard.cfg), keyed by player name. Attach a drive + leave a
-  disk inserted. Tablets sync on boot / after games via titan_install.
+  disk inserted. Tablets sync on boot / after games via titan_install + mesh.
 
   Usage:
     1. Keep this machine updated (you may wget/GitHub here — clients never see it).
     2. Wireless (or ender) modem + disk drive with floppy + run:  host
-    3. Give out tablets via install.lua role `t` (or disk copy).
+    3. Join the Titan router mesh (same as other devices).
+    4. Give out tablets via install.lua role `t` (or disk copy).
 
   Only serves files on the published list. Ctrl+T to stop.
 ]]
 
 local PROTOCOL = "titan_install"
+local ROUTER_PROTOCOL = "titan_router"
 local LB_NAME = "tetris_leaderboard.cfg"
 local LB_LOCAL_LEGACY = "tetris_leaderboard.cfg" -- migrate once from computer FS
 local LB_MAX = 25 -- keep extras; tablets only display top 3
@@ -315,51 +321,150 @@ else
   print(("Tetris leaderboard (RAM): %d entr%s"):format(
     #leaderboard, #leaderboard == 1 and "y" or "ies"))
 end
-print("Clients update over rednet (no GitHub URL on tablets).")
+print("Clients update over rednet + titan_router mesh (no GitHub URL on tablets).")
 print("Mesh relay on. Ctrl+T to stop.")
 print("")
 
+local function replyHostHere(dest, viaId)
+  dest = tonumber(dest)
+  if not dest then return end
+  local files = manifest()
+  local label = os.getComputerLabel()
+  local hostId = os.getComputerID()
+  rednet.send(dest, {
+    type = "host_here",
+    label = label,
+    files = files,
+    tetrisLb = true,
+    hostId = hostId,
+  }, PROTOCOL)
+  local mesh = {
+    type = "install_host_here",
+    hostId = hostId,
+    label = label,
+    files = files,
+    tetrisLb = true,
+    replyTo = dest,
+    originId = dest,
+    from = hostId,
+  }
+  rednet.send(dest, mesh, ROUTER_PROTOCOL)
+  if viaId and viaId ~= dest then
+    rednet.send(viaId, mesh, ROUTER_PROTOCOL)
+    rednet.send(viaId, {
+      type = "install_fwd",
+      dest = dest,
+      payload = mesh,
+      replyTo = dest,
+      from = hostId,
+    }, ROUTER_PROTOCOL)
+  end
+end
+
+local function replyFile(dest, path, viaId)
+  dest = tonumber(dest)
+  if not dest then return end
+  local data = readFile(path)
+  local hostId = os.getComputerID()
+  rednet.send(dest, {
+    type = "file", path = path, ok = data ~= nil, data = data,
+  }, PROTOCOL)
+  local mesh = {
+    type = "install_file",
+    path = path,
+    ok = data ~= nil,
+    data = data,
+    replyTo = dest,
+    originId = dest,
+    from = hostId,
+  }
+  rednet.send(dest, mesh, ROUTER_PROTOCOL)
+  if viaId and viaId ~= dest then
+    rednet.send(viaId, mesh, ROUTER_PROTOCOL)
+    rednet.send(viaId, {
+      type = "install_fwd",
+      dest = dest,
+      payload = mesh,
+      replyTo = dest,
+      from = hostId,
+    }, ROUTER_PROTOCOL)
+  end
+  print(("[get] %s -> #%d (%s)"):format(
+    tostring(path), dest, data and (#data .. "b") or "missing"))
+end
+
+local function replyLb(dest, viaId)
+  dest = tonumber(dest)
+  if not dest then return end
+  local payload = {
+    type = "tetris_lb",
+    ok = true,
+    entries = boardSnapshot(),
+    replyTo = dest,
+    from = os.getComputerID(),
+  }
+  rednet.send(dest, payload, PROTOCOL)
+  rednet.send(dest, payload, ROUTER_PROTOCOL)
+  if viaId and viaId ~= dest then
+    rednet.send(viaId, {
+      type = "install_fwd",
+      dest = dest,
+      payload = payload,
+      replyTo = dest,
+    }, ROUTER_PROTOCOL)
+  end
+end
+
+local function handleServeMsg(id, msg, proto)
+  if type(msg) ~= "table" or not msg.type then return end
+  local t = msg.type
+
+  if t == "discover" or t == "install_discover" then
+    local dest = tonumber(msg.originId) or tonumber(msg.replyTo) or id
+    replyHostHere(dest, id)
+    print(("[discover/%s] #%d -> reply #%d"):format(tostring(proto), id, dest))
+
+  elseif t == "get" or t == "install_get" then
+    local dest = tonumber(msg.replyTo) or tonumber(msg.originId) or id
+    replyFile(dest, msg.path, id)
+
+  elseif t == "tetris_lb_get" then
+    local dest = tonumber(msg.replyTo) or tonumber(msg.originId) or id
+    replyLb(dest, id)
+    print(("[tetris_lb] get -> #%d (%d)"):format(dest, #leaderboard))
+
+  elseif t == "tetris_lb_submit" then
+    local dest = tonumber(msg.replyTo) or tonumber(msg.originId) or id
+    local score = tonumber(msg.score) or 0
+    local name = msg.name or msg.hostname or ("#" .. tostring(id))
+    local ok = submitScore(msg.playerId or id, name, score)
+    local payload = {
+      type = "tetris_lb",
+      ok = ok,
+      entries = boardSnapshot(),
+      accepted = ok,
+      replyTo = dest,
+      from = os.getComputerID(),
+    }
+    rednet.send(dest, payload, PROTOCOL)
+    rednet.send(dest, payload, ROUTER_PROTOCOL)
+    if id ~= dest then
+      rednet.send(id, {
+        type = "install_fwd",
+        dest = dest,
+        payload = payload,
+        replyTo = dest,
+      }, ROUTER_PROTOCOL)
+    end
+    print(("[tetris_lb] #%d %s = %d"):format(id, tostring(name):sub(1, 12), score))
+  end
+end
+
 local function serveLoop()
   while true do
-    local id, msg = rednet.receive(PROTOCOL)
-    if type(msg) == "table" then
-      if msg.type == "discover" then
-        rednet.send(id, {
-          type  = "host_here",
-          label = os.getComputerLabel(),
-          files = manifest(),
-          tetrisLb = true,
-        }, PROTOCOL)
-        print(("[discover] #%d"):format(id))
-
-      elseif msg.type == "get" then
-        local data = readFile(msg.path)
-        rednet.send(id, {
-          type = "file", path = msg.path, ok = data ~= nil, data = data,
-        }, PROTOCOL)
-        print(("[get] %s -> #%d (%s)"):format(
-          tostring(msg.path), id, data and (#data .. "b") or "missing"))
-
-      elseif msg.type == "tetris_lb_get" then
-        rednet.send(id, {
-          type = "tetris_lb",
-          ok = true,
-          entries = boardSnapshot(),
-        }, PROTOCOL)
-        print(("[tetris_lb] get -> #%d (%d)"):format(id, #leaderboard))
-
-      elseif msg.type == "tetris_lb_submit" then
-        local score = tonumber(msg.score) or 0
-        local name = msg.name or msg.hostname or ("#" .. tostring(id))
-        local ok = submitScore(msg.playerId or id, name, score)
-        rednet.send(id, {
-          type = "tetris_lb",
-          ok = ok,
-          entries = boardSnapshot(),
-          accepted = ok,
-        }, PROTOCOL)
-        print(("[tetris_lb] #%d %s = %d"):format(id, tostring(name):sub(1, 12), score))
-      end
+    local id, msg, proto = rednet.receive(nil)
+    if proto == PROTOCOL or proto == ROUTER_PROTOCOL then
+      handleServeMsg(id, msg, proto)
     end
   end
 end

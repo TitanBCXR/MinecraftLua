@@ -35,11 +35,11 @@ local HUB_PARTS = {
 local MIN_VER = {
   ["router.lua"] = "1.4.4",
   ["router_main.lua"] = "1.4.2",
-  ["router_modem.lua"] = "1.4.1",
-  ["lib/router_hub_net.lua"] = "1.4.3",
+  ["router_modem.lua"] = "1.4.2",
+  ["lib/router_hub_net.lua"] = "1.4.4",
   ["lib/router_hub_ui.lua"] = "1.4.3",
   ["lib/router_hub_cmd.lua"] = "1.4.2",
-  ["lib/titan.lua"] = "1.2.22",
+  ["lib/titan.lua"] = "1.2.23",
 }
 
 --------------------------------------------------------------------------------

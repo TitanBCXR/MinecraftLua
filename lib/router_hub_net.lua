@@ -1,11 +1,14 @@
 --[[
   lib/router_hub_net.lua  -  Titan hub networking / roster / OTA (part)
-  Titan-Version: 1.4.3
+  Titan-Version: 1.4.4
 
   Loaded by router_main.lua into a shared env (setfenv). Do not run directly.
 
   Fleet net: debounced net_link_hello / fleet_map flushes + burst drain on
   the directory receive loop (same storm-control approach as quarry site).
+
+  Also bridges install-host OTA (install_discover / install_get / install_file)
+  across the ender backbone so host.lua updates reach cell tablets.
 ]]
 
 function loadRouterCfg()
@@ -1467,6 +1470,183 @@ function deliverPerimeterFwd(msg)
   return true
 end
 
+-- Bridge host.lua install / OTA traffic across modem cells + ender backbone.
+installFwdSeen = installFwdSeen or {}
+local function installFwdDedup(key, ttl)
+  local now = os.clock()
+  if installFwdSeen[key] and installFwdSeen[key] > now then return false end
+  installFwdSeen[key] = now + (ttl or 4)
+  if math.random(1, 25) == 1 then
+    for k, exp in pairs(installFwdSeen) do
+      if exp <= now then installFwdSeen[k] = nil end
+    end
+  end
+  return true
+end
+
+function deliverInstallPayload(dest, payload)
+  dest = tonumber(dest)
+  if not dest or type(payload) ~= "table" then return false end
+  payload.via = os.getComputerID()
+  rednet.send(dest, payload, PROTO_ROUTER)
+  rednet.send(dest, payload, "titan_net")
+  if dest ~= os.getComputerID() then
+    netHopDeliver(dest, payload)
+  end
+  return true
+end
+
+function handleInstallMesh(id, msg)
+  if type(msg) ~= "table" or type(msg.type) ~= "string" then return false end
+  local t = msg.type
+  if t ~= "install_discover" and t ~= "install_where" and t ~= "install_get"
+      and t ~= "install_file" and t ~= "install_host_here" and t ~= "install_fwd"
+      and t ~= "tetris_lb_get" and t ~= "tetris_lb_submit" and t ~= "tetris_lb" then
+    return false
+  end
+
+  if t == "install_fwd" then
+    local dest = tonumber(msg.dest) or tonumber(msg.replyTo)
+    local payload = msg.payload
+    local key = "fwd|" .. tostring(dest) .. "|" .. tostring(payload and payload.type) .. "|"
+      .. tostring(payload and payload.path) .. "|" .. tostring(payload and payload.replyTo)
+      .. "|" .. tostring(msg.from or id)
+    if not installFwdDedup(key, 3) then return true end
+    if isModemRole() and homeRouterId and dest ~= os.getComputerID() then
+      rednet.send(dest, payload, PROTO_ROUTER)
+      rednet.send(homeRouterId, msg, PROTO_ROUTER)
+    else
+      deliverInstallPayload(dest, payload)
+    end
+    return true
+  end
+
+  if t == "install_discover" or t == "install_where" then
+    local origin = tonumber(msg.originId) or tonumber(msg.replyTo) or id
+    local key = t .. "|" .. tostring(origin) .. "|" .. tostring(id)
+    if not installFwdDedup(key, 2) then return true end
+
+    if isModemRole() and homeRouterId then
+      rednet.send(homeRouterId, {
+        type = t,
+        originId = origin,
+        replyTo = origin,
+        from = id,
+        hop = true,
+      }, PROTO_ROUTER)
+      return true
+    end
+
+    if isBackbone() or isMain() then
+      local hosts = listOnlineKind("host")
+      if #hosts == 0 then
+        -- Also accept TitanHost labels that haven't hello'd as kind=host yet.
+        for hid, d in pairs(seen) do
+          if isOnline(d) then
+            local name = tostring(d.hostname or d.name or ""):lower()
+            if name:find("host", 1, true) or tostring(d.kind or "") == "host" then
+              hosts[#hosts + 1] = { id = hid, name = d.hostname or d.name }
+            end
+          end
+        end
+      end
+      for _, h in ipairs(hosts) do
+        rednet.send(origin, {
+          type = "install_host_here",
+          hostId = h.id,
+          label = h.name,
+          via = os.getComputerID(),
+          ok = true,
+          replyTo = origin,
+        }, PROTO_ROUTER)
+        local disc = {
+          type = "install_discover",
+          originId = origin,
+          replyTo = origin,
+          from = os.getComputerID(),
+          hop = true,
+        }
+        deliverInstallPayload(h.id, disc)
+      end
+      for peerId in pairs(netPeers) do
+        if peerId ~= id and peerId ~= origin then
+          rednet.send(peerId, {
+            type = "install_discover",
+            originId = origin,
+            replyTo = origin,
+            from = os.getComputerID(),
+            hop = true,
+          }, PROTO_ROUTER)
+        end
+      end
+      for cellId in pairs(netCells) do
+        if cellId ~= id and cellId ~= origin then
+          rednet.send(cellId, {
+            type = "install_discover",
+            originId = origin,
+            replyTo = origin,
+            from = os.getComputerID(),
+            hop = true,
+          }, PROTO_ROUTER)
+        end
+      end
+    end
+    return true
+  end
+
+  if t == "install_get" or t == "tetris_lb_get" or t == "tetris_lb_submit" then
+    local dest = tonumber(msg.dest) or tonumber(msg.hostId)
+    local origin = tonumber(msg.replyTo) or tonumber(msg.originId) or id
+    if not dest then
+      local hosts = listOnlineKind("host")
+      if hosts[1] then dest = hosts[1].id end
+    end
+    if not dest then return true end
+    msg.replyTo = origin
+    msg.originId = origin
+    msg.dest = dest
+    local key = t .. "|" .. tostring(dest) .. "|" .. tostring(origin) .. "|" .. tostring(msg.path or msg.score or "")
+    if not installFwdDedup(key, 3) then return true end
+    if isModemRole() and homeRouterId then
+      rednet.send(dest, msg, PROTO_ROUTER)
+      rednet.send(homeRouterId, {
+        type = "install_fwd",
+        dest = dest,
+        payload = msg,
+        replyTo = origin,
+        from = id,
+      }, PROTO_ROUTER)
+    else
+      deliverInstallPayload(dest, msg)
+    end
+    return true
+  end
+
+  if t == "install_file" or t == "install_host_here" or t == "tetris_lb" then
+    local dest = tonumber(msg.replyTo) or tonumber(msg.originId) or tonumber(msg.dest)
+    if not dest or dest == os.getComputerID() then return true end
+    local key = t .. "|" .. tostring(dest) .. "|" .. tostring(msg.path or msg.hostId or "") .. "|" .. tostring(id)
+    if not installFwdDedup(key, 3) then return true end
+    if isModemRole() then
+      rednet.send(dest, msg, PROTO_ROUTER)
+      if homeRouterId then
+        rednet.send(homeRouterId, {
+          type = "install_fwd",
+          dest = dest,
+          payload = msg,
+          replyTo = dest,
+          from = id,
+        }, PROTO_ROUTER)
+      end
+    else
+      deliverInstallPayload(dest, msg)
+    end
+    return true
+  end
+
+  return false
+end
+
 --------------------------------------------------------------------------------
 -- 1) Repeater  (faithful to the built-in `repeat` program)
 -- Bridges wireless <-> wired by re-transmitting on every open modem.
@@ -1717,7 +1897,9 @@ function directoryLoop()
       if msg.type == "quarry_sos" or msg.type == "quarry_sos_clear" then
         noteTurtleSos(id, msg)
       end
-      if proto == PROTO_ROUTER and handleNetControl(id, msg) then
+      if proto == PROTO_ROUTER and handleInstallMesh(id, msg) then
+        -- Host OTA / tetris LB bridged across the mesh.
+      elseif proto == PROTO_ROUTER and handleNetControl(id, msg) then
         if msg.type == "net_link_hello" or msg.type == "net_topo" then
           ingestRemoteTopology(id, msg)
         end

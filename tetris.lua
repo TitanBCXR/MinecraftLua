@@ -1,6 +1,6 @@
 --[[
   tetris.lua  -  Standalone Tetris for CC: Tweaked (pocket / computer)
-  Titan-Version: 1.0.8
+  Titan-Version: 1.0.10
 
   Drop on a pocket PC and run:
 
@@ -14,8 +14,8 @@
   prompts for a name after a game (saved in tetris.cfg). That name is what
   appears on the shared leaderboard.
 
-  Boot: host-only OTA + leaderboard sync + 3s Q-disclaimer
-  (run host.lua on your update server).
+  Boot: host-only OTA over the titan_router mesh + leaderboard sync + 5s
+  Q-disclaimer (run host.lua on your update server; join the router mesh).
 
   Color pocket: colored pieces. Mono: letter blocks.
 ]]
@@ -24,6 +24,7 @@ local CFG = "tetris.cfg"
 local COLS, ROWS = 10, 18
 local KIND = "tetris"
 local INSTALL_PROTO = "titan_install"
+local ROUTER_PROTO = "titan_router"
 local SIDE_W = 5 -- compact HUD column (score uses K/M/B/T)
 local LB_TOP = 3 -- only show top 3 on menu
 local PLAYER_RANGE = 8
@@ -133,13 +134,26 @@ local function formatScore(n)
 end
 
 local function findInstallHost(timeout)
-  timeout = tonumber(timeout) or 3
+  if titan and titan.findInstallHost then
+    return titan.findInstallHost(timeout or 5)
+  end
+  timeout = tonumber(timeout) or 5
+  local me = os.getComputerID()
+  local mainId = titan and titan.getMainRouterId and titan.getMainRouterId()
   rednet.broadcast({ type = "discover" }, INSTALL_PROTO)
+  rednet.broadcast({ type = "install_discover", originId = me, from = me }, ROUTER_PROTO)
+  if mainId then
+    rednet.send(mainId, { type = "install_discover", originId = me, from = me }, ROUTER_PROTO)
+    rednet.send(mainId, { type = "install_where", from = me }, ROUTER_PROTO)
+  end
   local deadline = os.clock() + timeout
   while os.clock() < deadline do
-    local id, msg = rednet.receive(INSTALL_PROTO, deadline - os.clock())
-    if id and type(msg) == "table" and msg.type == "host_here" then
-      return id, msg
+    local id, msg, proto = rednet.receive(nil, deadline - os.clock())
+    if type(msg) == "table" then
+      if msg.type == "host_here" then return id, msg end
+      if msg.type == "install_host_here" then
+        return tonumber(msg.hostId) or id, msg
+      end
     end
   end
   return nil
@@ -147,28 +161,47 @@ end
 
 -- Pull board; optionally submit a score under playerName. Returns entries or nil.
 local function syncLeaderboard(submitScore, playerName)
-  local hostId = findInstallHost(2.5)
+  local hostId = findInstallHost(5)
   if not hostId then return nil, "no host" end
   local name = sanitizeName(playerName)
     or sanitizeName(PLAYER_NAME)
     or sanitizeName(detectNearbyPlayer())
     or ("P" .. tostring(os.getComputerID()))
+  local me = os.getComputerID()
+  local mainId = titan and titan.getMainRouterId and titan.getMainRouterId()
   local req
   if submitScore and (tonumber(submitScore) or 0) > 0 then
     req = {
       type = "tetris_lb_submit",
-      playerId = os.getComputerID(),
+      playerId = me,
       name = name,
       score = math.floor(tonumber(submitScore) or 0),
+      replyTo = me,
+      originId = me,
+      dest = hostId,
+      hostId = hostId,
     }
   else
-    req = { type = "tetris_lb_get" }
+    req = {
+      type = "tetris_lb_get",
+      replyTo = me,
+      originId = me,
+      dest = hostId,
+      hostId = hostId,
+    }
   end
   rednet.send(hostId, req, INSTALL_PROTO)
-  local deadline = os.clock() + 3
+  rednet.send(hostId, req, ROUTER_PROTO)
+  if mainId then
+    rednet.send(mainId, req, ROUTER_PROTO)
+    rednet.send(mainId, {
+      type = "install_fwd", dest = hostId, payload = req, replyTo = me, from = me,
+    }, ROUTER_PROTO)
+  end
+  local deadline = os.clock() + 5
   while os.clock() < deadline do
-    local id, msg = rednet.receive(INSTALL_PROTO, deadline - os.clock())
-    if id == hostId and type(msg) == "table" and msg.type == "tetris_lb" then
+    local id, msg = rednet.receive(nil, deadline - os.clock())
+    if type(msg) == "table" and msg.type == "tetris_lb" then
       if type(msg.entries) == "table" then
         LEADERBOARD = msg.entries
         return LEADERBOARD
@@ -552,7 +585,7 @@ local function runGame()
     elseif ev == "key" and not over then
       local k = p1
       local K = keys
-      if k == K.p then
+      if k == K.p or (K.pause and k == K.pause) then
         paused = not paused
         dirty = true
         if not paused then
@@ -620,15 +653,13 @@ local function runGame()
         return score
       end
     elseif ev == "char" and not over then
+      -- Q only here as a fallback; pause is key-only so CC's paired
+      -- key+char for "p" does not toggle pause twice (appear broken).
       local ch = tostring(p1 or ""):lower()
       if ch == "q" then
         TRACK.playing = false
         TRACK.score = 0
         return 0
-      end
-      if ch == "p" then
-        paused = not paused
-        dirty = true
       end
     elseif ev == "terminate" then
       TRACK.playing = false
@@ -850,8 +881,8 @@ local function showQuitDisclaimer()
     text(2, y, msg[i], colors.white, colors.black)
     y = y + 1
   end
-  text(2, th, "Continuing in 3s...", colors.gray, colors.black)
-  sleep(3)
+  text(2, th, "Continuing in 5s...", colors.gray, colors.black)
+  sleep(5)
   drainInputEvents()
 end
 
@@ -929,7 +960,7 @@ local function sendTrackerBeacon()
     name = host,
     hostname = host,
     mainRouterId = titan.getMainRouterId and titan.getMainRouterId() or nil,
-    version = titan.systemVersion and titan.systemVersion() or "1.0.8",
+    version = titan.systemVersion and titan.systemVersion() or "1.0.10",
     game = "tetris",
     playing = TRACK.playing and true or false,
     score = TRACK.score,
@@ -1022,10 +1053,30 @@ local function bootCheckUpdates()
     end
   end
 
+  -- Join mesh first so host OTA can hop through MAIN / cell modems.
+  if titan and titan.findMainRouter then
+    print("Finding mesh router...")
+    local mainId = titan.findMainRouter(3)
+    if mainId then
+      print("Main router #" .. tostring(mainId))
+      if titan.announce then pcall(titan.announce, KIND) end
+    else
+      print("No main router yet — trying host anyway.")
+    end
+  end
+
   if titan and titan.bootUpdateCheck then
-    print("Checking for updates...")
-    if titan.writePackageList and not titan.readPackageList() then
+    print("Checking for updates (host via mesh)...")
+    if titan.writePackageList then
+      -- Always keep tetris on the desired list (old installs sometimes omitted it).
       titan.writePackageList({ "lib/titan.lua", "tetris.lua", "versions.lua" })
+    end
+    if titan.ensureHostManifest then
+      titan.ensureHostManifest({
+        role = "Tetris (pocket game + mesh tracker)",
+        run = "tetris.lua",
+        files = { "lib/titan.lua", "tetris.lua", "versions.lua" },
+      })
     end
     local updated, detail = titan.bootUpdateCheck({
       quiet = false,
@@ -1046,6 +1097,8 @@ local function bootCheckUpdates()
         print(msg)
       end
     end
+  else
+    print("lib/titan.lua missing OTA — reinstall role t from host.")
   end
 
   print("Syncing leaderboard...")
