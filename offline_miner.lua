@@ -1,6 +1,6 @@
 --[[
   offline_miner.lua  -  Local quarry turtle (optional site board)
-  Titan-Version: 1.4.2
+  Titan-Version: 1.4.3
 
   Place the turtle at the TOP-FRONT-LEFT corner of the dig, facing into the
   mine. That cell is origin 0,0,0:
@@ -56,7 +56,7 @@ local MODEM_SLOT = 15   -- wireless modem; swapped only with RIGHT pickaxe
 local PICK_SIDE = "right"  -- turtle upgrade slot 2 — never touch left (loaders)
 local MIN_FUEL = 200
 -- Keep in sync with Titan-Version header (label uses major.minor → V1.4-Miner12).
-local MINER_VERSION = "1.4.2"
+local MINER_VERSION = "1.4.3"
 local STOP = false
 local PROTO_QUARRY = "titan_quarry"
 local PROTO_NET = "titan_net"
@@ -970,6 +970,20 @@ local function clearJobFile(opts)
   if not opts.keepSite and siteSendJob then siteSendJob(nil, true) end
 end
 
+-- Drop local dig memory so the next `mine` takes a fresh site claim.
+local function clearLocalMineMemory(opts)
+  opts = opts or {}
+  clearJobFile({ keepSite = opts.keepSite == true })
+  adminAssign = nil
+  cfg.pendingAssign = nil
+  rebandClaim = nil
+  pendingReband = nil
+  pendingResetGo = nil
+  saveCfg()
+  if activeJob then activeJob = nil end
+  jobLabel = "idle"
+end
+
 local function jobSummary(j)
   if not j then return "(none)" end
   if j.type == "area" then
@@ -1571,12 +1585,15 @@ local function applyQuarryAssign(msg, fromId)
     y0 = y0, y1 = y1,
     assignId = msg.assignId,
     from = fromId or msg.from,
+    fromAdmin = true,
     W = tonumber(msg.W), L = tonumber(msg.L), H = tonumber(msg.H),
   }
   cfg.pendingAssign = adminAssign
   saveCfg()
   siteInfo = siteInfo or {}
   siteInfo.y0, siteInfo.y1 = y0, y1
+  siteInfo.x0, siteInfo.x1, siteInfo.z0, siteInfo.z1 = nil, nil, nil, nil
+  siteInfo.pattern = "layer"
   if adminAssign.W then siteInfo.W = adminAssign.W end
   if adminAssign.L then siteInfo.L = adminAssign.L end
   if adminAssign.H then siteInfo.H = adminAssign.H end
@@ -2078,6 +2095,7 @@ handleQuarryNetMsg = function(id, msg)
     siteInfo = msg
     maxTravel = tonumber(msg.maxTravel) or maxTravel
     cfg.siteId = id
+    if msg.pattern then cfg.pattern = normalizePattern(msg.pattern) or cfg.pattern end
     saveCfg()
     -- Only start a reband from welcome if we are idle (not already in one).
     local ep = tonumber(msg.rebandEpoch) or 0
@@ -2097,6 +2115,19 @@ handleQuarryNetMsg = function(id, msg)
         }
         STOP = true
       end
+    end
+  elseif t == "quarry_fleet_clear" then
+    -- Site wiped miner data / changed pattern — drop local dig memory.
+    print("\n[site] fleet clear — forgetting local job + assign ("
+      .. tostring(msg.reason or "?") .. ")")
+    STOP = true
+    digging = false
+    clearLocalMineMemory({ keepSite = true })
+    if msg.pattern then
+      cfg.pattern = normalizePattern(msg.pattern) or cfg.pattern
+      siteInfo = siteInfo or {}
+      siteInfo.pattern = cfg.pattern
+      saveCfg()
     end
   end
 end
@@ -2860,6 +2891,8 @@ local function runClaimBand(claim, fromOrigin, existingJob)
     }
   else
     j.site = true
+    j.pattern = "layer"
+    j.x0, j.x1, j.z0, j.z1 = nil, nil, nil, nil
     j.y0 = y0
     j.y1 = y1
     j.W = W
@@ -2877,7 +2910,10 @@ local function runClaimBand(claim, fromOrigin, existingJob)
     local unitsN = tonumber(j.total) or 1
     j.idx = math.max(1, math.min(cidx, unitsN + 1))
   end
-  adminAssign = { y0 = y0, y1 = y1, W = W, L = L, continueIdx = j.idx }
+  adminAssign = {
+    y0 = y0, y1 = y1, W = W, L = L, pattern = "layer",
+    continueIdx = j.idx, fromAdmin = false,
+  }
   cfg.pendingAssign = adminAssign
   saveCfg()
   siteSendJob(j)
@@ -2906,9 +2942,18 @@ local function claimFromAdminAssign()
     adminAssign = cfg.pendingAssign
   end
   if not adminAssign then return nil end
+  -- Only honor *tablet* locks here. Stale local pendingAssign must not override
+  -- the site board (that caused shared XZ bands / wrong layer digs).
+  if not adminAssign.fromAdmin and not adminAssign.assignId then
+    return nil
+  end
+  local sitePat = normalizePattern(siteInfo and siteInfo.pattern)
+    or normalizePattern(cfg.pattern)
   -- Site column mode uses 2×2 XZ claims from the board; ignore stale tablet Y assigns.
-  local sitePat = siteInfo and tostring(siteInfo.pattern or "")
   if sitePat == "column" and adminAssign.x0 == nil then
+    return nil
+  end
+  if sitePat == "layer" and adminAssign.x0 ~= nil then
     return nil
   end
   if adminAssign.x0 ~= nil then
@@ -3008,25 +3053,28 @@ local function digSiteMine(opts)
     end
     STOP = false
 
-    -- Tablet / saved assign wins over site auto-claim (prevents every bot
-    -- taking Y0..N when the site still has a stale shared claim).
+    -- Site board is authoritative for pattern + unique bands.
+    -- Tablet assign only when site is offline or after an explicit admin lock.
     local claim = nil
     if rebandClaim and not pendingReband then
       claim = rebandClaim
       rebandClaim = nil
     end
-    if not claim then claim = claimFromAdminAssign() end
-    if claim then
-      if claim.x0 ~= nil then
-        print(("Using assign column X%d-%d Z%d-%d  continue@%s"):format(
-          claim.x0, claim.x1 or claim.x0, claim.z0, claim.z1 or claim.z0,
-          tostring(claim.continueIdx or 1)))
-      else
-        print(("Using tablet/site assign Y %d..%d  continue@%s"):format(
-          claim.y0, claim.y1, tostring(claim.continueIdx or 1)))
-      end
-    elseif siteId then
+    if not claim and siteId then
       claim = claimBand(bandsDone > 0)
+    end
+    if not claim then
+      claim = claimFromAdminAssign()
+      if claim then
+        if claim.x0 ~= nil then
+          print(("Using tablet assign column X%d-%d Z%d-%d  continue@%s"):format(
+            claim.x0, claim.x1 or claim.x0, claim.z0, claim.z1 or claim.z0,
+            tostring(claim.continueIdx or 1)))
+        else
+          print(("Using tablet assign Y %d..%d  continue@%s"):format(
+            claim.y0, claim.y1, tostring(claim.continueIdx or 1)))
+        end
+      end
     end
     if claim and claim.fromAdmin and bandsDone > 0 then
       print("Admin Y band finished — set a new assign on the tablet, or use site claims.")
@@ -3035,20 +3083,22 @@ local function digSiteMine(opts)
     if not claim then
       if bandsDone == 0 then
         print("No free claims. Site needs `setup WxL H`, or all regions are taken/done.")
-        print("Site: `pattern column|layer`  |  `claims` / `clearclaims`")
-        print("Tablet: `quarry assign <id> <y0> <y1>` (layer mode)")
+        print("Site: `pattern column|layer`  |  `claims` / `clear` / `reband`")
+        print("Tablet: `quarry assign <id> <y0> <y1>` (layer mode only)")
       else
         print("No more free claims — this turtle is done.")
       end
       return
     end
 
-    -- Remember assign so reboots / site sync keep this turtle on its claim.
+    -- Cache last site claim for UI; do NOT treat as tablet override on reboot.
     adminAssign = {
       y0 = claim.y0, y1 = claim.y1,
       x0 = claim.x0, x1 = claim.x1, z0 = claim.z0, z1 = claim.z1,
       W = claim.W, L = claim.L, pattern = claim.pattern,
       continueIdx = claim.continueIdx,
+      fromAdmin = claim.fromAdmin == true,
+      assignId = claim.assignId,
     }
     cfg.pendingAssign = adminAssign
     saveCfg()
@@ -3059,21 +3109,30 @@ local function digSiteMine(opts)
     siteInfo.W, siteInfo.L = claim.W or siteInfo.W, claim.L or siteInfo.L
     siteInfo.pattern = claim.pattern or siteInfo.pattern
     siteInfo.continueIdx = claim.continueIdx
+    cfg.pattern = normalizePattern(claim.pattern) or cfg.pattern
+    saveCfg()
 
     local stored = nil
+    local sitePat = normalizePattern(claim.pattern) or "column"
     if prior and prior.status ~= "done" then
+      local priorPat = normalizePattern(prior.pattern)
+        or ((prior.x0 ~= nil) and "column") or "layer"
+      local samePat = priorPat == sitePat
       local sameCol = claim.x0 ~= nil
         and tonumber(prior.x0) == tonumber(claim.x0)
         and tonumber(prior.z0) == tonumber(claim.z0)
       local sameY = claim.x0 == nil
         and tonumber(prior.y0) == tonumber(claim.y0)
         and tonumber(prior.y1) == tonumber(claim.y1)
-      if sameCol or sameY then
+      if samePat and (sameCol or sameY) then
         stored = prior
         if claim.continueIdx then
           stored.idx = math.max(tonumber(stored.idx) or 1, tonumber(claim.continueIdx) or 1)
         end
         print("Resuming matching job for claim @ " .. tostring(stored.idx))
+      else
+        print("Dropping local job — does not match site claim/pattern.")
+        clearJobFile({ keepSite = true })
       end
     elseif claim.resume and siteId and not claim.fromAdmin then
       stored = fetchJobFromSite(3, true)
@@ -3182,17 +3241,28 @@ end
 local function continueJob(opts)
   opts = opts or {}
   local auto = opts.auto == true
+  -- Online + site: board owns pattern + unique bands. digSiteMine asks the
+  -- site, then resumes a local job only when it matches that claim.
+  if isOnlineMode() and (siteId or joinSite(4, true)) then
+    local j = loadJobFile()
+    local sitePat = normalizePattern(siteInfo and siteInfo.pattern)
+      or normalizePattern(cfg.pattern)
+    if j and sitePat then
+      local jPat = normalizePattern(j.pattern)
+        or ((j.x0 ~= nil) and "column") or ((j.y0 ~= nil) and "layer") or nil
+      if jPat and jPat ~= sitePat then
+        print(("Local job is %s but site is %s — clearing and re-claiming."):format(
+          jPat, sitePat))
+        clearLocalMineMemory({ keepSite = true })
+      end
+    end
+    print("Site mine — claim/pattern from board...")
+    digSiteMine({ fromOrigin = true })
+    return true
+  end
+
   local j, src = resolveResumeJob(auto)
   if not j then
-    if isOnlineMode() and (siteId or joinSite(4, true)) then
-      if auto then
-        print("No in-progress job on site — idle.")
-        return false
-      end
-      print("No saved job — claiming from the site...")
-      digSiteMine({ fromOrigin = true })
-      return true
-    end
     if not auto then
       if isOfflineMode() then
         print("No saved job. Offline mode: start with area / box / tunnel.")
@@ -3358,10 +3428,8 @@ local function handleCommand(line)
     if not j then print("No saved job.")
     else print(jobSummary(j)) end
   elseif cmd == "clearjob" or cmd == "forgetjob" or cmd == "clear" then
-    clearJobFile()
-    activeJob = nil
-    jobLabel = "idle"
-    print("Cleared " .. JOB_FILE)
+    clearLocalMineMemory()
+    print("Cleared " .. JOB_FILE .. " + pending site/tablet assign.")
   elseif cmd == "continue" or cmd == "resume" then
     continueJob()
   elseif cmd == "mode" then

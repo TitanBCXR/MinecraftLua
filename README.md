@@ -583,9 +583,12 @@ origin 120 72 -45 south      # GPS of quarry 0,0,0 + facing into mine (once)
 where 12                     # push turtle coords → admin distance screen
 where #12                    # same
 claims                       # active + free regions
-clearclaims                  # free all (turtles re-pick with mine)
+clear                        # wipe miner registry + jobs; turtles forget local digs
+clearclaims                  # free all bands + tell turtles forget local digs
 clearclaims Y 0 29           # free claims overlapping that Y range
 clearclaims done             # finished bands only
+pattern column|layer         # site dig mode (clears miner data; fleet must obey)
+reband                       # re-split unique XZ/Y bands across turtles
 auto                         # unlock auto-learn again
 
 # turtles (mode online)
@@ -668,8 +671,13 @@ from the install source (GitHub / pastebin / `host.lua`). Extras on disk that
 aren’t listed show as `*` and are not updated.
 
 Bump versions in `versions.lua` (and each file’s `Titan-Version:` header) when
-you ship a change; current system version is **1.5.30** (`admin` **1.4.8**,
-`offline_site` **1.2.2**, `offline_miner` **1.4.2**).
+you ship a change; current system version is **1.5.31** (`offline_site` **1.2.3**,
+`offline_miner` **1.4.3**, `admin` **1.4.8**).
+
+**Fleet claim authority:** the site board owns dig mode (`column` / `layer`) and
+hands each turtle a unique band. Local miner job files / old assigns no longer
+override the board. If turtles dig the wrong style or share a band: on the site
+run `clear` (or `pattern column|layer`), update miners, then `mine` / `reband`.
 
 ---
 

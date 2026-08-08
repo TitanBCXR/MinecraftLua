@@ -1,16 +1,17 @@
 --[[
   offline_site.lua  -  Quarry site board for multi-turtle offline miners
-  Titan-Version: 1.2.2
+  Titan-Version: 1.2.3
 
   Place this computer to the LEFT of the storage chest (storage sits behind
   the turtles' origin). Attach a modem (wired to the turtles is fine, or
   wireless in range).
 
   OPTIONAL — turtles can dig and report straight to the admin tablet with no
-  site board. When this board IS present it:
+    site board. When this board IS present it:
     * Auto-sets W×L×H from turtle mine/job data (or `setup` to lock manually)
     * Dig mode `column` (default): hands out non-overlapping 2×2 XZ columns
       (full height). Dig mode `layer`: Y bands across the footprint
+    * Site pattern + unique bands are authoritative (turtles must obey)
     * On join: rebands the whole fleet (split remaining work), calls all
       turtles home, turn-taking origin reset (depot), then continueIdx digs
     * Collects BPC so every turtle knows safe travel distance
@@ -24,12 +25,13 @@
     origin <x> <y> <z> [n|s|e|w|0-3]   GPS of quarry 0,0,0 + facing into mine
     where <id>                       ping admin tablet with that turtle's coords
     auto                             unlock auto-learn from turtles
-    pattern column|layer             claim style for mine/
+    pattern column|layer             claim style for mine/ (clears + tells fleet)
     fraction half|third              max Y band size hint (layer mode)
     reband                           force fleet reband + origin reset turns
     claims                           list claimed / free regions
     clearclaims [all|done|stale|Y…]  release claims (see help)
-    status | turtles | jobs | clear
+    clear | clearminers              wipe site miner data + tell turtles forget jobs
+    status | turtles | jobs
     help | exit
 
   Turtle side: offline_miner online mode; modem → join → reband → mine.
@@ -258,11 +260,58 @@ local function turtleHasClaim(t)
   return t.y0 ~= nil and t.y1 ~= nil
 end
 
+-- Claim shape must match site dig mode (column = XZ, layer = Y-only).
+local function claimMatchesPattern(t, pat)
+  if not turtleHasClaim(t) then return false end
+  pat = normalizePattern(pat) or sitePattern()
+  if pat == "column" then
+    return t.x0 ~= nil and t.z0 ~= nil
+  end
+  return t.x0 == nil and t.y0 ~= nil and t.y1 ~= nil
+end
+
 local function clearTurtleCoords(t)
   t.y0, t.y1 = nil, nil
   t.x0, t.x1, t.z0, t.z1 = nil, nil, nil, nil
   t.adminLock = false
   t.assignId = nil
+end
+
+-- Tell every turtle to drop local job + pendingAssign (site is source of truth).
+local function broadcastFleetClear(reason)
+  local msg = {
+    type = "quarry_fleet_clear",
+    siteId = os.getComputerID(),
+    reason = tostring(reason or "clear"),
+    pattern = sitePattern(),
+    W = cfg.W, L = cfg.L, H = cfg.H,
+    clearJobs = true,
+    clearAssign = true,
+  }
+  rednet.broadcast(msg, PROTO)
+  rednet.broadcast(msg, NET)
+  for id in pairs(turtles) do
+    rednet.send(id, msg, PROTO)
+  end
+  print(("[fleet] clear broadcast (%s) — turtles forget local jobs/assigns"):format(
+    tostring(reason or "clear")))
+end
+
+local function wipeMinerData(reason)
+  turtles, completedBands = {}, {}
+  rebandState.active = false
+  rebandState.currentTurn = nil
+  rebandState.homeReady = {}
+  rebandState.resetDone = {}
+  rebandState.turnOrder = {}
+  rebandState.parkOffset = {}
+  if fs.exists(JOB_DIR) then
+    for _, name in ipairs(fs.list(JOB_DIR)) do
+      pcall(fs.delete, JOB_DIR .. "/" .. name)
+    end
+  end
+  saveCfg()
+  broadcastFleetClear(reason or "clear")
 end
 
 local function claimLabel(t)
@@ -828,19 +877,9 @@ local function touchTurtle(id, msg)
   elseif msg.sos == false or msg.type == "quarry_sos_clear" then
     t.sos = false
   end
-  -- Tablet/admin locks pin Y bands — don't let an old job file overwrite them.
-  local locked = t.adminLock == true
-  if not locked then
-    if msg.y0 ~= nil then t.y0 = tonumber(msg.y0) or t.y0 end
-    if msg.y1 ~= nil then t.y1 = tonumber(msg.y1) or t.y1 end
-    if msg.x0 ~= nil then t.x0 = tonumber(msg.x0) or t.x0 end
-    if msg.x1 ~= nil then t.x1 = tonumber(msg.x1) or t.x1 end
-    if msg.z0 ~= nil then t.z0 = tonumber(msg.z0) or t.z0 end
-    if msg.z1 ~= nil then t.z1 = tonumber(msg.z1) or t.z1 end
-  elseif msg.y0 ~= nil and msg.y1 ~= nil
-      and tonumber(msg.y0) == tonumber(t.y0) and tonumber(msg.y1) == tonumber(t.y1) then
-    -- Same band — ok
-  end
+  -- Site board owns claim coords. Progress msgs / old job files must NOT
+  -- overwrite unique bands (that caused two turtles to share one XZ/Y claim).
+  -- Only sync continueIdx / dug / job snapshot here.
   if msg.clearJob or msg.job == false then
     t.job = nil
     persistTurtleJob(id, nil)
@@ -852,16 +891,15 @@ local function touchTurtle(id, msg)
     end
     if msg.job.total ~= nil then t.total = tonumber(msg.job.total) or t.total end
     if msg.job.dug ~= nil then t.dug = tonumber(msg.job.dug) or t.dug end
-    if not locked then
-      if msg.job.y0 ~= nil then t.y0 = tonumber(msg.job.y0) or t.y0 end
-      if msg.job.y1 ~= nil then t.y1 = tonumber(msg.job.y1) or t.y1 end
-      if msg.job.x0 ~= nil then t.x0 = tonumber(msg.job.x0) or t.x0 end
-      if msg.job.x1 ~= nil then t.x1 = tonumber(msg.job.x1) or t.x1 end
-      if msg.job.z0 ~= nil then t.z0 = tonumber(msg.job.z0) or t.z0 end
-      if msg.job.z1 ~= nil then t.z1 = tonumber(msg.job.z1) or t.z1 end
-    end
     if msg.job.status and not msg.status then t.status = msg.job.status end
     persistTurtleJob(id, msg.job)
+  end
+  -- Drop claim shapes that disagree with current site dig mode.
+  if turtleHasClaim(t) and not claimMatchesPattern(t, sitePattern()) then
+    print(("[claim] #%d cleared mismatched %s (site=%s)"):format(
+      id, claimLabel(t), sitePattern()))
+    clearTurtleCoords(t)
+    if t.status == "mining" or t.status == "assigned" then t.status = "idle" end
   end
   learnSiteFromMsg(msg)
   turtles[id] = t
@@ -1271,14 +1309,15 @@ local function assignClaim(id, msg)
     })
   end
 
+  local pat = sitePattern()
+
   -- During reband, hand back the assigned claim + continueIdx (no new free grab).
-  if rebandState.active and turtleHasClaim(t) then
+  if rebandState.active and turtleHasClaim(t) and claimMatchesPattern(t, pat) then
     local extra = claimExtrasFor(t)
     extra.resume = true
     return claimPayload(extra)
   end
 
-  local pat = sitePattern()
   -- Turtle finished a claim and wants another: archive old claim, don't resume it.
   if msg.nextBand or msg.forceNew then
     if turtleHasClaim(t) and t.status ~= "done" then
@@ -1297,16 +1336,23 @@ local function assignClaim(id, msg)
     if #ids > 0 then
       rebandFleet("next_band", id)
       t = turtles[id]
-      if turtleHasClaim(t) then
+      if turtleHasClaim(t) and claimMatchesPattern(t, pat) then
         return claimPayload(claimExtrasFor(t))
       end
     end
   end
   -- Keep the turtle's claim forever until done / clearclaims / reband.
+  -- But only if it matches site dig mode (column vs layer).
   if turtleHasClaim(t) and t.status ~= "done" then
-    local extra = claimExtrasFor(t)
-    extra.resume = true
-    return claimPayload(extra)
+    if claimMatchesPattern(t, pat) then
+      local extra = claimExtrasFor(t)
+      extra.resume = true
+      return claimPayload(extra)
+    end
+    print(("[claim] #%d drop stale %s — site is %s"):format(id, claimLabel(t), pat))
+    clearTurtleCoords(t)
+    t.status = "idle"
+    turtles[id] = t
   end
 
   -- First claim with an existing fleet → reband everyone (includes this turtle).
@@ -1317,7 +1363,7 @@ local function assignClaim(id, msg)
   if others > 0 or (turtleHasClaim(t) == false and #fleetIds() > 1) then
     rebandFleet("claim", id)
     t = turtles[id]
-    if turtleHasClaim(t) then
+    if turtleHasClaim(t) and claimMatchesPattern(t, pat) then
       return claimPayload(claimExtrasFor(t))
     end
     return claimPayload({ ok = false, err = "no remaining work after reband" })
@@ -1409,10 +1455,15 @@ local function applyAdminAssign(turtleId, msg)
     end
   end
   completedBands = keep
+  if sitePattern() == "column" then
+    print("[admin] refuse Y assign — site dig mode is column (use site column claims)")
+    return false
+  end
   local t = turtles[turtleId] or {
     name = "Turtle-" .. turtleId, seen = now(), status = "assigned",
   }
   t.y0, t.y1 = y0, y1
+  t.x0, t.x1, t.z0, t.z1 = nil, nil, nil, nil  -- layer claim = Y band only
   t.status = "assigned"
   t.assignId = msg.assignId
   t.assignedBy = msg.from
@@ -1698,6 +1749,8 @@ local function printHelp()
   print("  clearclaims stale                free claims from quiet turtles (manual)")
   print("  clearclaims Y <y0> [y1]          clear claims overlapping Y range")
   print("  clearclaims turtle <id>          release one turtle's claim")
+  print("  clear | clearminers              wipe miner registry + jobs; turtles forget local digs")
+  print("  reband                           re-split unique bands; turtles obey site pattern")
   print("  status | turtles | jobs | clear | broadcast")
   print("  help | exit")
   print("")
@@ -1881,7 +1934,8 @@ local function handleCommand(line)
     local n = 0
     if sub == "" or sub == "all" then
       n = clearClaims("all")
-      print(("Cleared all Y claims (%d released). Turtles can re-claim with mine."):format(n))
+      broadcastFleetClear("clearclaims")
+      print(("Cleared all claims (%d released). Turtles forget local digs; run mine/reband."):format(n))
     elseif sub == "done" or sub == "completed" then
       n = clearClaims("done")
       print(("Cleared completed Y bands (%d)."):format(n))
@@ -1910,16 +1964,12 @@ local function handleCommand(line)
     end
     broadcastStatus()
     printClaims()
-  elseif cmd == "clear" then
-    turtles, completedBands = {}, {}
-    if fs.exists(JOB_DIR) then
-      for _, name in ipairs(fs.list(JOB_DIR)) do
-        pcall(fs.delete, JOB_DIR .. "/" .. name)
-      end
-    end
-    saveCfg()
-    print("Cleared turtle registry / Y claims / quarry_jobs (footprint kept).")
-    print("Tip: `clearclaims` frees Y bands without wiping job files.")
+  elseif cmd == "clear" or cmd == "clearminers" or cmd == "resetfleet" then
+    wipeMinerData(cmd)
+    print("Cleared turtle registry / claims / quarry_jobs (footprint + pattern kept).")
+    print("Broadcast quarry_fleet_clear — each turtle drops local job + pending assign.")
+    print("Next: turtles `mine` (or reboot online) → site reband → unique bands.")
+    print("Tip: `clearclaims` frees bands without wiping job files / turtle list.")
     broadcastStatus()
   elseif cmd == "auto" then
     cfg.manual = false
@@ -1948,10 +1998,12 @@ local function handleCommand(line)
       print("  layer  = Y-band slices across the whole footprint")
       return true
     end
+    local prev = sitePattern()
     cfg.pattern = p
-    turtles, completedBands = {}, {}
-    saveCfg()
-    print("Dig mode set to " .. p .. " (claims cleared — turtles re-mine).")
+    wipeMinerData("pattern")
+    print(("Dig mode %s → %s (miner data cleared; fleet told to forget local jobs)."):format(
+      prev, p))
+    print("Run `reband` after turtles re-join, or let them `mine` to claim unique bands.")
     broadcastStatus()
   elseif cmd == "setup" then
     local raw = a[2]
@@ -1983,8 +2035,7 @@ local function handleCommand(line)
       cfg.W, cfg.L, cfg.H = W, L, H
       cfg.pattern = normalizePattern(cfg.pattern) or "column"
       cfg.manual = true
-      turtles, completedBands = {}, {}
-      saveCfg()
+      wipeMinerData("setup")
       if sitePattern() == "column" then
         print(("Site locked: %dx%d × %dY  pattern=column (2x2 XZ claims)"):format(W, L, H))
       else
