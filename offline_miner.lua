@@ -1,6 +1,6 @@
 --[[
   offline_miner.lua  -  Local quarry turtle (optional site board)
-  Titan-Version: 1.5.6
+  Titan-Version: 1.5.7
 
   Place the turtle at the TOP-FRONT-LEFT corner of the dig, facing into the
   mine. That cell is origin 0,0,0:
@@ -65,7 +65,7 @@ local WORK_RESERVE = 48      -- keep digging only with this much above home cost
 local MIN_FUEL = 200
 local TRAFFIC_Y = -1         -- cruise / traffic layer (+Y = down, so -1 is one above origin)
 -- Keep in sync with Titan-Version header (label uses major.minor → V1.5-Miner12).
-local MINER_VERSION = "1.5.6"
+local MINER_VERSION = "1.5.7"
 -- "outbound" = to cell (overtake) | "homebound" = to origin (yield) | "dig" = wait/retry
 local travelIntent = "dig"
 -- Other miners' last known quarry-relative poses (rednet). Used to tell turtle vs mob/player.
@@ -3129,9 +3129,13 @@ local function processRebandCycle()
   return rebandClaim
 end
 
+-- Site / resume helpers live on one table so the main chunk stays under Lua's
+-- 200-local limit (each `local function` at file scope counts).
+local site = {}
+
 -- Dig one claimed Y band. Returns "done" | "paused" | "stop" | "bad".
 -- fromContinue = turtle was placed back at origin (pose reset); job idx may still resume.
-local function runColumnClaim(claim, fromOrigin, existingJob)
+function site.runColumnClaim(claim, fromOrigin, existingJob)
   local x0 = math.floor(tonumber(claim.x0) or 0)
   local x1 = math.floor(tonumber(claim.x1) or x0)
   local z0 = math.floor(tonumber(claim.z0) or 0)
@@ -3253,14 +3257,14 @@ local function runColumnClaim(claim, fromOrigin, existingJob)
   return "done"
 end
 
-local function runClaimBand(claim, fromOrigin, existingJob)
+function site.runClaimBand(claim, fromOrigin, existingJob)
   -- Column / 2×2 XZ claims from site dig mode.
   if claim.x0 ~= nil or tostring(claim.pattern or "") == "column" then
     if claim.x0 == nil then
       print("Bad column claim from site (missing x0/z0).")
       return "bad"
     end
-    return runColumnClaim(claim, fromOrigin, existingJob)
+    return site.runColumnClaim(claim, fromOrigin, existingJob)
   end
 
   local W = math.floor(tonumber(claim.W) or 0)
@@ -3333,7 +3337,7 @@ local function runClaimBand(claim, fromOrigin, existingJob)
   return "done"
 end
 
-local function claimFromAdminAssign()
+function site.claimFromAdminAssign()
   if not adminAssign and type(cfg.pendingAssign) == "table" then
     adminAssign = cfg.pendingAssign
   end
@@ -3393,7 +3397,7 @@ local function claimFromAdminAssign()
   }
 end
 
-local function siteSendTyped(typeName, extra)
+function site.sendTyped(typeName, extra)
   ensureModemForComms(true)
   local msg = sitePayload(extra or {})
   msg.type = typeName
@@ -3404,7 +3408,7 @@ local function siteSendTyped(typeName, extra)
   end
 end
 
-local function inActiveCellXZ(slack)
+function site.inActiveCellXZ(slack)
   if not activeCell then return true end
   slack = tonumber(slack) or 0
   local x0 = (activeCell.x0 or 0) - slack
@@ -3416,7 +3420,7 @@ end
 
 -- Final full walk of every cell voxel. Must succeed before site cell_done.
 -- Returns ok, err, nextVerifyIdx
-local function verifyCellClear(box, startIdx)
+function site.verifyCellClear(box, startIdx)
   local x0 = box.x0
   local x1 = box.x1
   local z0 = box.z0
@@ -3436,7 +3440,7 @@ local function verifyCellClear(box, startIdx)
     local u = units[i]
     if not manageInventory(true) then return false, "inventory", i end
     if not ensurePickReady(true) then return false, "no-pickaxe", i end
-    if not inActiveCellXZ(2) and (pos.x ~= u.x or pos.z ~= u.z) then
+    if not site.inActiveCellXZ(2) and (pos.x ~= u.x or pos.z ~= u.z) then
       return false, "perimeter", i
     end
     if lastY ~= -999 and u.y > lastY then
@@ -3449,7 +3453,7 @@ local function verifyCellClear(box, startIdx)
     end
     lastY = u.y
     if not goTo(u.x, u.y, u.z) then return false, "path", i end
-    if not inActiveCellXZ(0) then return false, "perimeter", i end
+    if not site.inActiveCellXZ(0) then return false, "perimeter", i end
     excavateHere()
     if activeJob then
       activeJob.phase = "verify"
@@ -3469,7 +3473,7 @@ end
 
 -- Dig one site cell: full H, layer-by-layer, stay in XZ AABB.
 -- Returns "done" | "paused" | "stop" | "bad"
-local function runCellClaim(claim, existingJob)
+function site.runCellClaim(claim, existingJob)
   if not claim or claim.x0 == nil or claim.z0 == nil then
     print("Bad cell claim.")
     return "bad"
@@ -3547,12 +3551,12 @@ local function runCellClaim(claim, existingJob)
       fuel = estimateFuelUnits()
       if fuel ~= math.huge and fuel < need then
         print("Still short on fuel for this cell — pausing.")
-        siteSendTyped("quarry_progress", { status = "paused", cellId = claim.cellId })
+        site.sendTyped("quarry_progress", { status = "paused", cellId = claim.cellId })
         return "paused"
       end
     end
   end
-  siteSendTyped("quarry_leave_origin", { status = "travel", cellId = claim.cellId })
+  site.sendTyped("quarry_leave_origin", { status = "travel", cellId = claim.cellId })
   print(("Travel → cell #%s  X%d-%d Z%d-%d (up-over-down, modem on)"):format(
     tostring(claim.cellId or "?"), x0, x1, z0, z1))
 
@@ -3563,7 +3567,7 @@ local function runCellClaim(claim, existingJob)
     clear = 1,
     intent = "outbound",
     beforeSettle = function()
-      siteSendTyped("quarry_arrive_cell", { status = "arrive", cellId = claim.cellId })
+      site.sendTyped("quarry_arrive_cell", { status = "arrive", cellId = claim.cellId })
       announced = true
       restorePickAfterComms()
       equipToolFromInventory(nil, true)
@@ -3571,13 +3575,13 @@ local function runCellClaim(claim, existingJob)
   }) then
     setTravelIntent("dig")
     print("Could not reach cell corner.")
-    siteSendTyped("quarry_progress", { status = "paused", cellId = claim.cellId })
+    site.sendTyped("quarry_progress", { status = "paused", cellId = claim.cellId })
     return "bad"
   end
   setTravelIntent("dig")
   -- Origin cell / already-there: no settle hop, still announce while modem is up.
   if not announced then
-    siteSendTyped("quarry_arrive_cell", { status = "arrive", cellId = claim.cellId })
+    site.sendTyped("quarry_arrive_cell", { status = "arrive", cellId = claim.cellId })
   end
 
   print(("Arrived cell #%s — layer dig Y%d..%d"):format(
@@ -3602,7 +3606,7 @@ local function runCellClaim(claim, existingJob)
         digging = false
         ensureModemForComms(true)
         goHome()
-        siteSendTyped("quarry_progress", {
+        site.sendTyped("quarry_progress", {
           status = "homing", reason = pendingReturnHome, cellId = claim.cellId,
         })
         pendingReturnHome = nil
@@ -3624,13 +3628,13 @@ local function runCellClaim(claim, existingJob)
       saveJobFile(j)
 
       -- Stay inside cell perimeter (XZ).
-      if not inActiveCellXZ(2) and (pos.x ~= u.x or pos.z ~= u.z) then
+      if not site.inActiveCellXZ(2) and (pos.x ~= u.x or pos.z ~= u.z) then
         print(("Outside cell perimeter @ %d,%d — abort."):format(pos.x, pos.z))
         finishJob(false, "perimeter")
         digging = false
         ensureModemForComms(true)
         goHome()
-        siteSendTyped("quarry_progress", { status = "homing", reason = "perimeter" })
+        site.sendTyped("quarry_progress", { status = "homing", reason = "perimeter" })
         return "stop"
       end
 
@@ -3640,7 +3644,7 @@ local function runCellClaim(claim, existingJob)
         digging = false
         -- Resume same cell after dump.
         print("Resuming same cell after dump/refuel...")
-        return runCellClaim(claim, loadJobFile())
+        return site.runCellClaim(claim, loadJobFile())
       end
       if not ensurePickReady(true) then
         finishJob(false, "no-pickaxe")
@@ -3667,7 +3671,7 @@ local function runCellClaim(claim, existingJob)
         digging = false
         return "paused"
       end
-      if not inActiveCellXZ(0) then
+      if not site.inActiveCellXZ(0) then
         print("Left cell while pathing — abort.")
         finishJob(false, "perimeter")
         digging = false
@@ -3692,8 +3696,8 @@ local function runCellClaim(claim, existingJob)
   end
 
   print(("Verify cell #%s before marking done..."):format(tostring(claim.cellId or "?")))
-  siteSendTyped("quarry_progress", { status = "verify", cellId = claim.cellId })
-  local vOk, vErr, vAt = verifyCellClear({
+  site.sendTyped("quarry_progress", { status = "verify", cellId = claim.cellId })
+  local vOk, vErr, vAt = site.verifyCellClear({
     cellId = claim.cellId,
     x0 = x0, x1 = x1, z0 = z0, z1 = z1, y0 = y0, y1 = y1,
   }, j.verifyIdx or 1)
@@ -3707,7 +3711,7 @@ local function runCellClaim(claim, existingJob)
     if vErr == "return_home" or vErr == "perimeter" then
       ensureModemForComms(true)
       goHome()
-      siteSendTyped("quarry_progress", {
+      site.sendTyped("quarry_progress", {
         status = "homing", reason = tostring(vErr), cellId = claim.cellId,
       })
       pendingReturnHome = nil
@@ -3716,7 +3720,7 @@ local function runCellClaim(claim, existingJob)
     if vErr == "reband" or vErr == "stop" then return "stop" end
     if vErr == "inventory" then
       print("Resuming verify after dump/refuel...")
-      return runCellClaim(claim, loadJobFile())
+      return site.runCellClaim(claim, loadJobFile())
     end
     return "paused"
   end
@@ -3728,7 +3732,7 @@ local function runCellClaim(claim, existingJob)
   goHome()
   dumpToStorage()
   suckFuelFromLeft()
-  siteSendTyped("quarry_cell_done", {
+  site.sendTyped("quarry_cell_done", {
     status = "idle", cellDone = true, finished = true,
     cellId = claim.cellId, y0 = y0, y1 = y1,
     x0 = x0, x1 = x1, z0 = z0, z1 = z1,
@@ -3739,7 +3743,7 @@ local function runCellClaim(claim, existingJob)
 end
 
 -- opts.fromOrigin: turtle is at depot (default: true when pose is 0,0,0).
-local function digSiteMine(opts)
+function site.digSiteMine(opts)
   opts = opts or {}
   if isOfflineMode() then
     print("Offline mode — site claims disabled. `mode online` or use `area` / `box`.")
@@ -3760,7 +3764,7 @@ local function digSiteMine(opts)
     if pendingReturnHome then
       ensureModemForComms(true)
       goHome()
-      siteSendTyped("quarry_progress", { status = "homing", reason = pendingReturnHome })
+      site.sendTyped("quarry_progress", { status = "homing", reason = pendingReturnHome })
       pendingReturnHome = nil
       STOP = false
     end
@@ -3771,7 +3775,7 @@ local function digSiteMine(opts)
       pendingReband = nil
       ensureModemForComms(true)
       goHome()
-      siteSendTyped("quarry_home", {
+      site.sendTyped("quarry_home", {
         status = "homing", epoch = rb.epoch, recallOnly = true,
       })
       if rb.x0 ~= nil then
@@ -3836,7 +3840,7 @@ local function digSiteMine(opts)
     print(("Mining cell #%s  X%d-%d Z%d-%d ..."):format(
       tostring(claim.cellId or "?"),
       claim.x0, claim.x1 or claim.x0, claim.z0, claim.z1 or claim.z0))
-    local r = runCellClaim(claim, stored)
+    local r = site.runCellClaim(claim, stored)
     if r == "stop" and (pendingReband or pendingReturnHome) then
       -- loop
     elseif r ~= "done" then
@@ -3848,7 +3852,7 @@ local function digSiteMine(opts)
   end
 end
 
-local function jobIsResumable(j)
+function site.jobIsResumable(j)
   if type(j) ~= "table" or not j.type then return false end
   if j.status == "done" then return false end
   local st = tostring(j.status or "")
@@ -3858,14 +3862,14 @@ local function jobIsResumable(j)
 end
 
 -- Prefer local job; if missing/stale, take the site board copy (online mode only).
-local function resolveResumeJob(quiet)
+function site.resolveResumeJob(quiet)
   local localJ = loadJobFile()
   if localJ and localJ.status == "done" then
     clearJobFile({ keepSite = true })
     localJ = nil
   end
   if isOfflineMode() then
-    if localJ and jobIsResumable(localJ) then return localJ, "local" end
+    if localJ and site.jobIsResumable(localJ) then return localJ, "local" end
     return nil, nil
   end
   if not siteId then joinSite(quiet and 4 or 6, quiet == true) end
@@ -3874,7 +3878,7 @@ local function resolveResumeJob(quiet)
     -- Ask the board even when local exists — reboot recovery / newer progress.
     siteJ = fetchJobFromSite(quiet and 4 or 6, true, true)
   end
-  if siteJ and jobIsResumable(siteJ) then
+  if siteJ and site.jobIsResumable(siteJ) then
     if not localJ then
       adoptJob(siteJ, "site board")
       return loadJobFile() or siteJ, "site"
@@ -3891,15 +3895,15 @@ local function resolveResumeJob(quiet)
       return loadJobFile() or siteJ, "site"
     end
   end
-  if localJ and jobIsResumable(localJ) then return localJ, "local" end
-  if siteJ and jobIsResumable(siteJ) then
+  if localJ and site.jobIsResumable(localJ) then return localJ, "local" end
+  if siteJ and site.jobIsResumable(siteJ) then
     adoptJob(siteJ, "site board")
     return loadJobFile() or siteJ, "site"
   end
   return nil, nil
 end
 
-local function depotRefuelThenReady()
+function site.depotRefuelThenReady()
   print("Low fuel — returning to depot to refuel, then continuing...")
   if activeJob then
     activeJob.status = "paused"
@@ -3921,7 +3925,7 @@ local function depotRefuelThenReady()
 end
 
 -- Shared resume path for `continue` and reboot auto-resume.
-local function continueJob(opts)
+function site.continueJob(opts)
   opts = opts or {}
   local auto = opts.auto == true
   -- Online + site: board owns pattern + unique bands. digSiteMine asks the
@@ -3940,11 +3944,11 @@ local function continueJob(opts)
       end
     end
     print("Site mine — claim/pattern from board...")
-    digSiteMine({ fromOrigin = true })
+    site.digSiteMine({ fromOrigin = true })
     return true
   end
 
-  local j, src = resolveResumeJob(auto)
+  local j, src = site.resolveResumeJob(auto)
   if not j then
     if not auto then
       if isOfflineMode() then
@@ -3977,7 +3981,7 @@ local function continueJob(opts)
   local fromOrigin = false
   local inPlace = false
   if plan == "depot" then
-    if not depotRefuelThenReady() then return false end
+    if not site.depotRefuelThenReady() then return false end
     fromOrigin = true
     j = loadJobFile() or j
   elseif hadPose and (pos.x ~= 0 or pos.y ~= 0 or pos.z ~= 0) then
@@ -3991,7 +3995,7 @@ local function continueJob(opts)
   -- Site / claimed jobs keep claiming further regions after this one finishes.
   if isOnlineMode() and (j.site or j.y0 ~= nil or j.x0 ~= nil) then
     if not siteId then joinSite(4, true) end
-    digSiteMine({ fromOrigin = fromOrigin })
+    site.digSiteMine({ fromOrigin = fromOrigin })
     return true
   end
 
@@ -4000,23 +4004,23 @@ local function continueJob(opts)
 end
 
 -- On program start: resume mid-job (site sync only in online mode).
-local function bootAutoResume()
+function site.bootAutoResume()
   local j = loadJobFile()
   if j and j.status == "done" then
     clearJobFile({ keepSite = true })
     j = nil
   end
   if isOfflineMode() then
-    if not j or not jobIsResumable(j) then return false end
+    if not j or not site.jobIsResumable(j) then return false end
     print("")
     print("Offline mode — resuming local job (no site).")
-    return continueJob({ auto = true })
+    return site.continueJob({ auto = true })
   end
   -- Need modem/site or a local job file to consider auto-resume.
   if not j and not siteId and not cfg.siteId then return false end
   print("")
   print("Checking site board for in-progress work...")
-  return continueJob({ auto = true })
+  return site.continueJob({ auto = true })
 end
 
 --------------------------------------------------------------------------------
@@ -4090,7 +4094,7 @@ local function handleCommand(line)
     if isOfflineMode() then
       print("Offline mode — use `area` / `box` for solo digs, or `mode online` for site claims.")
     else
-      digSiteMine()
+      site.digSiteMine()
     end
   elseif cmd == "site" then
     printSiteInfo()
@@ -4115,7 +4119,7 @@ local function handleCommand(line)
     clearLocalMineMemory()
     print("Cleared " .. JOB_FILE .. " + pending site/tablet assign.")
   elseif cmd == "continue" or cmd == "resume" then
-    continueJob()
+    site.continueJob()
   elseif cmd == "mode" then
     if not a[2] then
       print("Mode: " .. tostring(cfg.mode or "online"))
@@ -4311,10 +4315,10 @@ if isOnlineMode() then
       if pendingReband then
         processRebandCycle()
       elseif saved then
-        local ok = bootAutoResume()
+        local ok = site.bootAutoResume()
         if ok then autoStarted = true; return end
       end
-      digSiteMine({ fromOrigin = true })
+      site.digSiteMine({ fromOrigin = true })
       autoStarted = true
     end, mineNetLoop)
   else
@@ -4324,7 +4328,7 @@ else
   siteId = nil
   print("OFFLINE — solo dig only (area / box). No site/admin. `mode online` to link.")
   if saved then
-    autoStarted = bootAutoResume() == true
+    autoStarted = site.bootAutoResume() == true
   end
 end
 
