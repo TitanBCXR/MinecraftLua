@@ -11,6 +11,7 @@ A wireless dispatch system for Minecraft's **CC: Tweaked** mod (active packages)
 - **`perimeter_sensor.lua` / `perimeter_manager.lua`** — Player Detector territory (one manager + admin alerts).
 - **`tetris.lua`** — Tetris for pocket / advanced PC + monitor (local LB; note music; monitor bottom half = touch pad).
 - **`minesweeper.lua`** — Minesweeper for pocket / advanced PC + monitor (no modem; monitor bottom half = Open/Flag touch pad).
+- **`sandstorm.lua`** — Darude Sandstorm note-block knockoff + desert pixel visualizer (speaker + color monitor).
 - **`github_install.lua`** — On an advanced PC + color monitor, role select draws on the monitor (touch tiles + UP/DOWN scroll).
 - **`lib/titan.lua`** — shared library (protocol, messaging, navigation).
 
@@ -94,7 +95,7 @@ Each device needs (active installer roles):
 | Offline miner     | `offline_miner.lua`, `lib/titan.lua`, `exclude.txt` |
 | Quarry site board | `offline_site.lua`, `lib/titan.lua` (+ modem) |
 | Perimeter sensor/manager | `perimeter_*.lua`, `lib/titan.lua`  |
-| Games (submenu **g**) | `tetris.lua` / `minesweeper.lua` (+ titan for Tetris) |
+| Games (submenu **g**) | `tetris.lua` / `minesweeper.lua` / `sandstorm.lua` (+ titan for Tetris) |
 
 Keep `lib/titan.lua` in a `lib` folder next to the program. Older roles are in
 [`archive/`](archive/).

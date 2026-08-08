@@ -1,6 +1,6 @@
 --[[
   install.lua  -  Titan network installer (CC: Tweaked)
-  Titan-Version: 1.2.2
+  Titan-Version: 1.2.3
 
   Downloads the Titan bot-network system onto this device from a running
   `host.lua` on the same rednet network (no pastebin / external web host).
@@ -27,6 +27,7 @@ local KEEP_ALL = {
   "lib/router_hub_net.lua", "lib/router_hub_ui.lua", "lib/router_hub_cmd.lua",
   "offline_miner.lua", "offline_site.lua", "exclude.txt",
   "perimeter_sensor.lua", "perimeter_manager.lua", "tetris.lua", "minesweeper.lua",
+  "sandstorm.lua",
   "host.lua", "versions.lua", "install.lua",
 }
 
@@ -35,6 +36,8 @@ local GAMES = {
     files = { "lib/titan.lua", "tetris.lua", "versions.lua" } },
   { key = "2", name = "Minesweeper (pocket / monitor)", run = "minesweeper.lua",
     files = { "minesweeper.lua" } },
+  { key = "3", name = "Sandstorm (noteblock + pixel show)", run = "sandstorm.lua",
+    files = { "sandstorm.lua" } },
 }
 
 local ROLES = {
@@ -277,6 +280,7 @@ local LABELS = {
   ["perimeter_manager.lua"] = "PerimMgr",
   ["tetris.lua"] = "Tetris",
   ["minesweeper.lua"] = "Mines",
+  ["sandstorm.lua"] = "Sandstorm",
   ["host.lua"] = "TitanHost",
 }
 local lbl = role.run and LABELS[role.run]

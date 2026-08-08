@@ -1,6 +1,6 @@
 --[[
   host.lua  -  Titan install / update host + Tetris leaderboard (CC: Tweaked)
-  Titan-Version: 1.2.4
+  Titan-Version: 1.2.5
 
   Run this on ONE computer that already has the Titan files (your "update
   server"). It serves those files over rednet so pockets and other devices can
@@ -48,6 +48,8 @@ local FILES = {
   "perimeter_sensor.lua",
   "perimeter_manager.lua",
   "tetris.lua",
+  "minesweeper.lua",
+  "sandstorm.lua",
   "host.lua",
   "exclude.txt",
   "github_install.lua",

@@ -1,6 +1,6 @@
 --[[
   github_install.lua  -  Install the Titan system straight from a GitHub repo
-  Titan-Version: 1.2.4
+  Titan-Version: 1.2.5
 
   Point RAW_BASE at your repo's raw content root, then on each Minecraft device:
 
@@ -34,7 +34,7 @@ local KEEP_ALL = {
   "lib/router_hub_net.lua", "lib/router_hub_ui.lua", "lib/router_hub_cmd.lua",
   "offline_miner.lua", "offline_site.lua", "exclude.txt",
   "perimeter_sensor.lua", "perimeter_manager.lua", "tetris.lua", "minesweeper.lua",
-  "host.lua", "versions.lua",
+  "sandstorm.lua", "host.lua", "versions.lua",
 }
 
 local GAMES = {
@@ -42,6 +42,8 @@ local GAMES = {
     files = { "lib/titan.lua", "tetris.lua", "versions.lua" } },
   { key = "2", name = "Minesweeper (pocket / monitor)", run = "minesweeper.lua",
     files = { "minesweeper.lua" } },
+  { key = "3", name = "Sandstorm (noteblock + pixel show)", run = "sandstorm.lua",
+    files = { "sandstorm.lua" } },
 }
 
 local ROLES = {
@@ -575,9 +577,10 @@ local function runInstaller()
     ["perimeter_sensor.lua"] = "PerimSensor",
     ["perimeter_manager.lua"] = "PerimMgr",
     ["tetris.lua"] = "Tetris",
-    ["minesweeper.lua"] = "Minesweeper",
-    ["host.lua"] = "TitanHost",
-  }
+  ["minesweeper.lua"] = "Minesweeper",
+  ["sandstorm.lua"] = "Sandstorm",
+  ["host.lua"] = "TitanHost",
+}
   local lbl = role.run and LABELS[role.run]
   if lbl and not os.getComputerLabel() then
     os.setComputerLabel(lbl .. "-" .. os.getComputerID())

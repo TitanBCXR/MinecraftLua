@@ -1,6 +1,6 @@
 --[[
   pastebin_install.lua  -  Pastebin bootstrap installer for the Titan system
-  Titan-Version: 1.2.2
+  Titan-Version: 1.2.3
 
   Pulls the Titan files straight from Pastebin (no in-game host needed). Upload
   each file to pastebin.com once, paste its CODE into the table below, then
@@ -36,6 +36,7 @@ local CODES = {
   ["perimeter_manager.lua"] = "",
   ["tetris.lua"]    = "",
   ["minesweeper.lua"] = "",
+  ["sandstorm.lua"] = "",
   ["host.lua"]      = "",
   ["exclude.txt"]   = "",
   ["versions.lua"]  = "",
@@ -47,7 +48,7 @@ local KEEP_ALL = {
   "lib/router_hub_net.lua", "lib/router_hub_ui.lua", "lib/router_hub_cmd.lua",
   "offline_miner.lua", "offline_site.lua", "exclude.txt",
   "perimeter_sensor.lua", "perimeter_manager.lua", "tetris.lua", "minesweeper.lua",
-  "host.lua", "versions.lua",
+  "sandstorm.lua", "host.lua", "versions.lua",
 }
 
 --==============================================================================
@@ -58,6 +59,8 @@ local GAMES = {
     files = { "lib/titan.lua", "tetris.lua", "versions.lua" } },
   { key = "2", name = "Minesweeper (pocket / monitor)", run = "minesweeper.lua",
     files = { "minesweeper.lua" } },
+  { key = "3", name = "Sandstorm (noteblock + pixel show)", run = "sandstorm.lua",
+    files = { "sandstorm.lua" } },
 }
 
 local ROLES = {
@@ -257,6 +260,7 @@ local LABELS = {
   ["perimeter_manager.lua"] = "PerimMgr",
   ["tetris.lua"] = "Tetris",
   ["minesweeper.lua"] = "Minesweeper",
+  ["sandstorm.lua"] = "Sandstorm",
   ["host.lua"] = "TitanHost",
 }
 local lbl = role.run and LABELS[role.run]
