@@ -1,6 +1,6 @@
 --[[
   pastebin_install.lua  -  Pastebin bootstrap installer for the Titan system
-  Titan-Version: 1.2.0
+  Titan-Version: 1.2.1
 
   Pulls the Titan files straight from Pastebin (no in-game host needed). Upload
   each file to pastebin.com once, paste its CODE into the table below, then
@@ -35,6 +35,7 @@ local CODES = {
   ["perimeter_sensor.lua"] = "",
   ["perimeter_manager.lua"] = "",
   ["tetris.lua"]    = "",
+  ["minesweeper.lua"] = "",
   ["host.lua"]      = "",
   ["exclude.txt"]   = "",
   ["versions.lua"]  = "",
@@ -45,8 +46,8 @@ local KEEP_ALL = {
   "router.lua", "router_main.lua", "router_modem.lua",
   "lib/router_hub_net.lua", "lib/router_hub_ui.lua", "lib/router_hub_cmd.lua",
   "offline_miner.lua", "offline_site.lua", "exclude.txt",
-  "perimeter_sensor.lua", "perimeter_manager.lua", "tetris.lua", "host.lua",
-  "versions.lua",
+  "perimeter_sensor.lua", "perimeter_manager.lua", "tetris.lua", "minesweeper.lua",
+  "host.lua", "versions.lua",
 }
 
 --==============================================================================
@@ -73,6 +74,8 @@ local ROLES = {
     files = { "lib/titan.lua", "perimeter_manager.lua" } },
   { key = "t", name = "Tetris (pocket + music/mesh)", run = "tetris.lua",
     files = { "lib/titan.lua", "tetris.lua", "versions.lua" } },
+  { key = "s", name = "Minesweeper (lightweight pocket)", run = "minesweeper.lua",
+    files = { "minesweeper.lua" } },
   { key = "h", name = "Install / update host (serves files over rednet)", run = "host.lua",
     files = { "lib/titan.lua", "host.lua", "install.lua", "versions.lua" } },
   { key = "9", name = "Everything (kept files, no auto-run)", run = nil,
@@ -222,6 +225,7 @@ local LABELS = {
   ["perimeter_sensor.lua"] = "PerimSensor",
   ["perimeter_manager.lua"] = "PerimMgr",
   ["tetris.lua"] = "Tetris",
+  ["minesweeper.lua"] = "Minesweeper",
   ["host.lua"] = "TitanHost",
 }
 local lbl = role.run and LABELS[role.run]
