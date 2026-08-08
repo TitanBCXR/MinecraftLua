@@ -1,23 +1,17 @@
 # Titan Bot Network (CC: Tweaked)
 
-A wireless dispatch system for Minecraft's **CC: Tweaked** mod:
+A wireless dispatch system for Minecraft's **CC: Tweaked** mod (active packages):
 
-- **`hub.lua`** — control computer with a monitor that shows live bot status + a command console.
-- **`bot.lua`** — a turtle that reports status, navigates by GPS, and executes tasks.
-- **`poi.lua`** — a "point of interest" computer that marks a location by coordinates and can summon a bot.
-- **`miner.lua`** — quarry turtle: digs between two corners down to a floor Y, skipping `exclude.txt`.
-- **`offline_miner.lua`** — local quarry turtle: `mode online|offline`, solo `area` / `box` / `tunnel` / `stair`, or online site fleet (modem → join → reband/reset → mine). Dig-line facing; fuel SOS to admin + MAIN.
-- **`offline_site.lua`** — quarry site board: `column` / `layer` claims, fleet reband on join, origin reset turns, `origin` + `where <id>` GPS track to admin, % progress.
-- **`perimeter_sensor.lua` / `perimeter_manager.lua`** — Player Detector territory enter/exit board (N/E/S/W + timestamps).
-- **`chest_sucker.lua`** — on boot/run, suck items from adjacent chests or barrels (loot containers).
-- **`lib/titan.lua`** — shared library (protocol, messaging, navigation). Copy this onto **every** device.
+- **`datacenter.lua`** — Parent Center (master password / fleet authority).
+- **`console.lua`** — terminal console with mesh/`ssh` helpers.
+- **`admin.lua`** — pocket admin tablet (live boards, quarry, where-track).
+- **`router.lua`** (+ hub net/ui/cmd) — mesh repeater / MAIN router.
+- **`offline_miner.lua`** — quarry turtle: solo `area`/`box`, or online **cell fleet**.
+- **`offline_site.lua`** — site board: XZ **cells** (target 20×20, min 4), one bot/cell, full-H layer digs, dual pose, `where`.
+- **`perimeter_sensor.lua` / `perimeter_manager.lua`** — Player Detector territory boards.
+- **`lib/titan.lua`** — shared library (protocol, messaging, navigation).
 
-```
-Hub (monitor + modem)  <--rednet-->  Bots (turtles)
-        ^                                 ^
-        |------------- rednet ------------|
-                    POIs (computers)
-```
+Older packages (hub/bot/poi/miner/…) live under [`archive/`](archive/) and are not in the installer menu.
 
 ## 1. Requirements
 
@@ -51,33 +45,16 @@ Full guide: <https://tweaked.cc/guide/gps_setup.html>
 
 ## 3. Install the files onto your in-game devices
 
-### Recommended: self-hosted installer (over your in-game network)
+### Recommended: GitHub installer
 
-You don't need pastebin or an external web host. One CC computer serves every
-file to the rest over rednet:
+On each device:
 
-1. Put all the Titan files on **one** computer (the "host"). If they're on your
-   PC, copy them into that computer's `computer/<id>/` folder in the world save,
-   or seed them once with pastebin. Give the host a **wireless/ender modem**.
-2. On the host, run:
+```
+wget run https://raw.githubusercontent.com/TitanBCXR/MinecraftLua/main/github_install.lua
+```
 
-   ```
-   host.lua
-   ```
-
-3. On every **other** device, seed just the tiny `install.lua` once (pastebin
-   get / a floppy / type it in), then run:
-
-   ```
-   install.lua
-   ```
-
-   It finds the host, asks what this device is (Hub, Bot, POI, Parent Center,
-   Bots Computer, Worker, Install host, or Everything), downloads exactly the
-   files that role needs, offers to write a `startup.lua`, and can launch it.
-
-Tip: choose **"Install host"** on a second computer to make another share point,
-or **"Everything"** to pull the whole system onto one machine.
+Pick a role (Parent Center, console, admin, router, offline miner, site board,
+perimeter, or Everything). Legacy `host.lua` rednet install is in `archive/`.
 
 ### Install from GitHub
 
@@ -100,23 +77,20 @@ The `.lua` files also install by hand:
 - Open the world save's `computer/<id>/` folder and copy the files in directly, or
 - Type them in via the in-game editor: `edit bot.lua`.
 
-Each device needs:
+Each device needs (active installer roles):
 
 | Device            | Files                                      |
 |-------------------|--------------------------------------------|
-| Install host      | all files + `host.lua`                     |
-| Hub computer      | `hub.lua`, `lib/titan.lua`                 |
-| Each turtle (bot) | `bot.lua`, `lib/titan.lua`                 |
-| Miner turtle      | `miner.lua`, `lib/titan.lua`, `exclude.txt` |
-| Offline miner     | `offline_miner.lua`, `exclude.txt` (optional) |
+| Parent Center     | `datacenter.lua`, `lib/titan.lua`          |
+| Console           | `console.lua`, `lib/titan.lua`             |
+| Admin tablet      | `admin.lua`, `lib/titan.lua`               |
+| Network router    | `router.lua`, hub libs, `versions.lua`     |
+| Offline miner     | `offline_miner.lua`, `lib/titan.lua`, `exclude.txt` |
 | Quarry site board | `offline_site.lua`, `lib/titan.lua` (+ modem) |
-| Chest sucker      | `chest_sucker.lua`                            |
-| Each POI computer | `poi.lua`, `lib/titan.lua`                 |
+| Perimeter sensor/manager | `perimeter_*.lua`, `lib/titan.lua`  |
 
-(The **Install host** runs `host.lua` and serves everything else over rednet;
-see §3. Fresh devices only need `install.lua` to pull their files.)
-
-Keep `lib/titan.lua` in a `lib` folder next to the program.
+Keep `lib/titan.lua` in a `lib` folder next to the program. Older roles are in
+[`archive/`](archive/).
 
 ## 4. Run
 
@@ -495,11 +469,11 @@ Use **offline** for a lone turtle (`area` / `box` / …). Use **online** for the
 same dig style plus site check-ins and multi-turtle projects.
 
 **Online boot:** waits until a wireless modem is in inventory (slot 15), joins
-the site board, then enters the site mine loop. When the fleet changes, the site
-**rebands** everyone (see below).
+the site board, claims an **XZ cell**, travels with modem on, digs full height
+layer-by-layer inside that cell, then homes and requests the next free cell.
 
 **Label:** each turtle sets `V{major}.{minor}-Miner{id}` from the miner version and
-computer id (e.g. `V1.4-Miner12`).
+computer id (e.g. `V1.5-Miner12`).
 
 ### Turtle commands
 
@@ -551,72 +525,41 @@ in) and run `continue`.
 When inventory fills it returns home, dumps behind, refuels from the left, then
 resumes. Optional `exclude.txt` is honored if present.
 
-### Site board (`offline_site.lua`)
+### Site board (`offline_site.lua`) — XZ cells
 
 Left of the storage chest. Auto-learns W×L×H from turtle reports, or lock with
-`setup`. Stores each job under `quarry_jobs/`, owns fleet bands, relays a
-combined snapshot to the admin tablet.
+`setup`. Splits the footprint into **cells** (target **20×20**, min **4×4**,
+edge remainders allowed). **One bot per cell.** Each bot digs that cell’s full
+`H` **one Y layer at a time**, then marks the cell complete and gets another.
 
-**Dig / claim patterns** (site-wide):
-
-| Pattern | What the site assigns | Best for |
-|---------|----------------------|----------|
-| **`column`** (default) | Remaining **2×2 XZ** columns split across N turtles | Multi-turtle shafts |
-| **`layer`** | Remaining Y layers split into N contiguous bands | Slice-by-slice |
-
-**Fleet reband (on join / `reband` / next band):**
-
-1. Site recounts active turtles and splits **remaining** (unmined) work into N bands.
-2. Broadcasts `quarry_reband` — every miner stops and returns to origin.
-3. Turtles not on reset turn park **down then right** so origin stays clear.
-4. One at a time: `quarry_reset_go` → dump loot (keep fuel / modem / pick / left upgrade) → adopt claim + **continueIdx**.
-5. Each turtle digs like offline from that continue point (skips already-mined units in its claim). Completed columns/layers stay archived and are never reassigned.
+**Lifecycle:** `leave_origin` (modem on) → travel → `arrive_cell` → dig inside
+cell AABB → home → `cell_done` → next free cell. Site computes **quarry-relative
+and world** pose (via `origin`). Outside-cell pose → `quarry_return_home`.
+GPS turtle fixes are stubbed for a later constellation pass.
 
 ```
 # site board
-setup 16x32 60 half column   # lock footprint + fraction + pattern
-setup 16x32 60 third layer
-pattern column|layer         # claim style
-fraction half|third          # layer band size hint
-reband                       # force fleet reband + origin reset turns
-origin 120 72 -45 south      # GPS of quarry 0,0,0 + facing into mine (once)
-where 12                     # push turtle coords → admin distance screen
-where #12                    # same
-claims                       # active + free regions
-clear                        # wipe miner registry + jobs; turtles forget local digs
-clearclaims                  # free all bands + tell turtles forget local digs
-clearclaims Y 0 29           # free claims overlapping that Y range
-clearclaims done             # finished bands only
-pattern column|layer         # site dig mode (clears miner data; fleet must obey)
-reband                       # re-split unique XZ/Y bands across turtles
-auto                         # unlock auto-learn again
+setup 215x100 13 20          # footprint + optional cell size
+cellsize 16                  # rebuild free cells (keeps completed)
+cells                        # list free / assigned / complete
+origin 1343 95 1084 south    # GPS of quarry 0,0,0 + facing into mine
+where 12                     # admin distance track
+reband                       # recall fleet home (keeps cell assigns)
+clear | clearminers          # wipe turtles/jobs; assigned→free
+clearcells                   # all cells free again
+status | turtles | jobs
 
 # turtles (mode online)
-# boot: wait for modem → join → reband/reset → mine
-mine                         # claim / continue site work
-area 16x32 40                # also reports footprint (helps auto-setup)
+mine                         # claim cells until none left
+clearjob                     # forget local dig + assign
 
 # admin tablet
-quarry                       # live board: claim, @pose, continue, SOS, homing/reset
-quarry assign 12 0 29        # set turtle Y band; acks on next check-in
-quarry pending
-where 5 12                   # ask site #5 for bot #12 → live GPS track screen
+quarry                       # cells %, per-turtle cell + rel/world pose
+where 5 12                   # site #5 bot #12 → live GPS track
 ```
 
-**Where / distance track:** Turtles report quarry-relative pose (`posX/Y/Z`). Set
-`origin` on the site once (stand at turtle `0,0,0` facing into the mine; use F3
-world coords + facing) so `where` can convert to world GPS. The admin tablet
-opens a locator-style screen (your GPS vs turtle coords, live distance as you
-move). If the tablet is locked, the track queues until the next login.
-
-Progress % shows on the site monitor and admin (`live quarry` / Quarry app).
-Statuses include `homing` / `reset` / `mining`. If a turtle has **no local** job
-file, `continue` / `mine` / `join` pull the stored list from the site
-(`quarry_jobs/<id>_…`) and resume at continueIdx.
-
-Put an enchanted pick in inventory and run `equip` (or reboot / `setup`) —
-`equipLeft`/`equipRight` keep NBT when the pack allows. Dump leaves tools in
-inventory so they aren’t sent to storage.
+Progress % = cells complete (+ partial credit on active cells). Statuses include
+`travel` / `arrive` / `mining` / `homing` / `sos`.
 
 Install via the installer → **"Offline miner"** / **"Offline quarry site board"**.
 
@@ -671,13 +614,11 @@ from the install source (GitHub / pastebin / `host.lua`). Extras on disk that
 aren’t listed show as `*` and are not updated.
 
 Bump versions in `versions.lua` (and each file’s `Titan-Version:` header) when
-you ship a change; current system version is **1.5.31** (`offline_site` **1.2.3**,
-`offline_miner` **1.4.3**, `admin` **1.4.8**).
+you ship a change; current system version is **1.6.0** (`offline_site` **1.3.0**,
+`offline_miner` **1.5.0**, `admin` **1.5.0**).
 
-**Fleet claim authority:** the site board owns dig mode (`column` / `layer`) and
-hands each turtle a unique band. Local miner job files / old assigns no longer
-override the board. If turtles dig the wrong style or share a band: on the site
-run `clear` (or `pattern column|layer`), update miners, then `mine` / `reband`.
+**Cell fleet:** the site board owns unique XZ cells; miners obey cell assigns and
+drop stale local jobs. Archived packages are under `archive/` (not in installers).
 
 ---
 

@@ -1,6 +1,6 @@
 --[[
   admin.lua  -  Titan admin console for a POCKET computer ("Live" tablet)
-  Titan-Version: 1.4.8
+  Titan-Version: 1.5.0
 
   Pocket remote for the whole fleet. Keep it on you; it joins the mesh like
   every other Titan device (MAIN router + modem hops).
@@ -24,8 +24,8 @@
     flatten ...                  — run flatten on Parent Center via SSH
     live [local|global|stats|gps|bots|quarry] — full-screen boards
       Advanced (color) pocket → pretty GUI; normal pocket → mono.
-    quarry                       — offline quarry site % / turtles (titan_quarry)
-    quarry assign <id> <y0> <y1> — set turtle Y band; delivered on next check-in
+    quarry                       — cell quarry board % / turtles (titan_quarry)
+    quarry assign <id> <y0> <y1> — legacy tablet Y lock (layer sites only)
     quarry unassign <id> | quarry pending
     where <siteId> <botId>       — live GPS distance to a quarry turtle
       (site `where <id>` also pushes a track screen / queues until login)
@@ -1242,13 +1242,15 @@ local function drawQuarryBoard(L)
     return
   end
   local name = tostring(snap.name or ("#" .. tostring(snap.siteId or "?")))
-  guiText(out, 1 + L.pad, 2, ("%s  %dx%d × %dY  [%s/%s]"):format(
+  local cellSz = tonumber(snap.cellSize)
+  local modeTxt = cellSz and ("cells@" .. tostring(cellSz))
+    or tostring(snap.pattern or "cell")
+  guiText(out, 1 + L.pad, 2, ("%s  %dx%d × %dY  [%s]"):format(
     name:sub(1, 12),
     tonumber(snap.W) or 0, tonumber(snap.L) or 0, tonumber(snap.H) or 0,
-    tostring(snap.pattern or "column"),
-    tostring(snap.fraction or "?")), colors.white, colors.black)
+    modeTxt), colors.white, colors.black)
   local pct = tonumber(snap.pct) or 0
-  guiText(out, 1 + L.pad, 3, ("Progress  %d%%   %s / %s"):format(
+  guiText(out, 1 + L.pad, 3, ("Progress  %d%%   cells %s / %s"):format(
     pct, tostring(snap.done or "?"), tostring(snap.total or "?")), colors.lime, colors.black)
   if L.h > 6 then
     local barW = math.max(4, L.w - 2 - L.pad)
@@ -1265,44 +1267,40 @@ local function drawQuarryBoard(L)
       out.write("[" .. string.rep("#", fill) .. string.rep("-", barW - fill) .. "]")
     end
   end
-  guiText(out, 1 + L.pad, 5, ("online:%s  minBPC:%s  maxTravel:%s  %ss"):format(
+  guiText(out, 1 + L.pad, 5, ("on:%s free:%s asg:%s done:%s  %ss"):format(
     tostring(snap.online or 0),
-    tostring(snap.minBpc or "?"),
-    tostring(snap.maxTravel or "?"),
+    tostring(snap.cellsFree or "?"),
+    tostring(snap.cellsAssigned or "?"),
+    tostring(snap.cellsComplete or "?"),
     tostring(age or "?")), colors.lightGray, colors.black)
   local y = 7
-  guiText(out, 1 + L.pad, 6, "ID  CLAIM    @LAST POS     ST", colors.orange or colors.yellow, colors.black)
+  guiText(out, 1 + L.pad, 6, "ID  CELL     @REL / WORLD     ST", colors.orange or colors.yellow, colors.black)
   local list = snap.turtles or {}
   for _, t in ipairs(list) do
     if y >= L.h - L.footerH then break end
-    local pend = quarryAssigns[t.id]
-    local band = "-"
-    if t.x0 ~= nil then
+    local band = t.cellId and ("C" .. tostring(t.cellId)) or "-"
+    if band == "-" and t.x0 ~= nil then
       band = ("X%dZ%d"):format(t.x0, t.z0 or 0)
-    elseif t.y0 and t.y1 then
-      band = ("%d-%d"):format(t.y0, t.y1)
-    end
-    if pend and not pend.acked then
-      band = ("%d-%d*"):format(pend.y0, pend.y1)
-    elseif pend and pend.acked and (not t.y0) and t.x0 == nil then
-      band = ("%d-%d"):format(pend.y0, pend.y1)
     end
     local st = tostring(t.status or "?")
     if t.sos or st == "sos" then st = "SOS"
-    elseif pend and not pend.acked then st = "waitAck"
     elseif (t.age or 0) >= 45 then st = "stale" end
     local last = "-"
     if t.posX ~= nil then
       last = ("%d,%d,%d"):format(t.posX, t.posY or 0, t.posZ or 0)
+      if t.hasWorld and t.wx then
+        last = last .. "/" .. tostring(math.floor(t.wx))
+      end
     end
     local col = colors.white
     if st == "SOS" then col = colors.red
-    elseif st == "mining" or st == "assigned" then col = colors.lime
-    elseif st == "waitAck" then col = colors.orange or colors.yellow
+    elseif st == "mining" or st == "assigned" or st == "arrive" then col = colors.lime
+    elseif st == "travel" then col = colors.yellow
+    elseif st == "homing" then col = colors.orange or colors.yellow
     elseif st == "done" then col = colors.lightGray
     elseif st == "stale" then col = colors.red end
-    guiText(out, 1 + L.pad, y, ("#%-3d %-7s %-12s %s"):format(
-      t.id or 0, band:sub(1, 7), last:sub(1, 12), st), col, colors.black)
+    guiText(out, 1 + L.pad, y, ("#%-3d %-7s %-14s %s"):format(
+      t.id or 0, band:sub(1, 7), last:sub(1, 14), st), col, colors.black)
     y = y + 1
   end
   if #list == 0 then
@@ -1310,7 +1308,7 @@ local function drawQuarryBoard(L)
     y = y + 1
   end
   if y < L.h - L.footerH then
-    guiText(out, 1 + L.pad, L.h - L.footerH, "last @ = relative quarry pose; SOS=out of fuel", colors.gray, colors.black)
+    guiText(out, 1 + L.pad, L.h - L.footerH, "cell fleet: one bot / XZ cell; SOS=out of fuel", colors.gray, colors.black)
   end
 end
 

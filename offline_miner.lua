@@ -1,6 +1,6 @@
 --[[
   offline_miner.lua  -  Local quarry turtle (optional site board)
-  Titan-Version: 1.4.3
+  Titan-Version: 1.5.0
 
   Place the turtle at the TOP-FRONT-LEFT corner of the dig, facing into the
   mine. That cell is origin 0,0,0:
@@ -15,17 +15,16 @@
     * Slot 15 = wireless modem
     * Pickaxe on turtle upgrade slot 2 (RIGHT) — modem only swaps with that side
       (left upgrade / chunk loader is never touched)
-    * Site computer (optional) LEFT of the storage chest — multi-turtle claims
+    * Site computer (optional) LEFT of the storage chest — cell fleet claims
 
   box / area (solo) — ALWAYS 1 Y-layer at a time (walk the plane, then drop one).
-  Online digs the same way, plus site check-ins and fleet rebanding.
-  Site dig mode `column` — claim XZ columns / shafts.
-  Site dig mode `layer`  — claim a Y band across the whole footprint.
 
-  Online fleet (site board):
-    * Wait for modem → join → site may reband everyone
-    * All turtles home; take turns at origin (others park down+right)
-    * Reset dump keeps fuel/modem/pick/left upgrade; then dig from continueIdx
+  Online fleet (site board — XZ cells):
+    * Claim one cell (target 20×20 XZ, full H, layer dig)
+    * Modem ON while traveling; check-in leave_origin + arrive_cell
+    * Dig full height one Y layer at a time; stay inside cell perimeter
+    * Home → cell_done → next free cell
+    * GPS correction hooks stubbed (relative pose for now)
 
   Never attack / dig other turtles — path around them (own-right: R F L F L F R).
 
@@ -44,7 +43,7 @@
     job | clearjob | home | dump | refuel | setup | stop | status | help
 
   mode offline — solo dig, no site/admin.
-  mode online  — wait for modem, join site, reband/reset, mine with check-ins.
+  mode online  — wait for modem, join site, claim cells, mine with check-ins.
   Run:  offline_miner
 ]]
 
@@ -55,8 +54,8 @@ local FUEL_SLOT = 16
 local MODEM_SLOT = 15   -- wireless modem; swapped only with RIGHT pickaxe
 local PICK_SIDE = "right"  -- turtle upgrade slot 2 — never touch left (loaders)
 local MIN_FUEL = 200
--- Keep in sync with Titan-Version header (label uses major.minor → V1.4-Miner12).
-local MINER_VERSION = "1.4.3"
+-- Keep in sync with Titan-Version header (label uses major.minor → V1.5-Miner12).
+local MINER_VERSION = "1.5.0"
 local STOP = false
 local PROTO_QUARRY = "titan_quarry"
 local PROTO_NET = "titan_net"
@@ -64,6 +63,13 @@ local PROTO_ROUTER = "titan_router"
 local digging = false
 local modemSwapSide = nil  -- only "right" while modem is over the pick
 local knownPeers = {}      -- [computerId] = true  (site board + admin tablets)
+local pendingReturnHome = nil  -- quarry_return_home reason
+local activeCell = nil         -- current site cell assign
+local titanLib = nil
+if fs.exists("lib/titan.lua") then
+  local ok, t = pcall(dofile, "lib/titan.lua")
+  if ok then titanLib = t end
+end
 
 -- Relative pose from boot origin. +Y is DOWN.
 local pos = { x = 0, y = 0, z = 0 }
@@ -1191,6 +1197,37 @@ local function boxBandUnits(W, D, y0, y1)
   return units
 end
 
+-- Absolute XZ cell rectangle, full Y band, 1 layer at a time.
+local function cellLayerUnits(x0, x1, z0, z1, y0, y1)
+  local units = {}
+  x0 = math.floor(tonumber(x0) or 0)
+  x1 = math.floor(tonumber(x1) or x0)
+  z0 = math.floor(tonumber(z0) or 0)
+  z1 = math.floor(tonumber(z1) or z0)
+  y0 = math.floor(tonumber(y0) or 0)
+  y1 = math.floor(tonumber(y1) or y0)
+  if x1 < x0 then x0, x1 = x1, x0 end
+  if z1 < z0 then z0, z1 = z1, z0 end
+  if y1 < y0 then y0, y1 = y1, y0 end
+  for y = y0, y1 do
+    for z = z0, z1 do
+      if ((z - z0) + (y - y0)) % 2 == 0 then
+        for x = x0, x1 do units[#units + 1] = { x = x, y = y, z = z } end
+      else
+        for x = x1, x0, -1 do units[#units + 1] = { x = x, y = y, z = z } end
+      end
+    end
+  end
+  return units
+end
+
+local function gpsStubFields()
+  -- Groundwork for later constellation correction. Disabled for now so digs
+  -- don't stall waiting on gps.locate; site still receives gpsOk=false.
+  -- When enabling: call titanLib.gpsFix while modem is equipped (travel/check-in).
+  return { gpsX = nil, gpsY = nil, gpsZ = nil, gpsOk = false }
+end
+
 local function tunnelUnits(L, W)
   local units = {}
   for z = 0, L - 1 do
@@ -1438,6 +1475,7 @@ local function footprintFromJob(j)
 end
 
 local function sitePayload(extra)
+  local gps = gpsStubFields()
   local msg = {
     name = os.getComputerLabel(),
     hostname = os.getComputerLabel(),
@@ -1450,7 +1488,15 @@ local function sitePayload(extra)
     status = (activeJob and activeJob.status) or "idle",
     hasSite = siteId ~= nil,
     posX = pos.x, posY = pos.y, posZ = pos.z,
+    gpsX = gps.gpsX, gpsY = gps.gpsY, gpsZ = gps.gpsZ, gpsOk = gps.gpsOk,
+    pattern = "cell",
   }
+  if activeCell then
+    msg.cellId = activeCell.cellId
+    msg.x0, msg.x1 = activeCell.x0, activeCell.x1
+    msg.z0, msg.z1 = activeCell.z0, activeCell.z1
+    msg.y0, msg.y1 = activeCell.y0, activeCell.y1
+  end
   local j = activeJob or loadJobFile()
   if j then
     msg.job = j
@@ -1463,20 +1509,22 @@ local function sitePayload(extra)
     msg.x1 = j.x1 or msg.x1
     msg.z0 = j.z0 or msg.z0
     msg.z1 = j.z1 or msg.z1
+    msg.cellId = j.cellId or msg.cellId
     msg.pattern = j.pattern or msg.pattern
     local W, L, H = footprintFromJob(j)
     if W then msg.W, msg.L, msg.H = W, L, H end
   elseif siteInfo then
-    msg.y0 = siteInfo.y0
-    msg.y1 = siteInfo.y1
-    msg.x0 = siteInfo.x0
-    msg.x1 = siteInfo.x1
-    msg.z0 = siteInfo.z0
-    msg.z1 = siteInfo.z1
+    msg.y0 = siteInfo.y0 or msg.y0
+    msg.y1 = siteInfo.y1 or msg.y1
+    msg.x0 = siteInfo.x0 or msg.x0
+    msg.x1 = siteInfo.x1 or msg.x1
+    msg.z0 = siteInfo.z0 or msg.z0
+    msg.z1 = siteInfo.z1 or msg.z1
+    msg.cellId = siteInfo.cellId or msg.cellId
     msg.W = siteInfo.W
     msg.L = siteInfo.L
     msg.H = siteInfo.H
-    msg.pattern = siteInfo.pattern
+    msg.pattern = siteInfo.pattern or msg.pattern
   end
   if type(extra) == "table" then
     for k, v in pairs(extra) do
@@ -1975,72 +2023,59 @@ fetchJobFromSite = function(timeout, quiet, force)
   return nil
 end
 
-local function claimBand(nextBand)
+local function claimCell(nextCell)
   if not siteId then
     if not joinSite() then return nil end
   end
   if not ensureModemForComms() then return nil end
   local req = sitePayload({})
-  req.type = "quarry_claim_req"
-  if nextBand then
-    req.nextBand = true
+  req.type = "quarry_cell_req"
+  if nextCell then
+    req.nextCell = true
     req.forceNew = true
   end
   rednet.send(siteId, req, PROTO_QUARRY)
+  -- Compat with boards that only listen for claim_req
+  local req2 = {}
+  for k, v in pairs(req) do req2[k] = v end
+  req2.type = "quarry_claim_req"
+  rednet.send(siteId, req2, PROTO_QUARRY)
+
   local deadline = os.clock() + 8
   local claim = nil
   while os.clock() < deadline do
     local id, msg = rednet.receive(PROTO_QUARRY, math.max(0.05, deadline - os.clock()))
-    if id == siteId and type(msg) == "table" and msg.type == "quarry_claim" then
+    if id == siteId and type(msg) == "table"
+        and (msg.type == "quarry_cell" or msg.type == "quarry_claim") then
       if not msg.ok then
-        print("Claim failed: " .. tostring(msg.err or "unknown"))
+        print("Cell claim failed: " .. tostring(msg.err or "unknown"))
+        if digging then restorePickAfterComms() end
+        return nil
+      end
+      if msg.x0 == nil or msg.z0 == nil then
+        print("Bad cell (missing XZ) — update site board.")
         if digging then restorePickAfterComms() end
         return nil
       end
       maxTravel = tonumber(msg.maxTravel) or maxTravel
       siteInfo = msg
-      if msg.x0 ~= nil then
-        print(("Claimed column X%d-%d Z%d-%d  Y%d..%d  continue@%s%s"):format(
-          msg.x0, msg.x1 or msg.x0, msg.z0, msg.z1 or msg.z0,
-          msg.y0 or 0, msg.y1 or 0,
-          tostring(msg.continueIdx or 1),
-          msg.resume and " (resume)" or ""))
-      else
-        print(("Claimed Y %d..%d  (%d layers) continue@%s%s"):format(
-          msg.y0, msg.y1, (msg.y1 - msg.y0 + 1),
-          tostring(msg.continueIdx or 1),
-          msg.resume and " (resume)" or ""))
-      end
-      if type(msg.free) == "table" and #msg.free > 0 then
-        local parts = {}
-        for _, f in ipairs(msg.free) do
-          if f.x0 ~= nil then
-            parts[#parts + 1] = ("X%d-%dZ%d-%d"):format(f.x0, f.x1 or f.x0, f.z0, f.z1 or f.z0)
-          elseif f.y0 and f.y1 then
-            parts[#parts + 1] = ("%d..%d"):format(f.y0, f.y1)
-          end
-        end
-        if #parts > 0 then print("  Free on site: " .. table.concat(parts, ", ")) end
-      end
-      if type(msg.claims) == "table" and #msg.claims > 0 then
-        print("  Other claims:")
-        for _, c in ipairs(msg.claims) do
-          local who = (c.kind == "done") and "done" or ("#" .. tostring(c.id or "?"))
-          if c.x0 ~= nil then
-            print(("    X%d-%d Z%d-%d  %s"):format(
-              c.x0, c.x1 or c.x0, c.z0, c.z1 or c.z0, who))
-          elseif c.y0 and c.y1 then
-            print(("    Y %d..%d  %s"):format(c.y0, c.y1, who))
-          end
-        end
-      end
+      print(("Claimed cell #%s  X%d-%d Z%d-%d  Y%d..%d%s"):format(
+        tostring(msg.cellId or "?"),
+        msg.x0, msg.x1 or msg.x0, msg.z0, msg.z1 or msg.z0,
+        msg.y0 or 0, msg.y1 or 0,
+        msg.resume and " (resume)" or ""))
       claim = msg
       break
     end
   end
   if digging then restorePickAfterComms() end
-  if not claim then print("Claim timed out.") end
+  if not claim then print("Cell claim timed out.") end
   return claim
+end
+
+-- Back-compat alias
+local function claimBand(nextBand)
+  return claimCell(nextBand)
 end
 
 local function printSiteInfo()
@@ -2117,17 +2152,29 @@ handleQuarryNetMsg = function(id, msg)
       end
     end
   elseif t == "quarry_fleet_clear" then
-    -- Site wiped miner data / changed pattern — drop local dig memory.
     print("\n[site] fleet clear — forgetting local job + assign ("
       .. tostring(msg.reason or "?") .. ")")
     STOP = true
     digging = false
+    activeCell = nil
     clearLocalMineMemory({ keepSite = true })
-    if msg.pattern then
-      cfg.pattern = normalizePattern(msg.pattern) or cfg.pattern
-      siteInfo = siteInfo or {}
-      siteInfo.pattern = cfg.pattern
-      saveCfg()
+    cfg.pattern = "cell"
+    siteInfo = siteInfo or {}
+    siteInfo.pattern = "cell"
+    saveCfg()
+  elseif t == "quarry_return_home" then
+    pendingReturnHome = tostring(msg.reason or "site")
+    STOP = true
+    print("\n[site] return home — " .. pendingReturnHome)
+  elseif t == "quarry_cell" then
+    if msg.ok ~= false and msg.x0 ~= nil then
+      siteInfo = msg
+      activeCell = {
+        cellId = msg.cellId,
+        x0 = msg.x0, x1 = msg.x1, z0 = msg.z0, z1 = msg.z1,
+        y0 = msg.y0 or 0, y1 = msg.y1 or 0,
+        W = msg.W, L = msg.L, H = msg.H,
+      }
     end
   end
 end
@@ -2997,6 +3044,208 @@ local function claimFromAdminAssign()
   }
 end
 
+local function siteSendTyped(typeName, extra)
+  ensureModemForComms(true)
+  local msg = sitePayload(extra or {})
+  msg.type = typeName
+  if siteId then rednet.send(siteId, msg, PROTO_QUARRY) end
+  rednet.broadcast(msg, PROTO_QUARRY)
+  rednet.broadcast(msg, PROTO_NET)
+end
+
+local function inActiveCellXZ(slack)
+  if not activeCell then return true end
+  slack = tonumber(slack) or 0
+  local x0 = (activeCell.x0 or 0) - slack
+  local x1 = (activeCell.x1 or activeCell.x0 or 0) + slack
+  local z0 = (activeCell.z0 or 0) - slack
+  local z1 = (activeCell.z1 or activeCell.z0 or 0) + slack
+  return pos.x >= x0 and pos.x <= x1 and pos.z >= z0 and pos.z <= z1
+end
+
+-- Dig one site cell: full H, layer-by-layer, stay in XZ AABB.
+-- Returns "done" | "paused" | "stop" | "bad"
+local function runCellClaim(claim, existingJob)
+  if not claim or claim.x0 == nil or claim.z0 == nil then
+    print("Bad cell claim.")
+    return "bad"
+  end
+  local x0 = math.floor(tonumber(claim.x0) or 0)
+  local x1 = math.floor(tonumber(claim.x1) or x0)
+  local z0 = math.floor(tonumber(claim.z0) or 0)
+  local z1 = math.floor(tonumber(claim.z1) or z0)
+  local y0 = math.floor(tonumber(claim.y0) or 0)
+  local y1 = math.floor(tonumber(claim.y1) or math.max(0, (tonumber(claim.H) or 1) - 1))
+  if y1 < y0 then y0, y1 = y1, y0 end
+  local W = math.floor(tonumber(claim.W) or (siteInfo and siteInfo.W) or (x1 + 1))
+  local L = math.floor(tonumber(claim.L) or (siteInfo and siteInfo.L) or (z1 + 1))
+
+  activeCell = {
+    cellId = claim.cellId,
+    x0 = x0, x1 = x1, z0 = z0, z1 = z1, y0 = y0, y1 = y1,
+    W = W, L = L, H = y1 - y0 + 1,
+  }
+
+  local units = cellLayerUnits(x0, x1, z0, z1, y0, y1)
+  local j = existingJob
+  if not j or j.status == "done"
+      or tonumber(j.x0) ~= x0 or tonumber(j.z0) ~= z0
+      or tonumber(j.x1) ~= x1 or tonumber(j.z1) ~= z1 then
+    dug, skipped = 0, 0
+    j = {
+      type = "area", site = true, pattern = "cell", dig = "layer",
+      cellId = claim.cellId,
+      W = W, L = L, D = L, H = y1 + 1, stopY = y1 + 1,
+      x0 = x0, x1 = x1, z0 = z0, z1 = z1, y0 = y0, y1 = y1,
+      idx = 1, total = #units, status = "active", dug = 0, skipped = 0,
+    }
+  else
+    j.site = true
+    j.pattern = "cell"
+    j.cellId = claim.cellId
+    j.x0, j.x1, j.z0, j.z1 = x0, x1, z0, z1
+    j.y0, j.y1 = y0, y1
+    j.total = #units
+    j.idx = math.max(1, math.min(tonumber(j.idx) or 1, #units + 1))
+  end
+
+  -- Travel with modem on.
+  ensureModemForComms(true)
+  if pos.x ~= 0 or pos.y ~= 0 or pos.z ~= 0 then
+    print("Returning to origin before cell travel...")
+    goHome()
+  end
+  assumeAtOrigin()
+  suckFuelFromLeft()
+  siteSendTyped("quarry_leave_origin", { status = "travel", cellId = claim.cellId })
+  print(("Travel → cell #%s  X%d-%d Z%d-%d (modem on)"):format(
+    tostring(claim.cellId or "?"), x0, x1, z0, z1))
+
+  if not goTo(x0, 0, z0) then
+    print("Could not reach cell corner.")
+    siteSendTyped("quarry_progress", { status = "paused", cellId = claim.cellId })
+    return "bad"
+  end
+
+  siteSendTyped("quarry_arrive_cell", { status = "arrive", cellId = claim.cellId })
+  print(("Arrived cell #%s — layer dig Y%d..%d"):format(
+    tostring(claim.cellId or "?"), y0, y1))
+
+  restorePickAfterComms()
+  equipToolFromInventory(nil, true)
+  STOP = false
+  digging = true
+  activeJob = j
+  j.status = "active"
+  saveJobFile(j)
+  siteSendJob(j)
+  jobLabel = jobSummary(j)
+
+  local lastY = -999
+  for i = j.idx, #units do
+    if pendingReturnHome then
+      print("Pose fault — returning home.")
+      finishJob(false, "return_home")
+      digging = false
+      ensureModemForComms(true)
+      goHome()
+      siteSendTyped("quarry_progress", {
+        status = "homing", reason = pendingReturnHome, cellId = claim.cellId,
+      })
+      pendingReturnHome = nil
+      return "stop"
+    end
+    if pendingReband then
+      finishJob(false, "reband")
+      digging = false
+      return "stop"
+    end
+    if STOP then
+      finishJob(false, "stop")
+      digging = false
+      return "stop"
+    end
+
+    local u = units[i]
+    j.idx = i
+    saveJobFile(j)
+
+    -- Stay inside cell perimeter (XZ).
+    if not inActiveCellXZ(2) and (pos.x ~= u.x or pos.z ~= u.z) then
+      print(("Outside cell perimeter @ %d,%d — abort."):format(pos.x, pos.z))
+      finishJob(false, "perimeter")
+      digging = false
+      ensureModemForComms(true)
+      goHome()
+      siteSendTyped("quarry_progress", { status = "homing", reason = "perimeter" })
+      return "stop"
+    end
+
+    if not manageInventory(true) then
+      -- manageInventory already went home; keep modem for return trip.
+      ensureModemForComms(true)
+      digging = false
+      -- Resume same cell after dump.
+      print("Resuming same cell after dump/refuel...")
+      return runCellClaim(claim, loadJobFile())
+    end
+    if not ensurePickReady(true) then
+      finishJob(false, "no-pickaxe")
+      digging = false
+      return "bad"
+    end
+
+    if lastY ~= -999 and u.y > lastY then
+      while pos.y < u.y do
+        if not moveDown() then
+          finishJob(false, "layer drop")
+          digging = false
+          return "paused"
+        end
+      end
+      print(("  layer Y=%d"):format(u.y))
+    elseif lastY == -999 then
+      print(("  layer Y=%d"):format(u.y))
+    end
+    lastY = u.y
+
+    if not goTo(u.x, u.y, u.z) then
+      finishJob(false, "path")
+      digging = false
+      return "paused"
+    end
+    if not inActiveCellXZ(0) then
+      print("Left cell while pathing — abort.")
+      finishJob(false, "perimeter")
+      digging = false
+      ensureModemForComms(true)
+      goHome()
+      return "stop"
+    end
+    excavateHere()
+    j.idx = i + 1
+    saveJobFile(j)
+    if i % 8 == 0 then
+      checkIn("cell", { status = "mining", cellId = claim.cellId, job = j })
+    end
+  end
+
+  finishJob(true)
+  digging = false
+  ensureModemForComms(true)
+  goHome()
+  dumpToStorage()
+  suckFuelFromLeft()
+  siteSendTyped("quarry_cell_done", {
+    status = "idle", cellDone = true, finished = true,
+    cellId = claim.cellId, y0 = y0, y1 = y1,
+    x0 = x0, x1 = x1, z0 = z0, z1 = z1,
+  })
+  activeCell = nil
+  clearJobFile({ keepSite = true })
+  return "done"
+end
+
 -- opts.fromOrigin: turtle is at depot (default: true when pose is 0,0,0).
 local function digSiteMine(opts)
   opts = opts or {}
@@ -3006,161 +3255,103 @@ local function digSiteMine(opts)
   end
   if not waitForModemOnline(false) then return end
   if not siteId then joinSite(5, true) end
-  if not siteId and not adminAssign and type(cfg.pendingAssign) ~= "table" then
-    print("Need a site board (`join`) or a tablet Y assign (`quarry assign`).")
-    print("Solo dig: `area <W>x<L> <stopY>`  |  or `mode offline`.")
+  if not siteId then
+    print("Need a site board (`join`). Solo dig: `area` / `box` or `mode offline`.")
     return
   end
 
-  -- Local/site job files are only resumed when they match the assigned claim.
   local prior = loadJobFile()
   if not prior and siteId then prior = fetchJobFromSite(5, true) end
 
-  local fromOrigin = opts.fromOrigin
-  if fromOrigin == nil then
-    fromOrigin = (pos.x == 0 and pos.y == 0 and pos.z == 0)
-  end
-
-  local bandsDone = 0
+  local cellsDone = 0
   while true do
-    -- Fleet reband interrupts dig; complete home/reset then dig new claim.
-    if pendingReband then
-      local rc = processRebandCycle()
+    if pendingReturnHome then
+      ensureModemForComms(true)
+      goHome()
+      siteSendTyped("quarry_progress", { status = "homing", reason = pendingReturnHome })
+      pendingReturnHome = nil
       STOP = false
-      if rc then
-        prior = nil
-        fromOrigin = true
-        local cidx = tonumber(rc.continueIdx) or 1
-        print(("Reband claim continue @ %d"):format(cidx))
-        local r = runClaimBand(rc, true, nil)
-        fromOrigin = true
-        if r == "stop" and pendingReband then
-          -- loop again for newer reband
-        elseif r ~= "done" then
-          return
-        else
-          bandsDone = bandsDone + 1
-        end
-      elseif pendingReband then
-        -- try again
-      else
-        return
-      end
     end
 
-    if STOP and not pendingReband then
-      return
+    if pendingReband then
+      -- Recall-only reband: home, ping site, keep/reclaim cell.
+      local rb = pendingReband
+      pendingReband = nil
+      ensureModemForComms(true)
+      goHome()
+      siteSendTyped("quarry_home", {
+        status = "homing", epoch = rb.epoch, recallOnly = true,
+      })
+      if rb.x0 ~= nil then
+        rebandClaim = rb
+      end
+      STOP = false
     end
+
+    if STOP then return end
     STOP = false
 
-    -- Site board is authoritative for pattern + unique bands.
-    -- Tablet assign only when site is offline or after an explicit admin lock.
-    local claim = nil
-    if rebandClaim and not pendingReband then
-      claim = rebandClaim
-      rebandClaim = nil
-    end
-    if not claim and siteId then
-      claim = claimBand(bandsDone > 0)
-    end
-    if not claim then
-      claim = claimFromAdminAssign()
-      if claim then
-        if claim.x0 ~= nil then
-          print(("Using tablet assign column X%d-%d Z%d-%d  continue@%s"):format(
-            claim.x0, claim.x1 or claim.x0, claim.z0, claim.z1 or claim.z0,
-            tostring(claim.continueIdx or 1)))
-        else
-          print(("Using tablet assign Y %d..%d  continue@%s"):format(
-            claim.y0, claim.y1, tostring(claim.continueIdx or 1)))
-        end
-      end
-    end
-    if claim and claim.fromAdmin and bandsDone > 0 then
-      print("Admin Y band finished — set a new assign on the tablet, or use site claims.")
-      return
+    local claim = rebandClaim
+    rebandClaim = nil
+    if not claim and activeCell and prior and prior.status ~= "done"
+        and tonumber(prior.x0) == tonumber(activeCell.x0)
+        and tonumber(prior.z0) == tonumber(activeCell.z0) then
+      claim = {
+        ok = true, cellId = activeCell.cellId,
+        x0 = activeCell.x0, x1 = activeCell.x1,
+        z0 = activeCell.z0, z1 = activeCell.z1,
+        y0 = activeCell.y0, y1 = activeCell.y1,
+        W = activeCell.W, L = activeCell.L, H = activeCell.H,
+        resume = true, pattern = "cell",
+      }
     end
     if not claim then
-      if bandsDone == 0 then
-        print("No free claims. Site needs `setup WxL H`, or all regions are taken/done.")
-        print("Site: `pattern column|layer`  |  `claims` / `clear` / `reband`")
-        print("Tablet: `quarry assign <id> <y0> <y1>` (layer mode only)")
+      claim = claimCell(cellsDone > 0)
+    end
+    if not claim then
+      if cellsDone == 0 then
+        print("No free cells. Site: `setup WxL H` or `cells` / `clearcells`.")
       else
-        print("No more free claims — this turtle is done.")
+        print("No more free cells — this turtle is done.")
       end
       return
     end
 
-    -- Cache last site claim for UI; do NOT treat as tablet override on reboot.
-    adminAssign = {
-      y0 = claim.y0, y1 = claim.y1,
+    activeCell = {
+      cellId = claim.cellId,
       x0 = claim.x0, x1 = claim.x1, z0 = claim.z0, z1 = claim.z1,
-      W = claim.W, L = claim.L, pattern = claim.pattern,
-      continueIdx = claim.continueIdx,
-      fromAdmin = claim.fromAdmin == true,
-      assignId = claim.assignId,
+      y0 = claim.y0 or 0,
+      y1 = claim.y1 or math.max(0, (tonumber(claim.H) or 1) - 1),
+      W = claim.W, L = claim.L, H = claim.H,
     }
-    cfg.pendingAssign = adminAssign
-    saveCfg()
-    siteInfo = siteInfo or {}
-    siteInfo.y0, siteInfo.y1 = claim.y0, claim.y1
-    siteInfo.x0, siteInfo.x1 = claim.x0, claim.x1
-    siteInfo.z0, siteInfo.z1 = claim.z0, claim.z1
-    siteInfo.W, siteInfo.L = claim.W or siteInfo.W, claim.L or siteInfo.L
-    siteInfo.pattern = claim.pattern or siteInfo.pattern
-    siteInfo.continueIdx = claim.continueIdx
-    cfg.pattern = normalizePattern(claim.pattern) or cfg.pattern
+    siteInfo = claim
+    cfg.pattern = "cell"
     saveCfg()
 
     local stored = nil
-    local sitePat = normalizePattern(claim.pattern) or "column"
-    if prior and prior.status ~= "done" then
-      local priorPat = normalizePattern(prior.pattern)
-        or ((prior.x0 ~= nil) and "column") or "layer"
-      local samePat = priorPat == sitePat
-      local sameCol = claim.x0 ~= nil
+    if prior and prior.status ~= "done"
         and tonumber(prior.x0) == tonumber(claim.x0)
         and tonumber(prior.z0) == tonumber(claim.z0)
-      local sameY = claim.x0 == nil
-        and tonumber(prior.y0) == tonumber(claim.y0)
-        and tonumber(prior.y1) == tonumber(claim.y1)
-      if samePat and (sameCol or sameY) then
-        stored = prior
-        if claim.continueIdx then
-          stored.idx = math.max(tonumber(stored.idx) or 1, tonumber(claim.continueIdx) or 1)
-        end
-        print("Resuming matching job for claim @ " .. tostring(stored.idx))
-      else
-        print("Dropping local job — does not match site claim/pattern.")
-        clearJobFile({ keepSite = true })
-      end
-    elseif claim.resume and siteId and not claim.fromAdmin then
-      stored = fetchJobFromSite(3, true)
+        and tonumber(prior.x1) == tonumber(claim.x1)
+        and tonumber(prior.z1) == tonumber(claim.z1) then
+      stored = prior
+      print("Resuming cell job @ " .. tostring(stored.idx))
+    else
+      if prior then clearJobFile({ keepSite = true }) end
     end
     prior = nil
 
-    if claim.x0 ~= nil then
-      print(("Mining column X%d-%d Z%d-%d ..."):format(
-        claim.x0, claim.x1 or claim.x0, claim.z0, claim.z1 or claim.z0))
-    else
-      print(("Mining Y %d..%d (%d layers) — descending to band first..."):format(
-        claim.y0, claim.y1, claim.y1 - claim.y0 + 1))
-    end
-    -- Only the first resumed claim uses the caller's fromOrigin; later claims start at depot.
-    local r = runClaimBand(claim, fromOrigin, stored)
-    fromOrigin = true
-    if r == "stop" and pendingReband then
-      -- continue loop for reband
+    print(("Mining cell #%s  X%d-%d Z%d-%d ..."):format(
+      tostring(claim.cellId or "?"),
+      claim.x0, claim.x1 or claim.x0, claim.z0, claim.z1 or claim.z0))
+    local r = runCellClaim(claim, stored)
+    if r == "stop" and (pendingReband or pendingReturnHome) then
+      -- loop
     elseif r ~= "done" then
       return
     else
-      bandsDone = bandsDone + 1
-      if claim.fromAdmin then
-        cfg.pendingAssign = nil
-        adminAssign = nil
-        saveCfg()
-      end
-      print("Finished claim — requesting next free region...")
+      cellsDone = cellsDone + 1
+      print("Cell complete — requesting next...")
     end
   end
 end

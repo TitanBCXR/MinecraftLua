@@ -1,6 +1,6 @@
 --[[
   pastebin_install.lua  -  Pastebin bootstrap installer for the Titan system
-  Titan-Version: 1.1.20
+  Titan-Version: 1.2.0
 
   Pulls the Titan files straight from Pastebin (no in-game host needed). Upload
   each file to pastebin.com once, paste its CODE into the table below, then
@@ -21,90 +21,55 @@
 --==============================================================================
 local CODES = {
   ["lib/titan.lua"] = "",
-  ["hub.lua"]       = "",
-  ["bot.lua"]       = "",
-  ["poi.lua"]       = "",
-  ["worker.lua"]    = "",
-  ["botserver.lua"] = "",
   ["datacenter.lua"]= "",
   ["console.lua"]   = "",
   ["admin.lua"]     = "",
-  ["gpshost.lua"]   = "",
-  ["locator.lua"]   = "",
   ["router.lua"]    = "",
   ["router_main.lua"] = "",
   ["router_modem.lua"] = "",
   ["lib/router_hub_net.lua"] = "",
   ["lib/router_hub_ui.lua"] = "",
   ["lib/router_hub_cmd.lua"] = "",
-  ["miner.lua"]     = "",
   ["offline_miner.lua"] = "",
   ["offline_site.lua"] = "",
-  ["chest_sucker.lua"] = "",
-  ["loader.lua"]    = "",
-  ["marker.lua"]    = "",
-  ["storage_manager.lua"] = "",
   ["perimeter_sensor.lua"] = "",
   ["perimeter_manager.lua"] = "",
   ["exclude.txt"]   = "",
   ["versions.lua"]  = "",
 }
 
+local KEEP_ALL = {
+  "lib/titan.lua", "datacenter.lua", "console.lua", "admin.lua",
+  "router.lua", "router_main.lua", "router_modem.lua",
+  "lib/router_hub_net.lua", "lib/router_hub_ui.lua", "lib/router_hub_cmd.lua",
+  "offline_miner.lua", "offline_site.lua", "exclude.txt",
+  "perimeter_sensor.lua", "perimeter_manager.lua", "versions.lua",
+}
+
 --==============================================================================
 -- 2) Roles -> which files they need + what to auto-run (matches the README)
 --==============================================================================
 local ROLES = {
-  { key = "1", name = "Hub (control computer)",          run = "hub.lua",
-    files = { "lib/titan.lua", "hub.lua" } },
-  { key = "2", name = "Bot (basic turtle)",              run = "bot.lua",
-    files = { "lib/titan.lua", "bot.lua" } },
-  { key = "3", name = "POI (location computer)",          run = "poi.lua",
-    files = { "lib/titan.lua", "poi.lua" } },
-  { key = "4", name = "Parent Center (data center)",      run = "datacenter.lua",
+  { key = "1", name = "Parent Center (data center)",      run = "datacenter.lua",
     files = { "lib/titan.lua", "datacenter.lua" } },
-  { key = "5", name = "Bots Computer (worker server)",    run = "botserver.lua",
-    files = { "lib/titan.lua", "botserver.lua" } },
-  { key = "6", name = "Worker (builder/gatherer turtle)", run = "worker.lua",
-    files = { "lib/titan.lua", "worker.lua", "miner.lua", "exclude.txt" } },
-  { key = "7", name = "Terminal console (basic commands)", run = "console.lua",
+  { key = "2", name = "Terminal console (basic commands)", run = "console.lua",
     files = { "lib/titan.lua", "console.lua" } },
-  { key = "8", name = "Admin tablet (pocket console)",     run = "admin.lua",
+  { key = "3", name = "Admin tablet (pocket console)",     run = "admin.lua",
     files = { "lib/titan.lua", "admin.lua" } },
-  { key = "9", name = "GPS host (needs 4+ for navigation)", run = "gpshost.lua",
-    files = { "lib/titan.lua", "gpshost.lua" } },
-  { key = "10", name = "GPS locator (pocket)",             run = "locator.lua",
-    files = { "lib/titan.lua", "locator.lua" } },
-  { key = "11", name = "Network router (repeater + GPS)",  run = "router.lua",
+  { key = "4", name = "Network router (repeater + GPS)",  run = "router.lua",
     files = { "lib/titan.lua", "router.lua", "router_main.lua", "router_modem.lua",
               "lib/router_hub_net.lua", "lib/router_hub_ui.lua", "lib/router_hub_cmd.lua",
               "versions.lua" } },
-  { key = "12", name = "Miner (area quarry turtle)",       run = "miner.lua",
-    files = { "lib/titan.lua", "miner.lua", "exclude.txt" } },
-  { key = "13", name = "Offline miner (solo or multi Y-band)", run = "offline_miner.lua",
-    files = { "offline_miner.lua", "exclude.txt" } },
-  { key = "14", name = "Offline quarry site board",       run = "offline_site.lua",
+  { key = "5", name = "Offline miner (cell quarry turtle)", run = "offline_miner.lua",
+    files = { "lib/titan.lua", "offline_miner.lua", "exclude.txt" } },
+  { key = "6", name = "Offline quarry site board",       run = "offline_site.lua",
     files = { "offline_site.lua", "lib/titan.lua" } },
-  { key = "15", name = "StorageManager (Create storage)", run = "storage_manager.lua",
-    files = { "lib/titan.lua", "storage_manager.lua" } },
-  { key = "16", name = "Loader (chunk escort / Chunky Turtle)", run = "loader.lua",
-    files = { "lib/titan.lua", "loader.lua" } },
-  { key = "17", name = "Site marker (area + fleet job request)", run = "marker.lua",
-    files = { "lib/titan.lua", "marker.lua" } },
-  { key = "18", name = "Perimeter sensor (Player Detector gate)", run = "perimeter_sensor.lua",
+  { key = "7", name = "Perimeter sensor (Player Detector gate)", run = "perimeter_sensor.lua",
     files = { "lib/titan.lua", "perimeter_sensor.lua" } },
-  { key = "19", name = "Perimeter manager (territory board)", run = "perimeter_manager.lua",
+  { key = "8", name = "Perimeter manager (territory board)", run = "perimeter_manager.lua",
     files = { "lib/titan.lua", "perimeter_manager.lua" } },
-  { key = "20", name = "Chest sucker (pull from adjacent chests/barrels)", run = "chest_sucker.lua",
-    files = { "chest_sucker.lua" } },
-  { key = "21", name = "Everything (all files, no auto-run)", run = nil,
-    files = { "lib/titan.lua", "hub.lua", "bot.lua", "poi.lua", "worker.lua", "botserver.lua",
-              "datacenter.lua", "console.lua", "admin.lua", "gpshost.lua", "locator.lua",
-              "router.lua", "router_main.lua", "router_modem.lua",
-              "lib/router_hub_net.lua", "lib/router_hub_ui.lua", "lib/router_hub_cmd.lua",
-              "miner.lua", "offline_miner.lua", "offline_site.lua", "chest_sucker.lua",
-              "loader.lua", "marker.lua", "storage_manager.lua",
-              "perimeter_sensor.lua", "perimeter_manager.lua",
-              "exclude.txt", "versions.lua" } },
+  { key = "9", name = "Everything (kept files, no auto-run)", run = nil,
+    files = KEEP_ALL },
 }
 
 --==============================================================================
@@ -241,16 +206,14 @@ writeFile(".titan-install", textutils.serialize({
 
 -- Give this device a role-based label if it doesn't have one yet.
 local LABELS = {
-  ["hub.lua"] = "Hub", ["bot.lua"] = "Bot", ["poi.lua"] = "POI",
-  ["datacenter.lua"] = "ParentCenter", ["botserver.lua"] = "BotsComputer",
-  ["worker.lua"] = "Worker", ["console.lua"] = "Console",
-  ["admin.lua"] = "Admin", ["host.lua"] = "Host", ["gpshost.lua"] = "GPS",
-  ["locator.lua"] = "Locator", ["router.lua"] = "Router", ["miner.lua"] = "Miner",
+  ["datacenter.lua"] = "ParentCenter",
+  ["console.lua"] = "Console",
+  ["admin.lua"] = "Admin",
+  ["router.lua"] = "Router",
   ["offline_miner.lua"] = "OfflineMiner",
   ["offline_site.lua"] = "QuarrySite",
-  ["chest_sucker.lua"] = "ChestSucker",
-  ["loader.lua"] = "Loader", ["marker.lua"] = "SiteMarker",
-  ["storage_manager.lua"] = "StorageManager",
+  ["perimeter_sensor.lua"] = "PerimSensor",
+  ["perimeter_manager.lua"] = "PerimMgr",
 }
 local lbl = role.run and LABELS[role.run]
 if lbl and not os.getComputerLabel() then
