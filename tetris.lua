@@ -1,12 +1,12 @@
 --[[
   tetris.lua  -  Standalone Tetris for CC: Tweaked (pocket / computer)
-  Titan-Version: 1.0.7
+  Titan-Version: 1.0.8
 
   Drop on a pocket PC and run:
 
       tetris
 
-  Main menu: top-3 leaderboard, Play, Controls (C). Q quits the app from menu.
+  Main menu: top-3 leaderboard, Play, Controls (C). Q shuts the device down.
   In-game / Controls screen: Q always returns to the main menu.
   Mid-game Q abandons the run (score is not kept).
 
@@ -766,7 +766,7 @@ local function drawMenu(playBtn, ctrlBtn)
   text(cx, rowY, ctrlLabel, colors.black, ctrlBg)
   ctrlBtn.x, ctrlBtn.y, ctrlBtn.w, ctrlBtn.h = cx, rowY, #ctrlLabel, 1
 
-  text(2, th, "Enter play  C controls  N name  R sync  Q quit", colors.gray, colors.black)
+  text(2, th, "Enter play  C controls  N name  R sync  Q power off", colors.gray, colors.black)
 end
 
 local function controlsScreen()
@@ -876,7 +876,9 @@ local function mainMenu()
       elseif p1 == keys.q then
         clearScreen(colors.black)
         term.setCursorPos(1, 1)
-        print("Bye.")
+        print("Shutting down...")
+        sleep(0.2)
+        os.shutdown()
         return
       end
     elseif ev == "char" then
@@ -884,7 +886,9 @@ local function mainMenu()
       if ch == "q" then
         clearScreen(colors.black)
         term.setCursorPos(1, 1)
-        print("Bye.")
+        print("Shutting down...")
+        sleep(0.2)
+        os.shutdown()
         return
       elseif ch == "p" then
         local score = runGame()
@@ -925,7 +929,7 @@ local function sendTrackerBeacon()
     name = host,
     hostname = host,
     mainRouterId = titan.getMainRouterId and titan.getMainRouterId() or nil,
-    version = titan.systemVersion and titan.systemVersion() or "1.0.7",
+    version = titan.systemVersion and titan.systemVersion() or "1.0.8",
     game = "tetris",
     playing = TRACK.playing and true or false,
     score = TRACK.score,
