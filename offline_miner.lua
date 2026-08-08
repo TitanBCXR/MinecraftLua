@@ -1,6 +1,6 @@
 --[[
   offline_miner.lua  -  Local quarry turtle (optional site board)
-  Titan-Version: 1.3.5
+  Titan-Version: 1.3.7
 
   Place the turtle at the TOP-FRONT-LEFT corner of the dig, facing into the
   mine. That cell is origin 0,0,0:
@@ -236,7 +236,16 @@ local function turnTo(dir)
   end
 end
 
-local function faceForward() turnTo(0) end
+-- +Z "into the mine" is only a resting pose at origin XZ. Never spin back to
+-- +Z after mining a cell — locomotion uses turnTo() only when a step needs it.
+local function atOriginXZ()
+  return pos.x == 0 and pos.z == 0
+end
+
+local function faceForward()
+  if atOriginXZ() then turnTo(0) end
+end
+
 local function faceRight() turnTo(1) end
 local function faceBack() turnTo(2) end
 local function faceLeft() turnTo(3) end
@@ -755,26 +764,47 @@ local function moveDown()
 end
 
 -- One block only toward target. Never skips a cell.
+-- Locomotion uses turnTo() (not faceForward). Prefer the heading we're already on.
 local function stepOnceToward(tx, ty, tz)
   local ox, oy, oz = pos.x, pos.y, pos.z
   if oy < ty then
     if not moveDown() then return false, "down" end
   elseif oy > ty then
     if not moveUp() then return false, "up" end
-  elseif ox < tx then
-    faceRight()
-    if not moveForward() then return false, "x+" end
-  elseif ox > tx then
-    faceLeft()
-    if not moveForward() then return false, "x-" end
-  elseif oz < tz then
-    faceForward()
-    if not moveForward() then return false, "z+" end
-  elseif oz > tz then
-    faceBack()
-    if not moveForward() then return false, "z-" end
   else
-    return true
+    local dx, dz = tx - ox, tz - oz
+    local function stepDir(dir)
+      if dir == 0 and dz > 0 then
+        turnTo(0)
+        if not moveForward() then return false, "z+" end
+        return true
+      elseif dir == 1 and dx > 0 then
+        turnTo(1)
+        if not moveForward() then return false, "x+" end
+        return true
+      elseif dir == 2 and dz < 0 then
+        turnTo(2)
+        if not moveForward() then return false, "z-" end
+        return true
+      elseif dir == 3 and dx < 0 then
+        turnTo(3)
+        if not moveForward() then return false, "x-" end
+        return true
+      end
+      return nil
+    end
+    local moved, err = stepDir(facing)
+    if moved == nil then
+      if dx ~= 0 then
+        moved, err = stepDir(dx > 0 and 1 or 3)
+      elseif dz ~= 0 then
+        moved, err = stepDir(dz > 0 and 0 or 2)
+      else
+        return true
+      end
+    end
+    if moved == false then return false, err or "blocked" end
+    if moved == nil then return true end
   end
   local dist = math.abs(pos.x - ox) + math.abs(pos.y - oy) + math.abs(pos.z - oz)
   if dist ~= 1 then
@@ -792,8 +822,9 @@ local function stepOnceToward(tx, ty, tz)
   return true
 end
 
-local function goTo(tx, ty, tz)
-  -- Step one block at a time (Y, then X, then Z). Never jumps 2+.
+local function goTo(tx, ty, tz, opts)
+  -- Never re-face +Z at the destination. Dig line keeps its travel heading.
+  opts = opts or {}
   local floor = digFloorY()
   tx = math.floor(tonumber(tx) or 0)
   ty = math.floor(tonumber(ty) or 0)
@@ -808,13 +839,11 @@ local function goTo(tx, ty, tz)
     local ok, err = stepOnceToward(tx, ty, tz)
     if not ok then return false, err end
   end
-  faceForward()
+  if opts.faceForward then faceForward() end
   return true
 end
 
--- Mark this job cell done. Pathing digs the block on this layer as we step in;
--- do NOT digUp (above the layer) or digDown (next layer) or spin neighbors.
--- After the whole layer's units are done, runBoxJob drops one Y and continues.
+-- Cell is cleared by walking into it. No spin / digUp / digDown / neighbors.
 local function excavateHere()
   return true
 end
@@ -998,13 +1027,14 @@ end
 local function assumeAtOrigin()
   pos.x, pos.y, pos.z = 0, 0, 0
   facing = 0
-  faceForward()
+  turnTo(0)
 end
 
 local function goHome()
   jobLabel = "home"
   local ok, err = goTo(0, 0, 0)
-  faceForward()
+  -- Resting pose into the mine — only forced here at origin.
+  turnTo(0)
   return ok, err
 end
 
@@ -1507,7 +1537,8 @@ local function moveIntoBand(y0, y1, opts)
     ok, err = goTo(0, y0, 0)
   end
   activeJob = prev
-  faceForward()
+  -- At home column (0, y0, 0) — face into the mine before the dig starts.
+  if atOriginXZ() then turnTo(0) end
   if not ok then
     print("Could not reach band Y=" .. y0 .. ": " .. tostring(err))
     return false
@@ -2161,8 +2192,8 @@ local function runBoxJob(j)
     if not manageInventory(true) then finishJob(false, "inventory/fuel"); return end
 
     -- Drop exactly one Y when the work-list advances to the next layer.
+    -- Stay in place (no trip back to 0,0) — just dig down into the next layer.
     if lastY ~= -999 and u.y > lastY then
-      if not goTo(0, lastY, 0) then finishJob(false, "layer path"); return end
       while pos.y < u.y do
         if floor ~= nil and pos.y >= floor then break end
         if not moveDown() then finishJob(false, "layer drop"); return end
@@ -2180,7 +2211,7 @@ local function runBoxJob(j)
       return
     end
 
-    -- One cell at a time (goTo steps exactly 1 block per move). Clear this cell.
+    -- One cell at a time along the dig line — keep facing travel dir (no spin).
     if not goTo(u.x, u.y, u.z) then finishJob(false, "path"); return end
     if pos.x ~= u.x or pos.y ~= u.y or pos.z ~= u.z then
       print(("Pose mismatch at unit %d: at %d,%d,%d want %d,%d,%d"):format(
@@ -2193,11 +2224,9 @@ local function runBoxJob(j)
     j.idx = i + 1
     saveJobFile(j)
 
-    -- End of this dig line (next cell is another row or layer, or done).
-    if not nextU or nextU.z ~= u.z or nextU.y ~= u.y then
-      checkIn((nextU and nextU.y ~= u.y) and "layer" or "line", {
-        status = "mining", job = j, jobFile = JOB_FILE,
-      })
+    -- Check-in only at layer changes (not every row — modem swap kills speed).
+    if nextU and nextU.y ~= u.y then
+      checkIn("layer", { status = "mining", job = j, jobFile = JOB_FILE })
       if not ensurePickReady(true) then
         finishJob(false, "no-pickaxe")
         return
@@ -2264,7 +2293,7 @@ local function runStairJob(j)
     local nextU = units[i + 1]
     if nextU and nextU.step ~= u.step then
       if not goTo(0, u.y, u.z) then finishJob(false, "stair edge"); return end
-      faceForward()
+      turnTo(0)
       if not moveForward() then finishJob(false, "forward"); return end
       clearPlayerHeadroom()
       if dir == "down" then

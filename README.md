@@ -6,8 +6,8 @@ A wireless dispatch system for Minecraft's **CC: Tweaked** mod:
 - **`bot.lua`** — a turtle that reports status, navigates by GPS, and executes tasks.
 - **`poi.lua`** — a "point of interest" computer that marks a location by coordinates and can summon a bot.
 - **`miner.lua`** — quarry turtle: digs between two corners down to a floor Y, skipping `exclude.txt`.
-- **`offline_miner.lua`** — local quarry (solo or multi-turtle): origin at top-front-left, `area` / `box` / `tunnel` / `stair`, or `join` / `mine` with a site board.
-- **`offline_site.lua`** — quarry site computer (left of storage): Y-band claims, BPC / maxTravel, % progress for the admin tablet.
+- **`offline_miner.lua`** — local quarry turtle: `mode online|offline`, solo `area` / `box` / `tunnel` / `stair`, or site `join` / `mine`. Layer dig stays on the dig line (no spin); fuel SOS to admin + MAIN.
+- **`offline_site.lua`** — quarry site board (left of storage): dig mode `column` (2×2 XZ shafts) or `layer` (Y bands), job store, % progress for the admin tablet.
 - **`perimeter_sensor.lua` / `perimeter_manager.lua`** — Player Detector territory enter/exit board (N/E/S/W + timestamps).
 - **`lib/titan.lua`** — shared library (protocol, messaging, navigation). Copy this onto **every** device.
 
@@ -123,6 +123,14 @@ Keep `lib/titan.lua` in a `lib` folder next to the program.
 - **POIs:** `poi.lua` — first run asks for a name/description and reads GPS coords (or type them in). Use the menu to summon bots.
 
 Tip: rename a device with `label set <name>` so it shows a friendly name on the status board.
+
+Tip: auto-start needs **quotes** around the filename in `startup.lua`:
+
+```lua
+shell.run("offline_miner.lua")
+```
+
+Without quotes Lua treats `offline_miner.lua` as a table index and crashes on boot.
 
 ## 5. Hub console commands
 
@@ -454,86 +462,129 @@ grace timer so walking between detectors doesn’t false-exit.
 
 # Offline miner (`offline_miner.lua`) + site board (`offline_site.lua`)
 
-Solo mode needs no GPS or Parent Center — just a turtle and two chests. Stand at
-the **top-front-left** corner of the dig, facing into the mine. That pose is
-origin `0,0,0`:
+Needs no GPS or Parent Center for solo digs — turtle + two chests. Stand at the
+**top-front-left** corner of the dig, facing into the mine. That pose is origin
+`0,0,0`:
 
 | Axis | Direction |
 |------|-----------|
 | +X   | right     |
 | +Y   | down      |
-| +Z   | forward   |
+| +Z   | forward (into the mine) |
 
-**First boot** (or `setup`): fuel chest on the **left** (fills **slot 16** with coal
-only and keeps it there), storage chest **behind** (dumps slots 1–15).
+**First boot** (or `setup`):
+
+| Side / slot | Role |
+|-------------|------|
+| Chest **LEFT** | Fuel → **slot 16** (coal stays there) |
+| Chest **BEHIND** | Storage → dumps slots **1–14** |
+| **Slot 15** | Wireless modem (online mode) |
+| Upgrade **RIGHT** | Pickaxe (modem swaps with this side only; left/loader untouched) |
+| Site PC (optional) | Left of the storage chest |
+
+### Network mode
 
 ```
-area 16x32 40             width × length, 40 layers of 1 Y each (aliases: quarry)
-box 9x5x9                 width × 5 layers down × depth (always 1 Y per layer)
-tunnel 32                 length, player-tall 2 high (optional width: tunnel 32 3)
+mode offline              solo dig — no site board, no admin check-ins
+mode online               modem + site claims / admin tablet (default)
+```
+
+Use **offline** for a lone turtle (`area` / `box` / …). Use **online** when you
+want `join` / `mine`, tablet progress, fuel SOS, and reboot sync with the site.
+
+### Turtle commands
+
+```
+area 16x32 40             W×L footprint, 40 layers down (aliases: quarry, flatten)
+box 9x6x10                W×H×D — 9 right, 6 layers down, 10 forward
+tunnel 32 [3]             player-tall corridor (optional width)
 stair 3x20 down           width × steps, up|down (player-tall)
-equip [left|right]        mount a pick from inventory (aliases: tool, pick)
-continue | job | clearjob
-home | dump | refuel | stop | status
+equip | tool | pick       mount best pick from inventory
+mode online|offline       site/admin on or off
+join                      find site board (online)
+mine                      claim from site until none left
+continue | resume         resume saved / site job
+job | clearjob            show / forget saved job
+home | dump | refuel | setup | stop | status | site | help
 ```
 
-### Progress to the admin tablet (site board optional)
+### How it digs
 
-Give mining turtles a **wireless modem in slot 15**. For site/admin talk the
-turtle briefly equips that modem **in place of its diamond pickaxe** (never a
-loader upgrade), then puts the pickaxe back before digging. Any `area` / `box` /
-`mine` job can broadcast progress **with or without** a site PC.
+- **`box` / `area` (solo):** always **one Y layer at a time** — walk the plane
+  (snake rows), then drop one Y in place. No dig-up, no neighbor spin-dig.
+- **Facing:** stays on the dig-line heading while mining. It only faces into the
+  mine (`+Z`) at **origin** (home / depot / band start). Turns only when the
+  next step needs a new direction.
+- **Check-ins (online):** modem swap at depot dumps and when a **layer** finishes
+  (not every row — keeps speed up).
+- **Other turtles:** never attack them. If one is ahead, bypass to its own right:
+  `R F L F L F R`.
+- **tunnel / stair:** stay player-tall (2 high).
 
-**Without a site board:** run `area 16x32 40` — the tablet aggregates turtle
-reports into a progress view.
+### Fuel SOS
 
-**With a site board** (left of the storage chest): it auto-learns W×L×H from
-those reports (or lock with `setup`), stores each `offline_miner_job.cfg` under
-`quarry_jobs/`, hands out Y bands, and relays a combined snapshot to the tablet.
+At **0 fuel** the computer still runs. The turtle equips the modem and broadcasts
+`quarry_sos` to the **admin tablet** and **MAIN router monitors** until coal is
+restored (`quarry_sos_clear`). If it can’t walk home, it SOS in place.
+
+### Job memory + reboot resume
+
+Progress and pose save to `offline_miner_job.cfg` (synced to the site when
+online). A finished dig clears the file.
+
+On **reboot** (online): the turtle talks to the site, restores saved pose, and
+auto-continues when fuel allows. If fuel is only enough for the depot, it
+refuels there first, then continues. `continue` / `resume` do the same by hand.
+
+After a hard `stop` with no site: put the turtle back at origin (`0,0,0` facing
+in) and run `continue`.
+
+When inventory fills it returns home, dumps behind, refuels from the left, then
+resumes. Optional `exclude.txt` is honored if present.
+
+### Site board (`offline_site.lua`)
+
+Left of the storage chest. Auto-learns W×L×H from turtle reports, or lock with
+`setup`. Stores each job under `quarry_jobs/`, hands out claims, relays a
+combined snapshot to the admin tablet.
+
+**Dig / claim patterns** (site-wide):
+
+| Pattern | What `mine` claims | Best for |
+|---------|-------------------|----------|
+| **`column`** (default) | Non-overlapping **2×2 XZ** shafts, full height | Multi-turtle speed, less surface walking |
+| **`layer`** | Y bands across the whole footprint (max half / third of H) | Classic slice-by-slice |
 
 ```
-# optional site board
-setup 16x32 60 half       # lock footprint (or skip — auto from turtles)
-claims                    # show claimed + free Y bands
-clearclaims               # free all Y claims (turtles re-pick with mine)
-clearclaims Y 0 29        # free claims overlapping that Y range
-clearclaims done          # clear finished bands only
-auto                      # unlock auto-learn again
-# turtles
-join                      # link to site if present
-mine                      # ask site for a free Y band, then dig it
-area 16x32 40             # dig; reports to admin whenever a modem is present
+# site board
+setup 16x32 60 half column   # lock footprint + fraction + pattern
+setup 16x32 60 third layer
+pattern column|layer         # claim style for mine/
+fraction half|third          # max Y band size (layer mode)
+claims                       # active + free claims
+clearclaims                  # free all (turtles re-pick with mine)
+clearclaims Y 0 29           # free claims overlapping that Y range
+clearclaims done             # finished bands only
+auto                         # unlock auto-learn again
+
+# turtles (mode online)
+join
+mine                         # claim next free column or Y band, dig until none left
+area 16x32 40                # also reports footprint / progress with a modem
+
 # admin tablet
-quarry assign 12 0 29     # set turtle Y band; turtle acks on next check-in
-quarry pending            # waiting / acked assigns
+quarry                       # live board: claim, last @x,y,z pose, SOS
+quarry assign 12 0 29        # set turtle Y band; acks on next check-in
+quarry pending
 ```
 
-Y-band claims (max **half** / **third** of height) need the site board. Progress
-% shows on the site monitor and admin (`live quarry` / Quarry app / `quarry`).
+Progress % shows on the site monitor and admin (`live quarry` / Quarry app).
+If a turtle has **no local** job file, `continue` / `mine` / `join` pull the
+stored list from the site (`quarry_jobs/<id>_…`) and resume.
 
-If a turtle has **no local** `offline_miner_job.cfg`, `continue` / `mine` / `join`
-pull the stored job list from the site board (`quarry_jobs/<id>_…`) and resume
-from that.
-
-With a site board, `mine` **claims a Y band** for that turtle (other turtles get
-their own bands). When a band is finished the turtle claims the **next free**
-band until none remain.
-
-Put an enchanted pick in the turtle’s inventory and run `equip` (or reboot /
-`setup`) — the script uses `turtle.equipLeft`/`equipRight` so you don’t have to
-craft the tool onto the turtle. Dump leaves picks in the inventory so they aren’t
-sent to the storage chest.
-
-**box / area** always mine **one Y layer at a time** (walk the plane, then drop
-one). They never dig 2 high. **tunnel / stair** stay player-tall (2).
-
-Progress is saved to `offline_miner_job.cfg` while running or paused. A finished
-dig clears that file automatically. After `stop` / reboot: put the turtle back at
-origin (`0,0,0` facing in) and run `continue`. `job` shows the saved task;
-`clearjob` forgets a paused dig.
-
-When the inventory fills it returns to `0,0,0`, dumps behind, refuels from the
-left, then resumes in-session. Optional `exclude.txt` is honored if present.
+Put an enchanted pick in inventory and run `equip` (or reboot / `setup`) —
+`equipLeft`/`equipRight` keep NBT when the pack allows. Dump leaves tools in
+inventory so they aren’t sent to storage.
 
 Install via the installer → **"Offline miner"** / **"Offline quarry site board"**.
 
@@ -588,7 +639,8 @@ from the install source (GitHub / pastebin / `host.lua`). Extras on disk that
 aren’t listed show as `*` and are not updated.
 
 Bump versions in `versions.lua` (and each file’s `Titan-Version:` header) when
-you ship a change; current system version is **1.1.1**.
+you ship a change; current system version is **1.5.24** (`offline_miner` **1.3.7**,
+`offline_site` **1.1.0**).
 
 ---
 
@@ -661,6 +713,10 @@ deploy | flatten | dc | park | stop | continue | mode simple|advanced
 as the MAIN router monitor (`board_req`). An **advanced (color) pocket** gets the
 pretty GUI; a normal pocket stays mono. Keys: `1`–`6` select board, `←`/`→`
 cycle, `r` refresh, `q` quit.
+
+**Quarry board** lists each offline miner’s claim, status, and **last known pose**
+(`@x,y,z` relative to quarry origin). Out-of-fuel turtles show **SOS** (from
+`quarry_sos` broadcasts) until cleared.
 
 **`link`** builds the ender-router backbone and attaches local RF modems. Prefer
 `link auto` once hubs have GPS, or `link 5 12` to peer two routers / attach a
@@ -746,10 +802,13 @@ link auto            peer all routers; each modem → nearest hub (GPS)
   `gpshost.lua`) near distant areas too.
 - **Directory + status boards (MAIN):** two roster views on the monitor —
   **local** (`view local` / `screen roster`) for this hub’s modems and computers,
-  and **global** (`view global`) for backbone peers and remote mesh cells.
+  and **global** (`view global`) for **MAIN / backbone routers** and remote mesh
+  cells (RF modems and end devices are **not** counted as global “routers”).
   Also `devices` / `forget` in the console. **Advanced (color) monitors** get a
   denser GUI (header bars, status chips, alternating rows); plain monitors stay
   mono. Layout and text scale auto-adjust from the screen size (`tiny` → `large`).
+  Quarry **fuel SOS** overlays show on MAIN monitors when an offline miner is
+  out of coal.
 - **GPS host:** each hub can host GPS (`gpshost <x> <y> <z>`).
 
 Install via installer → **"Network router"**.
