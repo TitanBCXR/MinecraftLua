@@ -49,6 +49,9 @@ Full guide: <https://tweaked.cc/guide/gps_setup.html>
 
 ### Recommended: GitHub installer
 
+On an **advanced (color) pocket**, the installer opens a tap-friendly tile GUI.
+Other devices keep the classic text menu.
+
 On each device:
 
 ```
@@ -90,6 +93,7 @@ Each device needs (active installer roles):
 | Offline miner     | `offline_miner.lua`, `lib/titan.lua`, `exclude.txt` |
 | Quarry site board | `offline_site.lua`, `lib/titan.lua` (+ modem) |
 | Perimeter sensor/manager | `perimeter_*.lua`, `lib/titan.lua`  |
+| Games (submenu **g**) | `tetris.lua` / `minesweeper.lua` (+ titan for Tetris) |
 
 Keep `lib/titan.lua` in a `lib` folder next to the program. Older roles are in
 [`archive/`](archive/).

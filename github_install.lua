@@ -1,6 +1,6 @@
 --[[
   github_install.lua  -  Install the Titan system straight from a GitHub repo
-  Titan-Version: 1.2.2
+  Titan-Version: 1.2.3
 
   Point RAW_BASE at your repo's raw content root, then on each Minecraft device:
 
@@ -9,6 +9,9 @@
   (or `wget ... github_install.lua` then run it). It asks what the device is,
   pulls that role's files from GitHub (creating lib/ as needed), offers a
   startup.lua, and can launch it.
+
+  Advanced (color) pocket computers get a tap-friendly tile GUI; other devices
+  keep the classic text menu.
 
   GitHub is a public HTTPS host, so it's on CC: Tweaked's allow-list by default -
   no config changes needed. Use the RAW url (raw.githubusercontent.com), NOT the
@@ -101,15 +104,183 @@ if RAW_BASE:find("YOURNAME/REPO") then
   return
 end
 
--- Pick from a role list. cancelKey returns nil; backKey (optional) returns false.
-local function pickFromList(list, opts)
+-- Advanced pocket = color terminal + pocket API (golden / advanced pocket PC).
+local function useModernGui()
+  local ok, color = pcall(function() return term.isColor and term.isColor() end)
+  return ok and color == true and pocket ~= nil
+end
+
+local TILE_BG = {
+  ["1"] = colors.blue, ["2"] = colors.gray, ["3"] = colors.purple,
+  ["4"] = colors.cyan, ["5"] = colors.brown, ["6"] = colors.orange,
+  ["7"] = colors.red, ["8"] = colors.red, ["g"] = colors.magenta,
+  ["h"] = colors.green, ["9"] = colors.lightGray,
+  ["1g"] = colors.magenta, ["2g"] = colors.orange, -- games submenu
+}
+
+local function fill(x, y, w, h, bg, fg)
+  if term.setBackgroundColor then term.setBackgroundColor(bg or colors.black) end
+  if term.setTextColor then term.setTextColor(fg or colors.white) end
+  for row = y, y + h - 1 do
+    term.setCursorPos(x, row)
+    term.write((" "):rep(math.max(0, w)))
+  end
+end
+
+local function textAt(x, y, s, fg, bg)
+  if term.setBackgroundColor then term.setBackgroundColor(bg or colors.black) end
+  if term.setTextColor then term.setTextColor(fg or colors.white) end
+  term.setCursorPos(x, y)
+  term.write(tostring(s or ""))
+end
+
+local function shortName(name)
+  name = tostring(name or "")
+  -- Drop parenthetical clutter on small tiles.
+  name = name:gsub("%s*%b()", "")
+  return name
+end
+
+-- Modern tile picker for advanced pockets. Returns item, false (back), or nil (cancel).
+local function pickFromListGui(list, opts)
+  opts = opts or {}
+  local title = opts.title or "TITAN INSTALL"
+  local subtitle = opts.subtitle or ""
+  local allowBack = opts.backKey ~= nil
+  local sel, scroll = 1, 0
+  local cols = 1
+
+  local function layout()
+    local tw, th = term.getSize()
+    cols = (tw >= 28) and 2 or 1
+    local headerH = 3
+    local footerH = 1
+    local tileH = 3
+    local gap = 1
+    local usable = th - headerH - footerH
+    local rows = math.max(1, math.floor((usable + gap) / (tileH + gap)))
+    local page = rows * cols
+    local tileW = math.floor((tw - (cols + 1)) / cols)
+    return tw, th, headerH, footerH, tileH, gap, rows, page, tileW
+  end
+
+  local function tileRect(i, tw, headerH, tileH, gap, rows, tileW)
+    local localIdx = i - scroll
+    if localIdx < 1 then return nil end
+    local row = math.floor((localIdx - 1) / cols)
+    local col = (localIdx - 1) % cols
+    if row >= rows then return nil end
+    local x = 2 + col * (tileW + 1)
+    local y = headerH + 1 + row * (tileH + gap)
+    return x, y, tileW, tileH
+  end
+
+  while true do
+    local tw, th, headerH, footerH, tileH, gap, rows, page, tileW = layout()
+    if sel < 1 then sel = 1 end
+    if sel > #list then sel = #list end
+    if sel <= scroll then scroll = math.max(0, sel - 1) end
+    if sel > scroll + page then scroll = sel - page end
+    if scroll < 0 then scroll = 0 end
+    local maxScroll = math.max(0, #list - page)
+    if scroll > maxScroll then scroll = maxScroll end
+
+    fill(1, 1, tw, th, colors.black, colors.white)
+    fill(1, 1, tw, 1, colors.blue, colors.white)
+    textAt(2, 1, title:sub(1, tw - 2), colors.white, colors.blue)
+    if allowBack then
+      textAt(math.max(2, tw - 5), 1, "BACK", colors.yellow, colors.blue)
+    else
+      textAt(math.max(2, tw - 2), 1, "X", colors.red, colors.blue)
+    end
+    textAt(2, 2, (subtitle ~= "" and subtitle or "Tap a role to install"):sub(1, tw - 2),
+      colors.lightGray, colors.black)
+
+    for i = 1, #list do
+      local x, y, w, h = tileRect(i, tw, headerH, tileH, gap, rows, tileW)
+      if x then
+        local item = list[i]
+        local bg = TILE_BG[tostring(item.key)] or colors.gray
+        if opts.games then
+          bg = (i == 1) and colors.magenta or colors.orange
+        end
+        local fg = colors.white
+        if i == sel then
+          -- Selection ring
+          fill(x - 1, y, w + 2, h, colors.white, colors.black)
+          fill(x, y, w, h, bg, fg)
+        else
+          fill(x, y, w, h, bg, fg)
+        end
+        local label = shortName(item.name)
+        textAt(x + 1, y + 1, label:sub(1, math.max(1, w - 2)), fg, bg)
+        textAt(x + 1, y, tostring(item.key):upper():sub(1, 1), colors.yellow, bg)
+      end
+    end
+
+    local foot = allowBack and "Tap  Enter  B back  Q quit" or "Tap  Enter  Q quit"
+    if scroll > 0 or scroll + page < #list then
+      foot = "↑↓  " .. foot
+    end
+    fill(1, th, tw, 1, colors.gray, colors.white)
+    textAt(2, th, foot:sub(1, tw - 2), colors.white, colors.gray)
+
+    local ev, p1, p2, p3 = os.pullEvent()
+    if ev == "term_resize" then
+      -- redraw
+    elseif ev == "key" then
+      local K = keys
+      if p1 == K.up or p1 == K.left then
+        sel = sel > 1 and sel - 1 or #list
+      elseif p1 == K.down or p1 == K.right or p1 == K.tab then
+        sel = sel < #list and sel + 1 or 1
+      elseif p1 == K.enter or p1 == K.space then
+        return list[sel]
+      elseif p1 == K.q then
+        return nil
+      elseif allowBack and (p1 == K.b or p1 == K.backspace) then
+        return false
+      elseif p1 == K.pageUp then
+        sel = math.max(1, sel - page)
+      elseif p1 == K.pageDown then
+        sel = math.min(#list, sel + page)
+      end
+    elseif ev == "char" then
+      local ch = tostring(p1 or ""):lower()
+      if ch == "q" then return nil end
+      if allowBack and ch == "b" then return false end
+      for i, item in ipairs(list) do
+        if tostring(item.key):lower() == ch then return item end
+      end
+    elseif ev == "mouse_click" then
+      local btn, mx, my = p1, p2, p3
+      if my == 1 then
+        if allowBack and mx >= tw - 5 then return false end
+        if not allowBack and mx >= tw - 2 then return nil end
+      end
+      for i = 1, #list do
+        local x, y, w, h = tileRect(i, tw, headerH, tileH, gap, rows, tileW)
+        if x and mx >= x and mx < x + w and my >= y and my < y + h then
+          if btn == 1 then return list[i] end
+        end
+      end
+    elseif ev == "mouse_scroll" then
+      if p1 < 0 then sel = math.max(1, sel - 1)
+      elseif p1 > 0 then sel = math.min(#list, sel + 1) end
+    elseif ev == "terminate" then
+      return nil
+    end
+  end
+end
+
+-- Classic text picker. cancelKey returns nil; backKey returns false.
+local function pickFromListText(list, opts)
   opts = opts or {}
   local title = opts.title or "== Install =="
   local sourceLine = opts.sourceLine
   local promptHint = opts.promptHint or "What is this device?"
   local cancelKey = (opts.cancelKey or "q"):lower()
   local backKey = opts.backKey and tostring(opts.backKey):lower() or nil
-  local lastKey = list[#list].key
   while true do
     local idx = 1
     while idx <= #list do
@@ -151,19 +322,71 @@ local function pickFromList(list, opts)
   end
 end
 
+local function pickFromList(list, opts)
+  if useModernGui() then
+    return pickFromListGui(list, opts)
+  end
+  return pickFromListText(list, opts)
+end
+
+local function askYesNo(question, defaultYes)
+  if not useModernGui() then
+    write(question .. (defaultYes and " [Y/n] " or " [y/N] "))
+    local yn = read():lower()
+    if yn == "" then return defaultYes ~= false end
+    return yn == "y" or yn == "yes"
+  end
+  local tw, th = term.getSize()
+  while true do
+    fill(1, 1, tw, th, colors.black, colors.white)
+    fill(1, 1, tw, 1, colors.blue, colors.white)
+    textAt(2, 1, "CONFIRM", colors.white, colors.blue)
+    textAt(2, 3, question:sub(1, tw - 2), colors.white, colors.black)
+    local yW, nW = 8, 8
+    local yX = math.floor(tw / 2) - yW - 1
+    local nX = math.floor(tw / 2) + 2
+    local yY = math.min(th - 3, 6)
+    fill(yX, yY, yW, 3, colors.lime, colors.black)
+    textAt(yX + 2, yY + 1, "YES", colors.black, colors.lime)
+    fill(nX, yY, nW, 3, colors.red, colors.white)
+    textAt(nX + 2, yY + 1, "NO", colors.white, colors.red)
+    textAt(2, th, "Y / N   tap a button", colors.lightGray, colors.black)
+    local ev, p1, p2, p3 = os.pullEvent()
+    if ev == "char" then
+      local ch = tostring(p1 or ""):lower()
+      if ch == "y" then return true end
+      if ch == "n" then return false end
+    elseif ev == "key" then
+      if p1 == keys.enter then return defaultYes ~= false end
+      if p1 == keys.y then return true end
+      if p1 == keys.n then return false end
+    elseif ev == "mouse_click" then
+      local mx, my = p2, p3
+      if my >= yY and my < yY + 3 then
+        if mx >= yX and mx < yX + yW then return true end
+        if mx >= nX and mx < nX + nW then return false end
+      end
+    elseif ev == "terminate" then
+      return false
+    end
+  end
+end
+
 local function pickRole(title, sourceLine)
   while true do
     local role = pickFromList(ROLES, {
-      title = title,
+      title = useModernGui() and "TITAN INSTALL" or title,
       sourceLine = sourceLine,
+      subtitle = sourceLine,
       promptHint = "What is this device?  (g = Games)",
     })
     if role == nil then return nil end
     if role.submenu == "games" then
       local game = pickFromList(GAMES, {
-        title = "== Games ==",
+        title = useModernGui() and "GAMES" or "== Games ==",
         promptHint = "Pick a game:",
         backKey = "b",
+        games = true,
       })
       if game then return game end
       -- nil = cancel all; false = back to main menu
@@ -175,7 +398,22 @@ local function pickRole(title, sourceLine)
 end
 
 local role = pickRole("== Titan GitHub Installer ==", "Source: " .. RAW_BASE)
-if not role then print("Cancelled."); return end
+if not role then
+  if useModernGui() then
+    fill(1, 1, select(1, term.getSize()), select(2, term.getSize()), colors.black, colors.white)
+    term.setCursorPos(1, 1)
+  end
+  print("Cancelled.")
+  return
+end
+
+-- Leave GUI chrome before download logs.
+if useModernGui() then
+  term.setBackgroundColor(colors.black)
+  term.setTextColor(colors.white)
+  term.clear()
+  term.setCursorPos(1, 1)
+end
 
 local files, hasVersions = {}, false
 for _, path in ipairs(role.files) do
@@ -254,14 +492,12 @@ if lbl and not os.getComputerLabel() then
 end
 
 if role.run then
-  write("Auto-run " .. role.run .. " on boot? [Y/n] ")
-  local yn = read():lower()
-  if yn == "" or yn == "y" then
+  if askYesNo("Auto-run " .. role.run .. " on boot?", true) then
     writeFile("startup.lua", ('shell.run("%s")\n'):format(role.run))
     print("Wrote startup.lua.")
   end
-  write("Run " .. role.run .. " now? [Y/n] ")
-  local yn2 = read():lower()
-  if yn2 == "" or yn2 == "y" then return shell.run(role.run) end
+  if askYesNo("Run " .. role.run .. " now?", true) then
+    return shell.run(role.run)
+  end
 end
 print("Done.")
