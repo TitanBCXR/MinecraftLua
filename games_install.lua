@@ -1,6 +1,6 @@
 --[[
   games_install.lua  -  Titan Games suite installer (CC: Tweaked)
-  Titan-Version: 1.0.0
+  Titan-Version: 1.0.1
 
   Games only — not the fleet / router installer.
 
@@ -22,7 +22,6 @@ local FILES = {
   "lib/titan.lua", -- Tetris helper lib (speaker-only launch still works without modem)
   "tetris.lua",
   "minesweeper.lua",
-  "sandstorm.lua",
   "luigi_poker.lua",
   "slots.lua",
 }

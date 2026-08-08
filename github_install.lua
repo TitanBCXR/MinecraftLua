@@ -1,6 +1,6 @@
 --[[
   github_install.lua  -  Install the Titan system straight from a GitHub repo
-  Titan-Version: 1.2.9
+  Titan-Version: 1.2.10
 
   Point RAW_BASE at your repo's raw content root, then on each Minecraft device:
 
@@ -41,7 +41,7 @@ local KEEP_ALL = {
 -- Full suite installed by the Games launcher role (keeps itself + catalog updated).
 local GAMES_SUITE = {
   "games.lua", "games_catalog.lua", "versions.lua", "lib/titan.lua",
-  "tetris.lua", "minesweeper.lua", "sandstorm.lua", "luigi_poker.lua", "slots.lua",
+  "tetris.lua", "minesweeper.lua", "luigi_poker.lua", "slots.lua",
 }
 
 local GAMES = {
@@ -51,11 +51,9 @@ local GAMES = {
     files = { "lib/titan.lua", "tetris.lua", "versions.lua" } },
   { key = "2", name = "Minesweeper (pocket / monitor)", run = "minesweeper.lua",
     files = { "minesweeper.lua" } },
-  { key = "3", name = "Sandstorm (noteblock + pixel show)", run = "sandstorm.lua",
-    files = { "sandstorm.lua" } },
-  { key = "4", name = "Luigi Picture Poker (pocket)", run = "luigi_poker.lua",
+  { key = "3", name = "Luigi Picture Poker (pocket)", run = "luigi_poker.lua",
     files = { "luigi_poker.lua" } },
-  { key = "5", name = "Slots (3-reel)", run = "slots.lua",
+  { key = "4", name = "Slots (3-reel)", run = "slots.lua",
     files = { "slots.lua" } },
 }
 

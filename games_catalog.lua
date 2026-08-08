@@ -1,6 +1,6 @@
 --[[
   games_catalog.lua  -  Titan games suite catalog
-  Titan-Version: 1.0.1
+  Titan-Version: 1.0.2
 
   Source of truth for the Games launcher (`games.lua`).
   Add a new game here (+ versions.lua + ship the .lua) and every launcher
@@ -12,7 +12,7 @@
 ]]
 
 return {
-  version = "1.0.1",
+  version = "1.0.2",
   base = "https://raw.githubusercontent.com/TitanBCXR/MinecraftLua/main/",
   -- Launcher self-update files (always kept current).
   launcher = {
@@ -32,13 +32,6 @@ return {
       run = "minesweeper.lua",
       desc = "Pocket / monitor mines",
       files = { "minesweeper.lua" },
-    },
-    {
-      id = "sandstorm",
-      name = "Sandstorm",
-      run = "sandstorm.lua",
-      desc = "Noteblock track + pixel show",
-      files = { "sandstorm.lua" },
     },
     {
       id = "luigi_poker",

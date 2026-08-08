@@ -1,6 +1,6 @@
 --[[
   luigi_poker.lua  -  Luigi Picture Poker (SMB3-style) for CC: Tweaked
-  Titan-Version: 1.2.1
+  Titan-Version: 1.2.2
 
   Run:
 
@@ -260,9 +260,10 @@ local function bonusMult(hand)
   return 0
 end
 
--- Comparable strength for beating Luigi (higher = better).
+-- Comparable key: { category, …tiebreak ranks }. Higher category always wins.
+-- (Old packed integers were wrong: high-card hands could outscore pairs.)
 local function handRank(hand)
-  if not hand or #hand < 5 then return 0, "—" end
+  if not hand or #hand < 5 then return { -1 }, "—" end
   local c = counts(hand)
   local groups = {}
   for r = 1, 6 do
@@ -292,17 +293,32 @@ local function handRank(hand)
     name = RANKS[hi].name .. " high"
   end
 
-  local score = cat
-  for i = 1, #groups do
-    score = score * 10 + groups[i].c
-    score = score * 10 + groups[i].r
-  end
   local cards = { hand[1], hand[2], hand[3], hand[4], hand[5] }
   table.sort(cards, function(a, b) return a > b end)
+
+  -- Fixed-length key: category, then up to 5 (count,rank) slots, then 5 kickers.
+  local key = { cat }
   for i = 1, 5 do
-    score = score * 7 + cards[i]
+    local g = groups[i]
+    key[#key + 1] = g and g.c or 0
+    key[#key + 1] = g and g.r or 0
   end
-  return score, name
+  for i = 1, 5 do
+    key[#key + 1] = cards[i] or 0
+  end
+  return key, name
+end
+
+-- -1 if a<b, 0 equal, 1 if a>b
+local function cmpHandKey(a, b)
+  a, b = a or {}, b or {}
+  local n = math.max(#a, #b)
+  for i = 1, n do
+    local x, y = a[i] or 0, b[i] or 0
+    if x < y then return -1 end
+    if x > y then return 1 end
+  end
+  return 0
 end
 
 --------------------------------------------------------------------------------
@@ -551,9 +567,10 @@ local function doDraw(state)
       state.hand[i] = table.remove(state.deck) or state.hand[i]
     end
   end
-  local pScore, pName = handRank(state.hand)
-  local lScore, lName = handRank(state.luigi)
-  if pScore > lScore then
+  local pKey, pName = handRank(state.hand)
+  local lKey, lName = handRank(state.luigi)
+  local cmp = cmpHandKey(pKey, lKey)
+  if cmp > 0 then
     local bonus = bonusMult(state.hand)
     local mult = math.max(2, bonus > 0 and bonus or 2)
     state.win = state.bet * mult
@@ -561,7 +578,7 @@ local function doDraw(state)
     state.resultName = "Beat Luigi! " .. pName
     COINS = COINS + state.win
     sfx("win")
-  elseif pScore == lScore then
+  elseif cmp == 0 then
     state.win = state.bet
     state.outcome = "push"
     state.resultName = "Push — " .. pName
@@ -570,7 +587,7 @@ local function doDraw(state)
   else
     state.win = 0
     state.outcome = "lose"
-    state.resultName = "Luigi: " .. lName
+    state.resultName = "Luigi wins — " .. lName
     sfx("lose")
   end
   saveCfg()

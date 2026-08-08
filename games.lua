@@ -301,7 +301,6 @@ end
 local TILE = {
   tetris = colors.magenta,
   minesweeper = colors.lightGray,
-  sandstorm = colors.orange,
   luigi_poker = colors.lime,
   slots = colors.purple,
 }
