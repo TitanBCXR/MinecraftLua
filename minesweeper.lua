@@ -1,6 +1,6 @@
 --[[
   minesweeper.lua  -  Lightweight Minesweeper for CC: Tweaked
-  Titan-Version: 1.1.0
+  Titan-Version: 1.2.0
 
   Run:
 
@@ -10,14 +10,18 @@
   game draws there (keys still work on the computer). Color monitors / advanced
   pockets get colored numbers.
 
+  Music (speaker / Noisy pocket): calm menu bed + tense in-game pulse.
+  M mutes. Tiny note-block tracks only (no audio files).
+
   Controls:
     Mouse / monitor touch  left = open   right = flag (mouse)
-    Keys   arrows move cursor   Space/Enter open   F flag
+    Keys   arrows move cursor   Space/Enter open   F flag   M mute
            1/2/3 difficulty on menu   N new game   Q quit
 ]]
 
 local CFG = "mines.cfg"
 local BEST = {} -- [diffKey] = best seconds
+local MUSIC_ON = true
 local NATIVE = term.current()
 local USING_MONITOR = false
 
@@ -56,7 +60,7 @@ local function attachMonitor()
     NATIVE.setCursorPos(1, 2)
     NATIVE.write("Keys work on this PC")
     NATIVE.setCursorPos(1, 3)
-    NATIVE.write("Touch=open  F=flag")
+    NATIVE.write("Touch=open  F=flag  M=mute")
   end)
   return true
 end
@@ -82,16 +86,140 @@ local function loadCfg()
   local f = fs.open(CFG, "r")
   local d = textutils.unserialize(f.readAll() or "")
   f.close()
-  if type(d) == "table" and type(d.best) == "table" then BEST = d.best end
+  if type(d) ~= "table" then return end
+  if type(d.best) == "table" then BEST = d.best end
+  if d.music == false then MUSIC_ON = false end
 end
 
 local function saveCfg()
   local f = fs.open(CFG, "w")
-  f.write(textutils.serialize({ best = BEST }))
+  f.write(textutils.serialize({ best = BEST, music = MUSIC_ON }))
   f.close()
 end
 
 loadCfg()
+
+--------------------------------------------------------------------------------
+-- Speaker music (menu + gameplay). No audio files — tiny note tables.
+--------------------------------------------------------------------------------
+local SPEAKER = nil
+local musicIdx = 1
+local musicBassPulse = 0
+local musicTrackName = "menu"
+local TRACKS = {
+  -- Soft curious menu bed.
+  menu = {
+    beat = 0.22,
+    legato = 0.82,
+    style = "menu",
+    bass = { 2, 2, 2, 2, 5, 5, 5, 5, 0, 0, 7, 7, 2, 2, 5, 5 },
+    melody = {
+      {7, 2}, {9, 2}, {12, 3}, {9, 2}, {7, 2}, {5, 3},
+      {false, 1},
+      {5, 2}, {7, 2}, {11, 3}, {7, 2}, {5, 2}, {2, 4},
+      {false, 2},
+      {9, 2}, {12, 2}, {14, 3}, {12, 2}, {9, 2}, {7, 4},
+      {false, 2},
+    },
+  },
+  -- Tense in-game pulse (different mood from the menu).
+  game = {
+    beat = 0.15,
+    legato = 0.74,
+    style = "game",
+    bass = { 0, 0, 3, 3, 5, 5, 3, 3, 0, 0, 7, 7, 5, 5, 3, 3 },
+    melody = {
+      {12, 1}, {false, 1}, {12, 1}, {11, 1}, {9, 2}, {7, 2},
+      {9, 1}, {11, 1}, {12, 2}, {14, 2}, {12, 2},
+      {false, 1},
+      {14, 1}, {12, 1}, {11, 2}, {9, 2}, {7, 2}, {9, 3},
+      {false, 2},
+      {7, 1}, {9, 1}, {11, 1}, {12, 2}, {11, 1}, {9, 2}, {7, 3},
+      {false, 2},
+    },
+  },
+}
+
+local function refreshSpeaker()
+  SPEAKER = peripheral.find("speaker")
+  return SPEAKER ~= nil
+end
+
+local function stopMusic()
+  if SPEAKER then pcall(function() SPEAKER.stop() end) end
+end
+
+local function startMusic(trackName)
+  trackName = trackName or musicTrackName or "menu"
+  if trackName ~= musicTrackName then stopMusic() end
+  musicTrackName = trackName
+  musicIdx = 1
+  musicBassPulse = 0
+  return MUSIC_ON and refreshSpeaker()
+end
+
+local function playSoft(instrument, volume, pitch)
+  if not SPEAKER or pitch == nil or pitch < 0 or pitch > 24 then return end
+  pcall(function() SPEAKER.playNote(instrument, volume, pitch) end)
+end
+
+local function musicStepSeconds()
+  if not MUSIC_ON then return 0.5 end
+  if not SPEAKER and not refreshSpeaker() then return 1.0 end
+  local tr = TRACKS[musicTrackName] or TRACKS.game
+  local melody, bass = tr.melody, tr.bass
+  local note = melody[musicIdx] or { false, 1 }
+  musicIdx = musicIdx + 1
+  if musicIdx > #melody then musicIdx = 1 end
+  local pitch, beats = note[1], tonumber(note[2]) or 1
+
+  musicBassPulse = musicBassPulse + 1
+  local bassPitch = bass[((musicBassPulse - 1) % #bass) + 1]
+  playSoft("bass", tr.style == "menu" and 0.14 or 0.20, bassPitch)
+
+  if tr.style == "menu" then
+    if pitch ~= false and pitch ~= nil then
+      playSoft("chime", 0.22, pitch)
+      playSoft("guitar", 0.12, math.max(0, pitch - 5))
+    else
+      playSoft("harp", 0.08, math.min(24, bassPitch + 12))
+    end
+  else
+    -- Sparse tense lead + soft hat tick for "sweeper" feel.
+    if pitch ~= false and pitch ~= nil then
+      playSoft("pling", 0.28, pitch)
+      playSoft("guitar", 0.12, math.max(0, pitch - 7))
+    end
+    if musicBassPulse % 2 == 0 then
+      playSoft("hat", 0.10, 18)
+    end
+  end
+
+  return math.max(0.06, beats * (tr.beat or 0.16) * (tr.legato or 0.75))
+end
+
+local function sfxOpen()
+  if MUSIC_ON and refreshSpeaker() then playSoft("hat", 0.18, 14) end
+end
+
+local function sfxFlag()
+  if MUSIC_ON and refreshSpeaker() then playSoft("snare", 0.16, 8) end
+end
+
+local function sfxBoom()
+  if MUSIC_ON and refreshSpeaker() then
+    playSoft("basedrum", 0.7, 2)
+    playSoft("bass", 0.5, 0)
+  end
+end
+
+local function sfxWin()
+  if MUSIC_ON and refreshSpeaker() then
+    playSoft("chime", 0.4, 12)
+    playSoft("bell", 0.35, 16)
+    playSoft("chime", 0.3, 19)
+  end
+end
 
 local function clampBoard(diff)
   local tw, th = term.getSize()
@@ -275,8 +403,8 @@ local function drawGame(state)
     term.setTextColor(colors.lightGray)
   end
   local foot = USING_MONITOR
-    and "Touch open  F flag  N new  Q menu"
-    or "Spc/click open  F flag  N new  Q menu"
+    and "Touch open  F flag  M mute  N new  Q"
+    or "Spc open  F flag  M mute  N new  Q"
   if state.over then
     foot = state.won and "Cleared!  N new  Q menu" or "Boom!  N new  Q menu"
   end
@@ -301,6 +429,8 @@ local function openCell(state, x, y)
     state.over = true
     state.won = false
     state.finalTime = math.floor(os.clock() - state.t0)
+    stopMusic()
+    sfxBoom()
     -- Reveal all mines.
     for i = 1, #state.grid do
       if state.grid[i].mine then state.grid[i].open = true end
@@ -309,10 +439,13 @@ local function openCell(state, x, y)
   end
 
   floodOpen(state.grid, state.w, state.h, x, y)
+  sfxOpen()
   if won(state.grid) then
     state.over = true
     state.won = true
     state.finalTime = math.floor(os.clock() - state.t0)
+    stopMusic()
+    sfxWin()
     local prev = tonumber(BEST[state.diff.key])
     if not prev or state.finalTime < prev then
       BEST[state.diff.key] = state.finalTime
@@ -325,14 +458,12 @@ local function openCell(state, x, y)
 end
 
 local function toggleFlag(state, x, y)
-  if state.over or not state.started then
-    -- Allow flags before first open too.
-  end
   if state.over then return end
   if not inBounds(x, y, state.w, state.h) then return end
   local cell = state.grid[idx(x, y, state.w)]
   if cell.open then return end
   cell.flag = not cell.flag
+  sfxFlag()
 end
 
 local function newState(diff)
@@ -362,10 +493,18 @@ end
 local function runGame(diff)
   local state = newState(diff)
   local tick = os.startTimer(0.5)
+  startMusic("game")
+  local musicTimer = os.startTimer(MUSIC_ON and refreshSpeaker() and 0.05 or 3600)
   drawGame(state)
   while true do
     local ev, p1, p2, p3 = pullGameEvent()
-    if ev == "timer" and p1 == tick then
+    if ev == "timer" and p1 == musicTimer then
+      if MUSIC_ON and not state.over then
+        musicTimer = os.startTimer(musicStepSeconds())
+      else
+        musicTimer = os.startTimer(0.4)
+      end
+    elseif ev == "timer" and p1 == tick then
       if not state.over then drawGame(state) end
       tick = os.startTimer(0.5)
     elseif ev == "term_resize" or ev == "monitor_resize" then
@@ -393,9 +532,22 @@ local function runGame(diff)
         openCell(state, state.cursorX, state.cursorY); drawGame(state)
       elseif p1 == K.f then
         toggleFlag(state, state.cursorX, state.cursorY); drawGame(state)
+      elseif p1 == K.m then
+        MUSIC_ON = not MUSIC_ON
+        saveCfg()
+        if MUSIC_ON and not state.over then
+          startMusic("game")
+          musicTimer = os.startTimer(0.05)
+        else
+          stopMusic()
+        end
       elseif p1 == K.n then
-        state = newState(diff); drawGame(state)
+        state = newState(diff)
+        startMusic("game")
+        musicTimer = os.startTimer(MUSIC_ON and 0.05 or 3600)
+        drawGame(state)
       elseif p1 == K.q or p1 == K.backspace then
+        stopMusic()
         drainInput()
         return
       end
@@ -403,13 +555,27 @@ local function runGame(diff)
       local ch = tostring(p1 or ""):lower()
       if ch == "f" then
         toggleFlag(state, state.cursorX, state.cursorY); drawGame(state)
+      elseif ch == "m" then
+        MUSIC_ON = not MUSIC_ON
+        saveCfg()
+        if MUSIC_ON and not state.over then
+          startMusic("game")
+          musicTimer = os.startTimer(0.05)
+        else
+          stopMusic()
+        end
       elseif ch == "n" then
-        state = newState(diff); drawGame(state)
+        state = newState(diff)
+        startMusic("game")
+        musicTimer = os.startTimer(MUSIC_ON and 0.05 or 3600)
+        drawGame(state)
       elseif ch == "q" then
+        stopMusic()
         drainInput()
         return
       end
     elseif ev == "terminate" then
+      stopMusic()
       return
     end
   end
@@ -450,23 +616,48 @@ local function drawMenu(sel)
 
   if color then term.setTextColor(colors.gray) end
   term.setCursorPos(2, th)
-  term.write("1-3 / Enter play   Q quit")
+  term.write("1-3 play   M mute   Q quit")
 end
 
 local function mainMenu()
   local sel = 1
+  startMusic("menu")
+  local musicTimer = os.startTimer(MUSIC_ON and refreshSpeaker() and 0.05 or 3600)
+
+  local function resumeMenuMusic()
+    startMusic("menu")
+    musicTimer = os.startTimer(MUSIC_ON and SPEAKER and 0.05 or 3600)
+  end
+
+  local function playDiff(diff)
+    stopMusic()
+    runGame(diff)
+    resumeMenuMusic()
+  end
+
   while true do
     drawMenu(sel)
     local ev, p1, p2, p3 = pullGameEvent()
-    if ev == "key" then
+    if ev == "timer" and p1 == musicTimer then
+      if MUSIC_ON then
+        musicTimer = os.startTimer(musicStepSeconds())
+      else
+        musicTimer = os.startTimer(0.5)
+      end
+    elseif ev == "key" then
       if p1 == keys.up then sel = sel > 1 and sel - 1 or #DIFFS
       elseif p1 == keys.down then sel = sel < #DIFFS and sel + 1 or 1
       elseif p1 == keys.enter or p1 == keys.space then
-        runGame(DIFFS[sel])
-      elseif p1 == keys.one then runGame(DIFFS[1])
-      elseif p1 == keys.two then runGame(DIFFS[2])
-      elseif p1 == keys.three then runGame(DIFFS[3])
+        playDiff(DIFFS[sel])
+      elseif p1 == keys.one then playDiff(DIFFS[1])
+      elseif p1 == keys.two then playDiff(DIFFS[2])
+      elseif p1 == keys.three then playDiff(DIFFS[3])
+      elseif p1 == keys.m then
+        MUSIC_ON = not MUSIC_ON
+        saveCfg()
+        if MUSIC_ON then resumeMenuMusic() else stopMusic() end
       elseif p1 == keys.q or p1 == keys.backspace then
+        stopMusic()
         term.setBackgroundColor(colors.black)
         term.clear()
         term.setCursorPos(1, 1)
@@ -474,10 +665,15 @@ local function mainMenu()
       end
     elseif ev == "char" then
       local ch = tostring(p1 or ""):lower()
-      if ch == "1" then runGame(DIFFS[1])
-      elseif ch == "2" then runGame(DIFFS[2])
-      elseif ch == "3" then runGame(DIFFS[3])
+      if ch == "1" then playDiff(DIFFS[1])
+      elseif ch == "2" then playDiff(DIFFS[2])
+      elseif ch == "3" then playDiff(DIFFS[3])
+      elseif ch == "m" then
+        MUSIC_ON = not MUSIC_ON
+        saveCfg()
+        if MUSIC_ON then resumeMenuMusic() else stopMusic() end
       elseif ch == "q" then
+        stopMusic()
         term.setBackgroundColor(colors.black)
         term.clear()
         term.setCursorPos(1, 1)
@@ -487,11 +683,12 @@ local function mainMenu()
       -- Tap a difficulty row (y=3..5).
       local y = p3
       if y >= 3 and y <= 2 + #DIFFS then
-        runGame(DIFFS[y - 2])
+        playDiff(DIFFS[y - 2])
       end
     elseif ev == "term_resize" or ev == "monitor_resize" then
       -- redraw
     elseif ev == "terminate" then
+      stopMusic()
       return
     end
   end
@@ -500,5 +697,6 @@ end
 math.randomseed(os.epoch("utc") % 2147483647)
 attachMonitor()
 local ok, err = pcall(mainMenu)
+stopMusic()
 detachMonitor()
 if not ok then error(err, 0) end
