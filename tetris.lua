@@ -1,6 +1,6 @@
 --[[
   tetris.lua  -  Standalone Tetris for CC: Tweaked (pocket / computer)
-  Titan-Version: 1.2.3
+  Titan-Version: 1.2.4
 
   Drop on a pocket PC and run:
 
@@ -15,9 +15,9 @@
   crashes with speaker music). New scores update the local top-3 and queue for
   the next boot sync. R reloads the local cache only.
 
-  Music (Noisy pocket): tiny note-block Korobeiniki in this script only — no
-  DFPWM / HTTP audio files. M mutes. Mesh / leaderboard sync still need a
-  wireless modem at boot.
+  Music (Noisy pocket): two in-script note tracks — calm menu bed + retro
+  Korobeiniki in-game. M mutes. Mesh / leaderboard sync still need a wireless
+  modem at boot.
 
   Player name: uses Advanced Peripherals Player Detector when present; otherwise
   prompts for a name after a game (saved in tetris.cfg). That name is what
@@ -104,24 +104,46 @@ HI, PLAYER_NAME = loadCfg()
 local SPEAKER = nil
 local musicIdx = 1
 local musicBassPulse = 0
--- Compact note-block Korobeiniki (folk melody). No audio files — tiny in-script data.
-local MELODY = {
-  {16, 2}, {11, 1}, {12, 1}, {14, 2}, {12, 1}, {11, 1},
-  {9, 2}, {9, 1}, {12, 1}, {16, 2}, {14, 1}, {12, 1},
-  {11, 2}, {11, 1}, {12, 1}, {14, 2}, {16, 2},
-  {12, 2}, {9, 2}, {9, 4},
-  {false, 2},
-  {14, 2}, {17, 1}, {21, 2}, {19, 1}, {17, 1},
-  {16, 3}, {12, 1}, {16, 2}, {14, 1}, {12, 1},
-  {11, 2}, {11, 1}, {12, 1}, {14, 2}, {16, 2},
-  {12, 2}, {9, 2}, {9, 4},
-  {false, 4},
+local musicTrackName = "menu"
+-- Two tiny note-block tracks (no audio files).
+local TRACKS = {
+  -- Calm menu bed (soft arpeggios — different mood from the game theme).
+  menu = {
+    beat = 0.20,
+    legato = 0.80,
+    style = "menu",
+    bass = { 4, 4, 4, 4, 2, 2, 2, 2, 0, 0, 0, 0, 4, 4, 7, 7 },
+    melody = {
+      {9, 2}, {12, 2}, {16, 3}, {12, 2}, {9, 2}, {7, 3},
+      {false, 1},
+      {7, 2}, {11, 2}, {14, 3}, {11, 2}, {7, 2}, {4, 3},
+      {false, 1},
+      {4, 2}, {7, 2}, {12, 3}, {9, 2}, {7, 2}, {9, 4},
+      {false, 2},
+      {12, 2}, {16, 2}, {19, 3}, {16, 2}, {12, 2}, {9, 4},
+      {false, 3},
+    },
+  },
+  -- In-game: retro Korobeiniki (public-domain folk melody).
+  game = {
+    beat = 0.13,
+    legato = 0.72,
+    style = "game",
+    bass = { 4, 4, 2, 2, 0, 0, 4, 4, 7, 7, 4, 4, 0, 0, 4, 4 },
+    melody = {
+      {16, 2}, {11, 1}, {12, 1}, {14, 2}, {12, 1}, {11, 1},
+      {9, 2}, {9, 1}, {12, 1}, {16, 2}, {14, 1}, {12, 1},
+      {11, 2}, {11, 1}, {12, 1}, {14, 2}, {16, 2},
+      {12, 2}, {9, 2}, {9, 4},
+      {false, 2},
+      {14, 2}, {17, 1}, {21, 2}, {19, 1}, {17, 1},
+      {16, 3}, {12, 1}, {16, 2}, {14, 1}, {12, 1},
+      {11, 2}, {11, 1}, {12, 1}, {14, 2}, {16, 2},
+      {12, 2}, {9, 2}, {9, 4},
+      {false, 4},
+    },
+  },
 }
--- Pedal bass roots (played on a steady pulse so the lead never sits in silence).
-local BASS = { 4, 4, 2, 2, 0, 0, 4, 4, 7, 7, 4, 4, 0, 0, 4, 4 }
-local MUSIC_BEAT = 0.13
--- Start the next note before the previous duration ends (legato / less choppy).
-local MUSIC_LEGATO = 0.72
 local LEGACY_MUSIC_FILE = "tetris_lofi.dfpwm"
 
 local function refreshSpeaker()
@@ -161,17 +183,23 @@ local function swapPocketUpgrade()
 end
 
 local function stopMusic()
-  -- Only cut audio on pause/mute/exit — never between notes (that causes chop).
+  -- Only cut audio on pause/mute/exit / track switch — never between notes.
   if SPEAKER then pcall(function() SPEAKER.stop() end) end
 end
 
-local function startMusic()
+local function startMusic(trackName)
+  trackName = trackName or musicTrackName or "menu"
+  if trackName ~= musicTrackName then
+    stopMusic()
+  end
+  musicTrackName = trackName
   musicIdx = 1
   musicBassPulse = 0
   return MUSIC_ON and refreshSpeaker()
 end
 
 local function playSoft(instrument, volume, pitch)
+  if not SPEAKER then return end
   if pitch == nil or pitch < 0 or pitch > 24 then return end
   pcall(function() SPEAKER.playNote(instrument, volume, pitch) end)
 end
@@ -179,34 +207,44 @@ end
 local function musicStepSeconds()
   if not MUSIC_ON then return 0.5 end
   if not SPEAKER and not refreshSpeaker() then return 1.0 end
-
-  local note = MELODY[musicIdx] or { false, 1 }
+  local tr = TRACKS[musicTrackName] or TRACKS.game
+  local melody, bass = tr.melody, tr.bass
+  local note = melody[musicIdx] or { false, 1 }
   musicIdx = musicIdx + 1
-  if musicIdx > #MELODY then musicIdx = 1 end
+  if musicIdx > #melody then musicIdx = 1 end
   local pitch, beats = note[1], tonumber(note[2]) or 1
 
-  -- Steady soft bass pulse keeps the bed continuous under the lead.
   musicBassPulse = musicBassPulse + 1
-  local bassPitch = BASS[((musicBassPulse - 1) % #BASS) + 1]
-  playSoft("bass", 0.22, bassPitch)
+  local bassPitch = bass[((musicBassPulse - 1) % #bass) + 1]
 
-  if pitch ~= false and pitch ~= nil then
-    -- Layered soft lead: harp + quiet harmony (fills gaps between note attacks).
-    playSoft("harp", 0.42, pitch)
-    playSoft("pling", 0.18, pitch)
-    local harmony = pitch - 5
-    if harmony < 0 then harmony = pitch + 3 end
-    playSoft("guitar", 0.16, harmony)
-    if beats >= 2 then
-      playSoft("flute", 0.14, math.min(24, pitch + 7))
+  if tr.style == "menu" then
+    -- Softer, airier menu bed.
+    playSoft("bass", 0.16, bassPitch)
+    if pitch ~= false and pitch ~= nil then
+      playSoft("flute", 0.28, pitch)
+      playSoft("chime", 0.12, pitch)
+      playSoft("guitar", 0.12, math.max(0, pitch - 5))
+    else
+      playSoft("harp", 0.08, math.min(24, bassPitch + 12))
     end
   else
-    -- Rest: keep a gentle pad so it doesn't go dead-silent.
-    playSoft("guitar", 0.10, bassPitch + 12 <= 24 and bassPitch + 12 or bassPitch)
+    -- Brighter in-game theme.
+    playSoft("bass", 0.22, bassPitch)
+    if pitch ~= false and pitch ~= nil then
+      playSoft("harp", 0.42, pitch)
+      playSoft("pling", 0.18, pitch)
+      local harmony = pitch - 5
+      if harmony < 0 then harmony = pitch + 3 end
+      playSoft("guitar", 0.16, harmony)
+      if beats >= 2 then
+        playSoft("flute", 0.14, math.min(24, pitch + 7))
+      end
+    else
+      playSoft("guitar", 0.10, bassPitch + 12 <= 24 and bassPitch + 12 or bassPitch)
+    end
   end
 
-  -- Legato: fire the next step before this beat fully ends.
-  local wait = beats * MUSIC_BEAT * MUSIC_LEGATO
+  local wait = beats * (tr.beat or 0.14) * (tr.legato or 0.75)
   return math.max(0.06, wait)
 end
 
@@ -775,7 +813,7 @@ local function runGame()
   if not piece then over = true end
 
   refreshSpeaker()
-  startMusic()
+  startMusic("game")
   local musicTimer = os.startTimer(MUSIC_ON and SPEAKER and 0.05 or 3600)
 
   while true do
@@ -828,7 +866,7 @@ local function runGame()
         else
           dropTimer = os.startTimer(gravityMs(level) / 1000)
           if MUSIC_ON then
-            startMusic()
+            startMusic("game")
             musicTimer = os.startTimer(0.05)
           end
         end
@@ -836,7 +874,7 @@ local function runGame()
         MUSIC_ON = not MUSIC_ON
         saveCfg()
         if MUSIC_ON and SPEAKER then
-          startMusic()
+          startMusic("game")
           musicTimer = os.startTimer(0.05)
         else
           stopMusic()
@@ -919,7 +957,7 @@ local function runGame()
         MUSIC_ON = not MUSIC_ON
         saveCfg()
         if MUSIC_ON and SPEAKER then
-          startMusic()
+          startMusic("game")
           musicTimer = os.startTimer(0.05)
         else
           stopMusic()
@@ -1164,23 +1202,48 @@ local function mainMenu()
   -- Soft detect on menu open.
   local det = sanitizeName(detectNearbyPlayer())
   if det then PLAYER_NAME = det; saveCfg() end
+  startMusic("menu")
+  local musicTimer = os.startTimer(MUSIC_ON and refreshSpeaker() and 0.05 or 3600)
+
+  local function resumeMenuMusic()
+    startMusic("menu")
+    musicTimer = os.startTimer(MUSIC_ON and SPEAKER and 0.05 or 3600)
+  end
+
+  local function playRound()
+    stopMusic()
+    local score = runGame()
+    afterGame(score)
+    resumeMenuMusic()
+  end
+
   while true do
     drawMenu(playBtn, ctrlBtn)
     local ev, p1, p2, p3 = os.pullEvent()
-    if ev == "key" then
+    if ev == "timer" and p1 == musicTimer then
+      if MUSIC_ON then
+        musicTimer = os.startTimer(musicStepSeconds())
+      else
+        musicTimer = os.startTimer(0.5)
+      end
+    elseif ev == "key" then
       if p1 == keys.enter or p1 == keys.space or p1 == keys.p then
-        local score = runGame()
-        afterGame(score)
+        playRound()
       elseif p1 == keys.c then
+        stopMusic()
         controlsScreen()
+        resumeMenuMusic()
       elseif p1 == keys.r then
         -- Offline-safe: reload disk cache only (no rednet after boot).
         loadLbCache()
       elseif p1 == keys.n then
+        stopMusic()
         editPlayerName()
+        resumeMenuMusic()
       elseif p1 == keys.m then
         MUSIC_ON = not MUSIC_ON
         saveCfg()
+        if MUSIC_ON then resumeMenuMusic() else stopMusic() end
       elseif p1 == keys.u then
         local ok, err = swapPocketUpgrade()
         if not ok then
@@ -1191,7 +1254,9 @@ local function mainMenu()
           sleep(1.6)
           drainInputEvents()
         end
+        resumeMenuMusic()
       elseif p1 == keys.q then
+        stopMusic()
         clearScreen(colors.black)
         term.setCursorPos(1, 1)
         print("Shutting down...")
@@ -1202,6 +1267,7 @@ local function mainMenu()
     elseif ev == "char" then
       local ch = tostring(p1 or ""):lower()
       if ch == "q" then
+        stopMusic()
         clearScreen(colors.black)
         term.setCursorPos(1, 1)
         print("Shutting down...")
@@ -1209,17 +1275,21 @@ local function mainMenu()
         os.shutdown()
         return
       elseif ch == "p" then
-        local score = runGame()
-        afterGame(score)
+        playRound()
       elseif ch == "c" then
+        stopMusic()
         controlsScreen()
+        resumeMenuMusic()
       elseif ch == "r" then
         loadLbCache()
       elseif ch == "n" then
+        stopMusic()
         editPlayerName()
+        resumeMenuMusic()
       elseif ch == "m" then
         MUSIC_ON = not MUSIC_ON
         saveCfg()
+        if MUSIC_ON then resumeMenuMusic() else stopMusic() end
       elseif ch == "u" then
         local ok, err = swapPocketUpgrade()
         if not ok then
@@ -1230,18 +1300,21 @@ local function mainMenu()
           sleep(1.6)
           drainInputEvents()
         end
+        resumeMenuMusic()
       end
     elseif ev == "mouse_click" then
       local x, y = p2, p3
       if hitBtn(playBtn, x, y) then
-        local score = runGame()
-        afterGame(score)
+        playRound()
       elseif hitBtn(ctrlBtn, x, y) then
+        stopMusic()
         controlsScreen()
+        resumeMenuMusic()
       end
     elseif ev == "term_resize" then
       -- redraw
     elseif ev == "terminate" then
+      stopMusic()
       clearScreen(colors.black)
       return
     end
