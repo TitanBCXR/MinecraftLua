@@ -1,6 +1,6 @@
 --[[
   offline_miner.lua  -  Local quarry turtle (optional site board)
-  Titan-Version: 1.5.1
+  Titan-Version: 1.5.3
 
   Place the turtle at the TOP-FRONT-LEFT corner of the dig, facing into the
   mine. That cell is origin 0,0,0:
@@ -24,7 +24,10 @@
     * Modem ON while traveling; check-in leave_origin + arrive_cell
     * Surface hops: up 1 → cross XZ → down into cell (modem can't dig sideways)
     * Dig full height one Y layer at a time; stay inside cell perimeter
+    * Final full-cell verify walk before site cell_done (no false completes)
     * Home → cell_done → next free cell (same up-over-down hop)
+    * Fuel: return to depot while still able to reach it; mid-path fuel chests OK
+    * If stranded short of depot → SOS admin with coords + suggested refuel spot
     * GPS correction hooks stubbed (relative pose for now)
 
   Never attack / dig other turtles — path around them (own-right: R F L F L F R).
@@ -54,6 +57,9 @@ local EXCLUDE = "exclude.txt"
 local FUEL_SLOT = 16
 local MODEM_SLOT = 15   -- wireless modem; swapped only with RIGHT pickaxe
 local PICK_SIDE = "right"  -- turtle upgrade slot 2 — never touch left (loaders)
+-- Fuel budget: go home while we still have enough for the up-over-down hop + margin.
+local HOME_MARGIN = 24       -- spare fuel on arrival at depot
+local WORK_RESERVE = 48      -- keep digging only with this much above home cost
 local MIN_FUEL = 200
 -- Keep in sync with Titan-Version header (label uses major.minor → V1.5-Miner12).
 local MINER_VERSION = "1.5.0"
@@ -381,26 +387,49 @@ local function inventoryFull()
   return true
 end
 
--- Pull ONLY into slot 16 from the left chest (never empties the chest into 1-15).
-local function suckFuelFromLeft()
-  faceLeft()
+local function suckFuelIntoSlot16()
   consolidateFuelToSlot16()
   turtle.select(FUEL_SLOT)
   local space = turtle.getItemSpace(FUEL_SLOT)
   if space and space > 0 then
     turtle.suck(space)
   elseif turtle.getItemCount(FUEL_SLOT) == 0 then
-    -- Slot empty / different item: clear non-fuel out of 16 first isn't expected;
-    -- suck one stack worth into 16 only.
     turtle.suck(64)
-    -- If suck overflowed (CC may fill other slots when 16 is full), pull fuel back.
     consolidateFuelToSlot16()
   end
+end
+
+-- Pull ONLY into slot 16 from the left chest (never empties the chest into 1-15).
+local function suckFuelFromLeft()
+  local saved = facing
+  faceLeft()
+  suckFuelIntoSlot16()
   -- Top up the fuel tank a little but KEEP coal sitting in slot 16.
   burnSomeFuel()
-  faceForward()
+  turnTo(saved)
+  if atOriginXZ() then faceForward() end
   local n = turtle.getItemCount(FUEL_SLOT)
   print(("Fuel slot 16: %d item(s), tank=%s"):format(n, tostring(turtle.getFuelLevel())))
+  return turtle.getFuelLevel()
+end
+
+-- Mid-path / dig-layer refuel: try every side for a fuel chest (admin stations).
+local function suckFuelNearby()
+  local saved = facing
+  consolidateFuelToSlot16()
+  for dir = 0, 3 do
+    turnTo(dir)
+    suckFuelIntoSlot16()
+  end
+  turtle.select(FUEL_SLOT)
+  local space = turtle.getItemSpace(FUEL_SLOT)
+  if space and space > 0 then turtle.suckUp(space) else turtle.suckUp(64) end
+  consolidateFuelToSlot16()
+  space = turtle.getItemSpace(FUEL_SLOT)
+  if space and space > 0 then turtle.suckDown(space) else turtle.suckDown(64) end
+  consolidateFuelToSlot16()
+  burnSomeFuel()
+  turnTo(saved)
   return turtle.getFuelLevel()
 end
 
@@ -891,8 +920,14 @@ local function goToViaAir(tx, ty, tz, opts)
   return true
 end
 
--- Cell is cleared by walking into it. No spin / digUp / digDown / neighbors.
+-- Clear this voxel: walk-in already dug the floor block; catch gravel/sand + ceiling.
+-- Do not dig horizontal neighbors (would eat into adjacent cells).
 local function excavateHere()
+  digDir("up")
+  local floor = digFloorY()
+  if floor == nil or pos.y < floor then
+    digDir("down")
+  end
   return true
 end
 
@@ -960,6 +995,29 @@ local function distHome()
   return math.abs(pos.x) + math.abs(pos.y) + math.abs(pos.z)
 end
 
+-- Fuel cost of an up-over-down hop (matches goToViaAir).
+local function airTravelCost(x0, y0, z0, x1, y1, z1)
+  x0 = math.floor(tonumber(x0) or 0)
+  y0 = math.floor(tonumber(y0) or 0)
+  z0 = math.floor(tonumber(z0) or 0)
+  x1 = math.floor(tonumber(x1) or 0)
+  y1 = math.floor(tonumber(y1) or 0)
+  z1 = math.floor(tonumber(z1) or 0)
+  if x0 == x1 and y0 == y1 and z0 == z1 then return 0 end
+  if x0 == x1 and z0 == z1 then return math.abs(y0 - y1) end
+  local clear = 1
+  local top = math.min(y0, y1)
+  local cruiseY = top - clear
+  return math.abs(y0 - cruiseY) + math.abs(x1 - x0) + math.abs(z1 - z0) + math.abs(y1 - cruiseY)
+end
+
+-- Blocks of fuel needed to reach depot from a pose (includes arrival margin).
+local function homeFuelCost(px, py, pz)
+  return airTravelCost(
+    px or pos.x, py or pos.y, pz or pos.z,
+    0, 0, 0) + HOME_MARGIN
+end
+
 -- Tank fuel + estimated value of remaining fuel items (after a light top-up burn).
 local function estimateFuelUnits()
   local level = turtle.getFuelLevel()
@@ -989,25 +1047,25 @@ local function estimateFuelUnits()
   return total
 end
 
--- "continue" = enough to keep mining; "depot" = only enough to reach home; "sos" = stranded.
-local function resumeFuelPlan()
+-- "ok" = keep working; "depot" = go home now (enough to arrive); "stranded" = cannot reach depot.
+local function fuelPlanNow()
   local fuel = estimateFuelUnits()
-  local home = distHome()
-  local margin = 10
-  if fuel == math.huge then return "continue", fuel, home end
-  if home > 0 and fuel < home + margin then
-    return "sos", fuel, home
-  end
-  -- Need a comfortable surplus beyond the walk home before we dig in place.
-  if fuel >= math.max(MIN_FUEL, home + 48) then
-    return "continue", fuel, home
-  end
-  if home == 0 and fuel >= MIN_FUEL then
-    return "continue", fuel, home
-  end
-  if fuel >= home + margin then
+  local home = homeFuelCost()
+  if fuel == math.huge then return "ok", fuel, home end
+  if home <= HOME_MARGIN and (pos.x == 0 and pos.y == 0 and pos.z == 0) then
+    if fuel >= MIN_FUEL then return "ok", fuel, home end
     return "depot", fuel, home
   end
+  if fuel < home then return "stranded", fuel, home end
+  if fuel < home + WORK_RESERVE then return "depot", fuel, home end
+  return "ok", fuel, home
+end
+
+-- "continue" = enough to keep mining; "depot" = only enough to reach home; "sos" = stranded.
+local function resumeFuelPlan()
+  local plan, fuel, home = fuelPlanNow()
+  if plan == "ok" then return "continue", fuel, home end
+  if plan == "depot" then return "depot", fuel, home end
   return "sos", fuel, home
 end
 
@@ -1104,21 +1162,53 @@ end
 -- Forward decl — filled after publishMine / siteReportProgress exist.
 local checkIn
 
--- Dump only when inventory is full (or truly out of fuel). No distance/travel
--- timeout — deep Y bands stay down until slots fill.
+-- Inventory full and/or fuel budget: return while we can still reach depot.
+-- If short of home cost, suck mid-path chests; else SOS admin for a refuel station.
 local function manageInventory(resume)
   local full = inventoryFull()
-  if needsFuelSos() then
-    -- Can't walk home at 0 fuel — SOS in place (computer still runs).
-    if broadcastSos then broadcastSos("out_of_fuel") end
-    if needsFuelSos() then return false, "fuel" end
+  local plan, fuel, home = fuelPlanNow()
+
+  if plan == "ok" and not full then
+    return true
   end
-  local fuelOk = ensureFuel()
-  if not full and fuelOk then return true end
+
+  if plan == "stranded" then
+    print(("Fuel~%s < home trip %d — trying mid-path fuel chest..."):format(
+      tostring(fuel), home))
+    suckFuelNearby()
+    plan, fuel, home = fuelPlanNow()
+  end
+
+  if plan == "stranded" or needsFuelSos() then
+    local sx = math.floor((tonumber(pos.x) or 0) / 2)
+    local sy = -1
+    local sz = math.floor((tonumber(pos.z) or 0) / 2)
+    print(("Stranded: need refuel station (have~%s, home=%d). SOS admin."):format(
+      tostring(fuel), home))
+    if broadcastSos then
+      broadcastSos(needsFuelSos() and "out_of_fuel" or "need_refuel_station", {
+        homeCost = home,
+        fuelEst = fuel,
+        suggestX = sx, suggestY = sy, suggestZ = sz,
+      })
+    end
+    suckFuelNearby()
+    plan, fuel, home = fuelPlanNow()
+    if plan == "stranded" or needsFuelSos() then
+      return false, "fuel"
+    end
+  end
+
+  -- Mid-chest may have topped us up enough to keep digging.
+  if plan == "ok" and not full then
+    return true
+  end
+
   if full then
-    print("Inventory full — returning to dump...")
+    print("Inventory full — returning to dump/refuel...")
   else
-    print("Out of fuel — returning to refuel...")
+    print(("Fuel reserve low (have~%s, home needs %d) — returning to depot..."):format(
+      tostring(fuel), home))
   end
   if activeJob then
     activeJob.status = "paused"
@@ -1126,13 +1216,21 @@ local function manageInventory(resume)
   end
   local rx, ry, rz = pos.x, pos.y, pos.z
   if not goHome() then
-    if needsFuelSos() and broadcastSos then
-      broadcastSos("stranded_no_fuel")
+    suckFuelNearby()
+    if (fuelPlanNow() == "stranded" or needsFuelSos()) and broadcastSos then
+      broadcastSos("stranded_no_fuel", {
+        homeCost = homeFuelCost(),
+        fuelEst = estimateFuelUnits(),
+        suggestX = math.floor((pos.x or 0) / 2),
+        suggestY = -1,
+        suggestZ = math.floor((pos.z or 0) / 2),
+      })
     end
     return false, "home"
   end
   dumpToStorage()
   suckFuelFromLeft()
+  suckFuelNearby()
   if needsFuelSos() and broadcastSos then
     broadcastSos("depot_empty_fuel")
     if needsFuelSos() then return false, "fuel" end
@@ -1143,7 +1241,10 @@ local function manageInventory(resume)
   end
   if resume then
     print(("Resuming @ %d,%d,%d"):format(rx, ry, rz))
-    if not goTo(rx, ry, rz) then return false, "resume" end
+    -- Pick should already be on (dig path); air-hop back into the work pose.
+    if not goToViaAir(rx, ry, rz, { clear = 1 }) then
+      return false, "resume"
+    end
     if activeJob then
       activeJob.status = "active"
       saveJobFile(activeJob)
@@ -1869,20 +1970,37 @@ end
 
 local sosActive = false
 
--- Fuel empty: computer still runs — keep modem up and scream SOS until coal returns.
-broadcastSos = function(reason)
+-- Fuel empty / can't reach depot: modem on, SOS admin until we can move again.
+-- extra: homeCost, fuelEst, suggestX/Y/Z (mid-path refuel station hint).
+broadcastSos = function(reason, extra)
   reason = reason or "out_of_fuel"
+  extra = extra or {}
   sosActive = true
   if activeJob then
     activeJob.status = "sos"
     saveJobFile(activeJob)
   end
-  print("========== SOS: OUT OF FUEL ==========")
-  print(("Last pose %d,%d,%d  (relative to origin)"):format(pos.x, pos.y, pos.z))
+  local sx = tonumber(extra.suggestX) or math.floor((pos.x or 0) / 2)
+  local sy = tonumber(extra.suggestY) or -1
+  local sz = tonumber(extra.suggestZ) or math.floor((pos.z or 0) / 2)
+  local homeCost = tonumber(extra.homeCost) or homeFuelCost()
+  local fuelEst = tonumber(extra.fuelEst) or estimateFuelUnits()
+  print("========== SOS: FUEL ==========")
+  print(("Reason: %s"):format(reason))
+  print(("Bot @ rel %d,%d,%d  fuel~%s  homeCost=%d"):format(
+    pos.x, pos.y, pos.z, tostring(fuelEst), homeCost))
+  if reason == "need_refuel_station" or reason == "stranded_no_fuel" then
+    print(("Place a FUEL CHEST on the travel layer near bot or ~%d,%d,%d (rel)."):format(
+      sx, sy, sz))
+    print("Turtle sucks all sides + up/down. Also keep origin left-chest stocked.")
+  else
+    print("Put coal in slot 16, an adjacent chest, or the origin left chest.")
+  end
   print("Computer stays online — broadcasting to admin + MAIN monitors.")
-  print("Put coal in slot 16 (or left chest if you can reach the turtle).")
   while sosActive and not STOP do
-    if not needsFuelSos() then
+    suckFuelNearby()
+    local plan = fuelPlanNow()
+    if plan ~= "stranded" and not needsFuelSos() then
       clearSos()
       print("Fuel restored — SOS cleared.")
       return true
@@ -1894,22 +2012,26 @@ broadcastSos = function(reason)
       reason = reason,
       status = "sos",
       checkIn = "sos",
+      homeCost = homeCost,
+      fuelEst = estimateFuelUnits(),
+      suggestX = sx, suggestY = sy, suggestZ = sz,
     })
     msg.type = "quarry_sos"
     rednetPublish(msg)
-    -- Extra loud for router monitors that listen on titan_router.
     rednet.broadcast(msg, PROTO_ROUTER)
     rednet.broadcast(msg, PROTO_NET)
-    print(("[SOS] out of fuel @ %d,%d,%d"):format(pos.x, pos.y, pos.z))
-    -- Peek inventory while waiting (player may drop coal in).
+    print(("[SOS] %s @ %d,%d,%d  suggest refuel ~%d,%d,%d"):format(
+      reason, pos.x, pos.y, pos.z, sx, sy, sz))
     local deadline = os.clock() + 2.5
     while os.clock() < deadline and sosActive and not STOP do
-      if not needsFuelSos() then
+      suckFuelNearby()
+      plan = fuelPlanNow()
+      if plan ~= "stranded" and not needsFuelSos() then
         clearSos()
         print("Fuel restored — SOS cleared.")
         return true
       end
-      sleep(0.25)
+      sleep(0.35)
     end
   end
   return false
@@ -3107,6 +3229,59 @@ local function inActiveCellXZ(slack)
   return pos.x >= x0 and pos.x <= x1 and pos.z >= z0 and pos.z <= z1
 end
 
+-- Final full walk of every cell voxel. Must succeed before site cell_done.
+-- Returns ok, err, nextVerifyIdx
+local function verifyCellClear(box, startIdx)
+  local x0 = box.x0
+  local x1 = box.x1
+  local z0 = box.z0
+  local z1 = box.z1
+  local y0 = box.y0
+  local y1 = box.y1
+  local units = cellLayerUnits(x0, x1, z0, z1, y0, y1)
+  startIdx = math.max(1, math.floor(tonumber(startIdx) or 1))
+  if startIdx > #units then return true, nil, #units + 1 end
+  print(("Verify pass — %d voxels from #%d (must be clear before done)"):format(
+    #units, startIdx))
+  local lastY = -999
+  for i = startIdx, #units do
+    if STOP then return false, "stop", i end
+    if pendingReturnHome then return false, "return_home", i end
+    if pendingReband then return false, "reband", i end
+    local u = units[i]
+    if not manageInventory(true) then return false, "inventory", i end
+    if not ensurePickReady(true) then return false, "no-pickaxe", i end
+    if not inActiveCellXZ(2) and (pos.x ~= u.x or pos.z ~= u.z) then
+      return false, "perimeter", i
+    end
+    if lastY ~= -999 and u.y > lastY then
+      while pos.y < u.y do
+        if not moveDown() then return false, "layer", i end
+      end
+      print(("  verify layer Y=%d"):format(u.y))
+    elseif lastY == -999 then
+      print(("  verify layer Y=%d"):format(u.y))
+    end
+    lastY = u.y
+    if not goTo(u.x, u.y, u.z) then return false, "path", i end
+    if not inActiveCellXZ(0) then return false, "perimeter", i end
+    excavateHere()
+    if activeJob then
+      activeJob.phase = "verify"
+      activeJob.verifyIdx = i + 1
+      activeJob.status = "verify"
+      if i % 8 == 0 then saveJobFile(activeJob) end
+    end
+    if i % 8 == 0 and checkIn then
+      checkIn("cell", {
+        status = "verify", cellId = box.cellId,
+        verifyIdx = i, total = #units,
+      })
+    end
+  end
+  return true, nil, #units + 1
+end
+
 -- Dig one site cell: full H, layer-by-layer, stay in XZ AABB.
 -- Returns "done" | "paused" | "stop" | "bad"
 local function runCellClaim(claim, existingJob)
@@ -3151,6 +3326,10 @@ local function runCellClaim(claim, existingJob)
     j.y0, j.y1 = y0, y1
     j.total = #units
     j.idx = math.max(1, math.min(tonumber(j.idx) or 1, #units + 1))
+    if j.phase ~= "verify" and (tonumber(j.idx) or 1) > #units then
+      j.phase = "verify"
+      j.verifyIdx = math.max(1, math.floor(tonumber(j.verifyIdx) or 1))
+    end
   end
 
   -- Travel with modem on.
@@ -3161,6 +3340,33 @@ local function runCellClaim(claim, existingJob)
   end
   assumeAtOrigin()
   suckFuelFromLeft()
+  -- Bail before leaving if we can't reach the cell corner and still get home.
+  do
+    local toCell = airTravelCost(0, 0, 0, x0, 0, z0)
+    local back = homeFuelCost(x0, 0, z0)
+    local need = toCell + back
+    local fuel = estimateFuelUnits()
+    if fuel ~= math.huge and fuel < need then
+      local sx = math.floor(x0 / 2)
+      local sz = math.floor(z0 / 2)
+      print(("Cell too far for fuel (have~%s, need~%d to enter+return)."):format(
+        tostring(fuel), need))
+      if broadcastSos then
+        broadcastSos("need_refuel_station", {
+          homeCost = need,
+          fuelEst = fuel,
+          suggestX = sx, suggestY = -1, suggestZ = sz,
+        })
+      end
+      suckFuelFromLeft()
+      fuel = estimateFuelUnits()
+      if fuel ~= math.huge and fuel < need then
+        print("Still short on fuel for this cell — pausing.")
+        siteSendTyped("quarry_progress", { status = "paused", cellId = claim.cellId })
+        return "paused"
+      end
+    end
+  end
   siteSendTyped("quarry_leave_origin", { status = "travel", cellId = claim.cellId })
   print(("Travel → cell #%s  X%d-%d Z%d-%d (up-over-down, modem on)"):format(
     tostring(claim.cellId or "?"), x0, x1, z0, z1))
@@ -3199,94 +3405,134 @@ local function runCellClaim(claim, existingJob)
   jobLabel = jobSummary(j)
 
   local lastY = -999
-  for i = j.idx, #units do
-    if pendingReturnHome then
-      print("Pose fault — returning home.")
-      finishJob(false, "return_home")
-      digging = false
+  if j.phase ~= "verify" then
+    for i = j.idx, #units do
+      if pendingReturnHome then
+        print("Pose fault — returning home.")
+        finishJob(false, "return_home")
+        digging = false
+        ensureModemForComms(true)
+        goHome()
+        siteSendTyped("quarry_progress", {
+          status = "homing", reason = pendingReturnHome, cellId = claim.cellId,
+        })
+        pendingReturnHome = nil
+        return "stop"
+      end
+      if pendingReband then
+        finishJob(false, "reband")
+        digging = false
+        return "stop"
+      end
+      if STOP then
+        finishJob(false, "stop")
+        digging = false
+        return "stop"
+      end
+
+      local u = units[i]
+      j.idx = i
+      saveJobFile(j)
+
+      -- Stay inside cell perimeter (XZ).
+      if not inActiveCellXZ(2) and (pos.x ~= u.x or pos.z ~= u.z) then
+        print(("Outside cell perimeter @ %d,%d — abort."):format(pos.x, pos.z))
+        finishJob(false, "perimeter")
+        digging = false
+        ensureModemForComms(true)
+        goHome()
+        siteSendTyped("quarry_progress", { status = "homing", reason = "perimeter" })
+        return "stop"
+      end
+
+      if not manageInventory(true) then
+        -- manageInventory already went home; keep modem for return trip.
+        ensureModemForComms(true)
+        digging = false
+        -- Resume same cell after dump.
+        print("Resuming same cell after dump/refuel...")
+        return runCellClaim(claim, loadJobFile())
+      end
+      if not ensurePickReady(true) then
+        finishJob(false, "no-pickaxe")
+        digging = false
+        return "bad"
+      end
+
+      if lastY ~= -999 and u.y > lastY then
+        while pos.y < u.y do
+          if not moveDown() then
+            finishJob(false, "layer drop")
+            digging = false
+            return "paused"
+          end
+        end
+        print(("  layer Y=%d"):format(u.y))
+      elseif lastY == -999 then
+        print(("  layer Y=%d"):format(u.y))
+      end
+      lastY = u.y
+
+      if not goTo(u.x, u.y, u.z) then
+        finishJob(false, "path")
+        digging = false
+        return "paused"
+      end
+      if not inActiveCellXZ(0) then
+        print("Left cell while pathing — abort.")
+        finishJob(false, "perimeter")
+        digging = false
+        ensureModemForComms(true)
+        goHome()
+        return "stop"
+      end
+      excavateHere()
+      j.idx = i + 1
+      saveJobFile(j)
+      if i % 8 == 0 then
+        checkIn("cell", { status = "mining", cellId = claim.cellId, job = j })
+      end
+    end
+    -- Dig pass finished — must verify before site marks the cell complete.
+    j.phase = "verify"
+    j.verifyIdx = 1
+    j.idx = #units + 1
+    j.status = "verify"
+    saveJobFile(j)
+    siteSendJob(j)
+  end
+
+  print(("Verify cell #%s before marking done..."):format(tostring(claim.cellId or "?")))
+  siteSendTyped("quarry_progress", { status = "verify", cellId = claim.cellId })
+  local vOk, vErr, vAt = verifyCellClear({
+    cellId = claim.cellId,
+    x0 = x0, x1 = x1, z0 = z0, z1 = z1, y0 = y0, y1 = y1,
+  }, j.verifyIdx or 1)
+  if not vOk then
+    j.phase = "verify"
+    j.verifyIdx = vAt or j.verifyIdx or 1
+    j.status = "paused"
+    saveJobFile(j)
+    finishJob(false, "verify:" .. tostring(vErr))
+    digging = false
+    if vErr == "return_home" or vErr == "perimeter" then
       ensureModemForComms(true)
       goHome()
       siteSendTyped("quarry_progress", {
-        status = "homing", reason = pendingReturnHome, cellId = claim.cellId,
+        status = "homing", reason = tostring(vErr), cellId = claim.cellId,
       })
       pendingReturnHome = nil
       return "stop"
     end
-    if pendingReband then
-      finishJob(false, "reband")
-      digging = false
-      return "stop"
-    end
-    if STOP then
-      finishJob(false, "stop")
-      digging = false
-      return "stop"
-    end
-
-    local u = units[i]
-    j.idx = i
-    saveJobFile(j)
-
-    -- Stay inside cell perimeter (XZ).
-    if not inActiveCellXZ(2) and (pos.x ~= u.x or pos.z ~= u.z) then
-      print(("Outside cell perimeter @ %d,%d — abort."):format(pos.x, pos.z))
-      finishJob(false, "perimeter")
-      digging = false
-      ensureModemForComms(true)
-      goHome()
-      siteSendTyped("quarry_progress", { status = "homing", reason = "perimeter" })
-      return "stop"
-    end
-
-    if not manageInventory(true) then
-      -- manageInventory already went home; keep modem for return trip.
-      ensureModemForComms(true)
-      digging = false
-      -- Resume same cell after dump.
-      print("Resuming same cell after dump/refuel...")
+    if vErr == "reband" or vErr == "stop" then return "stop" end
+    if vErr == "inventory" then
+      print("Resuming verify after dump/refuel...")
       return runCellClaim(claim, loadJobFile())
     end
-    if not ensurePickReady(true) then
-      finishJob(false, "no-pickaxe")
-      digging = false
-      return "bad"
-    end
-
-    if lastY ~= -999 and u.y > lastY then
-      while pos.y < u.y do
-        if not moveDown() then
-          finishJob(false, "layer drop")
-          digging = false
-          return "paused"
-        end
-      end
-      print(("  layer Y=%d"):format(u.y))
-    elseif lastY == -999 then
-      print(("  layer Y=%d"):format(u.y))
-    end
-    lastY = u.y
-
-    if not goTo(u.x, u.y, u.z) then
-      finishJob(false, "path")
-      digging = false
-      return "paused"
-    end
-    if not inActiveCellXZ(0) then
-      print("Left cell while pathing — abort.")
-      finishJob(false, "perimeter")
-      digging = false
-      ensureModemForComms(true)
-      goHome()
-      return "stop"
-    end
-    excavateHere()
-    j.idx = i + 1
-    saveJobFile(j)
-    if i % 8 == 0 then
-      checkIn("cell", { status = "mining", cellId = claim.cellId, job = j })
-    end
+    return "paused"
   end
 
+  -- Only now tell the site the cell is complete (finishJob → quarry_done).
   finishJob(true)
   digging = false
   ensureModemForComms(true)
@@ -3609,7 +3855,8 @@ local function printHelp()
   print("Slot 15 = wireless modem (RIGHT pick swap) — used in online mode.")
   print("Reboot: resumes job; online also syncs with site (depot-first if low fuel).")
   print("Other turtles: never attack — go around to your own right.")
-  print("Out of fuel: SOS broadcast when modem available (computer stays on).")
+  print("Fuel: returns to depot while still able to reach it; mid-path chests OK.")
+  print("If short of home trip: SOS admin with coords + suggested refuel spot.")
   print("Jobs save pose+progress to " .. JOB_FILE .. ".")
 end
 

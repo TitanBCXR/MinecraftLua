@@ -1,6 +1,6 @@
 --[[
   offline_site.lua  -  Quarry site board (XZ cell fleet)
-  Titan-Version: 1.3.1
+  Titan-Version: 1.3.2
 
   Place LEFT of the storage chest (storage behind turtle origin). Modem required.
   Attach a **monitor** for the live status board — the computer terminal stays
@@ -961,9 +961,14 @@ local function handleMsg(id, msg)
   elseif t == "quarry_sos" or t == "quarry_sos_clear" then
     touchTurtle(id, msg)
     if t == "quarry_sos" then
-      print(("[SOS] #%d %s @ %s,%s,%s"):format(
-        id, tostring(msg.name or "?"),
-        tostring(msg.posX or "?"), tostring(msg.posY or "?"), tostring(msg.posZ or "?")))
+      print(("[SOS] #%d %s %s @ %s,%s,%s fuel~%s"):format(
+        id, tostring(msg.name or "?"), tostring(msg.reason or "fuel"),
+        tostring(msg.posX or "?"), tostring(msg.posY or "?"), tostring(msg.posZ or "?"),
+        tostring(msg.fuelEst or msg.fuel or "?")))
+      if msg.suggestX ~= nil then
+        print(("  → fuel chest on travel layer ~%s,%s,%s (rel)"):format(
+          tostring(msg.suggestX), tostring(msg.suggestY or -1), tostring(msg.suggestZ)))
+      end
     end
     broadcastStatus()
 

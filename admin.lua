@@ -1,6 +1,6 @@
 --[[
   admin.lua  -  Titan admin console for a POCKET computer ("Live" tablet)
-  Titan-Version: 1.5.1
+  Titan-Version: 1.5.2
 
   Pocket remote for the whole fleet. Keep it on you; it joins the mesh like
   every other Titan device (MAIN router + modem hops).
@@ -282,7 +282,7 @@ local function handle(id, msg)
     q.seen = now()
     q.sos = true
     q.status = "sos"
-    q.fuel = msg.fuel or 0
+    q.fuel = msg.fuel or msg.fuelEst or 0
     if msg.posX ~= nil then
       q.posX = tonumber(msg.posX) or q.posX
       q.posY = tonumber(msg.posY) or q.posY
@@ -290,17 +290,27 @@ local function handle(id, msg)
       q.lastPosAt = now()
     end
     q.sosReason = msg.reason or "out_of_fuel"
+    q.sosHomeCost = tonumber(msg.homeCost)
+    q.suggestX = tonumber(msg.suggestX)
+    q.suggestY = tonumber(msg.suggestY)
+    q.suggestZ = tonumber(msg.suggestZ)
     quarryTurtles[id] = q
     touchSystem(id, q.name, "offline_miner")
     table.insert(stuck, 1, {
       name = ("SOS " .. tostring(q.name)),
       x = q.posX, y = q.posY, z = q.posZ,
       reason = q.sosReason,
+      suggestX = q.suggestX, suggestY = q.suggestY, suggestZ = q.suggestZ,
     })
     while #stuck > 15 do table.remove(stuck) end
-    print(("[SOS] #%d %s out of fuel @ %s,%s,%s"):format(
-      id, tostring(q.name),
-      tostring(q.posX or "?"), tostring(q.posY or "?"), tostring(q.posZ or "?")))
+    print(("[SOS] #%d %s %s @ rel %s,%s,%s  fuel=%s"):format(
+      id, tostring(q.name), tostring(q.sosReason),
+      tostring(q.posX or "?"), tostring(q.posY or "?"), tostring(q.posZ or "?"),
+      tostring(q.fuel)))
+    if q.suggestX ~= nil then
+      print(("  → place fuel chest on travel layer near ~%d,%d,%d (rel)"):format(
+        q.suggestX, q.suggestY or -1, q.suggestZ or 0))
+    end
   elseif t == "quarry_sos_clear" then
     local q = quarryTurtles[id]
     if q then
@@ -2317,8 +2327,13 @@ local function handleCommand(a)
 
   elseif cmd == "stuck" then
     for i, al in ipairs(stuck) do
-      print(("%d) %s @ %d,%d,%d %s"):format(
-        i, al.name or "?", al.x or 0, al.y or 0, al.z or 0, al.reason or ""))
+      local line = ("%d) %s @ %d,%d,%d %s"):format(
+        i, al.name or "?", al.x or 0, al.y or 0, al.z or 0, al.reason or "")
+      if al.suggestX ~= nil then
+        line = line .. ("  refuel~%d,%d,%d"):format(
+          al.suggestX, al.suggestY or -1, al.suggestZ or 0)
+      end
+      print(line)
     end
 
   elseif cmd == "ping" then
