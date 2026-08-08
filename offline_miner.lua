@@ -1,6 +1,6 @@
 --[[
   offline_miner.lua  -  Local quarry turtle (optional site board)
-  Titan-Version: 1.3.4
+  Titan-Version: 1.3.5
 
   Place the turtle at the TOP-FRONT-LEFT corner of the dig, facing into the
   mine. That cell is origin 0,0,0:
@@ -812,12 +812,10 @@ local function goTo(tx, ty, tz)
   return true
 end
 
--- Dig only this job cell. Pathing already clears the block we stepped into;
--- do NOT spin-dig neighbors (those are other units / outside the claim).
+-- Mark this job cell done. Pathing digs the block on this layer as we step in;
+-- do NOT digUp (above the layer) or digDown (next layer) or spin neighbors.
+-- After the whole layer's units are done, runBoxJob drops one Y and continues.
 local function excavateHere()
-  -- Clear the block above feet in this cell only.
-  -- Do NOT digDown — that would steal the next Y layer / column step.
-  digDir("up")
   return true
 end
 
