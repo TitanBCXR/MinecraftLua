@@ -1,6 +1,6 @@
 --[[
   lib/router_hub_net.lua  -  Titan hub networking / roster / OTA (part)
-  Titan-Version: 1.4.4
+  Titan-Version: 1.4.6
 
   Loaded by router_main.lua into a shared env (setfenv). Do not run directly.
 
@@ -1417,10 +1417,15 @@ function perimeterFwdKey(originId, msg)
 end
 
 -- Forward sensor perimeter_* traffic to online perimeter managers (mesh bridge).
+-- Prefer a single bound manager (msg.managerId / dest / toManager) when set.
 function forwardPerimeterToManagers(originId, msg)
   if not isPerimeterTraffic(msg) then return 0 end
   local t = msg.type
-  if t == "perimeter_config" or t == "perimeter_update" then return 0 end
+  if t == "perimeter_config" or t == "perimeter_update"
+      or t == "perimeter_log_req" or t == "perimeter_log"
+      or t == "perimeter_alert" then
+    return 0
+  end
   local key = perimeterFwdKey(originId, msg)
   local now = os.clock()
   if perimeterFwdSeen[key] and perimeterFwdSeen[key] > now then return 0 end
@@ -1434,15 +1439,35 @@ function forwardPerimeterToManagers(originId, msg)
   local managers = listOnlineKind("perimeter_manager")
   if #managers == 0 then return 0 end
 
+  local bound = tonumber(msg.managerId) or tonumber(msg.destManager)
+    or tonumber(msg.toManager) or tonumber(msg.dest)
+  local targets = {}
+  if bound then
+    for _, m in ipairs(managers) do
+      if m.id == bound then targets[#targets + 1] = m; break end
+    end
+    -- Bound manager offline in roster: still try unicast hop to that id.
+    if #targets == 0 then
+      targets[1] = { id = bound }
+    end
+  else
+    -- Unbound discovery (hello only): all managers. Events should always bind.
+    if t ~= "perimeter_hello" and t ~= "perimeter_assign_req" then
+      return 0
+    end
+    for _, m in ipairs(managers) do targets[#targets + 1] = m end
+  end
+
   local fwd = {}
   for k, v in pairs(msg) do fwd[k] = v end
   fwd.hop = true
   fwd.originId = tonumber(msg.originId) or tonumber(msg.sensorId) or originId
   fwd.via = os.getComputerID()
   fwd.sensorId = fwd.originId
+  if bound then fwd.managerId = bound end
 
   local n = 0
-  for _, m in ipairs(managers) do
+  for _, m in ipairs(targets) do
     if m.id ~= originId and m.id ~= fwd.originId then
       rednet.send(m.id, fwd, "titan_net")
       rednet.send(m.id, {
@@ -1996,15 +2021,26 @@ function directoryLoop()
 
       else
         -- Perimeter alerts: bridge over the mesh to territory managers.
+        local handledPerimeter = false
         if isPerimeterTraffic(msg) then
-          local origin = tonumber(msg.originId) or tonumber(msg.sensorId) or id
-          if msg.kind == "sensor" or msg.sensorId or tostring(msg.type or ""):find("perimeter_", 1, true) then
-            local pk = "perimeter_sensor"
-            if msg.kind == "manager" or msg.kind == "perimeter_manager" then
-              pk = "perimeter_manager"
-            end
+          handledPerimeter = true
+          local tPerim = tostring(msg.type or "")
+          local isMgr = msg.kind == "manager" or msg.kind == "perimeter_manager"
+          -- Config/update: origin is the manager, not sensorId (that's the target).
+          local origin
+          if tPerim == "perimeter_config" or tPerim == "perimeter_update" then
+            origin = tonumber(msg.from) or tonumber(msg.originId) or id
+            isMgr = true
+          else
+            origin = tonumber(msg.originId) or tonumber(msg.from)
+              or ((not isMgr) and tonumber(msg.sensorId)) or id
+          end
+          local pk = isMgr and "perimeter_manager" or "perimeter_sensor"
+          -- Only tag real perimeter endpoints — never the hop/router sender.
+          if origin and origin ~= os.getComputerID() then
             rosterTouch(origin, {
-              kind = pk, hostname = msg.gate or msg.name or msg.hostname,
+              kind = pk,
+              hostname = msg.gate or msg.name or msg.hostname,
               x = msg.x, y = msg.y, z = msg.z,
             }, pk, false)
           end
@@ -2023,8 +2059,11 @@ function directoryLoop()
           end
         end
         -- Other protocols: remember presence only (no modem naming).
-        local kind = classify(msg)
-        if kind then rosterTouch(id, msg, kind, false) end
+        -- Skip for perimeter traffic — hop senders (routers) must not become "sensors".
+        if not handledPerimeter then
+          local kind = classify(msg)
+          if kind then rosterTouch(id, msg, kind, false) end
+        end
       end
       end) -- pcall per batch message
       if not ok then print("[net err] " .. tostring(err)) end

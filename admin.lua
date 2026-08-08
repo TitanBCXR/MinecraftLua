@@ -1,35 +1,37 @@
 --[[
   admin.lua  -  Titan admin console for a POCKET computer ("Live" tablet)
-  Titan-Version: 1.5.4
+  Titan-Version: 1.5.6
 
   Pocket remote for the whole fleet. Keep it on you; it joins the mesh like
   every other Titan device (MAIN router + modem hops).
 
   Two modes (saved in admin.cfg):
-    simple   — phone-style home screen with app tiles (default)
-    advanced — command-line / SSH power-user console
+    simple   - phone-style home screen with app tiles (default)
+    advanced - command-line / SSH power-user console
               `help` is paginated (10 commands per page)
 
   Switch anytime:  mode simple | mode advanced
 
   Advanced commands:
-    connections | hosts | list   — who is reachable for SSH
-    connect | ssh <id|label>     — remote shell (full device commands)
-    link                         — network topology (routers + modems)
-    link <a> <b>                 — peer two routers OR attach modem→router
-    link auto                    — GPS auto: peer routers, modems→nearest hub
+    connections | hosts | list   - who is reachable for SSH
+    connect | ssh <id|label>     - remote shell (full device commands)
+    link                         - network topology (routers + modems)
+    link <a> <b>                 - peer two routers OR attach modem->router
+    link auto                    - GPS auto: peer routers, modems->nearest hub
     bots / miners / loaders / markers
     pending | deploy | park | stop | mine | continue
-    dc | center                  — jump to Parent Center
-    flatten ...                  — run flatten on Parent Center via SSH
-    live [local|global|stats|gps|bots|quarry|qsite] — full-screen boards
-      Arrow right/left cycles; quarry ↔ qsite is the site monitor layout.
-      Advanced (color) pocket → pretty GUI; normal pocket → mono.
-    quarry                       — cell quarry % board (compact)
-    live qsite                   — site-manager style roster (rel + world)
-    quarry assign <id> <y0> <y1> — legacy tablet Y lock (layer sites only)
+    dc | center                  - jump to Parent Center
+    flatten ...                  - run flatten on Parent Center via SSH
+    live [local|global|stats|gps|bots|quarry|qsite|perimeter]
+      Arrow right/left cycles; quarry <-> qsite is the site monitor layout.
+      Stats board also shows recent perimeter activity.
+      Advanced (color) pocket -> pretty GUI; normal pocket -> mono.
+    quarry                       - cell quarry % board (compact)
+    live qsite                   - site-manager style roster (rel + world)
+    live perimeter / gates       - recent territory ENTER/EXIT activity
+    quarry assign <id> <y0> <y1> - legacy tablet Y lock (layer sites only)
     quarry unassign <id> | quarry pending
-    where <siteId> <botId>       — live GPS distance to a quarry turtle
+    where <siteId> <botId>       - live GPS distance to a quarry turtle
       (site `where <id>` also pushes a track screen / queues until login)
 
   Boots with a master-password prompt (before background loops). Deploy / SSH /
@@ -93,7 +95,13 @@ local quarrySnapAt = 0
 local quarryTurtles = {} -- [id] = turtle mine reports when no site board
 -- [turtleId] = { y0, y1, W, L, H, assignId, setAt, acked, ackedAt, name }
 local quarryAssigns = type(cfg.quarryAssigns) == "table" and cfg.quarryAssigns or {}
--- where-track: live GPS → turtle (site `where` / admin `where site bot`)
+-- Perimeter activity (manager alerts + log replies)
+local perimeterEvents = {}   -- newest-first { kind, player, side, gate, time, ts, managerId }
+local perimeterPresent = {}  -- from last perimeter_log
+local perimeterSnapAt = 0
+local perimeterManagerId = nil
+local perimeterTitle = "Territory"
+-- where-track: live GPS -> turtle (site `where` / admin `where site bot`)
 local pendingWhere = nil   -- queued until unlock
 local openWhereSoon = nil  -- unlocked: open from console UI thread
 local lastWhereMsg = nil
@@ -102,6 +110,90 @@ local flushWhereTrack      -- assigned later
 
 local function now() return os.epoch("utc") end
 local function ago(ts) return math.floor((now() - (ts or 0)) / 1000) end
+
+local function sideShortAdmin(s)
+  local map = {
+    north = "N", northeast = "NE", east = "E", southeast = "SE",
+    south = "S", southwest = "SW", west = "W", northwest = "NW",
+    n = "N", ne = "NE", e = "E", se = "SE", s = "S", sw = "SW", w = "W", nw = "NW",
+  }
+  local key = tostring(s or "?"):lower()
+  return map[key] or tostring(s or "?"):sub(1, 2):upper()
+end
+
+local function pushPerimeterEvent(e)
+  if type(e) ~= "table" then return end
+  local entry = {
+    kind = tostring(e.kind or "?"):upper(),
+    player = e.player or "?",
+    side = e.side,
+    gate = e.gate,
+    playerY = tonumber(e.playerY) or tonumber(e.entryY),
+    time = e.time or "",
+    ts = e.ts or e.eventTs or now(),
+    managerId = tonumber(e.managerId),
+  }
+  table.insert(perimeterEvents, 1, entry)
+  while #perimeterEvents > 40 do perimeterEvents[#perimeterEvents] = nil end
+  perimeterSnapAt = now()
+  if entry.managerId then perimeterManagerId = entry.managerId end
+end
+
+local function applyPerimeterLog(msg, fromId)
+  if type(msg) ~= "table" then return end
+  perimeterSnapAt = now()
+  perimeterManagerId = tonumber(msg.managerId) or tonumber(fromId) or perimeterManagerId
+  if msg.title then perimeterTitle = tostring(msg.title) end
+  if type(msg.present) == "table" then
+    perimeterPresent = msg.present
+  end
+  if type(msg.events) == "table" and #msg.events > 0 then
+    -- Replace cache with authoritative manager log (newest first).
+    local nextLog = {}
+    for i = 1, math.min(40, #msg.events) do
+      local e = msg.events[i]
+      if type(e) == "table" then
+        nextLog[#nextLog + 1] = {
+          kind = tostring(e.kind or "?"):upper(),
+          player = e.player or "?",
+          side = e.side,
+          gate = e.gate,
+          playerY = tonumber(e.playerY) or tonumber(e.entryY),
+          time = e.time or "",
+          ts = e.ts or e.eventTs or now(),
+          managerId = perimeterManagerId,
+        }
+      end
+    end
+    perimeterEvents = nextLog
+  end
+end
+
+local function requestPerimeterStatus(timeout)
+  timeout = tonumber(timeout) or 2
+  local req = {
+    type = MSG.PERIMETER_LOG_REQ or "perimeter_log_req",
+    from = os.getComputerID(),
+    limit = 24,
+  }
+  if perimeterManagerId then
+    rednet.send(perimeterManagerId, req, PROTO_NET)
+    local mainId = titan.getMainRouterId and titan.getMainRouterId()
+    if mainId and mainId ~= perimeterManagerId then
+      rednet.send(mainId, {
+        type = MSG.PERIMETER_FWD or "perimeter_fwd",
+        dest = perimeterManagerId,
+        originId = os.getComputerID(),
+        payload = req,
+        from = os.getComputerID(),
+      }, PROTO_ROUTER)
+    end
+  else
+    rednet.broadcast(req, PROTO_NET)
+  end
+  sleep(timeout)
+  return perimeterEvents
+end
 
 local function persistQuarryAssigns()
   cfg.quarryAssigns = quarryAssigns
@@ -411,6 +503,18 @@ local function handle(id, msg)
         print(("[quarry] #%d acked Y %d..%d"):format(tid, row.y0, row.y1))
       end
     end
+  elseif t == MSG.PERIMETER_ALERT or t == "perimeter_alert" then
+    pushPerimeterEvent(msg)
+    if msg.managerId then
+      touchSystem(tonumber(msg.managerId) or id, msg.title or "Perimeter", "perimeter_manager")
+    end
+  elseif t == MSG.PERIMETER_LOG or t == "perimeter_log" then
+    applyPerimeterLog(msg, id)
+    touchSystem(tonumber(msg.managerId) or id, msg.title or "Perimeter", "perimeter_manager")
+  elseif t == MSG.PERIMETER_FWD or t == "perimeter_fwd" then
+    if type(msg.payload) == "table" then
+      handle(tonumber(msg.originId) or id, msg.payload)
+    end
   end
 end
 
@@ -654,7 +758,7 @@ end
 --------------------------------------------------------------------------------
 -- Live boards (same stats as MAIN monitor; pretty on advanced pocket)
 --------------------------------------------------------------------------------
-local LIVE_BOARDS = { "local", "global", "stats", "gps", "bots", "quarry", "qsite" }
+local LIVE_BOARDS = { "local", "global", "stats", "perimeter", "gps", "bots", "quarry", "qsite" }
 local liveBoard = "local"
 local boardSnap = nil
 local boardSnapAt = 0
@@ -1174,6 +1278,103 @@ local function drawStatsBoard(L, snap)
   end
   if #keys == 0 and y <= y1 then
     guiText(out, 1 + L.pad, y, "(none)", THEME.dim, THEME.bg)
+    y = y + 1
+  end
+  -- Recent perimeter activity (manager -> admin)
+  if y + 2 <= y1 then
+    y = y + 1
+    if L.color then
+      guiFill(out, 1, y, w, 1, THEME.colHeader, THEME.colHeaderFg)
+      guiText(out, 2, y, "PERIMETER RECENT", THEME.colHeaderFg, THEME.colHeader)
+    else
+      guiText(out, 1 + L.pad, y, "Perimeter recent:", THEME.muted, THEME.bg)
+    end
+    y = y + 1
+    if #perimeterEvents == 0 then
+      if y <= y1 then
+        guiText(out, 1 + L.pad, y, "(no activity — open Gates / live perimeter)", THEME.dim, THEME.bg)
+      end
+    else
+      for i = 1, math.min(6, #perimeterEvents) do
+        if y > y1 then break end
+        local e = perimeterEvents[i]
+        local fg = (e.kind == "ENTER") and THEME.ok or THEME.warn
+        local yLvl = e.playerY
+        local line = ("%s %-5s %-8s %-3s Y%-4s %s"):format(
+          tostring(e.time):sub(-8), e.kind, tostring(e.player):sub(1, 8),
+          sideShortAdmin(e.side),
+          yLvl ~= nil and tostring(yLvl) or "?",
+          tostring(e.gate or ""):sub(1, 8))
+        guiText(out, 1 + L.pad, y, line:sub(1, w - L.pad), fg, THEME.bg)
+        y = y + 1
+      end
+    end
+  end
+end
+
+local function drawPerimeterBoard(L)
+  local out, w, h = L.out, L.w, L.h
+  local y = 1
+  local age = (perimeterSnapAt > 0) and ago(perimeterSnapAt) or nil
+  local right = age and (age .. "s") or "-"
+  guiBar(L, y, "GATES", right, THEME.warn)
+  y = y + 1
+  local y1 = h - L.footerH
+  guiText(out, 1 + L.pad, y, ("%s  mgr=#s"):format(
+    tostring(perimeterTitle or "Territory"):sub(1, 18),
+    tostring(perimeterManagerId or "?")), THEME.muted, THEME.bg)
+  y = y + 1
+  local insideN = type(perimeterPresent) == "table" and #perimeterPresent or 0
+  guiText(out, 1 + L.pad, y, ("Inside: %d   Events: %d   r refresh"):format(
+    insideN, #perimeterEvents), THEME.text, THEME.bg)
+  y = y + 1
+  if insideN > 0 and y <= y1 then
+    if L.color then
+      guiFill(out, 1, y, w, 1, THEME.colHeader, THEME.colHeaderFg)
+      guiText(out, 2, y, "INSIDE", THEME.colHeaderFg, THEME.colHeader)
+    else
+      guiText(out, 1 + L.pad, y, "Inside:", THEME.muted, THEME.bg)
+    end
+    y = y + 1
+    for i = 1, math.min(4, insideN) do
+      if y > y1 - 4 then break end
+      local p = perimeterPresent[i]
+      local yLvl = p.entryY or p.playerY
+      guiText(out, 1 + L.pad, y, ("%-10s %-3s Y%-4s %s"):format(
+        tostring(p.name or "?"):sub(1, 10),
+        sideShortAdmin(p.side),
+        yLvl ~= nil and tostring(yLvl) or "?",
+        tostring(p.gate or p.entered or ""):sub(1, 12)), THEME.ok, THEME.bg)
+      y = y + 1
+    end
+  end
+  if y <= y1 then
+    if L.color then
+      guiFill(out, 1, y, w, 1, THEME.colHeader, THEME.colHeaderFg)
+      guiText(out, 2, y, "RECENT ACTIVITY", THEME.colHeaderFg, THEME.colHeader)
+    else
+      guiText(out, 1 + L.pad, y, "Recent:", THEME.muted, THEME.bg)
+    end
+    y = y + 1
+  end
+  if #perimeterEvents == 0 then
+    if y <= y1 then
+      guiText(out, 1 + L.pad, y, "(waiting for manager - r to request)", THEME.dim, THEME.bg)
+    end
+  else
+    for i = 1, #perimeterEvents do
+      if y > y1 then break end
+      local e = perimeterEvents[i]
+      local fg = (e.kind == "ENTER") and THEME.ok or THEME.warn
+      local yLvl = e.playerY
+      local line = ("%s %-5s %-8s %-3s Y%-4s %s"):format(
+        tostring(e.time):sub(-8), e.kind, tostring(e.player):sub(1, 8),
+        sideShortAdmin(e.side),
+        yLvl ~= nil and tostring(yLvl) or "?",
+        tostring(e.gate or ""):sub(1, 10))
+      guiText(out, 1 + L.pad, y, line:sub(1, w - L.pad), fg, THEME.bg)
+      y = y + 1
+    end
   end
 end
 
@@ -1473,8 +1674,8 @@ end
 
 local function drawLiveFooter(L, board)
   local out, w, h = L.out, L.w, L.h
-  local tabs = "1loc 2glb 3stat 4gps 5bots 6qry 7site"
-  if L.tier == "tiny" then tabs = "1-7  n/p  q back" end
+  local tabs = "1loc 2glb 3stat 4gate 5gps 6bots 7qry 8site"
+  if L.tier == "tiny" then tabs = "1-8  n/p  q back" end
   local mode = L.color and "ADV" or "MONO"
   local right = (" %s %dx%d"):format(mode, w, h)
   local left = (" %s  %s"):format(board, (L.tier == "tiny") and "q=back" or "←/→ tabs  q back")
@@ -1499,6 +1700,8 @@ local function drawLiveBoard(board)
     drawQuarryBoard(L)
   elseif board == "qsite" then
     drawQuarrySiteBoard(L)
+  elseif board == "perimeter" then
+    drawPerimeterBoard(L)
   else
     local snap = boardSnap or refreshBoardSnap(false)
     if board == "global" then
@@ -1521,6 +1724,9 @@ local function normalizeLiveBoard(name)
   if name == "roster" or name == "loc" or name == "l" then return "local" end
   if name == "mesh" or name == "glb" or name == "g" then return "global" end
   if name == "stat" or name == "s" then return "stats" end
+  if name == "gate" or name == "gates" or name == "peri" or name == "territory" then
+    return "perimeter"
+  end
   if name == "p" then return "gps" end
   if name == "bot" or name == "b" then return "bots" end
   if name == "q" or name == "offline" then return "quarry" end
@@ -1535,6 +1741,14 @@ end
 
 local function isQuarryLiveBoard(b)
   return b == "quarry" or b == "qsite"
+end
+
+local function isPerimeterLiveBoard(b)
+  return b == "perimeter"
+end
+
+local function needsCustomLiveRefresh(b)
+  return isQuarryLiveBoard(b) or isPerimeterLiveBoard(b)
 end
 
 local function cycleLiveBoard(delta)
@@ -1555,15 +1769,27 @@ local function drainInputEvents()
   end
 end
 
+local function refreshLiveBoardData(board, timeout)
+  if isQuarryLiveBoard(board) then
+    requestQuarryStatus(timeout or 1)
+  elseif isPerimeterLiveBoard(board) then
+    requestPerimeterStatus(timeout or 1)
+  elseif board == "stats" then
+    refreshBoardSnap(true)
+    -- Soft-pull perimeter so the stats teaser stays fresh.
+    if #perimeterEvents == 0 or ago(perimeterSnapAt) > 20 then
+      requestPerimeterStatus(0.6)
+    end
+  else
+    refreshBoardSnap(true)
+  end
+end
+
 local function liveView(startBoard)
   if startBoard then
     liveBoard = normalizeLiveBoard(startBoard) or liveBoard
   end
-  if isQuarryLiveBoard(liveBoard) then
-    requestQuarryStatus(2)
-  else
-    refreshBoardSnap(true)
-  end
+  refreshLiveBoardData(liveBoard, 2)
   drawLiveBoard(liveBoard)
   local timer = os.startTimer(1)
   local snapTimer = os.startTimer(8)
@@ -1575,6 +1801,8 @@ local function liveView(startBoard)
     elseif ev == "timer" and p1 == snapTimer then
       if isQuarryLiveBoard(liveBoard) then
         -- keep last broadcast; optional soft refresh
+      elseif isPerimeterLiveBoard(liveBoard) then
+        requestPerimeterStatus(0.4)
       else
         refreshBoardSnap(true)
       end
@@ -1585,25 +1813,26 @@ local function liveView(startBoard)
       if ch == "q" then break
       elseif ch == "n" then
         cycleLiveBoard(1)
-        if isQuarryLiveBoard(liveBoard) then requestQuarryStatus(1) end
+        refreshLiveBoardData(liveBoard, 1)
         drawLiveBoard(liveBoard)
       elseif ch == "p" then
         cycleLiveBoard(-1)
-        if isQuarryLiveBoard(liveBoard) then requestQuarryStatus(1) end
+        refreshLiveBoardData(liveBoard, 1)
         drawLiveBoard(liveBoard)
       elseif ch == "1" then liveBoard = "local"; drawLiveBoard(liveBoard)
       elseif ch == "2" then liveBoard = "global"; drawLiveBoard(liveBoard)
-      elseif ch == "3" then liveBoard = "stats"; drawLiveBoard(liveBoard)
-      elseif ch == "4" then liveBoard = "gps"; drawLiveBoard(liveBoard)
-      elseif ch == "5" then liveBoard = "bots"; drawLiveBoard(liveBoard)
-      elseif ch == "6" then liveBoard = "quarry"; requestQuarryStatus(2); drawLiveBoard(liveBoard)
-      elseif ch == "7" then liveBoard = "qsite"; requestQuarryStatus(2); drawLiveBoard(liveBoard)
+      elseif ch == "3" then liveBoard = "stats"; refreshLiveBoardData("stats", 1); drawLiveBoard(liveBoard)
+      elseif ch == "4" then liveBoard = "perimeter"; requestPerimeterStatus(1); drawLiveBoard(liveBoard)
+      elseif ch == "5" then liveBoard = "gps"; drawLiveBoard(liveBoard)
+      elseif ch == "6" then liveBoard = "bots"; drawLiveBoard(liveBoard)
+      elseif ch == "7" then liveBoard = "quarry"; requestQuarryStatus(2); drawLiveBoard(liveBoard)
+      elseif ch == "8" then liveBoard = "qsite"; requestQuarryStatus(2); drawLiveBoard(liveBoard)
       elseif ch == "r" then
-        if isQuarryLiveBoard(liveBoard) then requestQuarryStatus(2) else refreshBoardSnap(true) end
+        refreshLiveBoardData(liveBoard, 2)
         drawLiveBoard(liveBoard)
       elseif ch == "\t" then
         cycleLiveBoard(1)
-        if isQuarryLiveBoard(liveBoard) then requestQuarryStatus(1) end
+        refreshLiveBoardData(liveBoard, 1)
         drawLiveBoard(liveBoard)
       end
     elseif ev == "key" then
@@ -1613,23 +1842,23 @@ local function liveView(startBoard)
       if p1 == K.backspace then break
       elseif p1 == K.right or p1 == K.tab then
         cycleLiveBoard(1)
-        if isQuarryLiveBoard(liveBoard) then requestQuarryStatus(1) end
+        refreshLiveBoardData(liveBoard, 1)
         drawLiveBoard(liveBoard)
       elseif p1 == K.left then
         cycleLiveBoard(-1)
-        if isQuarryLiveBoard(liveBoard) then requestQuarryStatus(1) end
+        refreshLiveBoardData(liveBoard, 1)
         drawLiveBoard(liveBoard)
       elseif p1 == K.r then
-        if isQuarryLiveBoard(liveBoard) then requestQuarryStatus(2) else refreshBoardSnap(true) end
+        refreshLiveBoardData(liveBoard, 2)
         drawLiveBoard(liveBoard)
       end
     elseif ev == "mouse_click" then
       -- button, x, y — tap right half → next board; left → prev
       local w = select(1, term.getSize())
       local x = p2
-      if x and x > 0 then
+        if x and x > 0 then
         if x > w / 2 then cycleLiveBoard(1) else cycleLiveBoard(-1) end
-        if isQuarryLiveBoard(liveBoard) then requestQuarryStatus(1) end
+        refreshLiveBoardData(liveBoard, 1)
         drawLiveBoard(liveBoard)
       end
     elseif ev == "terminate" then
@@ -2101,7 +2330,7 @@ end
 --------------------------------------------------------------------------------
 local HELP_PER_PAGE = 10
 local HELP_ENTRIES = {
-  { "live [board]", "MAIN boards (local/global/stats/gps/bots/quarry)" },
+  { "live [board]", "MAIN boards (+stats/perimeter gates)" },
   { "quarry", "Quarry board / assign Y bands" },
   { "quarry assign <id> <y0> <y1>", "Set turtle Y; ack on next check-in" },
   { "quarry pending", "List tablet Y assigns + ack state" },
@@ -2787,18 +3016,20 @@ local function simpleLiveMenu()
   print("Live boards (MAIN monitor stats)")
   print("  1) Local network")
   print("  2) Global mesh")
-  print("  3) Stats")
-  print("  4) GPS")
-  print("  5) Bots")
-  print("  6) Quarry progress")
+  print("  3) Stats (+ perimeter recent)")
+  print("  4) Perimeter / gates")
+  print("  5) GPS")
+  print("  6) Bots")
+  print("  7) Quarry progress")
   print("  0) Back")
   local n = askNumber("Pick: ")
   if n == 1 then liveView("local")
   elseif n == 2 then liveView("global")
   elseif n == 3 then liveView("stats")
-  elseif n == 4 then liveView("gps")
-  elseif n == 5 then liveView("bots")
-  elseif n == 6 then liveView("quarry")
+  elseif n == 4 then liveView("perimeter")
+  elseif n == 5 then liveView("gps")
+  elseif n == 6 then liveView("bots")
+  elseif n == 7 then liveView("quarry")
   end
 end
 
@@ -2831,6 +3062,7 @@ end
 -- Phone-style app catalog (id → action). Colors used when term.isColor().
 local PHONE_APPS = {
   { id = "stats",    name = "Stats",    sub = "network",  bg = colors.blue },
+  { id = "gates",    name = "Gates",    sub = "perimeter", bg = colors.red },
   { id = "miners",   name = "Miners",   sub = "turtles",  bg = colors.brown },
   { id = "loaders",  name = "Loaders",  sub = "escorts",  bg = colors.orange },
   { id = "sites",    name = "Sites",    sub = "markers",  bg = colors.purple },
@@ -2854,6 +3086,8 @@ local PHONE_PAGE = 10  -- apps per home page
 local function runPhoneApp(id)
   if id == "stats" then
     simpleStatusBoard()
+  elseif id == "gates" or id == "perimeter" then
+    liveView("perimeter")
   elseif id == "miners" then
     printBots("miner"); pauseSimple()
   elseif id == "loaders" then

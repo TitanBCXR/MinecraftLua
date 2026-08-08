@@ -1,27 +1,24 @@
 --[[
-  perimeter_sensor.lua  -  Territory edge sensor (Advanced Peripherals Player Detector)
-  Titan-Version: 1.2.3
+  perimeter_sensor.lua  -  Territory sensor (Advanced Peripherals Player Detector)
+  Titan-Version: 1.2.7
 
-  Place on a computer at a perimeter gate with:
+  Place on a computer with:
     * Advanced Peripherals Player Detector (adjacent / networked)
     * Wireless modem (joins the Titan mesh)
-    * GPS in range (for auto side / name from the manager origin)
+    * GPS in range (approach bearing, auto-name, and optional GPS host)
 
-  On hearing the manager origin, this sensor names itself from its direction:
-    North Gate, Northeast Gate, East Gate, ... Northwest Gate
-  Custom labels stick until you clear them (`autoname`) or the manager renames.
+  Modes:
+    * Multi-gate: manager assigns side -> North Gate, East Gate, ...
+    * Single-sensor: no side required; covers whole area (raise ranges).
+      On ENTER: approach bearing + player Y level.
 
-  Setup:
-    side <n|ne|e|se|s|sw|w|nw>   manual override (or wait for auto)
-    range <n>                    detection radius (default 50)
-    name <label>                 custom label (disables auto-name)
-    autoname                     restore direction-based name
-    auto                         ask manager to re-assign from GPS
-    update [-y]                  pull packages (manager can force this remotely)
-    status | help
+  Also hosts GPS for routers/nav (gpshost on by default when a fix exists).
 
-  Manager can push side / range / name remotely (`rename` on the board),
-  and `update` / `forceupdate` to OTA every perimeter sensor (SSH fallback).
+  Range is a half-extent per axis (blocks from the detector):
+    range <n>           set X=Y=Z
+    range x|y|z <n>     set one axis (e.g. wide X, short Z)
+
+  Reports only to ONE bound perimeter manager (not the whole mesh).
 
   Requires: modem, playerDetector / player_detector, lib/titan.lua
   Pair with: perimeter_manager.lua
@@ -36,11 +33,18 @@ titan.openModem()
 local CFG = "perimeter_sensor.cfg"
 local DEFAULT_RANGE = 50
 local cfg = {
-  side = nil,       -- 8-way compass sector
-  range = DEFAULT_RANGE,
+  side = nil,       -- 8-way compass sector (optional for single-sensor mode)
+  range = DEFAULT_RANGE,  -- legacy / default half-extent when axis unset
+  rangeX = nil,     -- X half-extent (blocks from detector); nil -> range
+  rangeY = nil,     -- Y half-extent (height); nil -> range
+  rangeZ = nil,     -- Z half-extent; nil -> range
   name = nil,
   poll = 0.5,
   autoName = true,  -- rename label when manager assigns a side
+  ignore = {},      -- [lowercase] = display name (synced from manager)
+  managerId = nil,  -- locked perimeter manager computer id
+  gpsHost = true,   -- answer gps.locate for routers / nav (via titan.relayLoop)
+  gpsCoords = nil,  -- optional {x,y,z}; else live GPS fix
 }
 
 local seen = {}
@@ -50,29 +54,74 @@ local managerOrigin = nil
 local managerId = nil          -- perimeter manager computer id (direct or via mesh)
 local otaBusy = false
 local broadcastHello -- forward decl (used by self-assign)
+local saveCfg        -- forward decl (used by setBoundManager)
+local locateGps      -- forward decl (used by syncGpsHost)
 
--- Deliver a perimeter payload: manager unicast when known, else broadcast;
--- one MAIN hop on router protocol (avoids 3–4× floods per hello/pulse).
+local function boundManagerId()
+  return tonumber(cfg.managerId) or tonumber(managerId)
+end
+
+local function setBoundManager(id, opts)
+  opts = opts or {}
+  id = tonumber(id)
+  if not id or id == os.getComputerID() then return false end
+  local prev = cfg.managerId
+  cfg.managerId = id
+  managerId = id
+  if prev ~= id then
+    saveCfg()
+    if not opts.quiet then
+      print("Bound manager #" .. tostring(id))
+    end
+  end
+  return true
+end
+
+-- Deliver to the bound manager only (unicast + targeted MAIN hop).
+-- Discovery hellos may flood until a manager is locked.
 local function deliverPerimeter(msg, opts)
   opts = opts or {}
-  if type(msg) ~= "table" then return end
+  if type(msg) ~= "table" then return false end
   msg.from = os.getComputerID()
   msg.sensorId = msg.sensorId or os.getComputerID()
   msg.originId = msg.originId or os.getComputerID()
-  if managerId and managerId ~= os.getComputerID() and not opts.flood then
-    rednet.send(managerId, msg, P)
-  else
+  local dest = boundManagerId()
+  if dest then msg.managerId = dest end
+
+  local t = tostring(msg.type or "")
+  local isHello = (t == (MSG.PERIMETER_HELLO or "perimeter_hello")
+    or t == (MSG.PERIMETER_ASSIGN_REQ or "perimeter_assign_req"))
+
+  if dest and dest ~= os.getComputerID() and not opts.flood then
+    rednet.send(dest, msg, P)
+    local mainId = titan.getMainRouterId and titan.getMainRouterId()
+    if mainId and mainId ~= os.getComputerID() and mainId ~= dest then
+      rednet.send(mainId, {
+        type = MSG.PERIMETER_FWD or "perimeter_fwd",
+        dest = dest,
+        originId = os.getComputerID(),
+        payload = msg,
+        from = os.getComputerID(),
+        managerId = dest,
+      }, titan.ROUTER_PROTOCOL or "titan_router")
+    end
+    return true
+  end
+
+  -- Unbound: only discovery traffic may broadcast; never flood events/pulses.
+  if opts.flood or (isHello and not dest) then
     rednet.broadcast(msg, P)
+    local mainId = titan.getMainRouterId and titan.getMainRouterId()
+    if mainId and mainId ~= os.getComputerID() then
+      local hop = {}
+      for k, v in pairs(msg) do hop[k] = v end
+      hop.hop = true
+      hop.originId = os.getComputerID()
+      rednet.send(mainId, hop, titan.ROUTER_PROTOCOL or "titan_router")
+    end
+    return true
   end
-  local mainId = titan.getMainRouterId and titan.getMainRouterId()
-  if mainId and mainId ~= os.getComputerID() and mainId ~= managerId then
-    local hop = {}
-    for k, v in pairs(msg) do hop[k] = v end
-    hop.hop = true
-    hop.originId = os.getComputerID()
-    -- Router protocol so MAIN's directory loop always sees it for forwarding.
-    rednet.send(mainId, hop, titan.ROUTER_PROTOCOL or "titan_router")
-  end
+  return false
 end
 
 local function rememberManager(id, msg)
@@ -81,7 +130,12 @@ local function rememberManager(id, msg)
   if msg and msg.kind and msg.kind ~= "manager" and msg.kind ~= "perimeter_manager" then
     return
   end
+  -- Locked sensors ignore other managers.
+  if cfg.managerId and cfg.managerId ~= id then return end
   managerId = id
+  if not cfg.managerId then
+    setBoundManager(id, { quiet = true })
+  end
   if msg and msg.origin then
     managerOrigin = {
       x = msg.origin.x, y = msg.origin.y, z = msg.origin.z,
@@ -142,7 +196,7 @@ local function runForcedUpdate(fromId, reason, opts)
   return true, detail
 end
 
-local function saveCfg()
+saveCfg = function()
   local f = fs.open(CFG, "w"); f.write(textutils.serialize(cfg)); f.close()
 end
 
@@ -154,6 +208,92 @@ local function loadCfg()
     for k, v in pairs(d) do cfg[k] = v end
   end
   if cfg.range == nil then cfg.range = DEFAULT_RANGE end
+  if type(cfg.ignore) ~= "table" then cfg.ignore = {} end
+  if cfg.managerId ~= nil then
+    cfg.managerId = tonumber(cfg.managerId)
+    managerId = cfg.managerId
+  end
+  for _, k in ipairs({ "rangeX", "rangeY", "rangeZ" }) do
+    if cfg[k] ~= nil then cfg[k] = tonumber(cfg[k]) end
+  end
+  if cfg.gpsHost == nil then cfg.gpsHost = true end
+  if type(cfg.gpsCoords) == "table" and cfg.gpsCoords.x and cfg.gpsCoords.z then
+    cfg.gpsCoords = {
+      x = math.floor(tonumber(cfg.gpsCoords.x) + 0.5),
+      y = math.floor(tonumber(cfg.gpsCoords.y or 0) + 0.5),
+      z = math.floor(tonumber(cfg.gpsCoords.z) + 0.5),
+    }
+  else
+    cfg.gpsCoords = nil
+  end
+end
+
+local function axisRange(axis)
+  local v = nil
+  if axis == "x" then v = cfg.rangeX
+  elseif axis == "y" then v = cfg.rangeY
+  elseif axis == "z" then v = cfg.rangeZ
+  end
+  v = tonumber(v) or tonumber(cfg.range) or DEFAULT_RANGE
+  return math.max(1, math.floor(v))
+end
+
+local function rangeSummary()
+  return ("X=%d Y=%d Z=%d"):format(axisRange("x"), axisRange("y"), axisRange("z"))
+end
+
+local function syncGpsHost()
+  if cfg.gpsHost == false then
+    if titan.setGpsHost then titan.setGpsHost(false) end
+    return false
+  end
+  local c = cfg.gpsCoords
+  if not (c and c.x and c.z) then
+    locateGps()
+    if lastPos.x then
+      c = { x = lastPos.x, y = lastPos.y or 0, z = lastPos.z }
+    end
+  end
+  if c and c.x and c.z and titan.setGpsHost then
+    titan.setGpsHost(c)
+    return true
+  end
+  if titan.setGpsHost then titan.setGpsHost(false) end
+  return false
+end
+
+local function ignoreKey(name)
+  return tostring(name or ""):lower()
+end
+
+local function isIgnored(name)
+  return type(cfg.ignore) == "table" and cfg.ignore[ignoreKey(name)] ~= nil
+end
+
+local function applyIgnoreList(list)
+  local nextMap = {}
+  if type(list) == "table" then
+    for k, v in pairs(list) do
+      if type(k) == "number" and type(v) == "string" and v:match("%S") then
+        nextMap[ignoreKey(v)] = v:match("^%s*(.-)%s*$")
+      elseif type(k) == "string" and k:match("%S") then
+        local display = (type(v) == "string" and v:match("%S")) and v or k
+        nextMap[ignoreKey(k)] = display:match("^%s*(.-)%s*$")
+      end
+    end
+  end
+  local prev = cfg.ignore or {}
+  local changed = false
+  for k, v in pairs(nextMap) do
+    if prev[k] ~= v then changed = true; break end
+  end
+  if not changed then
+    for k in pairs(prev) do
+      if nextMap[k] == nil then changed = true; break end
+    end
+  end
+  cfg.ignore = nextMap
+  return changed
 end
 
 local function normalizeSide(s)
@@ -211,7 +351,7 @@ local function findDetector()
   return nil, nil
 end
 
-local function locateGps()
+locateGps = function()
   local x, y, z = gps.locate(2)
   if x then
     lastPos.x, lastPos.y, lastPos.z = math.floor(x + 0.5), math.floor(y + 0.5), math.floor(z + 0.5)
@@ -230,16 +370,44 @@ local function stamp()
 end
 
 local function gateLabel()
-  return cfg.name or os.getComputerLabel() or ("Gate-" .. os.getComputerID())
+  if cfg.name and cfg.name ~= "" then return cfg.name end
+  local label = os.getComputerLabel()
+  if label and label ~= "" then return label end
+  if cfg.side then return sidePretty(cfg.side) .. " Gate" end
+  return "Territory"
 end
 
 local function applyNameFromSide()
-  if cfg.autoName == false or not cfg.side then return false end
-  local name = sidePretty(cfg.side) .. " Gate"
+  if cfg.autoName == false then return false end
+  local name
+  if cfg.side then
+    name = sidePretty(cfg.side) .. " Gate"
+  else
+    name = "Territory"
+  end
   if cfg.name == name and os.getComputerLabel() == name then return false end
   cfg.name = name
   os.setComputerLabel(name)
   return true
+end
+
+-- Player world pos via Advanced Peripherals (nil if unavailable).
+local function playerWorldPos(name)
+  if not detector or type(name) ~= "string" then return nil end
+  local ok, pos = pcall(function() return detector.getPlayerPos(name) end)
+  if ok and type(pos) == "table" and pos.x and pos.z then
+    return math.floor(pos.x + 0.5), math.floor((pos.y or 0) + 0.5), math.floor(pos.z + 0.5)
+  end
+  return nil
+end
+
+-- Bearing from this sensor toward the player (approach direction).
+local function approachFromPlayer(name)
+  locateGps()
+  local px, py, pz = playerWorldPos(name)
+  if not px or not lastPos.x or not lastPos.z then return nil end
+  local bearing = sectorFromDelta(px - lastPos.x, pz - lastPos.z)
+  return bearing, px, py, pz
 end
 
 -- Name / side from GPS vs manager origin (self-assign).
@@ -300,9 +468,14 @@ broadcastHello = function(extra)
     gate = gateLabel(),
     sensorId = os.getComputerID(),
     range = cfg.range,
+    rangeX = axisRange("x"),
+    rangeY = axisRange("y"),
+    rangeZ = axisRange("z"),
+    gpsHost = (cfg.gpsHost ~= false),
     autoName = (cfg.autoName ~= false),
     x = lastPos.x, y = lastPos.y, z = lastPos.z,
-    wantAssign = (cfg.side == nil) or (extra and extra.wantAssign),
+    -- Only request a gate side when explicitly asked (`auto`); nil side = whole-area.
+    wantAssign = not not (extra and extra.wantAssign),
   }
   if type(extra) == "table" then
     flood = not not extra.flood
@@ -340,7 +513,13 @@ local function applyConfig(msg)
   if msg.autoName ~= nil then
     cfg.autoName = not not msg.autoName
   end
-  if msg.side then
+  if msg.clearSide or msg.side == false or msg.side == "" then
+    if cfg.side ~= nil then
+      cfg.side = nil
+      changed = true
+      if cfg.autoName ~= false then applyNameFromSide() end
+    end
+  elseif msg.side then
     local s = normalizeSide(msg.side)
     if s and s ~= cfg.side then
       cfg.side = s
@@ -352,10 +531,49 @@ local function applyConfig(msg)
   end
   if msg.range ~= nil then
     local r = math.floor(tonumber(msg.range) or 0)
-    if r >= 1 and r ~= cfg.range then
-      cfg.range = r
+    if r >= 1 then
+      if r ~= cfg.range then cfg.range = r; changed = true end
+      -- Uniform range clears per-axis overrides unless axes are in the same msg.
+      if msg.rangeX == nil and msg.rangeY == nil and msg.rangeZ == nil then
+        if cfg.rangeX or cfg.rangeY or cfg.rangeZ then
+          cfg.rangeX, cfg.rangeY, cfg.rangeZ = nil, nil, nil
+          changed = true
+        end
+      end
+    end
+  end
+  for _, axis in ipairs({ "rangeX", "rangeY", "rangeZ" }) do
+    if msg[axis] ~= nil then
+      local r = math.floor(tonumber(msg[axis]) or 0)
+      if r >= 1 and cfg[axis] ~= r then
+        cfg[axis] = r
+        changed = true
+      end
+    end
+  end
+  if msg.gpsHost ~= nil then
+    local want = not not msg.gpsHost
+    if (cfg.gpsHost ~= false) ~= want then
+      cfg.gpsHost = want
       changed = true
     end
+  end
+  if msg.gpsHere then
+    locateGps()
+    if lastPos.x then
+      cfg.gpsHost = true
+      cfg.gpsCoords = { x = lastPos.x, y = lastPos.y or 0, z = lastPos.z }
+      changed = true
+    end
+  end
+  if type(msg.gpsCoords) == "table" and msg.gpsCoords.x and msg.gpsCoords.z then
+    cfg.gpsCoords = {
+      x = math.floor(tonumber(msg.gpsCoords.x) + 0.5),
+      y = math.floor(tonumber(msg.gpsCoords.y or 0) + 0.5),
+      z = math.floor(tonumber(msg.gpsCoords.z) + 0.5),
+    }
+    cfg.gpsHost = true
+    changed = true
   end
   -- Gate display name. Direction assign sends name + autoName=true.
   -- rename sends name without keeping autoname (autoName false / omitted → custom).
@@ -375,23 +593,46 @@ local function applyConfig(msg)
     local p = tonumber(msg.poll)
     if p and p >= 0.2 then cfg.poll = p; changed = true end
   end
+  if msg.managerId ~= nil or msg.bindManager ~= nil then
+    local mid = tonumber(msg.managerId or msg.bindManager)
+    if mid and mid ~= cfg.managerId then
+      setBoundManager(mid, { quiet = true })
+      changed = true
+    end
+  end
+  if msg.clearManager then
+    if cfg.managerId then
+      cfg.managerId = nil
+      managerId = nil
+      changed = true
+    end
+  end
+  if msg.ignore ~= nil then
+    if applyIgnoreList(msg.ignore) then changed = true end
+  end
   if changed then
     saveCfg()
-    print(("Config from manager: side=%s range=%s name=%s%s"):format(
-      tostring(cfg.side), tostring(cfg.range), gateLabel(),
+    local ign = 0
+    for _ in pairs(cfg.ignore or {}) do ign = ign + 1 end
+    print(("Config from manager: side=%s range=%s name=%s mgr=%s ignore=%d%s"):format(
+      tostring(cfg.side or "area"), rangeSummary(), gateLabel(),
+      tostring(boundManagerId() or "?"), ign,
       (cfg.autoName == false) and " (custom)" or ""))
-    broadcastHello()
+    syncGpsHost()
+    -- Don't re-hello on ignore/bind-only sync (avoids config loops).
+    if msg.side ~= nil or msg.clearSide or msg.range ~= nil
+        or msg.rangeX ~= nil or msg.rangeY ~= nil or msg.rangeZ ~= nil
+        or msg.name ~= nil or msg.poll ~= nil or msg.autoName ~= nil
+        or msg.gpsHost ~= nil or msg.gpsCoords ~= nil or msg.gpsHere then
+      broadcastHello()
+    end
   end
   return changed
 end
 
-local function listInRange()
-  if not detector then return {} end
-  local ok, list = pcall(function()
-    return detector.getPlayersInRange(tonumber(cfg.range) or DEFAULT_RANGE)
-  end)
-  if not ok or type(list) ~= "table" then return {} end
+local function normalizePlayerList(list)
   local out, set = {}, {}
+  if type(list) ~= "table" then return out, set end
   for _, name in ipairs(list) do
     if type(name) == "string" and name ~= "" then
       out[#out + 1] = name
@@ -404,27 +645,110 @@ local function listInRange()
   return out, set
 end
 
+-- Half-extents on each axis (blocks from detector). Prefer cubic / coords APIs.
+local function listInRange()
+  if not detector then return {} end
+  local rx, ry, rz = axisRange("x"), axisRange("y"), axisRange("z")
+  local list = nil
+  -- getPlayersInCubic(w,h,d): full cuboid size centered on the detector.
+  -- Our ranges are half-extents (same idea as old radial `range`).
+  if detector.getPlayersInCubic then
+    local ok, res = pcall(function()
+      return detector.getPlayersInCubic(rx * 2, ry * 2, rz * 2)
+    end)
+    if ok and type(res) == "table" then list = res end
+  end
+  if not list and detector.getPlayersInCoords then
+    locateGps()
+    if lastPos.x then
+      local ok, res = pcall(function()
+        return detector.getPlayersInCoords(
+          { x = lastPos.x - rx, y = (lastPos.y or 0) - ry, z = lastPos.z - rz },
+          { x = lastPos.x + rx + 1, y = (lastPos.y or 0) + ry + 1, z = lastPos.z + rz + 1 }
+        )
+      end)
+      if ok and type(res) == "table" then list = res end
+    end
+  end
+  if not list then
+    local span = math.max(rx, ry, rz)
+    local ok, res = pcall(function()
+      return detector.getPlayersInRange(span)
+    end)
+    if ok and type(res) == "table" then
+      -- Filter spherical results down to the X/Z(/Y) box when we have positions.
+      local filtered = {}
+      for _, name in ipairs(res) do
+        local n = (type(name) == "table" and name.name) or name
+        if type(n) == "string" then
+          local px, py, pz = playerWorldPos(n)
+          if not px then
+            filtered[#filtered + 1] = n
+          else
+            locateGps()
+            local cx, cy, cz = lastPos.x or px, lastPos.y or py, lastPos.z or pz
+            if math.abs(px - cx) <= rx and math.abs((py or 0) - (cy or 0)) <= ry
+                and math.abs(pz - cz) <= rz then
+              filtered[#filtered + 1] = n
+            end
+          end
+        end
+      end
+      list = filtered
+    end
+  end
+  return normalizePlayerList(list)
+end
+
 local function scanOnce()
-  if not cfg.side then return end
+  -- Side is optional: unset = single-sensor whole-area mode.
   if not detector then
     detector = findDetector()
     if not detector then return end
   end
   local list, nowSet = listInRange()
+  -- Drop ignored players from the live set / pulse.
+  local filtered, filteredSet = {}, {}
+  for _, name in ipairs(list) do
+    if not isIgnored(name) then
+      filtered[#filtered + 1] = name
+      filteredSet[name] = true
+    elseif seen[name] then
+      seen[name] = nil -- silently drop if they were tracked before ignore
+    end
+  end
+  list, nowSet = filtered, filteredSet
+
   for name in pairs(nowSet) do
     if not seen[name] then
       seen[name] = true
-      print(("[%s] ENTER %s via %s"):format(
-        os.date("%H:%M:%S") or "?", name, sideAbbrev(cfg.side)))
-      sendEvent(MSG.PERIMETER_ENTER or "perimeter_enter", name)
+      local approach, px, py, pz = approachFromPlayer(name)
+      local via = approach or cfg.side
+      print(("[%s] ENTER %s from %s at Y=%s"):format(
+        os.date("%H:%M:%S") or "?", name, sideAbbrev(via),
+        py ~= nil and tostring(py) or "?"))
+      sendEvent(MSG.PERIMETER_ENTER or "perimeter_enter", name, {
+        approach = approach,
+        side = cfg.side or approach,
+        playerX = px, playerY = py, playerZ = pz,
+        entryY = py,
+      })
     end
   end
   for name in pairs(seen) do
     if not nowSet[name] then
       seen[name] = nil
-      print(("[%s] EXIT  %s via %s"):format(
-        os.date("%H:%M:%S") or "?", name, sideAbbrev(cfg.side)))
-      sendEvent(MSG.PERIMETER_EXIT or "perimeter_exit", name)
+      local approach, px, py, pz = approachFromPlayer(name)
+      local via = approach or cfg.side
+      print(("[%s] EXIT  %s via %s Y=%s"):format(
+        os.date("%H:%M:%S") or "?", name, sideAbbrev(via),
+        py ~= nil and tostring(py) or "?"))
+      sendEvent(MSG.PERIMETER_EXIT or "perimeter_exit", name, {
+        approach = approach,
+        side = cfg.side or approach,
+        playerX = px, playerY = py, playerZ = pz,
+        entryY = py,
+      })
     end
   end
   local utc, text = stamp()
@@ -435,6 +759,9 @@ local function scanOnce()
     sensorId = os.getComputerID(),
     players = list,
     range = cfg.range,
+    rangeX = axisRange("x"),
+    rangeY = axisRange("y"),
+    rangeZ = axisRange("z"),
     ts = utc,
     time = text,
     x = lastPos.x, y = lastPos.y, z = lastPos.z,
@@ -442,27 +769,47 @@ local function scanOnce()
 end
 
 local function printHelp()
-  print("Perimeter sensor — Player Detector gate")
-  print("  side <n|ne|e|se|s|sw|w|nw>   manual sector")
-  print("  range <blocks>               default " .. DEFAULT_RANGE)
+  print("Perimeter sensor - Player Detector")
+  print("  side <n|ne|e|se|s|sw|w|nw>   gate sector (optional)")
+  print("  range <n>                    set X=Y=Z half-extent (default 50)")
+  print("  range x|y|z <n>              set one axis (blocks from detector)")
+  print("  rangex|rangey|rangez <n>     same")
+  print("  gpshost [on|off|here|x y z]  host GPS for routers/nav")
   print("  name <label>                 custom label (locks auto-name)")
   print("  autoname                     name from direction vs manager")
   print("  auto                         ask manager to assign from GPS")
   print("  update [-y]                  download packages (reboot with -y)")
   print("  poll <seconds>               scan rate (default 0.5)")
+  print("  manager <id>|clear           lock reports to one manager")
   print("  status | help")
-  print("Auto-names from manager origin (North Gate, …). Manager: rename / update")
+  print("No side = whole-area mode (approach bearing + enter Y).")
+  print("Reports only go to the bound manager (not whole mesh).")
 end
 
 local function printStatus()
   print("gate: " .. gateLabel() .. (cfg.autoName == false and " (custom)" or " (auto)"))
-  print("side: " .. tostring(cfg.side and (sidePretty(cfg.side) .. " (" .. sideAbbrev(cfg.side) .. ")") or "(waiting for manager origin / assign)"))
-  print("range: " .. tostring(cfg.range) .. "  poll: " .. tostring(cfg.poll))
+  if cfg.side then
+    print("side: " .. sidePretty(cfg.side) .. " (" .. sideAbbrev(cfg.side) .. ")")
+  else
+    print("side: (none - whole-area / approach bearing)")
+  end
+  print("range: " .. rangeSummary() .. "  poll: " .. tostring(cfg.poll))
+  print("manager: #" .. tostring(boundManagerId() or "(unbound - discovering)"))
   locateGps()
   if lastPos.x then
     print(("gps: %d,%d,%d"):format(lastPos.x, lastPos.y, lastPos.z))
   else
-    print("gps: (none — needed for auto-name)")
+    print("gps: (none - needed for approach / auto-name / gpshost)")
+  end
+  if cfg.gpsHost == false then
+    print("gpshost: off")
+  else
+    local c = cfg.gpsCoords or (lastPos.x and lastPos) or nil
+    if c and c.x then
+      print(("gpshost: on @ %d,%d,%d"):format(c.x, c.y or 0, c.z))
+    else
+      print("gpshost: on (waiting for GPS fix)")
+    end
   end
   if managerOrigin then
     print(("manager origin: %d,%d,%d"):format(
@@ -472,6 +819,14 @@ local function printStatus()
   end
   local d, kind = findDetector()
   print("detector: " .. (d and kind or "NOT FOUND"))
+  local ign = {}
+  for _, display in pairs(cfg.ignore or {}) do ign[#ign + 1] = display end
+  table.sort(ign, function(a, b) return a:lower() < b:lower() end)
+  if #ign == 0 then
+    print("ignore: (none)")
+  else
+    print("ignore: " .. table.concat(ign, ", "))
+  end
   local n = 0
   for _ in pairs(seen) do n = n + 1 end
   print(("in range now: %d"):format(n))
@@ -497,15 +852,76 @@ local function handleCommand(line)
       print("side = " .. sidePretty(s))
       broadcastHello()
     end
-  elseif cmd == "range" then
-    local n = tonumber(a[2])
-    if not n or n < 1 then
-      print("Usage: range <blocks>")
+  elseif cmd == "range" or cmd == "rangex" or cmd == "rangey" or cmd == "rangez" then
+    local axis, n
+    if cmd == "rangex" then axis, n = "x", tonumber(a[2])
+    elseif cmd == "rangey" then axis, n = "y", tonumber(a[2])
+    elseif cmd == "rangez" then axis, n = "z", tonumber(a[2])
+    else
+      local a2 = (a[2] or ""):lower()
+      if a2 == "x" or a2 == "y" or a2 == "z" then
+        axis, n = a2, tonumber(a[3])
+      else
+        n = tonumber(a[2])
+      end
+    end
+    if axis then
+      if not n or n < 1 then
+        print("Usage: range " .. axis .. " <blocks>")
+      else
+        local key = "range" .. axis:upper()
+        cfg[key] = math.floor(n)
+        saveCfg()
+        print(key .. " = " .. cfg[key] .. "  (" .. rangeSummary() .. ")")
+        broadcastHello()
+      end
+    elseif not n or n < 1 then
+      print("range " .. rangeSummary())
+      print("Usage: range <n>   or   range x|y|z <n>")
     else
       cfg.range = math.floor(n)
+      cfg.rangeX, cfg.rangeY, cfg.rangeZ = nil, nil, nil
       saveCfg()
-      print("range = " .. cfg.range)
+      print("range X=Y=Z = " .. cfg.range)
       broadcastHello()
+    end
+  elseif cmd == "gpshost" or cmd == "gps" then
+    local sub = (a[2] or ""):lower()
+    if sub == "" or sub == "status" then
+      syncGpsHost()
+      printStatus()
+    elseif sub == "off" or sub == "disable" or sub == "false" then
+      cfg.gpsHost = false
+      saveCfg()
+      syncGpsHost()
+      print("gpshost off")
+    elseif sub == "on" or sub == "enable" or sub == "true" then
+      cfg.gpsHost = true
+      saveCfg()
+      local ok = syncGpsHost()
+      print(ok and "gpshost on" or "gpshost on (need GPS fix or gpshost x y z)")
+    elseif sub == "here" or sub == "auto" then
+      locateGps()
+      if not lastPos.x then
+        print("No GPS fix.")
+      else
+        cfg.gpsHost = true
+        cfg.gpsCoords = { x = lastPos.x, y = lastPos.y or 0, z = lastPos.z }
+        saveCfg()
+        syncGpsHost()
+        print(("gpshost @ %d,%d,%d"):format(cfg.gpsCoords.x, cfg.gpsCoords.y, cfg.gpsCoords.z))
+      end
+    else
+      local x, y, z = tonumber(a[2]), tonumber(a[3]), tonumber(a[4])
+      if not (x and y and z) then
+        print("Usage: gpshost on|off|here|<x> <y> <z>")
+      else
+        cfg.gpsHost = true
+        cfg.gpsCoords = { x = math.floor(x), y = math.floor(y), z = math.floor(z) }
+        saveCfg()
+        syncGpsHost()
+        print(("gpshost @ %d,%d,%d"):format(cfg.gpsCoords.x, cfg.gpsCoords.y, cfg.gpsCoords.z))
+      end
     end
   elseif cmd == "name" or cmd == "label" then
     if not a[2] then
@@ -535,6 +951,24 @@ local function handleCommand(line)
   elseif cmd == "auto" or cmd == "assign" then
     if managerOrigin then selfAssignFromOrigin(managerOrigin) end
     requestAssign()
+  elseif cmd == "manager" or cmd == "mgr" or cmd == "bind" then
+    local sub = (a[2] or ""):lower()
+    if sub == "" or sub == "status" or sub == "show" then
+      print("manager: #" .. tostring(boundManagerId() or "(unbound)"))
+    elseif sub == "clear" or sub == "none" or sub == "off" then
+      cfg.managerId = nil
+      managerId = nil
+      saveCfg()
+      print("Manager unbound — discovery flood until next bind.")
+    else
+      local id = tonumber(a[2])
+      if not id then
+        print("Usage: manager <id> | manager clear")
+      else
+        setBoundManager(id)
+        broadcastHello()
+      end
+    end
   elseif cmd == "update" or cmd == "upgrade" then
     local auto = (a[2] == "-y" or a[2] == "--yes" or a[2] == "yes")
     -- Over SSH: update then return "reboot" so the client gets an ACK first.
@@ -595,16 +1029,29 @@ print(gateLabel() .. "  #" .. os.getComputerID())
 if not detector then
   print("WARNING: No playerDetector / player_detector found.")
 else
-  print("Detector OK.  range=" .. tostring(cfg.range))
+  print("Detector OK.  range " .. rangeSummary())
+  syncGpsHost()
 end
 if cfg.side then
   print("side = " .. sidePretty(cfg.side) .. " (" .. sideAbbrev(cfg.side) .. ")")
   if cfg.autoName ~= false then applyNameFromSide() end
 else
-  print("No side yet — will self-name from manager origin (needs GPS)...")
-  requestAssign()
+  print("Whole-area mode (no side) - scanning now; approach bearing on enter.")
+  print("Multi-gate layout: type `auto` (or set side) after manager `here`.")
+  if cfg.autoName ~= false then applyNameFromSide() end
 end
-print("Type help. Manager: rename <id> <label>")
+do
+  local mid = boundManagerId()
+  if mid then
+    print("manager: #" .. tostring(mid) .. " (reports locked)")
+  else
+    print("manager: unbound - will lock to first manager hello")
+  end
+  local ign = 0
+  for _ in pairs(cfg.ignore or {}) do ign = ign + 1 end
+  if ign > 0 then print("ignore list: " .. ign .. " player(s)") end
+end
+print("Type help.  manager <id>  |  status")
 print("")
 
 local function scanLoop()
@@ -620,15 +1067,13 @@ local function helloLoop()
   local n = 0
   while true do
     n = n + 1
-    -- Flood only until a manager is known (mesh discovery).
+    syncGpsHost()
+    -- Flood only until bound to a manager (mesh discovery).
+    local bound = boundManagerId()
     broadcastHello({
-      wantAssign = (cfg.side == nil) or (n % 6 == 1),
-      flood = not managerId,
+      flood = not bound,
     })
-    if cfg.side == nil and lastPos.x and (n % 2 == 1) then
-      requestAssign()
-    end
-    if not managerId or (n % 4 == 0) then
+    if not bound or (n % 4 == 0) then
       requestManagerViaRouter()
     end
     sleep(28)
@@ -643,6 +1088,10 @@ local function handleNetMsg(id, msg, proto)
     local target = msg.sensorId or msg.id or msg.to
     if target == nil or tonumber(target) == os.getComputerID()
         or target == "*" or target == "all" then
+      -- Only accept config from bound manager once locked.
+      local bound = boundManagerId()
+      local fromId = tonumber(msg.from) or tonumber(id)
+      if bound and fromId and fromId ~= bound then return end
       if id then rememberManager(id, { kind = "manager" }) end
       applyConfig(msg)
     end
@@ -650,21 +1099,29 @@ local function handleNetMsg(id, msg, proto)
     local target = msg.sensorId or msg.id or msg.to
     if target == nil or tonumber(target) == os.getComputerID()
         or target == "*" or target == "all" then
+      local bound = boundManagerId()
+      local fromId = tonumber(msg.from) or tonumber(id)
+      if bound and fromId and fromId ~= bound then return end
       runForcedUpdate(id, "Manager force-update", { reboot = true })
     end
   elseif (t == MSG.PERIMETER_HELLO or t == "perimeter_hello")
       and (msg.kind == "manager" or msg.kind == "perimeter_manager") then
     rememberManager(id, msg)
-    if msg.origin then
-      selfAssignFromOrigin(msg.origin)
+    if msg.origin and (not cfg.managerId or cfg.managerId == tonumber(id)) then
+      managerOrigin = {
+        x = msg.origin.x, y = msg.origin.y, z = msg.origin.z,
+      }
+      -- Multi-gate only: refresh side/name if already assigned.
+      if cfg.side then
+        selfAssignFromOrigin(msg.origin, { quiet = true })
+      end
     end
-    if not cfg.side then requestAssign() end
   elseif (t == MSG.PERIMETER_ROSTER or t == "perimeter_roster")
       or (proto == routerProto and t == "perimeter_roster") then
     local managers = msg.managers or {}
-    if #managers > 0 then
+    if #managers > 0 and not boundManagerId() then
       rememberManager(managers[1].id, { kind = "manager" })
-      print("Manager via router: #" .. tostring(managerId))
+      print("Bound manager via router: #" .. tostring(boundManagerId()))
     end
   elseif t == MSG.PERIMETER_FWD or t == "perimeter_fwd" then
     local payload = msg.payload
@@ -672,6 +1129,9 @@ local function handleNetMsg(id, msg, proto)
       local target = payload.sensorId or payload.id or payload.to or msg.dest
       if target == nil or tonumber(target) == os.getComputerID()
           or target == "*" or target == "all" then
+        local bound = boundManagerId()
+        local fromId = tonumber(payload.from) or tonumber(msg.from) or tonumber(id)
+        if bound and fromId and fromId ~= bound then return end
         local pt = payload.type
         if pt == MSG.PERIMETER_CONFIG or pt == "perimeter_config" then
           applyConfig(payload)

@@ -1,6 +1,6 @@
 --[[
   titan.lua  -  Shared library for the Titan bot network (CC: Tweaked)
-  Titan-Version: 1.2.23
+  Titan-Version: 1.2.25
 
   Provides:
     * Rednet protocol constants + message type enum
@@ -95,6 +95,9 @@ titan.MSG = {
   PERIMETER_ROSTER_REQ = "perimeter_roster_req", -- manager/sensor -> main : list perimeter peers
   PERIMETER_ROSTER = "perimeter_roster", -- main -> requester : sensors + managers
   PERIMETER_FWD = "perimeter_fwd", -- main <-> perimeter : hop a payload to dest id
+  PERIMETER_LOG_REQ = "perimeter_log_req", -- admin -> manager : recent activity
+  PERIMETER_LOG = "perimeter_log", -- manager -> admin : events + present
+  PERIMETER_ALERT = "perimeter_alert", -- manager -> admin : ENTER/EXIT push
 
   -- Network topology (ender routers + local RF modems)
   NET_LINK = "net_link",           -- admin/router -> node : peer / home / cell
@@ -654,20 +657,51 @@ function titan.registerLoop(kind, period)
   end
 end
 
+-- Optional GPS host coords for devices that also run relayLoop (e.g. perimeter
+-- sensors). Same protocol as stock `gps host` / router gpshost.
+titan._gpsHost = nil  -- { x, y, z } or nil/false to disable
+
+function titan.setGpsHost(coords)
+  if coords == false or coords == nil then
+    titan._gpsHost = nil
+    return nil
+  end
+  if type(coords) ~= "table" or coords.x == nil or coords.z == nil then
+    return nil, "need {x,y,z}"
+  end
+  titan._gpsHost = {
+    x = math.floor(tonumber(coords.x) + 0.5),
+    y = math.floor(tonumber(coords.y or 0) + 0.5),
+    z = math.floor(tonumber(coords.z) + 0.5),
+  }
+  return titan._gpsHost
+end
+
+function titan.getGpsHost()
+  return titan._gpsHost
+end
+
 -- Mesh repeater: forward rednet hop packets on CHANNEL_REPEAT (de-duplicated).
+-- Also answers gps.locate PINGs when titan.setGpsHost(...) is active (one
+-- modem_message consumer — avoids racing a separate gpsHostLoop).
 -- Faithful to CraftOS `repeat` / router.lua. Safe to run on every bot — if the
 -- main router is out of range, nearby workers/miners keep the network linked.
 function titan.relayLoop()
   local REPEAT = rednet.CHANNEL_REPEAT
+  local GPS = gps.CHANNEL_GPS
   local relayed = {}   -- [nMessageID] = expireClock
-  -- Ensure the repeat channel is open (in case openModem ran before an upgrade).
+  -- Ensure the repeat + GPS channels are open (in case openModem ran before an upgrade).
   for _, side in ipairs(titan.modemSides()) do
     pcall(peripheral.call, side, "open", REPEAT)
+    pcall(peripheral.call, side, "open", GPS)
   end
   -- Only pull modem_message so keyboard/read() in parallel consoles is never starved.
   while true do
     local _, side, channel, replyChannel, message = os.pullEvent("modem_message")
-    if channel == REPEAT and type(message) == "table"
+    if channel == GPS and message == "PING" and replyChannel and titan._gpsHost then
+      local c = titan._gpsHost
+      pcall(peripheral.call, side, "transmit", replyChannel, GPS, { c.x, c.y, c.z })
+    elseif channel == REPEAT and type(message) == "table"
        and message.nMessageID and message.nRecipient then
       local now = os.clock()
       for mid, exp in pairs(relayed) do

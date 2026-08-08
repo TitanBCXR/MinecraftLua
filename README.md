@@ -4,11 +4,11 @@ A wireless dispatch system for Minecraft's **CC: Tweaked** mod (active packages)
 
 - **`datacenter.lua`** — Parent Center (master password / fleet authority).
 - **`console.lua`** — terminal console with mesh/`ssh` helpers.
-- **`admin.lua`** — pocket admin tablet (live boards, quarry, where-track).
+- **`admin.lua`** — pocket admin tablet (live boards, quarry, gates/perimeter, where-track).
 - **`router.lua`** (+ hub net/ui/cmd) — mesh repeater / MAIN router.
 - **`offline_miner.lua`** — quarry turtle: solo `area`/`box`, or online **cell fleet**.
 - **`offline_site.lua`** — site board: XZ **cells** (target 20×20, min 4), one bot/cell, full-H layer digs, dual pose, `where`.
-- **`perimeter_sensor.lua` / `perimeter_manager.lua`** — Player Detector territory boards.
+- **`perimeter_sensor.lua` / `perimeter_manager.lua`** — Player Detector territory (one manager + admin alerts).
 - **`lib/titan.lua`** — shared library (protocol, messaging, navigation).
 
 Older packages (hub/bot/poi/miner/…) live under [`archive/`](archive/) and are not in the installer menu.
@@ -392,6 +392,18 @@ fleet miners pick those up automatically.
 Track players entering / leaving your territory with Advanced Peripherals
 **Player Detector** blocks on the Titan mesh.
 
+### Layouts
+
+- **Single sensor:** one detector covering the whole area (leave side unset,
+  raise `range`). On ENTER the board shows **approach bearing** (player position
+  vs the detector).
+- **Multi-gate:** one sensor per edge; `here` then `assign all` maps
+  N/NE/E/SE/S/SW/W/NW from GPS.
+
+Sensors **bind to one manager** (not the whole mesh). The manager can forward
+ENTER/EXIT to an **admin tablet**; the tablet **Stats** board shows recent
+activity, and **Gates** / `live perimeter` is the full activity screen.
+
 ### Perimeter manager (`perimeter_manager.lua`)
 
 One board computer (installer → **"Perimeter manager"**), ideally with a monitor + GPS:
@@ -401,23 +413,33 @@ here                 set territory origin (stand at center)
 assign all           auto-map sensors to N/NE/E/SE/S/SW/W/NW from GPS
 rename <id|gate> Main Gate
 set <id|all> range 50
+set <id> range x 80
+set <id> range z 40
+set <id> range y 256
 set <id> side ne
+set <id> side clear  whole-area mode (no gate side)
+set <id|all> gpshost on|off|here|<x> <y> <z>
+set <id|all> poll 0.5
+set <id|all> autoname
+ignore add Steve     allowed player (no alerts; pushed to sensors)
+ignore remove Steve | ignore list | ignore clear
+admin <tabletId>     forward ENTER/EXIT to that admin pocket
+admin clear | admin
 update | forceupdate OTA this board + every perimeter sensor
 sensors | status | log
 newlog | logs        rotate / list disk event logs
 ```
 
-Shows who’s inside, entry sector, timestamps, and a rolling ENTER/EXIT log.
+Shows who’s inside, entry / approach sector, timestamps, and a rolling ENTER/EXIT log.
 Events are appended under `perimeter_logs/` and reloaded on boot (latest file).
 Logs over **5 MB** are deleted automatically; `newlog` starts a fresh file and
 removes the previous one.
 
-Sensors **self-name** from direction vs `here` (`North Gate`, `Southeast Gate`, …).
-Override any one with `rename <id|gate> <label>` (custom names survive `assign`).
+Sensors auto-bind to this manager on hello (`managerId` pushed). Override on a
+sensor with `manager <id>` / `manager clear`.
 
-**Mesh:** sensors out of direct range still reach the manager through the **MAIN
-router** (and modem extenders). Alerts are hopped to the board; `sensors`
-refreshes the gate list from the router roster.
+**Mesh:** sensors out of direct range still reach **their** manager through the
+**MAIN router** (targeted hop, not a flood to every manager).
 
 **`update` / `forceupdate`:** refreshes the manager, pushes OTA to every known
 perimeter sensor over rednet, then **SSH**es any that don’t ACK (master password)
@@ -425,14 +447,18 @@ and runs `update -y` on them.
 
 ### Perimeter sensor (`perimeter_sensor.lua`)
 
-Install on each gate (installer → **"Perimeter sensor"**):
+Install on each gate or as one territory detector (installer → **"Perimeter sensor"**):
 
 - Computer + wireless modem + Player Detector + GPS coverage
-- Default **range 50**; side + name from GPS vs manager origin
-- Manual: `side ne`, `range 50`, `name My Gate`, `autoname`, `auto`
+- Default **range 50** per axis (half-extent from detector); no side = whole-area
+- ENTER reports **approach bearing** + **player Y** (useful when the sensor sits at Y=0)
+- Axis ranges: `range x 80`, `range z 40`, `range y 256` (or `range 50` for all)
+- **GPS host** for routers/nav: on by default once GPS is known (`gpshost here|off|x y z`)
+- Multi-gate: `auto` / manager `assign`, or `side ne`, `name My Gate`, `autoname`
+- `manager <id>` locks reports to one manager (auto-bound on first hello)
 
-Manager can push `side` / `range` / `name` remotely. Overlapping gates use a
-grace timer so walking between detectors doesn’t false-exit.
+Manager can push `side` / `range` / `rangex|y|z` / `name` / ignore / `managerId` remotely.
+Overlapping gates use a grace timer so walking between detectors doesn’t false-exit.
 
 ---
 

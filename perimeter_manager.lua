@@ -1,29 +1,36 @@
 --[[
   perimeter_manager.lua  -  Territory board for perimeter sensors
-  Titan-Version: 1.3.2
+  Titan-Version: 1.3.7
 
   Central display for perimeter_sensor.lua gates. Shows who is inside the
   territory, which sector they entered from (N NE E SE S SW W NW), enter time,
   and a rolling enter/exit log with timestamps.
 
+  Layouts:
+    * Multi-gate: `here` then `assign all` (one sensor per direction)
+    * Single-sensor: one detector covering the whole area (no side required);
+      ENTER shows approach bearing from player position vs that sensor
+
+  Sensors bind to THIS manager only (managerId pushed on hello/config).
+  Forward ENTER/EXIT to an admin tablet:
+    admin <id> | admin clear | admin
+
+  Ignore list: allowed players never trigger ENTER/EXIT (pushed to sensors).
+    ignore add|remove <name> | ignore list | ignore clear
+
   Event log is saved under perimeter_logs/ and reloaded on boot. Files over 5MB
   are deleted. `newlog` starts a fresh log and removes the previous one.
-
-  Sensors auto-name from their direction vs origin (North Gate, …). Override
-  any gate with `rename <id|gate> <label>` (or `set <id> name <label>`).
-
-  Mesh: sensors out of direct range reach this board through the MAIN router
-  (roster sync + hopped enter/exit/pulse). `sensors` refreshes via router.
 
   Remote control of sensors:
     assign [id|all]              auto side/name from GPS vs origin
     rename <id|gate> <label>     custom name for one sensor
-    set <id|all> side <dir>
+    set <id|all> side <dir|clear>
     set <id|all> range <n>
     set <id|all> name <label>
     range <n>                    shorthand: set all range
+    ignore add|remove|list|clear allowed players
+    admin <id>|clear             admin tablet for alerts / log sync
     update / forceupdate         OTA this board + every perimeter sensor
-                                 (rednet first, SSH fallback)
     origin / here / setpos       territory center
     log [n] | newlog | logs      event history on disk
 
@@ -47,6 +54,8 @@ local cfg = {
   defaultRange = DEFAULT_SENSOR_RANGE,
   origin = nil,  -- {x,y,z} manager / territory center
   logFile = nil, -- current log path under LOG_DIR
+  ignore = {},   -- [lowercase] = display name (allowed / no alerts)
+  adminId = nil, -- admin tablet computer id (alerts + log replies)
 }
 
 local present = {}
@@ -55,6 +64,8 @@ local sensors = {}      -- [id] = { side, gate, seen, players, x,y,z, range }
 local dirty = true
 local updateAcks = {}   -- [id] = ack msg (force-update campaign)
 local updateFails = {}  -- [id] = fail msg
+local hopViaMainRouter  -- forward decl (notifyAdmin / log reply)
+local sendConfig        -- forward decl (bindSensorToSelf)
 
 local function saveCfg()
   local f = fs.open(CFG, "w"); f.write(textutils.serialize(cfg)); f.close()
@@ -68,6 +79,38 @@ local function loadCfg()
     for k, v in pairs(d) do cfg[k] = v end
   end
   if cfg.defaultRange == nil then cfg.defaultRange = DEFAULT_SENSOR_RANGE end
+  if type(cfg.ignore) ~= "table" then cfg.ignore = {} end
+  if cfg.adminId ~= nil then cfg.adminId = tonumber(cfg.adminId) end
+end
+
+local function ignoreKey(name)
+  return tostring(name or ""):lower()
+end
+
+local function isIgnored(name)
+  return type(cfg.ignore) == "table" and cfg.ignore[ignoreKey(name)] ~= nil
+end
+
+local function ignoreListSorted()
+  local list = {}
+  for _, display in pairs(cfg.ignore or {}) do
+    list[#list + 1] = display
+  end
+  table.sort(list, function(a, b) return a:lower() < b:lower() end)
+  return list
+end
+
+local function dropIgnoredPresent(name)
+  local key = ignoreKey(name)
+  local remove = {}
+  for pname in pairs(present) do
+    if ignoreKey(pname) == key then remove[#remove + 1] = pname end
+  end
+  for _, pname in ipairs(remove) do
+    present[pname] = nil
+    dirty = true
+  end
+  return #remove
 end
 
 local function nowUtc() return os.epoch("utc") end
@@ -237,6 +280,7 @@ local function encodeLogLine(entry)
     esc(entry.player),
     esc(entry.side),
     esc(entry.gate),
+    tostring(entry.playerY or entry.entryY or ""),
   }, "|")
 end
 
@@ -244,7 +288,7 @@ local function decodeLogLine(line)
   if not line or line == "" or line:sub(1, 1) == "#" then return nil end
   local parts = {}
   local rest = tostring(line)
-  for _ = 1, 5 do
+  for _ = 1, 6 do
     local a, b = rest:match("^(.-)|(.*)$")
     if not a then break end
     parts[#parts + 1] = a
@@ -259,6 +303,8 @@ local function decodeLogLine(line)
     player = parts[4],
     side = parts[5],
     gate = parts[6],
+    playerY = tonumber(parts[7]),
+    entryY = tonumber(parts[7]),
   }
 end
 
@@ -325,12 +371,35 @@ local function startNewLog()
   return path
 end
 
-local function pushLog(kind, player, side, gate, ts, timeText)
+local function notifyAdmin(kind, player, side, gate, ts, timeText, playerY)
+  local adminId = tonumber(cfg.adminId)
+  if not adminId then return end
+  local payload = {
+    type = MSG.PERIMETER_ALERT or "perimeter_alert",
+    kind = kind,
+    player = player,
+    side = side,
+    gate = gate,
+    playerY = playerY,
+    entryY = playerY,
+    eventTs = ts or nowUtc(),
+    time = formatTime(ts, timeText),
+    title = cfg.title,
+    managerId = os.getComputerID(),
+    from = os.getComputerID(),
+  }
+  rednet.send(adminId, payload, P)
+  hopViaMainRouter(adminId, payload)
+end
+
+local function pushLog(kind, player, side, gate, ts, timeText, playerY)
   local entry = {
     kind = kind,
     player = player,
     side = side,
     gate = gate,
+    playerY = playerY,
+    entryY = playerY,
     ts = ts or nowUtc(),
     time = formatTime(ts, timeText),
   }
@@ -338,42 +407,98 @@ local function pushLog(kind, player, side, gate, ts, timeText)
   while #log > LOG_MAX do log[#log] = nil end
   appendLogFile(entry)
   dirty = true
-  print(("[%s] %s %-12s %-5s %s"):format(
+  local yTxt = (playerY ~= nil) and (" Y=" .. tostring(playerY)) or ""
+  print(("[%s] %s %-12s %-5s %s%s"):format(
     entry.time, kind, tostring(player),
-    sideShort(side), tostring(gate or "")))
+    sideShort(side), tostring(gate or ""), yTxt))
+  if kind == "ENTER" or kind == "EXIT" then
+    notifyAdmin(kind, player, side, gate, entry.ts, entry.time, playerY)
+  end
 end
 
-local function touchPresent(player, side, gate, ts, timeText, isEnter)
+local function replyPerimeterLog(toId, msg)
+  toId = tonumber(toId) or tonumber(msg and msg.from)
+  if not toId then return end
+  local n = math.max(1, math.min(40, tonumber(msg and msg.limit) or 20))
+  local events = {}
+  for i = 1, math.min(n, #log) do
+    local e = log[i]
+    events[#events + 1] = {
+      kind = e.kind, player = e.player, side = e.side,
+      gate = e.gate, ts = e.ts, time = e.time,
+      playerY = e.playerY or e.entryY, entryY = e.entryY or e.playerY,
+    }
+  end
+  local inside = {}
+  for name, row in pairs(present) do
+    inside[#inside + 1] = {
+      name = name,
+      side = row.entrySide or row.lastSide,
+      gate = row.lastGate,
+      entered = row.enteredText,
+      entryY = row.entryY,
+      playerY = row.entryY or row.lastY,
+    }
+  end
+  table.sort(inside, function(a, b) return a.name:lower() < b.name:lower() end)
+  local payload = {
+    type = MSG.PERIMETER_LOG or "perimeter_log",
+    events = events,
+    present = inside,
+    title = cfg.title,
+    managerId = os.getComputerID(),
+    adminId = cfg.adminId,
+    from = os.getComputerID(),
+    ts = nowUtc(),
+  }
+  rednet.send(toId, payload, P)
+  hopViaMainRouter(toId, payload)
+end
+
+local function bindSensorToSelf(sensorId)
+  sendConfig(sensorId, {
+    managerId = os.getComputerID(),
+    ignore = ignoreListSorted(),
+  })
+end
+
+local function touchPresent(player, side, gate, ts, timeText, isEnter, playerY)
   local row = present[player]
   if not row then
     row = {
       entrySide = side,
       enteredAt = ts or nowUtc(),
       enteredText = formatTime(ts, timeText),
+      entryY = playerY,
+      lastY = playerY,
       lastSide = side,
       lastGate = gate,
       lastSeen = ts or nowUtc(),
     }
     present[player] = row
-    pushLog("ENTER", player, side, gate, ts, timeText)
+    pushLog("ENTER", player, side, gate, ts, timeText, playerY)
   else
     row.lastSide = side or row.lastSide
     row.lastGate = gate or row.lastGate
     row.lastSeen = ts or nowUtc()
+    if playerY ~= nil then row.lastY = playerY end
     row.pendingExit = nil
     if isEnter and not row.entrySide then
       row.entrySide = side
       row.enteredAt = ts or nowUtc()
       row.enteredText = formatTime(ts, timeText)
+      if playerY ~= nil then row.entryY = playerY end
+    elseif isEnter and row.entryY == nil and playerY ~= nil then
+      row.entryY = playerY
     end
   end
   dirty = true
 end
 
-local function markExit(player, side, gate, ts, timeText)
+local function markExit(player, side, gate, ts, timeText, playerY)
   local row = present[player]
   if not row then
-    pushLog("EXIT", player, side, gate, ts, timeText)
+    pushLog("EXIT", player, side, gate, ts, timeText, playerY)
     return
   end
   row.pendingExit = true
@@ -381,6 +506,7 @@ local function markExit(player, side, gate, ts, timeText)
   row.pendingGate = gate or row.lastGate
   row.pendingTs = ts or nowUtc()
   row.pendingText = formatTime(ts, timeText)
+  row.pendingY = playerY or row.lastY or row.entryY
   dirty = true
 end
 
@@ -392,10 +518,12 @@ local function confirmExits()
     local stale = (t - (row.lastSeen or 0)) >= graceMs
     if row.pendingExit and stale then
       pushLog("EXIT", name, row.pendingSide or row.lastSide,
-        row.pendingGate or row.lastGate, row.pendingTs, row.pendingText)
+        row.pendingGate or row.lastGate, row.pendingTs, row.pendingText,
+        row.pendingY or row.lastY or row.entryY)
       remove[#remove + 1] = name
     elseif stale and not row.pendingExit then
-      pushLog("EXIT", name, row.lastSide, row.lastGate, t, formatTime(t))
+      pushLog("EXIT", name, row.lastSide, row.lastGate, t, formatTime(t),
+        row.lastY or row.entryY)
       remove[#remove + 1] = name
     end
   end
@@ -405,7 +533,7 @@ local function confirmExits()
   end
 end
 
-local function hopViaMainRouter(destId, payload)
+hopViaMainRouter = function(destId, payload)
   local mainId = titan.getMainRouterId and titan.getMainRouterId()
   if not mainId or not destId then return false end
   rednet.send(mainId, {
@@ -418,7 +546,7 @@ local function hopViaMainRouter(destId, payload)
   return true
 end
 
-local function sendConfig(targetId, fields)
+sendConfig = function(targetId, fields)
   -- Do not put a default `name` here — sensors treat that as their gate label.
   local msg = {
     type = MSG.PERIMETER_CONFIG or "perimeter_config",
@@ -448,6 +576,10 @@ local function sendConfig(targetId, fields)
   end
 end
 
+local function pushIgnoreToSensors(targetId)
+  sendConfig(targetId or "*", { ignore = ignoreListSorted() })
+end
+
 local function sensorIdFrom(id, msg)
   return tonumber(msg.originId) or tonumber(msg.sensorId) or tonumber(msg.from) or id
 end
@@ -464,11 +596,23 @@ local function requestRouterRoster()
   return true
 end
 
+local function looksLikeSensorName(name)
+  name = tostring(name or ""):lower()
+  if name == "" then return true end
+  -- Drop backbone nodes that MAIN sometimes mis-lists in the sensor roster.
+  if name:find("router", 1, true) or name:find("modem", 1, true) then return false end
+  if name:find("perimetermgr", 1, true) or name:find("perimeter_mgr", 1, true) then
+    return false
+  end
+  if name:find("perimeter manager", 1, true) then return false end
+  return true
+end
+
 local function applyRouterRoster(msg)
   local n = 0
   for _, s in ipairs(msg.sensors or {}) do
     local id = tonumber(s.id)
-    if id then
+    if id and id ~= os.getComputerID() and looksLikeSensorName(s.name) then
       local row = sensors[id] or {}
       row.gate = s.name or row.gate
       if s.x then row.x, row.y, row.z = s.x, s.y, s.z end
@@ -532,13 +676,15 @@ local function touchSensor(id, msg)
 end
 
 local function maybeAutoAssign(id, s, msg)
-  if not msg.wantAssign and s.side then return end
+  -- Whole-area sensors leave side unset; only assign when they ask (`auto`).
+  if not msg.wantAssign then return end
   if not cfg.origin then return end
   if not (s.x and s.z) then return end
-  -- Re-assign when requested, or when side missing.
-  if msg.wantAssign or not s.side then
-    assignSensor(id, s)
-  end
+  assignSensor(id, s)
+end
+
+local function eventVia(msg, fallbackSide)
+  return msg.approach or msg.side or fallbackSide
 end
 
 local function handleMsg(id, msg)
@@ -563,34 +709,63 @@ local function handleMsg(id, msg)
   end
 
   local sid = sensorIdFrom(id, msg)
+  -- Sensors bound to another manager: ignore their events.
+  local boundTo = tonumber(msg.managerId)
+  if boundTo and boundTo ~= os.getComputerID()
+      and (t == MSG.PERIMETER_ENTER or t == "perimeter_enter"
+        or t == MSG.PERIMETER_EXIT or t == "perimeter_exit"
+        or t == MSG.PERIMETER_PULSE or t == "perimeter_pulse"
+        or t == MSG.PERIMETER_HELLO or t == "perimeter_hello"
+        or t == MSG.PERIMETER_ASSIGN_REQ or t == "perimeter_assign_req") then
+    return
+  end
+
   if t == MSG.PERIMETER_HELLO or t == "perimeter_hello" then
     if msg.kind == "sensor" or msg.kind == "perimeter_sensor"
         or msg.sensorId or msg.side or msg.x then
       local s = touchSensor(sid, msg)
       maybeAutoAssign(sid, s, msg)
+      -- Bind sensor to this manager + sync ignore list.
+      bindSensorToSelf(sid)
     end
   elseif t == MSG.PERIMETER_ASSIGN_REQ or t == "perimeter_assign_req" then
     local s = touchSensor(sid, msg)
     local ok, err = assignSensor(sid, s)
     if not ok then print("Assign #" .. tostring(sid) .. " failed: " .. tostring(err)) end
+    bindSensorToSelf(sid)
   elseif t == MSG.PERIMETER_ENTER or t == "perimeter_enter" then
-    if msg.player then
+    if msg.player and not isIgnored(msg.player) then
       local ets = msg.eventTs or msg.ts
-      touchPresent(msg.player, msg.side, msg.gate, ets, msg.time, true)
+      local py = tonumber(msg.entryY) or tonumber(msg.playerY)
+      touchPresent(msg.player, eventVia(msg), msg.gate, ets, msg.time, true, py)
       touchSensor(sid, msg)
     end
   elseif t == MSG.PERIMETER_EXIT or t == "perimeter_exit" then
-    if msg.player then
-      markExit(msg.player, msg.side, msg.gate, msg.eventTs or msg.ts, msg.time)
+    if msg.player and not isIgnored(msg.player) then
+      local py = tonumber(msg.entryY) or tonumber(msg.playerY)
+      markExit(msg.player, eventVia(msg), msg.gate, msg.eventTs or msg.ts, msg.time, py)
       if sensors[sid] then sensors[sid].seen = nowUtc() end
     end
   elseif t == MSG.PERIMETER_PULSE or t == "perimeter_pulse" then
     local s = touchSensor(sid, msg)
+    if msg.rangeX then s.rangeX = msg.rangeX end
+    if msg.rangeY then s.rangeY = msg.rangeY end
+    if msg.rangeZ then s.rangeZ = msg.rangeZ end
     for _, name in ipairs(msg.players or {}) do
-      if type(name) == "string" then
-        touchPresent(name, msg.side or s.side, msg.gate or s.gate, msg.eventTs or msg.ts, msg.time, false)
+      if type(name) == "string" and not isIgnored(name) then
+        touchPresent(name, eventVia(msg, s.side), msg.gate or s.gate,
+          msg.eventTs or msg.ts, msg.time, false)
       end
     end
+  elseif t == MSG.PERIMETER_LOG_REQ or t == "perimeter_log_req" then
+    local from = tonumber(msg.from) or tonumber(id)
+    -- Auto-learn admin tablet when it asks for the log.
+    if from and not cfg.adminId then
+      cfg.adminId = from
+      saveCfg()
+      print("Admin tablet auto-set to #" .. tostring(from))
+    end
+    replyPerimeterLog(from, msg)
   elseif t == MSG.PERIMETER_UPDATE_ACK or t == "perimeter_update_ack" then
     updateAcks[sid] = msg
     touchSensor(sid, msg)
@@ -893,7 +1068,7 @@ local function drawOn(t)
   put(1, 3, ("Inside: %d   Gates: %d   grace=%ss  defRange=%s"):format(
     #inside, nSens, tostring(cfg.grace), tostring(cfg.defaultRange)), colors.lime)
 
-  put(1, 5, "PLAYER           IN  ENTERED             VIA GATE", colors.orange)
+  put(1, 5, "PLAYER           IN  Y    ENTERED             VIA GATE", colors.orange)
   local y = 6
   if #inside == 0 then
     put(1, y, "(no players in range)", colors.gray)
@@ -902,11 +1077,13 @@ local function drawOn(t)
     for _, e in ipairs(inside) do
       if y >= h - 6 then break end
       local r = e.row
-      local line = ("%-16s %-3s %-19s %s"):format(
+      local yLvl = r.entryY or r.lastY
+      local line = ("%-16s %-3s %-4s %-19s %s"):format(
         e.name:sub(1, 16),
         sideShort(r.entrySide),
+        yLvl ~= nil and tostring(yLvl) or "?",
         tostring(r.enteredText or "?"):sub(1, 19),
-        tostring(r.lastGate or r.entrySide or ""):sub(1, math.max(1, w - 42))
+        tostring(r.lastGate or r.entrySide or ""):sub(1, math.max(1, w - 48))
       )
       put(1, y, line, r.pendingExit and colors.yellow or colors.white)
       y = y + 1
@@ -918,10 +1095,12 @@ local function drawOn(t)
   for i = 1, math.min(#log, h - y) do
     local e = log[i]
     local fg = (e.kind == "ENTER") and colors.lime or colors.red
-    put(1, y, ("%s %-5s %-12s %-4s %s"):format(
-      tostring(e.time):sub(-8), e.kind, tostring(e.player):sub(1, 12),
+    local yLvl = e.playerY or e.entryY
+    put(1, y, ("%s %-5s %-10s %-3s Y%-4s %s"):format(
+      tostring(e.time):sub(-8), e.kind, tostring(e.player):sub(1, 10),
       sideShort(e.side),
-      tostring(e.gate or ""):sub(1, 12)), fg)
+      yLvl ~= nil and tostring(yLvl) or "?",
+      tostring(e.gate or ""):sub(1, 10)), fg)
     y = y + 1
   end
 end
@@ -942,18 +1121,21 @@ end
 -- Commands
 --------------------------------------------------------------------------------
 local function printHelp()
-  print("Perimeter manager — territory board")
+  print("Perimeter manager - territory board")
   print("ORIGIN: here | origin | setpos <x> <y> <z>")
   print("GATES : sensors | assign [id|all] | rename <id|gate> <label>")
-  print("        set <id|all> side|range|name ...")
-  print("        range <n>     push detection range to all sensors")
+  print("        set <id|all> side|range|name|poll|gpshost|autoname ...")
+  print("        set <id|all> side clear")
+  print("        set <id|all> range <n> | range x|y|z <n>")
+  print("        set <id|all> gpshost on|off|here|<x> <y> <z>")
+  print("        range <n> | range x|y|z <n>   push ranges to all sensors")
+  print("IGNORE: ignore add|remove <name> | ignore list | ignore clear")
+  print("ADMIN : admin <tabletId> | admin clear | admin")
   print("UPDATE: update | forceupdate [-y]   OTA board + all perimeter sensors")
-  print("        (rednet first; SSH into any that don't ACK)")
   print("VIEW  : status | log [n] | logs | newlog | clear | grace <s> | title <name>")
-  print("        newlog        start fresh disk log (deletes the previous file)")
-  print("        logs          list saved log files under perimeter_logs/")
-  print("Names : sensors auto-name North/East/… Gate from origin; rename overrides")
-  print("Sides : n ne e se s sw w nw  (auto from GPS vs origin)")
+  print("Sensors bind to this manager only; ENTER/EXIT forward to admin tablet.")
+  print("Single sensor: leave side unset; ENTER shows approach bearing + Y.")
+  print("Multi-gate: here then assign all (N/NE/E/... Gate from origin)")
 end
 
 local function handleCommand(line)
@@ -1005,14 +1187,32 @@ local function handleCommand(line)
     local id = findSensorRef(a[2])
     local field = (a[3] or ""):lower()
     if not id or field == "" then
-      print("Usage: set <id|all> side <dir>")
-      print("       set <id|all> range <n>")
+      print("Usage: set <id|all> side <dir|clear>")
+      print("       set <id|all> range <n> | range x|y|z <n>")
       print("       set <id|all> name <label>")
+      print("       set <id|all> poll <seconds>")
+      print("       set <id|all> gpshost on|off|here|<x> <y> <z>")
+      print("       set <id|all> autoname")
       return true
     end
     if field == "side" then
+      local arg = (a[4] or ""):lower()
+      if arg == "clear" or arg == "none" or arg == "area" or arg == "-" then
+        sendConfig(id, { clearSide = true, side = false })
+        if id == "*" then
+          for _, s in pairs(sensors) do
+            s.side = nil
+            if s.autoName ~= false then s.gate = "Territory" end
+          end
+        elseif sensors[id] then
+          sensors[id].side = nil
+          if sensors[id].autoName ~= false then sensors[id].gate = "Territory" end
+        end
+        print("Cleared side (whole-area) -> " .. tostring(id))
+        return true
+      end
       local side = normalizeSide(a[4])
-      if not side then print("side: n|ne|e|se|s|sw|w|nw"); return true end
+      if not side then print("side: n|ne|e|se|s|sw|w|nw|clear"); return true end
       -- Side only: auto-named sensors rename themselves; custom labels stay.
       sendConfig(id, { side = side })
       if id == "*" then
@@ -1026,14 +1226,39 @@ local function handleCommand(line)
           sensors[id].gate = sidePretty(side) .. " Gate"
         end
       end
-      print("Pushed side " .. sidePretty(side) .. " → " .. tostring(id))
-    elseif field == "range" then
-      local r = math.floor(tonumber(a[4]) or 0)
-      if r < 1 then print("Usage: set <id|all> range <n>"); return true end
-      sendConfig(id, { range = r })
-      if id == "*" then cfg.defaultRange = r; saveCfg() end
-      if id ~= "*" and sensors[id] then sensors[id].range = r end
-      print("Pushed range " .. r .. " → " .. tostring(id))
+      print("Pushed side " .. sidePretty(side) .. " -> " .. tostring(id))
+    elseif field == "range" or field == "rangex" or field == "rangey" or field == "rangez" then
+      local axis, r
+      if field == "rangex" then axis, r = "x", math.floor(tonumber(a[4]) or 0)
+      elseif field == "rangey" then axis, r = "y", math.floor(tonumber(a[4]) or 0)
+      elseif field == "rangez" then axis, r = "z", math.floor(tonumber(a[4]) or 0)
+      else
+        local a4 = (a[4] or ""):lower()
+        if a4 == "x" or a4 == "y" or a4 == "z" then
+          axis, r = a4, math.floor(tonumber(a[5]) or 0)
+        else
+          r = math.floor(tonumber(a[4]) or 0)
+        end
+      end
+      if axis then
+        if r < 1 then
+          print("Usage: set <id|all> range " .. axis .. " <n>")
+          return true
+        end
+        local key = "range" .. axis:upper()
+        sendConfig(id, { [key] = r })
+        if id ~= "*" and sensors[id] then sensors[id][key] = r end
+        print(("Pushed %s=%d -> %s"):format(key, r, tostring(id)))
+      else
+        if r < 1 then print("Usage: set <id|all> range <n> | range x|y|z <n>"); return true end
+        sendConfig(id, { range = r })
+        if id == "*" then cfg.defaultRange = r; saveCfg() end
+        if id ~= "*" and sensors[id] then
+          sensors[id].range = r
+          sensors[id].rangeX, sensors[id].rangeY, sensors[id].rangeZ = nil, nil, nil
+        end
+        print("Pushed range X=Y=Z " .. r .. " -> " .. tostring(id))
+      end
     elseif field == "name" then
       if not a[4] then print("Usage: set <id|all> name <label>"); return true end
       local name = table.concat(a, " ", 4)
@@ -1044,9 +1269,74 @@ local function handleCommand(line)
         sensors[id].gate = name
         sensors[id].autoName = false
       end
-      print("Renamed → " .. tostring(id) .. " = " .. name)
+      print("Renamed -> " .. tostring(id) .. " = " .. name)
+    elseif field == "poll" then
+      local p = tonumber(a[4])
+      if not p or p < 0.2 then
+        print("Usage: set <id|all> poll <seconds>  (min 0.2)")
+        return true
+      end
+      sendConfig(id, { poll = p })
+      if id ~= "*" and sensors[id] then sensors[id].poll = p end
+      print(("Pushed poll=%.2fs -> %s"):format(p, tostring(id)))
+    elseif field == "gpshost" or field == "gps" then
+      local sub = (a[4] or ""):lower()
+      if sub == "" then
+        print("Usage: set <id|all> gpshost on|off|here|<x> <y> <z>")
+        return true
+      end
+      if sub == "off" or sub == "disable" or sub == "false" then
+        sendConfig(id, { gpsHost = false })
+        if id == "*" then
+          for _, s in pairs(sensors) do s.gpsHost = false end
+        elseif sensors[id] then
+          sensors[id].gpsHost = false
+        end
+        print("Pushed gpshost off -> " .. tostring(id))
+      elseif sub == "on" or sub == "enable" or sub == "true" then
+        sendConfig(id, { gpsHost = true })
+        if id == "*" then
+          for _, s in pairs(sensors) do s.gpsHost = true end
+        elseif sensors[id] then
+          sensors[id].gpsHost = true
+        end
+        print("Pushed gpshost on -> " .. tostring(id))
+      elseif sub == "here" or sub == "auto" then
+        -- Ask sensors to lock GPS host to their own current fix.
+        sendConfig(id, { gpsHost = true, gpsHere = true })
+        print("Pushed gpshost here (use sensor GPS) -> " .. tostring(id))
+      else
+        local x, y, z = tonumber(a[4]), tonumber(a[5]), tonumber(a[6])
+        if not (x and y and z) then
+          print("Usage: set <id|all> gpshost on|off|here|<x> <y> <z>")
+          return true
+        end
+        local coords = {
+          x = math.floor(x), y = math.floor(y), z = math.floor(z),
+        }
+        sendConfig(id, { gpsHost = true, gpsCoords = coords })
+        if id == "*" then
+          for _, s in pairs(sensors) do
+            s.gpsHost = true
+            s.gpsCoords = coords
+          end
+        elseif sensors[id] then
+          sensors[id].gpsHost = true
+          sensors[id].gpsCoords = coords
+        end
+        print(("Pushed gpshost @ %d,%d,%d -> %s"):format(
+          coords.x, coords.y, coords.z, tostring(id)))
+      end
+    elseif field == "autoname" or field == "autolabel" then
+      sendConfig(id, { autoName = true })
+      if id == "*" then
+        for _, s in pairs(sensors) do s.autoName = true end
+      elseif sensors[id] then
+        sensors[id].autoName = true
+      end
+      print("Pushed autoname on -> " .. tostring(id))
     else
-      print("Unknown field. Use side|range|name")
+      print("Unknown field. Use side|range|name|poll|gpshost|autoname")
     end
   elseif cmd == "rename" or cmd == "name" then
     -- rename <id|gate|side> <label...>
@@ -1065,16 +1355,120 @@ local function handleCommand(line)
     dirty = true
     print(("Renamed #%s → %s"):format(tostring(id), name))
   elseif cmd == "range" then
-    local r = math.floor(tonumber(a[2]) or 0)
-    if r < 1 then
-      print("defaultRange = " .. tostring(cfg.defaultRange))
-      print("Usage: range <n>   (push to all sensors)")
+    local a2 = (a[2] or ""):lower()
+    if a2 == "x" or a2 == "y" or a2 == "z" then
+      local r = math.floor(tonumber(a[3]) or 0)
+      if r < 1 then
+        print("Usage: range x|y|z <n>   (push axis to all sensors)")
+      else
+        local key = "range" .. a2:upper()
+        sendConfig("*", { [key] = r })
+        for _, s in pairs(sensors) do s[key] = r end
+        print(("Pushed %s=%d to all sensors."):format(key, r))
+      end
     else
-      cfg.defaultRange = r
+      local r = math.floor(tonumber(a[2]) or 0)
+      if r < 1 then
+        print("defaultRange = " .. tostring(cfg.defaultRange))
+        print("Usage: range <n>   or   range x|y|z <n>")
+      else
+        cfg.defaultRange = r
+        saveCfg()
+        sendConfig("*", { range = r })
+        for _, s in pairs(sensors) do
+          s.range = r
+          s.rangeX, s.rangeY, s.rangeZ = nil, nil, nil
+        end
+        print("Pushed range X=Y=Z " .. r .. " to all sensors.")
+      end
+    end
+  elseif cmd == "ignore" or cmd == "allow" then
+    local sub = (a[2] or "list"):lower()
+    if sub == "list" or sub == "ls" or sub == "show" then
+      local list = ignoreListSorted()
+      if #list == 0 then
+        print("ignore: (none)")
+      else
+        print(("ignore (%d): %s"):format(#list, table.concat(list, ", ")))
+      end
+    elseif sub == "clear" or sub == "reset" then
+      cfg.ignore = {}
       saveCfg()
-      sendConfig("*", { range = r })
-      for _, s in pairs(sensors) do s.range = r end
-      print("Pushed range " .. r .. " to all sensors.")
+      pushIgnoreToSensors("*")
+      print("Ignore list cleared (pushed to sensors).")
+    elseif sub == "add" or sub == "+" then
+      if not a[3] then print("Usage: ignore add <player>"); return true end
+      local name = table.concat(a, " ", 3):match("^%s*(.-)%s*$")
+      cfg.ignore[ignoreKey(name)] = name
+      saveCfg()
+      local dropped = dropIgnoredPresent(name)
+      pushIgnoreToSensors("*")
+      print(("Ignored %s (pushed to sensors)%s"):format(
+        name, dropped > 0 and (" - removed from board") or ""))
+    elseif sub == "remove" or sub == "rm" or sub == "del" or sub == "-" then
+      if not a[3] then print("Usage: ignore remove <player>"); return true end
+      local name = table.concat(a, " ", 3):match("^%s*(.-)%s*$")
+      local key = ignoreKey(name)
+      if not cfg.ignore[key] then
+        print("Not on ignore list: " .. name)
+      else
+        local was = cfg.ignore[key]
+        cfg.ignore[key] = nil
+        saveCfg()
+        pushIgnoreToSensors("*")
+        print("Removed from ignore: " .. tostring(was))
+      end
+    else
+      -- Bare `ignore Steve` = add
+      local name = table.concat(a, " ", 2):match("^%s*(.-)%s*$")
+      if name == "" then
+        print("Usage: ignore add|remove|list|clear <player>")
+      else
+        cfg.ignore[ignoreKey(name)] = name
+        saveCfg()
+        dropIgnoredPresent(name)
+        pushIgnoreToSensors("*")
+        print("Ignored " .. name .. " (pushed to sensors)")
+      end
+    end
+  elseif cmd == "admin" or cmd == "tablet" then
+    local sub = (a[2] or ""):lower()
+    if sub == "" or sub == "status" or sub == "show" then
+      print("admin tablet: #" .. tostring(cfg.adminId or "(unset)"))
+      print("Usage: admin <id> | admin clear")
+    elseif sub == "clear" or sub == "none" or sub == "off" then
+      cfg.adminId = nil
+      saveCfg()
+      print("Admin tablet cleared.")
+    else
+      local id = tonumber(a[2])
+      if not id then
+        print("Usage: admin <tabletId> | admin clear")
+      else
+        cfg.adminId = id
+        saveCfg()
+        print("Admin tablet = #" .. tostring(id))
+        -- Push a hello so the tablet can refresh its perimeter board.
+        rednet.send(id, {
+          type = MSG.PERIMETER_LOG or "perimeter_log",
+          events = {},
+          present = {},
+          title = cfg.title,
+          managerId = os.getComputerID(),
+          from = os.getComputerID(),
+          hello = true,
+        }, P)
+        hopViaMainRouter(id, {
+          type = MSG.PERIMETER_LOG or "perimeter_log",
+          events = {},
+          present = {},
+          title = cfg.title,
+          managerId = os.getComputerID(),
+          from = os.getComputerID(),
+          hello = true,
+        })
+        replyPerimeterLog(id, { limit = 20, from = id })
+      end
     end
   elseif cmd == "status" then
     local list = sortedPlayers()
@@ -1082,9 +1476,15 @@ local function handleCommand(line)
     if #list == 0 then print("  (none)") end
     for _, e in ipairs(list) do
       local r = e.row
-      print(("  %-16s entered %s from %s  (%s)"):format(
+      local yLvl = r.entryY or r.lastY
+      print(("  %-16s entered %s from %s Y=%s  (%s)"):format(
         e.name, tostring(r.enteredText), sideShort(r.entrySide),
+        yLvl ~= nil and tostring(yLvl) or "?",
         tostring(r.lastGate or "")))
+    end
+    local ign = ignoreListSorted()
+    if #ign > 0 then
+      print(("Ignored (%d): %s"):format(#ign, table.concat(ign, ", ")))
     end
   elseif cmd == "log" then
     local n = tonumber(a[2]) or 20
@@ -1093,8 +1493,11 @@ local function handleCommand(line)
     end
     for i = 1, math.min(n, #log) do
       local e = log[i]
-      print(("%s  %-5s  %-12s  %-4s  %s"):format(
-        e.time, e.kind, e.player, sideShort(e.side), tostring(e.gate or "")))
+      local yLvl = e.playerY or e.entryY
+      print(("%s  %-5s  %-12s  %-4s  Y%-4s  %s"):format(
+        e.time, e.kind, e.player, sideShort(e.side),
+        yLvl ~= nil and tostring(yLvl) or "?",
+        tostring(e.gate or "")))
     end
     if #log == 0 then print("(no events yet)") end
   elseif cmd == "logs" then
@@ -1186,11 +1589,17 @@ os.setComputerLabel(os.getComputerLabel() or ("PerimeterMgr-" .. os.getComputerI
 
 term.clear(); term.setCursorPos(1, 1)
 print("== Perimeter Manager ==")
-print("8-way auto-assign from origin. Default sensor range " .. DEFAULT_SENSOR_RANGE .. ".")
+print("Default sensor range " .. DEFAULT_SENSOR_RANGE .. ". Single-sensor or multi-gate.")
 if not cfg.origin then
-  print("Tip: stand at territory center and type: here")
+  print("Tip: stand at territory center and type: here (multi-gate assign)")
 else
   print(("origin %d,%d,%d"):format(cfg.origin.x, cfg.origin.y, cfg.origin.z))
+end
+do
+  local ign = ignoreListSorted()
+  if #ign > 0 then
+    print(("ignore (%d): %s"):format(#ign, table.concat(ign, ", ")))
+  end
 end
 local nLoaded = loadLogFromDisk()
 if cfg.logFile then
@@ -1198,7 +1607,7 @@ if cfg.logFile then
 else
   print("No saved event log yet.")
 end
-print("Type help.")
+print("Type help.  admin <tabletId>  |  ignore add <name>")
 print("")
 
 broadcastManagerHello()

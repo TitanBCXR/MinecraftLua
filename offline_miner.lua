@@ -1,6 +1,6 @@
 --[[
   offline_miner.lua  -  Local quarry turtle (optional site board)
-  Titan-Version: 1.5.8
+  Titan-Version: 1.5.9
 
   Place the turtle at the TOP-FRONT-LEFT corner of the dig, facing into the
   mine. That cell is origin 0,0,0:
@@ -65,7 +65,7 @@ local WORK_RESERVE = 48      -- keep digging only with this much above home cost
 local MIN_FUEL = 200
 local TRAFFIC_Y = -1         -- cruise / traffic layer (+Y = down, so -1 is one above origin)
 -- Keep in sync with Titan-Version header (label uses major.minor → V1.5-Miner12).
-local MINER_VERSION = "1.5.8"
+local MINER_VERSION = "1.5.9"
 -- "outbound" = to cell (overtake) | "homebound" = to origin (yield) | "dig" = wait/retry
 local travelIntent = "dig"
 -- Other miners' last known quarry-relative poses (rednet). Used to tell turtle vs mob/player.
@@ -4320,7 +4320,7 @@ if isOnlineMode() then
       end
       site.digSiteMine({ fromOrigin = true })
       autoStarted = true
-    end, mineNetLoop)
+    end, site.mineNetLoop)
   else
     print("ONLINE — stopped waiting for modem.")
   end
@@ -4365,7 +4365,7 @@ if autoStarted then
 end
 
 if isOnlineMode() and hasModem then
-  parallel.waitForAny(consoleLoop, mineNetLoop)
+  parallel.waitForAny(site.consoleLoop, site.mineNetLoop)
 else
   site.consoleLoop()
 end
