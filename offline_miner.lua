@@ -1,6 +1,6 @@
 --[[
   offline_miner.lua  -  Local quarry turtle (optional site board)
-  Titan-Version: 1.5.0
+  Titan-Version: 1.5.1
 
   Place the turtle at the TOP-FRONT-LEFT corner of the dig, facing into the
   mine. That cell is origin 0,0,0:
@@ -22,8 +22,9 @@
   Online fleet (site board — XZ cells):
     * Claim one cell (target 20×20 XZ, full H, layer dig)
     * Modem ON while traveling; check-in leave_origin + arrive_cell
+    * Surface hops: up 1 → cross XZ → down into cell (modem can't dig sideways)
     * Dig full height one Y layer at a time; stay inside cell perimeter
-    * Home → cell_done → next free cell
+    * Home → cell_done → next free cell (same up-over-down hop)
     * GPS correction hooks stubbed (relative pose for now)
 
   Never attack / dig other turtles — path around them (own-right: R F L F L F R).
@@ -848,6 +849,48 @@ local function goTo(tx, ty, tz, opts)
   return true
 end
 
+-- Surface hop for depot ↔ cell travel (modem on = can't dig horizontally).
+-- Quarry +Y is down, so "up one" is cruiseY = topY - clear (usually -1).
+-- Pure vertical moves skip the hop. opts.beforeSettle() runs before final Y.
+local function goToViaAir(tx, ty, tz, opts)
+  opts = opts or {}
+  local clear = math.max(1, math.floor(tonumber(opts.clear) or 1))
+  tx = math.floor(tonumber(tx) or 0)
+  ty = math.floor(tonumber(ty) or 0)
+  tz = math.floor(tonumber(tz) or 0)
+
+  if pos.x == tx and pos.y == ty and pos.z == tz then
+    if opts.faceForward then faceForward() end
+    return true
+  end
+  -- Same column — just climb/drop (no sideways tunnel needed).
+  if pos.x == tx and pos.z == tz then
+    return goTo(tx, ty, tz, opts)
+  end
+
+  local top = math.min(pos.y, ty)
+  local cruiseY = top - clear
+
+  if pos.y ~= cruiseY then
+    local ok, err = goTo(pos.x, cruiseY, pos.z)
+    if not ok then return false, err or "climb" end
+  end
+  if pos.x ~= tx or pos.z ~= tz then
+    local ok, err = goTo(tx, cruiseY, tz)
+    if not ok then return false, err or "cross" end
+  end
+  if type(opts.beforeSettle) == "function" then
+    opts.beforeSettle()
+  end
+  if pos.y ~= ty then
+    local ok, err = goTo(tx, ty, tz, opts)
+    if not ok then return false, err or "settle" end
+  elseif opts.faceForward then
+    faceForward()
+  end
+  return true
+end
+
 -- Cell is cleared by walking into it. No spin / digUp / digDown / neighbors.
 local function excavateHere()
   return true
@@ -1051,7 +1094,8 @@ end
 
 local function goHome()
   jobLabel = "home"
-  local ok, err = goTo(0, 0, 0)
+  -- Up → over → down so we don't tunnel sideways at Y=0 (often with modem on).
+  local ok, err = goToViaAir(0, 0, 0, { clear = 1 })
   -- Resting pose into the mine — only forced here at origin.
   turnTo(0)
   return ok, err
@@ -3118,16 +3162,29 @@ local function runCellClaim(claim, existingJob)
   assumeAtOrigin()
   suckFuelFromLeft()
   siteSendTyped("quarry_leave_origin", { status = "travel", cellId = claim.cellId })
-  print(("Travel → cell #%s  X%d-%d Z%d-%d (modem on)"):format(
+  print(("Travel → cell #%s  X%d-%d Z%d-%d (up-over-down, modem on)"):format(
     tostring(claim.cellId or "?"), x0, x1, z0, z1))
 
-  if not goTo(x0, 0, z0) then
+  -- Modem can't dig: climb 1, cross above dig surface, announce, pick, drop in.
+  local announced = false
+  if not goToViaAir(x0, 0, z0, {
+    clear = 1,
+    beforeSettle = function()
+      siteSendTyped("quarry_arrive_cell", { status = "arrive", cellId = claim.cellId })
+      announced = true
+      restorePickAfterComms()
+      equipToolFromInventory(nil, true)
+    end,
+  }) then
     print("Could not reach cell corner.")
     siteSendTyped("quarry_progress", { status = "paused", cellId = claim.cellId })
     return "bad"
   end
+  -- Origin cell / already-there: no settle hop, still announce while modem is up.
+  if not announced then
+    siteSendTyped("quarry_arrive_cell", { status = "arrive", cellId = claim.cellId })
+  end
 
-  siteSendTyped("quarry_arrive_cell", { status = "arrive", cellId = claim.cellId })
   print(("Arrived cell #%s — layer dig Y%d..%d"):format(
     tostring(claim.cellId or "?"), y0, y1))
 
