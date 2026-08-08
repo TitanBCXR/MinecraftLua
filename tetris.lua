@@ -1,27 +1,21 @@
 --[[
   tetris.lua  -  Standalone Tetris for CC: Tweaked (pocket / computer)
-  Titan-Version: 1.0.4
+  Titan-Version: 1.0.7
 
   Drop on a pocket PC and run:
 
       tetris
 
-  Main menu shows the shared host leaderboard + Play. Q quits.
+  Main menu: top-3 leaderboard, Play, Controls (C). Q quits the app from menu.
+  In-game / Controls screen: Q always returns to the main menu.
+  Mid-game Q abandons the run (score is not kept).
 
-  Hidden Titan mesh (optional): if lib/titan.lua + a wireless modem are present,
-  this joins your rednet mesh in the background — SSH + GPS beacons.
+  Player name: uses Advanced Peripherals Player Detector when present; otherwise
+  prompts for a name after a game (saved in tetris.cfg). That name is what
+  appears on the shared leaderboard.
 
-  Boot: host-only OTA + leaderboard sync (run host.lua on your update server).
-  Scores submit to the host on boot and after each game.
-
-  Controls (in game):
-    ← / A / H     move left
-    → / D / L     move right
-    ↑ / W / K / X rotate
-    ↓ / S / J     soft drop
-    Space / Enter hard drop
-    P             pause
-    Q             quit to menu
+  Boot: host-only OTA + leaderboard sync + 3s Q-disclaimer
+  (run host.lua on your update server).
 
   Color pocket: colored pieces. Mono: letter blocks.
 ]]
@@ -31,10 +25,12 @@ local COLS, ROWS = 10, 18
 local KIND = "tetris"
 local INSTALL_PROTO = "titan_install"
 local SIDE_W = 5 -- compact HUD column (score uses K/M/B/T)
-local LB_TOP = 8 -- rows shown on menu
+local LB_TOP = 3 -- only show top 3 on menu
+local PLAYER_RANGE = 8
 
 -- Cached host leaderboard (from last sync).
 local LEADERBOARD = {}
+local PLAYER_NAME = nil -- Minecraft / typed display name for the board
 
 -- Live state for SSH / mesh beacons (updated by the game loop).
 local TRACK = {
@@ -57,22 +53,59 @@ local function isColor()
   return ok and c == true
 end
 
-local function loadHi()
-  if not fs.exists(CFG) then return 0 end
+local function loadCfg()
+  local hi, name = 0, nil
+  if not fs.exists(CFG) then return hi, name end
   local f = fs.open(CFG, "r")
   local d = textutils.unserialize(f.readAll() or "")
   f.close()
-  if type(d) == "table" then return tonumber(d.hi) or 0 end
-  return 0
+  if type(d) == "table" then
+    hi = tonumber(d.hi) or 0
+    if type(d.playerName) == "string" and d.playerName:match("%S") then
+      name = d.playerName:match("^%s*(.-)%s*$")
+    end
+  end
+  return hi, name
 end
 
-local function saveHi(hi)
+local function saveCfg()
   local f = fs.open(CFG, "w")
-  f.write(textutils.serialize({ hi = hi }))
+  f.write(textutils.serialize({
+    hi = HI,
+    playerName = PLAYER_NAME,
+  }))
   f.close()
 end
 
-local HI = loadHi()
+local HI
+HI, PLAYER_NAME = loadCfg()
+
+-- Advanced Peripherals Player Detector (optional on pockets / desks).
+local function detectNearbyPlayer()
+  local pd = peripheral.find("playerDetector") or peripheral.find("player_detector")
+  if not pd then return nil end
+  local ok, players = pcall(function() return pd.getPlayersInRange(PLAYER_RANGE) end)
+  if ok and type(players) == "table" and #players > 0 then
+    local p = players[1]
+    if type(p) == "string" then return p end
+    if type(p) == "table" then return p.name or p.displayName or p.username end
+  end
+  local ok2, online = pcall(function() return pd.getOnlinePlayers() end)
+  if ok2 and type(online) == "table" and #online > 0 then
+    local p = online[1]
+    if type(p) == "string" then return p end
+    if type(p) == "table" then return p.name or p.displayName or p.username end
+  end
+  return nil
+end
+
+local function sanitizeName(name)
+  name = tostring(name or ""):gsub("[%c%z]", ""):match("^%s*(.-)%s*$") or ""
+  name = name:gsub("[%[%]%{%}%|=,;]", "")
+  if #name > 16 then name = name:sub(1, 16) end
+  if name == "" then return nil end
+  return name
+end
 
 -- Compact score: 999 → 999, 1400 → 1.4K, 14000 → 14K, etc.
 local function formatScore(n)
@@ -112,11 +145,14 @@ local function findInstallHost(timeout)
   return nil
 end
 
--- Pull board; optionally submit local best. Returns entries table or nil.
-local function syncLeaderboard(submitScore)
+-- Pull board; optionally submit a score under playerName. Returns entries or nil.
+local function syncLeaderboard(submitScore, playerName)
   local hostId = findInstallHost(2.5)
   if not hostId then return nil, "no host" end
-  local name = os.getComputerLabel() or ("Tetris-" .. os.getComputerID())
+  local name = sanitizeName(playerName)
+    or sanitizeName(PLAYER_NAME)
+    or sanitizeName(detectNearbyPlayer())
+    or ("P" .. tostring(os.getComputerID()))
   local req
   if submitScore and (tonumber(submitScore) or 0) > 0 then
     req = {
@@ -504,7 +540,6 @@ local function runGame()
             score = score + lineScore(n, level)
             lines = lines + n
             level = math.floor(lines / 10)
-            if score > HI then HI = score; saveHi(HI) end
           end
           piece, bag = spawn(grid, bag)
           if not piece then over = true end
@@ -524,9 +559,10 @@ local function runGame()
           dropTimer = os.startTimer(gravityMs(level) / 1000)
         end
       elseif k == K.q then
+        -- Mid-game Q: abandon run (score not kept / not submitted).
         TRACK.playing = false
-        TRACK.score = score
-        return score
+        TRACK.score = 0
+        return 0
       elseif not paused and piece then
         if k == K.left or k == K.a or k == K.h then
           if fits(grid, piece.kind, piece.rot, piece.x - 1, piece.y) then
@@ -571,7 +607,6 @@ local function runGame()
             lines = lines + n
             level = math.floor(lines / 10)
           end
-          if score > HI then HI = score; saveHi(HI) end
           piece, bag = spawn(grid, bag)
           if not piece then over = true end
           dirty = true
@@ -580,7 +615,6 @@ local function runGame()
       end
     elseif ev == "key" and over then
       if p1 == keys.enter or p1 == keys.q or p1 == keys.space then
-        if score > HI then HI = score; saveHi(HI) end
         TRACK.playing = false
         TRACK.score = score
         return score
@@ -589,8 +623,8 @@ local function runGame()
       local ch = tostring(p1 or ""):lower()
       if ch == "q" then
         TRACK.playing = false
-        TRACK.score = score
-        return score
+        TRACK.score = 0
+        return 0
       end
       if ch == "p" then
         paused = not paused
@@ -598,8 +632,8 @@ local function runGame()
       end
     elseif ev == "terminate" then
       TRACK.playing = false
-      TRACK.score = score
-      return score
+      TRACK.score = 0
+      return 0
     end
   end
 end
@@ -607,20 +641,78 @@ end
 --------------------------------------------------------------------------------
 -- Main menu (leaderboard + play)
 --------------------------------------------------------------------------------
+-- CC queues both key + char for the same press; flush so a leftover "q" from
+-- the game does not immediately quit the main menu.
+local function drainInputEvents()
+  local t = os.startTimer(0)
+  while true do
+    local ev, p1 = os.pullEvent()
+    if ev == "timer" and p1 == t then return end
+  end
+end
+
+-- After a run: prefer detector, else saved name, else typed prompt.
+local function resolvePlayerName(score)
+  local detected = sanitizeName(detectNearbyPlayer())
+  if detected then
+    PLAYER_NAME = detected
+    saveCfg()
+    return PLAYER_NAME
+  end
+  if (tonumber(score) or 0) <= 0 then
+    return PLAYER_NAME
+  end
+  clearScreen(colors.black)
+  term.setCursorPos(1, 1)
+  if term.setTextColor then term.setTextColor(colors.white) end
+  print("Game over")
+  print("Score  " .. formatScore(score))
+  print("")
+  print("Name for the leaderboard:")
+  if PLAYER_NAME then
+    print("(Enter keeps \"" .. PLAYER_NAME .. "\")")
+  else
+    print("(Player Detector auto-fills when attached)")
+  end
+  print("")
+  local def = PLAYER_NAME or ""
+  write("Name" .. (def ~= "" and (" [" .. def .. "]") or "") .. ": ")
+  local typed = sanitizeName(read() or "")
+  if not typed then typed = def end
+  if not typed or typed == "" then typed = "Player" end
+  PLAYER_NAME = typed
+  saveCfg()
+  drainInputEvents()
+  return PLAYER_NAME
+end
+
 local function afterGame(score)
   score = tonumber(score) or 0
   if score > HI then
     HI = score
-    saveHi(HI)
   end
+  local name = nil
   if score > 0 then
-    pcall(syncLeaderboard, math.max(score, HI))
+    name = resolvePlayerName(score)
   else
-    pcall(syncLeaderboard, HI > 0 and HI or nil)
+    name = sanitizeName(detectNearbyPlayer()) or PLAYER_NAME
+    if name then PLAYER_NAME = name; saveCfg() end
   end
+  saveCfg()
+  if score > 0 then
+    pcall(syncLeaderboard, score, name)
+  else
+    pcall(syncLeaderboard, nil, name)
+  end
+  drainInputEvents()
 end
 
-local function drawMenu(playBtn)
+local function hitBtn(btn, x, y)
+  return btn and btn.x and x >= btn.x and x < btn.x + btn.w
+      and y >= btn.y and y < btn.y + btn.h
+end
+
+local function drawMenu(playBtn, ctrlBtn)
   local tw, th = term.getSize()
   local color = isColor()
   clearScreen(colors.black)
@@ -628,58 +720,159 @@ local function drawMenu(playBtn)
   local accent = color and colors.cyan or colors.white
   fill(1, 1, tw, 1, accent, colors.black)
   text(2, 1, "TETRIS", colors.black, accent)
-  local you = ("you " .. formatScore(HI)):sub(1, tw - 10)
+  local who = PLAYER_NAME or "guest"
+  local you = (who .. " " .. formatScore(HI)):sub(1, tw - 9)
   text(math.max(2, tw - #you), 1, you, colors.black, accent)
 
   local y = 3
+  text(2, y, "TOP 3", color and colors.yellow or colors.white, colors.black)
+  y = y + 1
   text(2, y, "#  NAME         SCORE", color and colors.lightGray or colors.white, colors.black)
   y = y + 1
-  local shown = 0
-  local myId = os.getComputerID()
+  local myName = PLAYER_NAME and PLAYER_NAME:lower()
   if #LEADERBOARD == 0 then
     text(2, y, "(no scores yet — be #1)", colors.gray, colors.black)
     y = y + 1
   else
-    local maxRows = math.max(1, th - 7)
-    for i = 1, math.min(LB_TOP, #LEADERBOARD, maxRows) do
+    for i = 1, math.min(LB_TOP, #LEADERBOARD) do
       local e = LEADERBOARD[i]
       local name = tostring(e.name or ("#" .. tostring(e.id))):sub(1, 12)
       local sc = formatScore(e.score or 0)
       local line = ("%-2d %-12s %5s"):format(i, name, sc)
       local fg = colors.white
-      if tonumber(e.id) == myId then
+      if myName and tostring(e.name or ""):lower() == myName then
         fg = color and colors.lime or colors.white
       elseif i == 1 then
         fg = colors.yellow
       end
       text(2, y, line:sub(1, tw - 2), fg, colors.black)
       y = y + 1
-      shown = shown + 1
     end
   end
 
-  local label = "  PLAY  "
-  local bx = math.max(2, math.floor((tw - #label) / 2) + 1)
-  local by = math.min(th - 2, y + 1)
-  local btnBg = color and colors.lime or colors.white
-  fill(bx, by, #label, 1, btnBg, colors.black)
-  text(bx, by, label, colors.black, btnBg)
-  playBtn.x, playBtn.y, playBtn.w, playBtn.h = bx, by, #label, 1
+  local playLabel = "  PLAY  "
+  local ctrlLabel = " CONTROLS "
+  local gap = 2
+  local total = #playLabel + gap + #ctrlLabel
+  local rowY = math.min(th - 2, y + 1)
+  local startX = math.max(2, math.floor((tw - total) / 2) + 1)
+  local playBg = color and colors.lime or colors.white
+  local ctrlBg = color and colors.orange or colors.lightGray
+  fill(startX, rowY, #playLabel, 1, playBg, colors.black)
+  text(startX, rowY, playLabel, colors.black, playBg)
+  playBtn.x, playBtn.y, playBtn.w, playBtn.h = startX, rowY, #playLabel, 1
+  local cx = startX + #playLabel + gap
+  fill(cx, rowY, #ctrlLabel, 1, ctrlBg, colors.black)
+  text(cx, rowY, ctrlLabel, colors.black, ctrlBg)
+  ctrlBtn.x, ctrlBtn.y, ctrlBtn.w, ctrlBtn.h = cx, rowY, #ctrlLabel, 1
 
-  text(2, th, "Enter play  R refresh  Q quit", colors.gray, colors.black)
+  text(2, th, "Enter play  C controls  N name  R sync  Q quit", colors.gray, colors.black)
+end
+
+local function controlsScreen()
+  while true do
+    local tw, th = term.getSize()
+    local color = isColor()
+    clearScreen(colors.black)
+    local accent = color and colors.orange or colors.white
+    fill(1, 1, tw, 1, accent, colors.black)
+    text(2, 1, "CONTROLS", colors.black, accent)
+
+    local lines = {
+      { "Left",  "A / H / ←" },
+      { "Right", "D / L / →" },
+      { "Rotate","W / K / X / ↑" },
+      { "Soft",  "S / J / ↓" },
+      { "Hard",  "Space / Enter" },
+      { "Pause", "P" },
+      { "Menu",  "Q (always)" },
+    }
+    local y = 3
+    for i = 1, #lines do
+      if y >= th - 2 then break end
+      local row = lines[i]
+      text(2, y, row[1], color and colors.yellow or colors.white, colors.black)
+      text(10, y, row[2], colors.white, colors.black)
+      y = y + 1
+    end
+    y = y + 1
+    if y < th then
+      text(2, y, "Q mid-game abandons score.", color and colors.red or colors.white, colors.black)
+    end
+    text(2, th, "Q  main menu", colors.gray, colors.black)
+
+    local ev, p1 = os.pullEvent()
+    if ev == "key" and (p1 == keys.q or p1 == keys.backspace) then
+      drainInputEvents()
+      return
+    elseif ev == "char" and tostring(p1 or ""):lower() == "q" then
+      drainInputEvents()
+      return
+    elseif ev == "terminate" then
+      return
+    end
+  end
+end
+
+local function editPlayerName()
+  clearScreen(colors.black)
+  term.setCursorPos(1, 1)
+  print("Leaderboard name")
+  local det = sanitizeName(detectNearbyPlayer())
+  if det then print("Detected: " .. det) end
+  local def = det or PLAYER_NAME or ""
+  write("Name" .. (def ~= "" and (" [" .. def .. "]") or "") .. ": ")
+  local typed = sanitizeName(read() or "")
+  if not typed then typed = def end
+  if typed and typed ~= "" then
+    PLAYER_NAME = typed
+    saveCfg()
+  end
+  drainInputEvents()
+end
+
+local function showQuitDisclaimer()
+  clearScreen(colors.black)
+  local tw, th = term.getSize()
+  local color = isColor()
+  local accent = color and colors.red or colors.white
+  fill(1, 1, tw, 1, accent, colors.black)
+  text(2, 1, "NOTICE", colors.black, accent)
+  local y = 3
+  local msg = {
+    "Pressing Q during a game",
+    "returns you to the menu.",
+    "",
+    "That run's score is NOT kept.",
+    "Finish the game to save it.",
+  }
+  for i = 1, #msg do
+    text(2, y, msg[i], colors.white, colors.black)
+    y = y + 1
+  end
+  text(2, th, "Continuing in 3s...", colors.gray, colors.black)
+  sleep(3)
+  drainInputEvents()
 end
 
 local function mainMenu()
-  local playBtn = {}
+  local playBtn, ctrlBtn = {}, {}
+  -- Soft detect on menu open.
+  local det = sanitizeName(detectNearbyPlayer())
+  if det then PLAYER_NAME = det; saveCfg() end
   while true do
-    drawMenu(playBtn)
+    drawMenu(playBtn, ctrlBtn)
     local ev, p1, p2, p3 = os.pullEvent()
     if ev == "key" then
       if p1 == keys.enter or p1 == keys.space or p1 == keys.p then
         local score = runGame()
         afterGame(score)
+      elseif p1 == keys.c then
+        controlsScreen()
       elseif p1 == keys.r then
-        pcall(syncLeaderboard, HI > 0 and HI or nil)
+        pcall(syncLeaderboard, nil, PLAYER_NAME)
+      elseif p1 == keys.n then
+        editPlayerName()
       elseif p1 == keys.q then
         clearScreen(colors.black)
         term.setCursorPos(1, 1)
@@ -696,15 +889,20 @@ local function mainMenu()
       elseif ch == "p" then
         local score = runGame()
         afterGame(score)
+      elseif ch == "c" then
+        controlsScreen()
       elseif ch == "r" then
-        pcall(syncLeaderboard, HI > 0 and HI or nil)
+        pcall(syncLeaderboard, nil, PLAYER_NAME)
+      elseif ch == "n" then
+        editPlayerName()
       end
     elseif ev == "mouse_click" then
       local x, y = p2, p3
-      if x >= playBtn.x and x < playBtn.x + playBtn.w
-          and y >= playBtn.y and y < playBtn.y + playBtn.h then
+      if hitBtn(playBtn, x, y) then
         local score = runGame()
         afterGame(score)
+      elseif hitBtn(ctrlBtn, x, y) then
+        controlsScreen()
       end
     elseif ev == "term_resize" then
       -- redraw
@@ -727,7 +925,7 @@ local function sendTrackerBeacon()
     name = host,
     hostname = host,
     mainRouterId = titan.getMainRouterId and titan.getMainRouterId() or nil,
-    version = titan.systemVersion and titan.systemVersion() or "1.0.4",
+    version = titan.systemVersion and titan.systemVersion() or "1.0.7",
     game = "tetris",
     playing = TRACK.playing and true or false,
     score = TRACK.score,
@@ -847,13 +1045,23 @@ local function bootCheckUpdates()
   end
 
   print("Syncing leaderboard...")
-  local board, err = syncLeaderboard(HI > 0 and HI or nil)
+  do
+    local det = sanitizeName(detectNearbyPlayer())
+    if det then PLAYER_NAME = det; saveCfg() end
+  end
+  local board, err
+  if HI > 0 and PLAYER_NAME then
+    board, err = syncLeaderboard(HI, PLAYER_NAME)
+  else
+    board, err = syncLeaderboard(nil, PLAYER_NAME)
+  end
   if board then
     print(("Leaderboard: %d player%s"):format(#board, #board == 1 and "" or "s"))
   else
     print("Leaderboard offline (" .. tostring(err or "?") .. ")")
   end
   sleep(0.55)
+  showQuitDisclaimer()
 end
 
 bootCheckUpdates()

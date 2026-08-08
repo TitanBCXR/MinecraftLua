@@ -1,13 +1,14 @@
 --[[
   host.lua  -  Titan install / update host + Tetris leaderboard (CC: Tweaked)
-  Titan-Version: 1.2.1
+  Titan-Version: 1.2.2
 
   Run this on ONE computer that already has the Titan files (your "update
   server"). It serves those files over rednet so pockets and other devices can
   install / OTA without storing any GitHub / wget URL on the clients.
 
-  Also holds the shared Tetris leaderboard (tetris_leaderboard.cfg). Tablets
-  sync scores on boot / after games via the same titan_install protocol.
+  Also holds the shared Tetris leaderboard (tetris_leaderboard.cfg), keyed by
+  player name so shared tablets can track different people. Tablets sync on
+  boot / after games via titan_install.
 
   Usage:
     1. Keep this machine updated (you may wget/GitHub here — clients never see it).
@@ -19,7 +20,7 @@
 
 local PROTOCOL = "titan_install"
 local LB_FILE = "tetris_leaderboard.cfg"
-local LB_MAX = 10
+local LB_MAX = 25 -- keep extras; tablets only display top 3
 
 local FILES = {
   "install.lua",
@@ -129,24 +130,32 @@ local function boardSnapshot()
   return out
 end
 
--- Upsert by computer id; only improves that player's best score.
+-- Upsert by player name (case-insensitive) so shared pockets track people, not HW.
 local function submitScore(id, name, score)
   id = tonumber(id)
   score = math.floor(tonumber(score) or 0)
-  if not id or score < 0 then return false, "bad score" end
-  name = tostring(name or ("#" .. id)):sub(1, 16)
+  if score < 0 then return false, "bad score" end
+  name = tostring(name or ""):gsub("[%c%z]", ""):match("^%s*(.-)%s*$") or ""
+  if name == "" then name = id and ("P" .. tostring(id)) or "Player" end
+  name = name:sub(1, 16)
+  local key = name:lower()
   local found = nil
   for i = 1, #leaderboard do
-    if tonumber(leaderboard[i].id) == id then found = i; break end
+    if tostring(leaderboard[i].name or ""):lower() == key then
+      found = i
+      break
+    end
   end
   if found then
     if score > (leaderboard[found].score or 0) then
       leaderboard[found].score = score
       leaderboard[found].name = name
       leaderboard[found].at = os.epoch("utc")
+      if id then leaderboard[found].id = id end
     else
-      -- keep existing best; still refresh name
+      -- keep best score; refresh display casing / last tablet id
       leaderboard[found].name = name
+      if id then leaderboard[found].id = id end
     end
   else
     leaderboard[#leaderboard + 1] = {
