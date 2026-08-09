@@ -1,14 +1,17 @@
 --[[
   quarry/workers/strip_miner.lua  -  Branch / strip mining turtle
-  Titan-Version: 1.0.2
+  Titan-Version: 1.0.3
 
   Classic strip mine: dig a main 1×2 tunnel, then left/right branches every
   few blocks. Solo worker (no site board). Same chest layout as cell miner:
 
-    * Fuel chest LEFT  → coal in slot 16
-    * Storage BEHIND   → dump slots 1-14
+    * Fuel chest LEFT  → coal in slot 16; mined coal excess returns here
+    * Storage BEHIND   → dump non-fuel slots 1-14 only
     * Slot 15 = wireless modem (optional)
     * Pickaxe on RIGHT upgrade
+
+  Mined coal/charcoal: keep one stack (64) in slot 16; excess → fuel chest,
+  never the deposit chest.
 
   Fuel safety: estimates tank + fuel items vs Manhattan home cost, returns to
   depot while it can still arrive (+ margin), and pauses with a clear SOS if
@@ -38,10 +41,11 @@ local JOB_FILE = "strip_miner_job.cfg"
 local EXCLUDE = "exclude.txt"
 local FUEL_SLOT = 16
 local MODEM_SLOT = 15
+local FUEL_KEEP = 64         -- keep one stack of coal on the turtle
 local MIN_FUEL = 200
 local HOME_MARGIN = 24       -- spare fuel on arrival at depot
 local WORK_RESERVE = 48      -- keep digging only with this much above home cost
-local VERSION = "1.0.2"
+local VERSION = "1.0.3"
 
 local STOP = false
 local dug, skipped, moves = 0, 0, 0
@@ -386,32 +390,112 @@ local function inventoryFull()
   return true
 end
 
-local function dumpToStorage()
-  faceDir(2) -- behind when origin faces +Z into mine
+local function isCoalName(name)
+  name = tostring(name or ""):lower()
+  if name == "" then return false end
+  -- Coal / charcoal (and blocks) — keep as turtle fuel stock.
+  return name:find("coal", 1, true) ~= nil or name:find("charcoal", 1, true) ~= nil
+end
+
+local function slotIsCoal(slot)
+  local d = itemDetail(slot)
+  return d and isCoalName(d.name)
+end
+
+-- Pull mined coal into slot 16 (up to FUEL_KEEP). Other fuels also consolidate.
+local function gatherCoalToFuelSlot()
+  consolidateFuelToSlot16()
+  for s = 1, 14 do
+    if turtle.getItemCount(FUEL_SLOT) >= FUEL_KEEP then break end
+    if turtle.getItemCount(s) > 0 and slotIsCoal(s) then
+      turtle.select(s)
+      turtle.transferTo(FUEL_SLOT)
+    end
+  end
+  turtle.select(FUEL_SLOT)
+end
+
+-- Drop excess fuel/coal into the LEFT fuel chest. Never into the deposit.
+local function depositExcessFuel()
+  gatherCoalToFuelSlot()
+  faceDir(3) -- left = fuel chest
+  local n = turtle.getItemCount(FUEL_SLOT)
+  if n > FUEL_KEEP then
+    turtle.select(FUEL_SLOT)
+    turtle.drop(n - FUEL_KEEP)
+  end
   for s = 1, 14 do
     if turtle.getItemCount(s) > 0 then
       turtle.select(s)
-      turtle.drop()
+      if selectedIsFuel() or slotIsCoal(s) then
+        turtle.drop()
+      end
     end
   end
+  -- Trim again if more coal landed in 16 somehow.
+  n = turtle.getItemCount(FUEL_SLOT)
+  if n > FUEL_KEEP then
+    turtle.select(FUEL_SLOT)
+    turtle.drop(n - FUEL_KEEP)
+  end
   faceDir(0)
+  turtle.select(FUEL_SLOT)
 end
 
+-- Deposit chest BEHIND: non-fuel only. Coal/fuel excess already went LEFT.
+local function dumpToStorage()
+  gatherCoalToFuelSlot()
+  depositExcessFuel()
+  faceDir(2) -- behind = storage
+  for s = 1, 14 do
+    if turtle.getItemCount(s) > 0 then
+      turtle.select(s)
+      if selectedIsFuel() or slotIsCoal(s) then
+        -- Prefer fuel chest, never deposit.
+        faceDir(3)
+        turtle.drop()
+        faceDir(2)
+      else
+        turtle.drop()
+      end
+    end
+  end
+  -- Ensure slot 16 is still capped at one stack.
+  faceDir(3)
+  local n = turtle.getItemCount(FUEL_SLOT)
+  if n > FUEL_KEEP then
+    turtle.select(FUEL_SLOT)
+    turtle.drop(n - FUEL_KEEP)
+  end
+  faceDir(0)
+  turtle.select(FUEL_SLOT)
+end
+
+-- Top up slot 16 to FUEL_KEEP from LEFT; burn only enough for the tank.
 local function suckFuel()
   faceDir(3) -- left
   turtle.select(FUEL_SLOT)
-  for _ = 1, 64 do
-    if not turtle.suck() then break end
+  while turtle.getItemCount(FUEL_SLOT) < FUEL_KEEP do
+    local need = FUEL_KEEP - turtle.getItemCount(FUEL_SLOT)
+    if not turtle.suck(need) then break end
   end
-  turtle.refuel()
+  local level = turtle.getFuelLevel()
+  if level ~= "unlimited" and (tonumber(level) or 0) < MIN_FUEL then
+    local have = turtle.getItemCount(FUEL_SLOT)
+    -- Burn a little, but try to leave coal in the slot.
+    local burn = math.min(8, math.max(0, have - 16))
+    if burn < 1 and have > 0 then burn = 1 end
+    if burn > 0 then turtle.refuel(burn) end
+  end
   faceDir(0)
+  turtle.select(FUEL_SLOT)
 end
 
 local function goHome()
   local ok = goTo(0, 0, 0)
   faceDir(0)
-  dumpToStorage()
-  suckFuel()
+  dumpToStorage() -- excess coal → fuel chest; ores → deposit
+  suckFuel()      -- refill slot 16 to 64 from fuel chest
   return ok
 end
 
@@ -523,6 +607,8 @@ local function digShaftStep()
     if not forward(true) then return false end
   end
   digDir("up")
+  -- Keep mined coal stacking into slot 16 while digging.
+  gatherCoalToFuelSlot()
   return true
 end
 
