@@ -5,11 +5,11 @@
   The console `packages` command shows these names + versions.
   Installers / OTA updates ship this file so devices know what they have.
 
-  Titan-Version: 1.6.61
+  Titan-Version: 1.6.63
 ]]
 
 return {
-  system = "1.6.61",
+  system = "1.6.63",
   packages = {
     ["lib/titan.lua"]      = "1.2.26",
     ["console.lua"]        = "1.1.9",
@@ -25,7 +25,7 @@ return {
     ["datacenter.lua"]     = "1.2.14",
     ["admin.lua"]          = "1.5.8",
     ["quarry/workers/offline_miner.lua"] = "1.6.0",
-    ["quarry/workers/strip_miner.lua"]   = "1.0.0",
+    ["quarry/workers/strip_miner.lua"]   = "1.0.2",
     ["quarry/managers/offline_site.lua"] = "1.4.0",
     ["offline_miner.lua"]  = "1.0.0",
     ["offline_site.lua"]   = "1.0.0",
@@ -41,6 +41,6 @@ return {
     ["games_install.lua"]  = "1.0.1",
     ["host.lua"]           = "1.2.10",
     ["exclude.txt"]        = "1.0.1",
-    ["versions.lua"]       = "1.6.61",
+    ["versions.lua"]       = "1.6.63",
   },
 }

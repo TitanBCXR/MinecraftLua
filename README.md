@@ -638,11 +638,15 @@ Progress % = cells complete (+ partial credit on active cells). Statuses include
 Solo branch miner (not site-managed). Same chest layout. At the tunnel mouth:
 
 ```
-setup
-strip 64 3 16       # main 64, branch every 3, branches 16 long
-strip 128 3 20 2    # two levels deep
-continue
+set 64 3 16 1       # save defaults once (length spacing branch levels)
+mine                # begin (or resume a fuel pause)
 ```
+
+Aliases: `go` / `start`. One-off dig: `strip 128 3 20 2` (also updates defaults).
+
+Fuel guard matches the cell miner idea: estimates tank + fuel items vs Manhattan
+home cost, returns to the depot while it can still arrive (+ margin/reserve),
+checks branch affordability, and SOS-pauses if stranded. `mine` / `continue` resume.
 
 Install via the installer → **Quarry → Workers / Managers**.
 
