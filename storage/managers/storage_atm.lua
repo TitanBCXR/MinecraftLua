@@ -1,36 +1,36 @@
 --[[
-  storage/managers/storage_atm.lua  -  Standalone Create storage ATM
-  Titan-Version: 1.0.0
+  storage/managers/storage_atm.lua  -  Standalone vault ATM (wired modem)
+  Titan-Version: 1.1.0
 
-  Solo item ATM for a Create logistics network. No casino chips, no Currency
-  Manager, no Titan mesh required.
+  Solo item ATM. No casino, no Currency Manager, no Create Stock Ticker.
+  Talks to a Create vault (or any inventory) over a wired modem network.
 
   Hardware:
-    - vanilla intake chest (frogport hauls deposits into the vault network)
-    - Create Stock Ticker (withdraw requests)
-    - Create frogport / package address for this ATM's output
+    [Intake chest]  --touching/wired--> [ATM PC]
+    [Output chest]  --touching/wired-->/
+    [Vault]         --wired modem----/
 
-  Deposit:
-    Put items in the intake chest, run `deposit`, confirm. Items stay for the
-    frogport — this PC does not move them (Create does).
-
-  Withdraw:
-    Looks up Create stock. Calls Stock Ticker requestFiltered ONLY if the
-    network has enough of the requested item(s). Package goes to `address`.
+  Deposit: put items in intake → `deposit` → confirm → pushItems into vault.
+  Withdraw: if vault has enough → pushItems vault → output. No move if short.
 
   Setup:
+    invs
     bind intake <side|name>
-    address <packageAddress>
+    bind output <side|name>
+    bind vault <side|name>
     deposit | withdraw | stock | status | help
 ]]
 
 local LOCAL_CFG = "storage_atm.cfg"
-local VERSION = "1.0.0"
+local VERSION = "1.1.0"
 
 local cfg = {
   intake = nil,
-  address = nil,
+  output = nil,
+  vault = nil,
   label = nil,
+  -- legacy Create ticker fields ignored if present
+  address = nil,
 }
 
 --------------------------------------------------------------------------------
@@ -57,95 +57,59 @@ local function isInventory(name)
   return w and type(w.list) == "function"
 end
 
-local function wrapIntake()
-  local n = cfg.intake
+local function wrapRole(role)
+  local n = cfg[role]
   if not n or not isInventory(n) then return nil end
   return peripheral.wrap(n), n
 end
 
-local function findTicker()
-  local t = peripheral.find("Create_StockTicker")
-  if t then return t, "Create_StockTicker" end
-  for _, name in ipairs(peripheral.getNames()) do
-    local typ = tostring(peripheral.getType(name) or ""):lower()
-    if typ:find("stockticker", 1, true) or typ:find("stock_ticker", 1, true) then
-      return peripheral.wrap(name), name
-    end
-  end
-  return nil
-end
-
 local function shortName(id)
   id = tostring(id or "")
-  local bare = id:match("([^:]+)$") or id
-  return bare
+  return id:match("([^:]+)$") or id
+end
+
+local function collectInventories()
+  local seen, names = {}, {}
+  local function add(n, note)
+    if not n or seen[n] or not isInventory(n) then return end
+    seen[n] = true
+    names[#names + 1] = { name = n, note = note }
+  end
+  for _, n in ipairs(peripheral.getNames()) do
+    add(n, nil)
+  end
+  for _, side in ipairs(peripheral.getNames()) do
+    if peripheral.getType(side) == "modem" then
+      local m = peripheral.wrap(side)
+      if m and type(m.getNamesRemote) == "function" then
+        for _, n in ipairs(m.getNamesRemote() or {}) do
+          add(n, "via " .. side)
+        end
+      end
+    end
+  end
+  table.sort(names, function(a, b) return a.name < b.name end)
+  return names
 end
 
 --------------------------------------------------------------------------------
--- Create stock helpers
+-- Vault stock / transfer
 --------------------------------------------------------------------------------
-local function createStockList(ticker, detailed)
-  local ok, stock
-  if detailed then
-    ok, stock = pcall(function() return ticker.stock(true) end)
-  end
-  if not ok or type(stock) ~= "table" then
-    ok, stock = pcall(function() return ticker.stock() end)
-  end
-  if not ok or type(stock) ~= "table" then return {}, "stock() failed" end
-  return stock, nil
-end
-
-local function createStockMap(ticker)
-  local stock, err = createStockList(ticker, true)
+local function inventoryStock(inv)
   local map = {}
-  for _, row in ipairs(stock) do
-    if type(row) == "table" and row.name then
-      map[row.name] = (map[row.name] or 0) + (tonumber(row.count) or 0)
+  local list = inv.list() or {}
+  for _, detail in pairs(list) do
+    if type(detail) == "table" and detail.name then
+      local c = tonumber(detail.count) or 0
+      if c > 0 then
+        map[detail.name] = (map[detail.name] or 0) + c
+      end
     end
   end
-  return map, err
+  return map
 end
 
-local function matchStock(stockMap, query)
-  query = tostring(query or ""):lower()
-  if query == "" then return nil end
-  if stockMap[query] then return query, stockMap[query] end
-  -- exact bare name / substring
-  local hits = {}
-  for name, count in pairs(stockMap) do
-    local low = name:lower()
-    local bare = shortName(name):lower()
-    if low == query or bare == query then
-      return name, count
-    end
-    if low:find(query, 1, true) or bare:find(query, 1, true) then
-      hits[#hits + 1] = { name = name, count = count }
-    end
-  end
-  table.sort(hits, function(a, b) return a.name < b.name end)
-  if #hits == 1 then return hits[1].name, hits[1].count end
-  if #hits > 1 then return nil, hits end
-  return nil, nil
-end
-
-local function requestItems(ticker, address, item, count)
-  count = math.floor(tonumber(count) or 0)
-  if count <= 0 then return false, "bad count" end
-  local ok, n = pcall(function()
-    return ticker.requestFiltered(address, {
-      name = item,
-      _requestCount = count,
-    })
-  end)
-  if not ok then return false, tostring(n) end
-  return true, tonumber(n) or 0
-end
-
---------------------------------------------------------------------------------
--- Intake listing
---------------------------------------------------------------------------------
-local function listIntake(inv)
+local function listContents(inv)
   local list = inv.list() or {}
   local rows, total = {}, 0
   local slots = {}
@@ -164,132 +128,204 @@ local function listIntake(inv)
   return rows, total
 end
 
+local function matchStock(stockMap, query)
+  query = tostring(query or ""):lower()
+  if query == "" then return nil end
+  if stockMap[query] then return query, stockMap[query] end
+  local hits = {}
+  for name, count in pairs(stockMap) do
+    local low = name:lower()
+    local bare = shortName(name):lower()
+    if low == query or bare == query then
+      return name, count
+    end
+    if low:find(query, 1, true) or bare:find(query, 1, true) then
+      hits[#hits + 1] = { name = name, count = count }
+    end
+  end
+  table.sort(hits, function(a, b) return a.name < b.name end)
+  if #hits == 1 then return hits[1].name, hits[1].count end
+  if #hits > 1 then return nil, hits end
+  return nil, nil
+end
+
+--- Push all slots from `from` into peripheral `toName`. Returns moved count.
+local function pushAll(from, toName)
+  if type(from.pushItems) ~= "function" then return 0, "no pushItems" end
+  local moved = 0
+  local rows = listContents(from)
+  for _, r in ipairs(rows) do
+    local left = r.count
+    while left > 0 do
+      local ok, n = pcall(from.pushItems, toName, r.slot, left)
+      n = (ok and tonumber(n)) or 0
+      if n <= 0 then break end
+      moved = moved + n
+      left = left - n
+    end
+  end
+  return moved, nil
+end
+
+--- Move `need` of `item` from vault → output. Returns moved count.
+local function pullItem(vault, vname, oname, item, need)
+  local moved = 0
+  while moved < need do
+    local list = vault.list() or {}
+    local slots = {}
+    for slot, detail in pairs(list) do
+      if type(detail) == "table" and detail.name == item then
+        slots[#slots + 1] = slot
+      end
+    end
+    table.sort(slots)
+    if #slots == 0 then break end
+    local progressed = false
+    for _, slot in ipairs(slots) do
+      if moved >= need then break end
+      local detail = (vault.list() or {})[slot]
+      local have = (type(detail) == "table" and tonumber(detail.count)) or 0
+      local want = math.min(need - moved, have)
+      if want > 0 then
+        local ok, n = pcall(vault.pushItems, oname, slot, want)
+        n = (ok and tonumber(n)) or 0
+        if n > 0 then
+          moved = moved + n
+          progressed = true
+        end
+      end
+    end
+    if not progressed then break end
+  end
+  return moved
+end
+
 --------------------------------------------------------------------------------
 -- Commands
 --------------------------------------------------------------------------------
 local function cmdBind(a)
-  local name = a[2]
-  if name and name:lower() == "intake" then name = a[3] end
+  local role = tostring(a[2] or ""):lower()
+  local name = a[3]
+  if role ~= "intake" and role ~= "output" and role ~= "vault" then
+    print("Usage: bind intake|output|vault <peripheralName|side>")
+    return
+  end
   if not name then
-    print("Usage: bind intake <peripheralName|side>")
+    print("Usage: bind " .. role .. " <peripheralName|side>")
     return
   end
   if not isInventory(name) then
     print("Not an inventory: " .. tostring(name))
-    print("Use a vanilla chest/barrel touching this PC.")
+    print("Tip: invs — use a vanilla chest or a modem-linked Create vault.")
     return
   end
-  cfg.intake = name
-  saveCfg()
-  print("Intake = " .. name)
-end
-
-local function cmdAddress(a)
-  local addr = a[2] and table.concat(a, " ", 2) or nil
-  if not addr or addr == "" then
-    print("Current address: " .. tostring(cfg.address or "(unset)"))
-    print("Usage: address <createPackageAddress>")
-    return
+  if role == "intake" and (name == cfg.vault or name == cfg.output) then
+    print("Intake must be a different chest than vault/output."); return
   end
-  cfg.address = addr
+  if role == "output" and (name == cfg.vault or name == cfg.intake) then
+    print("Output must be a different chest than vault/intake."); return
+  end
+  if role == "vault" and (name == cfg.intake or name == cfg.output) then
+    print("Vault must be different from intake/output."); return
+  end
+  cfg[role] = name
   saveCfg()
-  print("Package address = " .. addr)
+  print("Bound " .. role .. " = " .. name)
 end
 
 local function cmdInvs()
   print("Inventories:")
-  local any = false
-  for _, n in ipairs(peripheral.getNames()) do
-    if isInventory(n) then
-      any = true
-      local mark = (n == cfg.intake) and " [intake]" or ""
-      print("  " .. n .. mark)
-    end
+  local list = collectInventories()
+  if #list == 0 then
+    print("  (none)")
+    print("Put chests against this PC, or cable a wired modem to the vault.")
+    return
   end
-  if not any then print("  (none)") end
-  local ticker, tname = findTicker()
-  print("Stock Ticker: " .. (ticker and tostring(tname) or "NONE"))
+  for _, row in ipairs(list) do
+    local marks = ""
+    if row.name == cfg.intake then marks = marks .. " [intake]" end
+    if row.name == cfg.output then marks = marks .. " [output]" end
+    if row.name == cfg.vault then marks = marks .. " [vault]" end
+    local note = row.note and ("  (" .. row.note .. ")") or ""
+    print("  " .. row.name .. marks .. note)
+  end
 end
 
 local function cmdStatus()
   print("== Storage ATM v" .. VERSION .. " ==")
-  print("Mode:    Create logistics only (no casino / mesh)")
-  print("Intake:  " .. tostring(cfg.intake or "(unbound)"))
-  print("Address: " .. tostring(cfg.address or "(unset)"))
-  print("Ticker:  " .. (findTicker() and "OK" or "NONE"))
+  print("Mode:   wired modem ↔ vault (no ticker / casino)")
+  print("Intake: " .. tostring(cfg.intake or "(unbound)"))
+  print("Output: " .. tostring(cfg.output or "(unbound)"))
+  print("Vault:  " .. tostring(cfg.vault or "(unbound)"))
 end
 
 local function cmdStock(a)
-  local ticker = findTicker()
-  if not ticker then print("No Create Stock Ticker."); return end
+  local vault = wrapRole("vault")
+  if not vault then print("Bind vault: bind vault <name|side>"); return end
   local filter = a[2] and table.concat(a, " ", 2):lower() or nil
-  local stock, err = createStockList(ticker, true)
-  if err and #stock == 0 then print(err); return end
-
+  local map = inventoryStock(vault)
   local rows = {}
-  for _, row in ipairs(stock) do
-    if type(row) == "table" and row.name then
-      local name = row.name
-      local disp = row.displayName or shortName(name)
-      local count = tonumber(row.count) or 0
-      if not filter or name:lower():find(filter, 1, true)
-          or tostring(disp):lower():find(filter, 1, true) then
-        rows[#rows + 1] = { name = name, disp = disp, count = count }
-      end
+  for name, count in pairs(map) do
+    if not filter or name:lower():find(filter, 1, true)
+        or shortName(name):lower():find(filter, 1, true) then
+      rows[#rows + 1] = { name = name, count = count }
     end
   end
   table.sort(rows, function(x, y)
     if x.count ~= y.count then return x.count > y.count end
     return x.name < y.name
   end)
-
-  print(("Create stock%s:"):format(filter and (" filter=" .. filter) or ""))
+  print(("Vault stock%s:"):format(filter and (" filter=" .. filter) or ""))
   if #rows == 0 then print("  (none)"); return end
   local limit = math.min(#rows, 40)
   for i = 1, limit do
     local r = rows[i]
-    print(("  %6d  %s"):format(r.count, r.disp))
-    if r.disp ~= shortName(r.name) then
-      print("         " .. r.name)
-    end
+    print(("  %6d  %s"):format(r.count, r.name))
   end
   if #rows > limit then
-    print(("  … %d more (narrow with: stock <filter>)"):format(#rows - limit))
+    print(("  … %d more (stock <filter>)"):format(#rows - limit))
   end
 end
 
 local function cmdDeposit()
-  local inv, iname = wrapIntake()
-  if not inv then
-    print("Bind intake first: bind intake <side|name>")
-    return
+  local intake, iname = wrapRole("intake")
+  local vault, vname = wrapRole("vault")
+  if not intake then print("Bind intake: bind intake <side|name>"); return end
+  if not vault then print("Bind vault: bind vault <side|name>"); return end
+  if type(intake.pushItems) ~= "function" then
+    print("Intake cannot pushItems."); return
   end
-  local rows, total = listIntake(inv)
+
+  local rows, total = listContents(intake)
   if total <= 0 then
-    print("Intake chest is empty.")
-    print("Put items in the chest, then run deposit.")
-    return
+    print("Intake empty — put items in, then deposit."); return
   end
   print(("Intake (%s) — %d item(s):"):format(iname, total))
   for _, r in ipairs(rows) do
     print(("  %dx %s"):format(r.count, r.name))
   end
-  write("Confirm deposit for frogport haul? (y/N): ")
+  write("Move into vault? (y/N): ")
   local ans = tostring(read() or ""):lower()
   if ans ~= "y" and ans ~= "yes" then
-    print("Cancelled — items left in chest.")
-    return
+    print("Cancelled — items left in intake."); return
   end
-  print("Confirmed. Leave items in intake — Create frogport should haul to vault.")
-  print("(This ATM does not move items; Create logistics does.)")
+
+  local moved, err = pushAll(intake, vname)
+  if err then print(err); return end
+  local left = select(2, listContents(intake))
+  print(("Moved %d item(s) → vault %s."):format(moved, vname))
+  if left > 0 then
+    print(("Vault full? %d item(s) still in intake."):format(left))
+  end
 end
 
 local function cmdWithdraw(a)
-  local ticker = findTicker()
-  if not ticker then print("No Create Stock Ticker."); return end
-  if not cfg.address or cfg.address == "" then
-    print("Set package address: address <name>")
-    return
+  local vault, vname = wrapRole("vault")
+  local output, oname = wrapRole("output")
+  if not vault then print("Bind vault: bind vault <side|name>"); return end
+  if not output then print("Bind output: bind output <side|name>"); return end
+  if type(vault.pushItems) ~= "function" then
+    print("Vault cannot pushItems."); return
   end
 
   local itemQ = a[2]
@@ -308,9 +344,7 @@ local function cmdWithdraw(a)
   count = math.floor(tonumber(count) or 0)
   if count <= 0 then print("Need a positive count."); return end
 
-  local stockMap, err = createStockMap(ticker)
-  if err and not next(stockMap) then print(tostring(err)); return end
-
+  local stockMap = inventoryStock(vault)
   local item, availOrHits = matchStock(stockMap, itemQ)
   if type(availOrHits) == "table" then
     print("Multiple matches — be more specific:")
@@ -321,43 +355,41 @@ local function cmdWithdraw(a)
     return
   end
   if not item then
-    print("Not in Create stock: " .. tostring(itemQ))
-    print("Stock Ticker was NOT called.")
+    print("Not in vault: " .. tostring(itemQ))
     return
   end
   local avail = tonumber(availOrHits) or 0
   if avail < count then
-    print(("Not enough in Create stock (have %d, need %d)."):format(avail, count))
-    print("Stock Ticker was NOT called.")
+    print(("Not enough in vault (have %d, need %d)."):format(avail, count))
     return
   end
 
-  print(("Request %dx %s → address '%s'"):format(count, item, cfg.address))
-  write("Send package? (y/N): ")
+  print(("Withdraw %dx %s → output %s"):format(count, item, oname))
+  write("Confirm? (y/N): ")
   local ans = tostring(read() or ""):lower()
   if ans ~= "y" and ans ~= "yes" then
-    print("Cancelled — ticker not called."); return
+    print("Cancelled."); return
   end
 
-  local ok, nOrErr = requestItems(ticker, cfg.address, item, count)
-  if not ok then
-    print("Ticker request failed: " .. tostring(nOrErr))
-    return
+  local moved = pullItem(vault, vname, oname, item, count)
+  if moved <= 0 then
+    print("Nothing moved — output may be full."); return
   end
-  print(("Requested (%s). Package should arrive at: %s"):format(
-    tostring(nOrErr), cfg.address))
+  print(("Moved %d/%d → output."):format(moved, count))
+  if moved < count then
+    print("Partial — output full or vault changed.")
+  end
 end
 
 local function cmdHelp()
   print([[
-Storage ATM — Create vault only (no casino).
+Storage ATM — wired modem to vault (no Create ticker).
 
-bind intake <side|name>     frogport-watched deposit chest
-address <createAddress>     package destination for withdraws
+bind intake|output|vault <side|name>
 invs | status
-stock [filter]              browse Create network stock
-deposit                     confirm intake contents for frog haul
-withdraw [item] [count]     request if stock has enough (else no ticker call)
+stock [filter]              list vault contents
+deposit                     confirm → move intake → vault
+withdraw [item] [count]     if vault has enough → vault → output
 help | exit
 ]])
 end
@@ -368,10 +400,10 @@ os.setComputerLabel(cfg.label or os.getComputerLabel() or ("StorageATM-" .. os.g
 
 term.clear(); term.setCursorPos(1, 1)
 print("== Storage ATM v" .. VERSION .. " ==")
-print("Create logistics only — no mesh / casino.")
-if not cfg.intake then print("Bind intake: bind intake <side>") end
-if not cfg.address then print("Set address: address <name>") end
-if not findTicker() then print("Attach a Create Stock Ticker.") end
+print("Wired modem ↔ vault — no ticker / casino.")
+if not cfg.intake then print("bind intake <side>") end
+if not cfg.output then print("bind output <side>") end
+if not cfg.vault then print("bind vault <name>  (modem-linked Create vault)") end
 print("Type help.")
 print("")
 
@@ -386,12 +418,13 @@ while true do
   elseif cmd == "exit" or cmd == "quit" then break
   elseif cmd == "help" or cmd == "?" then cmdHelp()
   elseif cmd == "bind" then cmdBind(a)
-  elseif cmd == "address" or cmd == "addr" then cmdAddress(a)
   elseif cmd == "invs" then cmdInvs()
   elseif cmd == "status" then cmdStatus()
   elseif cmd == "stock" or cmd == "list" then cmdStock(a)
   elseif cmd == "deposit" or cmd == "dep" then cmdDeposit()
   elseif cmd == "withdraw" or cmd == "wd" or cmd == "get" then cmdWithdraw(a)
+  elseif cmd == "address" or cmd == "addr" then
+    print("Address/ticker mode removed — use: bind vault <name>")
   else
     print("Unknown. help")
   end

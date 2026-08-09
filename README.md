@@ -24,7 +24,7 @@ A wireless dispatch system for Minecraft's **CC: Tweaked** mod (active packages)
 - **`games.lua`** + **`games_catalog.lua`** — Games launcher: HTTP updates; **S** settings for speaker vs modem (global LB / casino chips).
 - **`games/managers/currency_manager.lua`** — casino ledger (floppy rates/balances); mesh API for games + ATMs.
 - **`games/managers/casino_atm.lua`** — casino ATM (chips + Create ticker).
-- **`storage/managers/storage_atm.lua`** — solo Create storage ATM (items only, no casino/mesh).
+- **`storage/managers/storage_atm.lua`** — solo storage ATM (wired modem ↔ vault; no ticker/casino).
 - **`games_install.lua`** — **Games-only** installer (separate from the fleet installer).
 - **`github_install.lua`** — Fleet / Titan role installer (routers, quarry, admin, …).
 - **`lib/titan.lua`** — shared library (protocol, messaging, navigation).
@@ -556,30 +556,32 @@ load that player’s balance from the Currency Manager over the mesh.
 Installer: **s → Storage → Managers / Workers**. Root `storage_manager.lua` /
 `storage_builder.lua` / `storage_atm.lua` are thin shims.
 
-## Storage ATM (Create only)
+## Storage ATM (wired modem ↔ vault)
 
 Installer: **s → Storage → Managers → 2**. Standalone item ATM — **no** casino,
-**no** Currency Manager, **no** mesh required.
+**no** Stock Ticker, **no** wireless mesh required.
 
 ```text
-[Intake chest] --frogport--> Create vault network
-[Storage ATM + Stock Ticker]
-        | requestFiltered only if stock has enough
-        v
-   package → frogport @ ATM address
+[Intake chest]  --touching/wired--> [ATM PC]
+[Output chest]  --touching/wired-->/
+[Create vault]  --wired modem----/
 ```
 
 ```text
+invs
 bind intake left
-address Warehouse-1
+bind output right
+bind vault create:item_vault_0
 stock iron
 deposit
 withdraw minecraft:iron_ingot 64
 ```
 
-- **deposit** — confirm what’s in the intake; items stay for the frogport  
-- **withdraw** — checks Create `stock()` first; ticker is called only if enough  
-- **stock [filter]** — browse the Create network
+- **deposit** — confirm → `pushItems` intake → vault  
+- **withdraw** — only if vault has enough → vault → output  
+- **stock [filter]** — list vault contents  
+Right-click wired modems on the vault so they connect; use vanilla chests for
+intake/output (modded storage often won’t activate CC modems).
 
 Bulk storage cell (v1 — no auto-crafting, no GPS courier):
 

@@ -90,7 +90,7 @@ local STORAGE_WORKERS = {
 local STORAGE_MANAGERS = {
   { key = "1", name = "Storage Manager (vault + I/O)", run = "storage/managers/storage_manager.lua",
     files = { "lib/titan.lua", "storage/managers/storage_manager.lua", "storage_manager.lua" } },
-  { key = "2", name = "Storage ATM (Create ticker only)", run = "storage/managers/storage_atm.lua",
+  { key = "2", name = "Storage ATM (modem ↔ vault)", run = "storage/managers/storage_atm.lua",
     files = { "storage/managers/storage_atm.lua", "storage_atm.lua" } },
 }
 
