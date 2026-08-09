@@ -1,6 +1,6 @@
 --[[
   games_catalog.lua  -  Titan games suite catalog
-  Titan-Version: 1.0.5
+  Titan-Version: 1.0.6
 
   Source of truth for the Games launcher (`games.lua`).
   Add a new game here (+ versions.lua + ship the .lua) and every launcher
@@ -47,7 +47,7 @@ return {
       id = "higher_lower",
       name = "Higher / Lower Poker",
       run = "higher_lower.lua",
-      desc = "Jacks+ poker → H/L streak for jackpot",
+      desc = "Pair of Jacks+ poker → H/L streak for jackpot",
       files = { "higher_lower.lua", "lib/casino.lua", "lib/games_economy.lua" },
     },
     {

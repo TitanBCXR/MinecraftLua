@@ -1,6 +1,6 @@
 --[[
   higher_lower.lua  -  Video Poker → Higher / Lower streak (CC: Tweaked)
-  Titan-Version: 1.1.0
+  Titan-Version: 1.1.1
 
   Run:
 
@@ -8,8 +8,9 @@
       higher_lower --launcher [--managed|--unmanaged]
 
   1) Bet, deal 5 cards, HOLD / DRAW (video poker — no dealer).
-  2) Any paying hand (Jacks+, two pair, trips, straight, flush, …)
+  2) Any paying hand (pair of Jacks+, two pair, trips, straight, flush, …)
      starts a Higher/Lower streak with those earnings.
+     Jacks rule: need TWO Jacks (or a pair of Q/K/A) — a single Jack does not pay.
   3) Guess H/L up to 10 correct in a row for the JACKPOT.
      Wrong guess dumps your earnings into the jackpot.
      After each win (before 10) you may CASH OUT or CONTINUE.
@@ -68,6 +69,8 @@ local SUITS = {
 }
 
 -- Video-poker payouts × bet (Jacks or Better style).
+-- Lowest pair that pays: TWO Jacks (rank 11). One Jack / low pair = no pay.
+local MIN_PAIR_RANK = 11 -- Jack
 local PAY_TABLE = {
   { cat = 9, name = "Royal flush",   mult = 250 }, -- special
   { cat = 8, name = "Straight flush", mult = 50 },
@@ -77,7 +80,7 @@ local PAY_TABLE = {
   { cat = 4, name = "Straight",       mult = 4 },
   { cat = 3, name = "Three of a kind", mult = 3 },
   { cat = 2, name = "Two pair",       mult = 2 },
-  { cat = 1, name = "Jacks or better", mult = 1 }, -- pair J+
+  { cat = 1, name = "Pair of Jacks+", mult = 1 },
 }
 
 --------------------------------------------------------------------------------
@@ -346,12 +349,14 @@ local function evaluateHand(hand)
   elseif groups[1].c == 2 and groups[2] and groups[2].c == 2 then
     return 2, "Two pair"
   elseif groups[1].c == 2 then
+    -- Exactly one pair: pays only if it is TWO Jacks / Queens / Kings / Aces.
     local r = groups[1].r
-    if r >= 11 then
+    if r >= MIN_PAIR_RANK then
       return 1, "Pair " .. (RANK_NAME[r] or "?") .. "s"
     end
     return 0, "Pair " .. (RANK_NAME[r] or "?") .. "s"
   end
+  -- High card only (including a lone Jack) never pays.
   return 0, (RANK_NAME[ranks[1]] or "?") .. " high"
 end
 
@@ -474,7 +479,7 @@ local function drawScreen(state)
   state.btns = {}
 
   if phase == "bet" or phase == "result" then
-    textAt(2, 4, "Jacks+ poker → H/L streak", colors.lightGray, colors.black)
+    textAt(2, 4, "2 Jacks+ poker → H/L streak", colors.lightGray, colors.black)
     textAt(2, 5, ("10 correct = jackpot (%d)"):format(JACKPOT):sub(1, tw - 2),
       colors.orange, colors.black)
     if state.message then
@@ -699,7 +704,7 @@ local function main()
     bet = clampBet(10),
     player = {},
     held = { false, false, false, false, false },
-    message = "Bet ±10/50/100 — Jacks+ to play H/L",
+    message = "Bet ±10/50/100 — need 2 Jacks+ to play H/L",
     lastWin = 0,
     earnings = 0,
     streak = 0,
