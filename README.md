@@ -6,8 +6,10 @@ A wireless dispatch system for Minecraft's **CC: Tweaked** mod (active packages)
 - **`console.lua`** — terminal console with mesh/`ssh` helpers.
 - **`admin.lua`** — pocket admin tablet (live boards, quarry, gates/perimeter, where-track).
 - **`router.lua`** (+ hub net/ui/cmd) — mesh repeater / MAIN router.
-- **`offline_miner.lua`** — quarry turtle: solo `area`/`box`, or online **cell fleet**.
-- **`offline_site.lua`** — site board: XZ **cells** (target 20×20, min 4), one bot/cell, full-H layer digs, dual pose, `where`.
+- **Quarry** (`quarry/`) — installer submenu **q**:
+  - **Workers:** `quarry/workers/offline_miner.lua` (cell fleet) · `quarry/workers/strip_miner.lua` (branch tunnels)
+  - **Managers:** `quarry/managers/offline_site.lua` (cell site board + optional Geo Scanner)
+  - Root `offline_miner.lua` / `offline_site.lua` are compat shims.
 - **`perimeter_sensor.lua` / `perimeter_manager.lua`** — Player Detector territory (one manager + admin alerts).
 - **`tetris.lua`** — Tetris for pocket / advanced PC + monitor (local LB; note music; monitor bottom half = touch pad).
 - **`minesweeper.lua`** — Minesweeper for pocket / advanced PC + monitor (no modem; monitor bottom half = Open/Flag touch pad).
@@ -107,8 +109,9 @@ Each device needs (active installer roles):
 | Console           | `console.lua`, `lib/titan.lua`             |
 | Admin tablet      | `admin.lua`, `lib/titan.lua`               |
 | Network router    | `router.lua`, hub libs, `versions.lua`     |
-| Offline miner     | `offline_miner.lua`, `lib/titan.lua`, `exclude.txt` |
-| Quarry site board | `offline_site.lua`, `lib/titan.lua` (+ modem) |
+| Quarry → Workers → Cell miner | `quarry/workers/offline_miner.lua`, `lib/titan.lua`, `exclude.txt` |
+| Quarry → Workers → Strip miner | `quarry/workers/strip_miner.lua`, `lib/titan.lua`, `exclude.txt` |
+| Quarry → Managers → Site board | `quarry/managers/offline_site.lua`, `lib/titan.lua` (+ modem; Geo Scanner optional) |
 | Perimeter sensor/manager | `perimeter_*.lua`, `lib/titan.lua`  |
 | Games launcher (**g**) | `games.lua` + catalog + all games (auto-update / auto-add) |
 | One game (**i**) | individual `tetris` / `minesweeper` / … |
@@ -127,10 +130,10 @@ Tip: rename a device with `label set <name>` so it shows a friendly name on the 
 Tip: auto-start needs **quotes** around the filename in `startup.lua`:
 
 ```lua
-shell.run("offline_miner.lua")
+shell.run("quarry/workers/offline_miner.lua")
 ```
 
-Without quotes Lua treats `offline_miner.lua` as a table index and crashes on boot.
+Without quotes Lua treats the path as a table index and crashes on boot.
 
 ## 5. Hub console commands
 
@@ -488,7 +491,10 @@ Overlapping gates use a grace timer so walking between detectors doesn’t false
 
 ---
 
-# Offline miner (`offline_miner.lua`) + site board (`offline_site.lua`)
+# Quarry (`quarry/workers` + `quarry/managers`)
+
+Installer: **q → Quarry → Workers / Managers**. Scripts live under those folders;
+root `offline_miner.lua` / `offline_site.lua` are thin shims.
 
 Needs no GPS or Parent Center for solo digs — turtle + two chests. Stand at the
 **top-front-left** corner of the dig, facing into the mine. That pose is origin
@@ -577,12 +583,25 @@ in) and run `continue`.
 When inventory fills it returns home, dumps behind, refuels from the left, then
 resumes. Optional `exclude.txt` is honored if present.
 
-### Site board (`offline_site.lua`) — XZ cells
+### Site board (`quarry/managers/offline_site.lua`) — XZ cells + Geo Scanner
 
 Left of the storage chest. Auto-learns W×L×H from turtle reports, or lock with
 `setup`. Splits the footprint into **cells** (target **20×20**, min **4×4**,
 edge remainders allowed). **One bot per cell.** Each bot digs that cell’s full
 `H` **one Y layer at a time**, then marks the cell complete and gets another.
+
+**Geo Scanner (Advanced Peripherals):** place next to the site computer. Set
+`origin` (and preferably GPS). Then:
+
+```
+scan [radius]    # block scan (default 8) → empty quarry-Y hints for miners
+ores             # chunk ore counts
+geo              # last summary
+```
+
+Empty Y hints ride on cell claims so cell miners can skip barren layers near
+the scanner. Coverage is limited to the scanner radius — re-`scan` as the dig
+moves, or treat it as a depot-local efficiency boost.
 
 **Lifecycle:** `leave_origin` (modem on) → travel → `arrive_cell` → dig inside
 cell AABB → home → `cell_done` → next free cell. Site computes **quarry-relative
@@ -595,6 +614,7 @@ setup 215x100 13 20          # footprint + optional cell size
 cellsize 16                  # rebuild free cells (keeps completed)
 cells                        # list free / assigned / complete
 origin 1343 95 1084 south    # GPS of quarry 0,0,0 + facing into mine
+scan 8 | ores | geo          # Advanced Peripherals Geo Scanner
 where 12                     # admin distance track
 reband                       # recall fleet home (keeps cell assigns)
 clear | clearminers          # wipe turtles/jobs; assigned→free
@@ -613,7 +633,18 @@ where 5 12                   # site #5 bot #12 → live GPS track
 Progress % = cells complete (+ partial credit on active cells). Statuses include
 `travel` / `arrive` / `mining` / `homing` / `sos`.
 
-Install via the installer → **"Offline miner"** / **"Offline quarry site board"**.
+### Strip miner (`quarry/workers/strip_miner.lua`)
+
+Solo branch miner (not site-managed). Same chest layout. At the tunnel mouth:
+
+```
+setup
+strip 64 3 16       # main 64, branch every 3, branches 16 long
+strip 128 3 20 2    # two levels deep
+continue
+```
+
+Install via the installer → **Quarry → Workers / Managers**.
 
 ---
 

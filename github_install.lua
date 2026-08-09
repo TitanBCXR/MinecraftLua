@@ -1,6 +1,6 @@
 --[[
   github_install.lua  -  Install the Titan system straight from a GitHub repo
-  Titan-Version: 1.2.10
+  Titan-Version: 1.2.11
 
   Point RAW_BASE at your repo's raw content root, then on each Minecraft device:
 
@@ -32,6 +32,8 @@ local KEEP_ALL = {
   "lib/titan.lua", "datacenter.lua", "console.lua", "admin.lua",
   "router.lua", "router_main.lua", "router_modem.lua",
   "lib/router_hub_net.lua", "lib/router_hub_ui.lua", "lib/router_hub_cmd.lua",
+  "quarry/workers/offline_miner.lua", "quarry/workers/strip_miner.lua",
+  "quarry/managers/offline_site.lua",
   "offline_miner.lua", "offline_site.lua", "exclude.txt",
   "perimeter_sensor.lua", "perimeter_manager.lua", "tetris.lua", "minesweeper.lua",
   "sandstorm.lua", "luigi_poker.lua", "slots.lua",
@@ -57,6 +59,30 @@ local GAMES = {
     files = { "slots.lua" } },
 }
 
+local QUARRY_WORKERS = {
+  { key = "1", name = "Cell quarry miner", run = "quarry/workers/offline_miner.lua",
+    files = { "lib/titan.lua", "quarry/workers/offline_miner.lua", "offline_miner.lua", "exclude.txt" } },
+  { key = "2", name = "Strip miner (branch tunnels)", run = "quarry/workers/strip_miner.lua",
+    files = { "lib/titan.lua", "quarry/workers/strip_miner.lua", "exclude.txt" } },
+}
+
+local QUARRY_MANAGERS = {
+  { key = "1", name = "Site board (cell fleet + geo)", run = "quarry/managers/offline_site.lua",
+    files = { "lib/titan.lua", "quarry/managers/offline_site.lua", "offline_site.lua" } },
+}
+
+local QUARRY = {
+  { key = "w", name = "Workers...", submenu = "quarry_workers" },
+  { key = "m", name = "Managers...", submenu = "quarry_managers" },
+}
+
+local SUBMENUS = {
+  games = GAMES,
+  quarry = QUARRY,
+  quarry_workers = QUARRY_WORKERS,
+  quarry_managers = QUARRY_MANAGERS,
+}
+
 local ROLES = {
   { key = "1", name = "Parent Center (data center)",       run = "datacenter.lua",
     files = { "lib/titan.lua", "datacenter.lua" } },
@@ -68,10 +94,7 @@ local ROLES = {
     files = { "lib/titan.lua", "router.lua", "router_main.lua", "router_modem.lua",
               "lib/router_hub_net.lua", "lib/router_hub_ui.lua", "lib/router_hub_cmd.lua",
               "versions.lua" } },
-  { key = "5", name = "Offline miner (cell quarry turtle)", run = "offline_miner.lua",
-    files = { "lib/titan.lua", "offline_miner.lua", "exclude.txt" } },
-  { key = "6", name = "Offline quarry site board",        run = "offline_site.lua",
-    files = { "offline_site.lua", "lib/titan.lua" } },
+  { key = "q", name = "Quarry (workers & managers)...", submenu = "quarry" },
   { key = "7", name = "Perimeter sensor (Player Detector gate)", run = "perimeter_sensor.lua",
     files = { "lib/titan.lua", "perimeter_sensor.lua" } },
   { key = "8", name = "Perimeter manager (territory board)", run = "perimeter_manager.lua",
@@ -185,6 +208,7 @@ local TILE_BG = {
   ["7"] = colors.red, ["8"] = colors.red, ["g"] = colors.magenta,
   ["i"] = colors.magenta, ["h"] = colors.green, ["9"] = colors.lightGray,
   ["0"] = colors.magenta, -- games launcher in submenu
+  ["q"] = colors.brown, ["w"] = colors.brown, ["m"] = colors.orange,
 }
 
 local function fill(x, y, w, h, bg, fg)
@@ -478,24 +502,32 @@ local function askYesNo(question, defaultYes)
 end
 
 local function pickRole(title, sourceLine)
+  local stack = { ROLES }
+  local titles = { useModernGui() and "TITAN INSTALL" or title }
   while true do
-    local role = pickFromList(ROLES, {
-      title = useModernGui() and "TITAN INSTALL" or title,
+    local depth = #stack
+    local list = stack[depth]
+    local role = pickFromList(list, {
+      title = titles[depth],
       sourceLine = sourceLine,
       subtitle = sourceLine,
-      promptHint = "What is this device?  (g = Games)",
+      promptHint = depth == 1 and "What is this device?  (q = Quarry, g = Games)"
+        or "Pick an option:",
+      backKey = depth > 1 and "b" or nil,
+      games = list == GAMES,
     })
     if role == nil then return nil end
-    if role.submenu == "games" then
-      local game = pickFromList(GAMES, {
-        title = useModernGui() and "GAMES" or "== Games ==",
-        promptHint = "Pick a game:",
-        backKey = "b",
-        games = true,
-      })
-      if game then return game end
-      -- nil = cancel all; false = back to main menu
-      if game == nil then return nil end
+    if role == false then
+      if depth > 1 then
+        table.remove(stack)
+        table.remove(titles)
+      else
+        return nil
+      end
+    elseif role.submenu and SUBMENUS[role.submenu] then
+      stack[#stack + 1] = SUBMENUS[role.submenu]
+      local t = tostring(role.name or role.submenu):gsub("%.%.%.$", "")
+      titles[#titles + 1] = useModernGui() and t:upper() or ("== " .. t .. " ==")
     else
       return role
     end
@@ -587,6 +619,9 @@ local function runInstaller()
     ["router.lua"] = "Router",
     ["offline_miner.lua"] = "OfflineMiner",
     ["offline_site.lua"]  = "QuarrySite",
+    ["quarry/workers/offline_miner.lua"] = "OfflineMiner",
+    ["quarry/workers/strip_miner.lua"] = "StripMiner",
+    ["quarry/managers/offline_site.lua"] = "QuarrySite",
     ["perimeter_sensor.lua"] = "PerimSensor",
     ["perimeter_manager.lua"] = "PerimMgr",
     ["tetris.lua"] = "Tetris",
