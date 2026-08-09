@@ -19,7 +19,7 @@ A wireless dispatch system for Minecraft's **CC: Tweaked** mod (active packages)
 - **`minesweeper.lua`** — Minesweeper for pocket / advanced PC + monitor (no modem; monitor bottom half = Open/Flag touch pad).
 - **`sandstorm.lua`** — Darude Sandstorm note-block knockoff + desert pixel visualizer (speaker + color monitor).
 - **`luigi_poker.lua`** — Luigi Picture Poker (beat Luigi’s visible hand; pocket-first; hold/draw).
-- **`higher_lower.lua`** — Poker → Higher/Lower (standard deck; your hand only; then guess H/L).
+- **`higher_lower.lua`** — Jacks+ video poker → Higher/Lower streak (cash out or risk for jackpot at 10).
 - **`slots.lua`** — 3-reel slots (bet/spin animation, coin bank; monitor tap UI).
 - **`games.lua`** + **`games_catalog.lua`** — Games launcher: HTTP updates; **S** settings for speaker vs modem (global LB / casino chips).
 - **`games/managers/currency_manager.lua`** — password-protected casino: scan chest tender → floppy rates; deposit chips for gambling games.
@@ -507,7 +507,7 @@ game, **U** update, **S** settings, **Q** quit. Closing a game returns here.
 **Economy (first install):**
 - **Managed** — in-game items via Currency Manager (mesh); gambling games use casino chips.
 - **Unmanaged** — grants **10,000** local chips (shared wallet); no hard bet cap —
-  only what you have. Bet buttons **+10 / +50 / +100**.
+  only what you have. Bet buttons **±10 / ±50 / ±100**.
 
 **Settings (S):** mesh speaker/modem toggle + **ECON** to re-run economy setup.
 

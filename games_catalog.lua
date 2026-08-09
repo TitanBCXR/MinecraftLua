@@ -47,7 +47,7 @@ return {
       id = "higher_lower",
       name = "Higher / Lower Poker",
       run = "higher_lower.lua",
-      desc = "Win the hand, then guess Higher or Lower",
+      desc = "Jacks+ poker → H/L streak for jackpot",
       files = { "higher_lower.lua", "lib/casino.lua", "lib/games_economy.lua" },
     },
     {

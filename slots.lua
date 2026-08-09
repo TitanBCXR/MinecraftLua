@@ -1,6 +1,6 @@
 --[[
   slots.lua  -  3-reel slots for CC: Tweaked
-  Titan-Version: 1.0.3
+  Titan-Version: 1.0.4
 
   Run:
 
@@ -8,10 +8,10 @@
       slots --launcher [--managed|--unmanaged]
       slots --speaker --launcher --unmanaged
 
-  Bet chips (no hard cap — only what you have). Buttons +10 / +50 / +100.
+  Bet chips (no hard cap — only what you have). Buttons ±10 / ±50 / ±100.
 
   Controls:
-    +10 +50 +100   raise bet (capped at balance)
+    +10/+50/+100 and -10/-50/-100   change bet
     Space / SPIN   spin
     M mute   Q / CLOSE quit
 ]]
@@ -356,21 +356,28 @@ local function drawScreen(state)
     textAt(2, msgY, "3 Diamonds = 50x   3 Sevens = 25x", colors.gray, colors.black)
   end
 
-  -- Bet row (+10/+50/+100) + action row (SPIN / CLOSE)
-  local rows = 2
-  local padH = math.max(2, math.min(3, math.floor((th - msgY - 1) / rows)))
-  local byBet = th - padH * 2 + 1
+  -- Bet rows (±10/50/100) + action row (SPIN / CLOSE)
+  local rows = 3
+  local padH = math.max(2, math.min(2, math.floor((th - msgY - 1) / rows)))
+  local byM = th - padH * 3 + 1
+  local byP = th - padH * 2 + 1
   local byAct = th - padH + 1
   local bw3 = math.floor(tw / 3)
   local bw2 = math.floor(tw / 2)
   state.btns = {
-    b10  = { x = 1, y = byBet, w = bw3, h = padH },
-    b50  = { x = bw3 + 1, y = byBet, w = bw3, h = padH },
-    b100 = { x = 2 * bw3 + 1, y = byBet, w = tw - 2 * bw3, h = padH },
+    m100 = { x = 1, y = byM, w = bw3, h = padH },
+    m50  = { x = bw3 + 1, y = byM, w = bw3, h = padH },
+    m10  = { x = 2 * bw3 + 1, y = byM, w = tw - 2 * bw3, h = padH },
+    b10  = { x = 1, y = byP, w = bw3, h = padH },
+    b50  = { x = bw3 + 1, y = byP, w = bw3, h = padH },
+    b100 = { x = 2 * bw3 + 1, y = byP, w = tw - 2 * bw3, h = padH },
     spin = { x = 1, y = byAct, w = bw2, h = padH },
     quit = { x = bw2 + 1, y = byAct, w = tw - bw2, h = padH },
   }
   local busy = state.spinning
+  drawBtn(state.btns.m100, " -100 ", color and colors.brown or colors.black)
+  drawBtn(state.btns.m50, " -50 ", color and colors.brown or colors.black)
+  drawBtn(state.btns.m10, " -10 ", color and colors.brown or colors.black)
   drawBtn(state.btns.b10, " +10 ", color and colors.gray or colors.black)
   drawBtn(state.btns.b50, " +50 ", color and colors.lightGray or colors.black)
   drawBtn(state.btns.b100, " +100 ", color and colors.white or colors.black, colors.black)
@@ -474,7 +481,13 @@ local function main()
       else
         local b = state.btns
         local mx, my = p2, p3
-        if inBtn(b.b10, mx, my) then
+        if inBtn(b.m10, mx, my) then
+          addBet(state, -10); sfx("coin"); drawScreen(state)
+        elseif inBtn(b.m50, mx, my) then
+          addBet(state, -50); sfx("coin"); drawScreen(state)
+        elseif inBtn(b.m100, mx, my) then
+          addBet(state, -100); sfx("coin"); drawScreen(state)
+        elseif inBtn(b.b10, mx, my) then
           addBet(state, 10); sfx("coin"); drawScreen(state)
         elseif inBtn(b.b50, mx, my) then
           addBet(state, 50); sfx("coin"); drawScreen(state)
@@ -502,6 +515,9 @@ local function main()
         if p1 == K.one then addBet(state, 10); drawScreen(state)
         elseif p1 == K.two then addBet(state, 50); drawScreen(state)
         elseif p1 == K.three then addBet(state, 100); drawScreen(state)
+        elseif p1 == K.four then addBet(state, -10); drawScreen(state)
+        elseif p1 == K.five then addBet(state, -50); drawScreen(state)
+        elseif p1 == K.six then addBet(state, -100); drawScreen(state)
         elseif p1 == K.space or p1 == K.enter then
           state.bet = clampBet(state.bet)
           if beginSpin(state) then
@@ -524,6 +540,12 @@ local function main()
         addBet(state, 50); drawScreen(state)
       elseif not state.spinning and ch == "3" then
         addBet(state, 100); drawScreen(state)
+      elseif not state.spinning and ch == "4" then
+        addBet(state, -10); drawScreen(state)
+      elseif not state.spinning and ch == "5" then
+        addBet(state, -50); drawScreen(state)
+      elseif not state.spinning and ch == "6" then
+        addBet(state, -100); drawScreen(state)
       end
     elseif ev == "terminate" then
       return

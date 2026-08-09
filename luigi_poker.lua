@@ -1,6 +1,6 @@
 --[[
   luigi_poker.lua  -  Luigi Picture Poker (SMB3-style) for CC: Tweaked
-  Titan-Version: 1.2.4
+  Titan-Version: 1.2.5
 
   Run:
 
@@ -9,14 +9,14 @@
 
   Beat Luigi: he shows a 5-card hand you must beat. Hold/draw once, then
   compare. Win pays 2x (or more if you also hit a bonus hand). Push returns
-  the bet. Bet with +10 / +50 / +100 (capped at balance).
+  the bet. Bet with ±10 / ±50 / ±100 (capped at balance).
 
   Cards (low → high): Cloud  Mushroom  Flower  Star  Mario  Luigi
 
   Controls:
     1-5 / tap card   toggle HOLD
     D / DRAW         redraw unheld cards
-    +10 +50 +100     raise bet
+    ±10/50/100       change bet
     Space / DEAL     deal or next hand
     M mute   Q quit
 ]]
@@ -576,13 +576,21 @@ local function drawScreen(state)
   if state.phase == "bet" then
     local bw3 = math.floor(tw / 3)
     local bw2 = math.floor(tw / 2)
-    local byBet = th - padH * 2 + 1
+    padH = 2
+    local byM = th - padH * 3 + 1
+    local byP = th - padH * 2 + 1
     local byAct = th - padH + 1
-    state.btns.b10  = { x = 1, y = byBet, w = bw3, h = padH }
-    state.btns.b50  = { x = bw3 + 1, y = byBet, w = bw3, h = padH }
-    state.btns.b100 = { x = 2 * bw3 + 1, y = byBet, w = tw - 2 * bw3, h = padH }
+    state.btns.m100 = { x = 1, y = byM, w = bw3, h = padH }
+    state.btns.m50  = { x = bw3 + 1, y = byM, w = bw3, h = padH }
+    state.btns.m10  = { x = 2 * bw3 + 1, y = byM, w = tw - 2 * bw3, h = padH }
+    state.btns.b10  = { x = 1, y = byP, w = bw3, h = padH }
+    state.btns.b50  = { x = bw3 + 1, y = byP, w = bw3, h = padH }
+    state.btns.b100 = { x = 2 * bw3 + 1, y = byP, w = tw - 2 * bw3, h = padH }
     state.btns.deal = { x = 1, y = byAct, w = bw2, h = padH }
     state.btns.quit = { x = bw2 + 1, y = byAct, w = tw - bw2, h = padH }
+    drawBtn(state.btns.m100, " -100 ", color and colors.brown or colors.black)
+    drawBtn(state.btns.m50, " -50 ", color and colors.brown or colors.black)
+    drawBtn(state.btns.m10, " -10 ", color and colors.brown or colors.black)
     drawBtn(state.btns.b10, " +10 ", color and colors.gray or colors.black)
     drawBtn(state.btns.b50, " +50 ", color and colors.lightGray or colors.black)
     drawBtn(state.btns.b100, " +100 ", color and colors.white or colors.black, colors.black)
@@ -711,7 +719,13 @@ local function main()
           return
         end
       elseif state.phase == "bet" then
-        if inBtn(b.b10, mx, my) then
+        if inBtn(b.m10, mx, my) then
+          addBet(state, -10); sfx("coin"); drawScreen(state)
+        elseif inBtn(b.m50, mx, my) then
+          addBet(state, -50); sfx("coin"); drawScreen(state)
+        elseif inBtn(b.m100, mx, my) then
+          addBet(state, -100); sfx("coin"); drawScreen(state)
+        elseif inBtn(b.b10, mx, my) then
           addBet(state, 10); sfx("coin"); drawScreen(state)
         elseif inBtn(b.b50, mx, my) then
           addBet(state, 50); sfx("coin"); drawScreen(state)
@@ -745,6 +759,9 @@ local function main()
         if p1 == K.one then addBet(state, 10); drawScreen(state)
         elseif p1 == K.two then addBet(state, 50); drawScreen(state)
         elseif p1 == K.three then addBet(state, 100); drawScreen(state)
+        elseif p1 == K.four then addBet(state, -10); drawScreen(state)
+        elseif p1 == K.five then addBet(state, -50); drawScreen(state)
+        elseif p1 == K.six then addBet(state, -100); drawScreen(state)
         elseif p1 == K.space or p1 == K.enter then
           state.bet = clampBet(state.bet)
           if dealHand(state) then drawScreen(state) end
@@ -781,6 +798,12 @@ local function main()
         addBet(state, 50); drawScreen(state)
       elseif state.phase == "bet" and ch == "3" then
         addBet(state, 100); drawScreen(state)
+      elseif state.phase == "bet" and ch == "4" then
+        addBet(state, -10); drawScreen(state)
+      elseif state.phase == "bet" and ch == "5" then
+        addBet(state, -50); drawScreen(state)
+      elseif state.phase == "bet" and ch == "6" then
+        addBet(state, -100); drawScreen(state)
       end
     elseif ev == "terminate" then
       return

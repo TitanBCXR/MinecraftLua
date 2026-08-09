@@ -1,26 +1,31 @@
 --[[
-  higher_lower.lua  -  Poker → Higher / Lower (CC: Tweaked)
-  Titan-Version: 1.0.3
+  higher_lower.lua  -  Video Poker → Higher / Lower streak (CC: Tweaked)
+  Titan-Version: 1.1.0
 
   Run:
 
       higher_lower
       higher_lower --launcher [--managed|--unmanaged]
 
-  Standard 52-card deck. You only see YOUR hand (dealer stays hidden).
-  Bet with +10 / +50 / +100 (capped at your balance — no hard max).
+  1) Bet, deal 5 cards, HOLD / DRAW (video poker — no dealer).
+  2) Any paying hand (Jacks+, two pair, trips, straight, flush, …)
+     starts a Higher/Lower streak with those earnings.
+  3) Guess H/L up to 10 correct in a row for the JACKPOT.
+     Wrong guess dumps your earnings into the jackpot.
+     After each win (before 10) you may CASH OUT or CONTINUE.
+
+  Bet: -100/-50/-10 and +10/+50/+100 (capped at balance).
 
   Controls:
-    1-5 / tap card   toggle HOLD (poker phase)
-    D / DRAW         redraw unheld cards
-    H / L            higher / lower (bonus)
-    +10 +50 +100     raise bet
-    Space / DEAL     deal or next hand
+    1-5 / tap   HOLD   D DRAW   H/L guess
+    C cash out  G continue
     M mute   Q quit
 ]]
 
 local CFG = "higher_lower.cfg"
 local START_COINS = 100
+local JACKPOT_SEED = 500
+local STREAK_GOAL = 10
 
 local NATIVE = term.current()
 local USING_MONITOR = false
@@ -42,6 +47,7 @@ local SPEAKER = nil
 local MUSIC_ON = true
 local COINS = START_COINS
 local BEST = START_COINS
+local JACKPOT = JACKPOT_SEED
 local CASINO, USE_CASINO = nil, false
 local USE_WALLET = false
 local econ = nil
@@ -50,17 +56,28 @@ if fs.exists("lib/games_economy.lua") then
   if ok then econ = e; econ.load() end
 end
 
--- Rank value 2..14 (Ace high). Suit for color/display only.
 local RANK_NAME = {
   [2] = "2", [3] = "3", [4] = "4", [5] = "5", [6] = "6", [7] = "7",
   [8] = "8", [9] = "9", [10] = "10", [11] = "J", [12] = "Q", [13] = "K", [14] = "A",
 }
--- Standard deck suits: red (hearts/diamonds) vs black (clubs/spades).
 local SUITS = {
   { id = "H", name = "Hearts",   ch = "h", red = true },
   { id = "D", name = "Diamonds", ch = "d", red = true },
   { id = "C", name = "Clubs",    ch = "c", red = false },
   { id = "S", name = "Spades",   ch = "s", red = false },
+}
+
+-- Video-poker payouts × bet (Jacks or Better style).
+local PAY_TABLE = {
+  { cat = 9, name = "Royal flush",   mult = 250 }, -- special
+  { cat = 8, name = "Straight flush", mult = 50 },
+  { cat = 7, name = "Four of a kind", mult = 25 },
+  { cat = 6, name = "Full house",     mult = 9 },
+  { cat = 5, name = "Flush",          mult = 6 },
+  { cat = 4, name = "Straight",       mult = 4 },
+  { cat = 3, name = "Three of a kind", mult = 3 },
+  { cat = 2, name = "Two pair",       mult = 2 },
+  { cat = 1, name = "Jacks or better", mult = 1 }, -- pair J+
 }
 
 --------------------------------------------------------------------------------
@@ -86,15 +103,6 @@ local function attachMonitor()
   end)
   term.redirect(m)
   USING_MONITOR = true
-  pcall(function()
-    NATIVE.setBackgroundColor(colors.black)
-    NATIVE.clear()
-    NATIVE.setCursorPos(1, 1)
-    if NATIVE.setTextColor then NATIVE.setTextColor(colors.lightGray) end
-    NATIVE.write("Higher / Lower Poker")
-    NATIVE.setCursorPos(1, 2)
-    NATIVE.write("Win hand → guess H/L")
-  end)
   return true
 end
 
@@ -135,13 +143,16 @@ local function loadCfg()
   if type(d) ~= "table" then return end
   COINS = math.max(0, tonumber(d.coins) or START_COINS)
   BEST = math.max(COINS, tonumber(d.best) or COINS)
+  JACKPOT = math.max(0, tonumber(d.jackpot) or JACKPOT_SEED)
   if d.music == false then MUSIC_ON = false end
 end
 
 local function saveCfg()
   if COINS > BEST then BEST = COINS end
   local f = fs.open(CFG, "w")
-  f.write(textutils.serialize({ coins = COINS, best = BEST, music = MUSIC_ON }))
+  f.write(textutils.serialize({
+    coins = COINS, best = BEST, music = MUSIC_ON, jackpot = JACKPOT,
+  }))
   f.close()
   if USE_WALLET and econ then econ.setCoins(COINS) end
 end
@@ -246,14 +257,12 @@ local function sfx(kind)
 end
 
 --------------------------------------------------------------------------------
--- Deck / poker eval
+-- Deck / poker
 --------------------------------------------------------------------------------
 local function newDeck()
   local d = {}
   for s = 1, 4 do
-    for r = 2, 14 do
-      d[#d + 1] = { rank = r, suit = s }
-    end
+    for r = 2, 14 do d[#d + 1] = { rank = r, suit = s } end
   end
   for i = #d, 2, -1 do
     local j = math.random(i)
@@ -302,10 +311,9 @@ local function sortedRanks(hand)
 end
 
 local function isStraight(ranksDesc)
-  -- Ace-low wheel: A,5,4,3,2
   if ranksDesc[1] == 14 and ranksDesc[2] == 5 and ranksDesc[3] == 4
       and ranksDesc[4] == 3 and ranksDesc[5] == 2 then
-    return true, 5 -- treat as 5-high for tiebreak
+    return true, 5
   end
   for i = 1, 4 do
     if ranksDesc[i] ~= ranksDesc[i + 1] + 1 then return false end
@@ -313,60 +321,52 @@ local function isStraight(ranksDesc)
   return true, ranksDesc[1]
 end
 
--- key = { category, … } higher wins. cat: 8=SF … 0=high
-local function handRank(hand)
-  if not hand or #hand < 5 then return { -1 }, "—" end
+-- Returns cat (0..9), name. cat 9 = royal flush.
+local function evaluateHand(hand)
+  if not hand or #hand < 5 then return 0, "—" end
   local groups = handCounts(hand)
   local ranks = sortedRanks(hand)
   local flush = isFlush(hand)
   local straight, straightHi = isStraight(ranks)
 
-  local cat, name = 0, (RANK_NAME[ranks[1]] or "?") .. " high"
-  if straight and flush then
-    cat, name = 8, "Straight flush"
+  if straight and flush and ranks[1] == 14 and ranks[5] == 10 then
+    return 9, "Royal flush"
+  elseif straight and flush then
+    return 8, "Straight flush"
   elseif groups[1].c == 4 then
-    cat, name = 7, "Four " .. (RANK_NAME[groups[1].r] or "?") .. "s"
+    return 7, "Four " .. (RANK_NAME[groups[1].r] or "?") .. "s"
   elseif groups[1].c == 3 and groups[2] and groups[2].c >= 2 then
-    cat, name = 6, "Full house"
+    return 6, "Full house"
   elseif flush then
-    cat, name = 5, "Flush"
+    return 5, "Flush"
   elseif straight then
-    cat, name = 4, "Straight"
+    return 4, "Straight"
   elseif groups[1].c == 3 then
-    cat, name = 3, "Three " .. (RANK_NAME[groups[1].r] or "?") .. "s"
+    return 3, "Three " .. (RANK_NAME[groups[1].r] or "?") .. "s"
   elseif groups[1].c == 2 and groups[2] and groups[2].c == 2 then
-    cat, name = 2, "Two pair"
+    return 2, "Two pair"
   elseif groups[1].c == 2 then
-    cat, name = 1, "Pair " .. (RANK_NAME[groups[1].r] or "?") .. "s"
-  end
-
-  local key = { cat }
-  if straight then
-    key[#key + 1] = straightHi or ranks[1]
-  else
-    for i = 1, 5 do
-      local g = groups[i]
-      key[#key + 1] = g and g.c or 0
-      key[#key + 1] = g and g.r or 0
+    local r = groups[1].r
+    if r >= 11 then
+      return 1, "Pair " .. (RANK_NAME[r] or "?") .. "s"
     end
+    return 0, "Pair " .. (RANK_NAME[r] or "?") .. "s"
   end
-  for i = 1, 5 do key[#key + 1] = ranks[i] or 0 end
-  return key, name
+  return 0, (RANK_NAME[ranks[1]] or "?") .. " high"
 end
 
-local function cmpKey(a, b)
-  a, b = a or {}, b or {}
-  local n = math.max(#a, #b)
-  for i = 1, n do
-    local x, y = a[i] or 0, b[i] or 0
-    if x < y then return -1 end
-    if x > y then return 1 end
+local function pokerPayout(cat, bet)
+  if cat <= 0 then return 0, nil end
+  for _, row in ipairs(PAY_TABLE) do
+    if row.cat == cat then
+      return bet * row.mult, row.name
+    end
   end
-  return 0
+  return 0, nil
 end
 
 --------------------------------------------------------------------------------
--- Draw helpers
+-- Draw
 --------------------------------------------------------------------------------
 local function drawBtn(b, label, bg, fg)
   if not b then return end
@@ -383,12 +383,14 @@ end
 
 local function drawCardFace(x, y, w, h, card, held, hidden)
   local color = isColor()
-  local border = held and (color and colors.yellow or colors.white) or (color and colors.white or colors.lightGray)
+  local border = held and (color and colors.yellow or colors.white)
+    or (color and colors.white or colors.lightGray)
   fill(x, y, w, h, border)
   if hidden then
-    fill(x + 1, y + 1, math.max(1, w - 2), math.max(1, h - 2), color and colors.blue or colors.gray)
-    textAt(x + math.max(1, math.floor((w - 1) / 2)), y + math.floor(h / 2), "?", colors.white,
+    fill(x + 1, y + 1, math.max(1, w - 2), math.max(1, h - 2),
       color and colors.blue or colors.gray)
+    textAt(x + math.max(1, math.floor((w - 1) / 2)), y + math.floor(h / 2), "?",
+      colors.white, color and colors.blue or colors.gray)
     return
   end
   if not card then
@@ -400,10 +402,11 @@ local function drawCardFace(x, y, w, h, card, held, hidden)
   local fg = color and (suit.red and colors.red or colors.black) or colors.black
   fill(x + 1, y + 1, math.max(1, w - 2), math.max(1, h - 2), bg)
   local lab = RANK_NAME[card.rank] or "?"
-  textAt(x + math.max(1, math.floor((w - #lab) / 2)), y + math.floor(h / 2) - (h >= 4 and 1 or 0),
-    lab, fg, bg)
+  textAt(x + math.max(1, math.floor((w - #lab) / 2)),
+    y + math.floor(h / 2) - (h >= 4 and 1 or 0), lab, fg, bg)
   if h >= 4 then
-    textAt(x + math.max(1, math.floor((w - 1) / 2)), y + math.floor(h / 2) + 1, suit.ch, fg, bg)
+    textAt(x + math.max(1, math.floor((w - 1) / 2)), y + math.floor(h / 2) + 1,
+      suit.ch, fg, bg)
   end
   if held and h >= 3 then
     textAt(x + 1, y + h - 1, "H", colors.black, colors.yellow)
@@ -417,13 +420,39 @@ local function layoutCards(tw, count, cardW, cardH, y)
   local boxes = {}
   for i = 1, count do
     boxes[i] = {
-      x = ox + (i - 1) * (cardW + gap),
-      y = y,
-      w = cardW,
-      h = cardH,
+      x = ox + (i - 1) * (cardW + gap), y = y, w = cardW, h = cardH,
     }
   end
   return boxes
+end
+
+local function drawBetButtons(state, tw, th, color, dealLabel)
+  local padH = math.max(2, math.min(2, 2))
+  local by1 = th - padH * 3 + 1
+  local by2 = th - padH * 2 + 1
+  local by3 = th - padH + 1
+  local bw3 = math.floor(tw / 3)
+  local bw2 = math.floor(tw / 2)
+  state.btns = {
+    m100 = { x = 1, y = by1, w = bw3, h = padH },
+    m50  = { x = bw3 + 1, y = by1, w = bw3, h = padH },
+    m10  = { x = 2 * bw3 + 1, y = by1, w = tw - 2 * bw3, h = padH },
+    b10  = { x = 1, y = by2, w = bw3, h = padH },
+    b50  = { x = bw3 + 1, y = by2, w = bw3, h = padH },
+    b100 = { x = 2 * bw3 + 1, y = by2, w = tw - 2 * bw3, h = padH },
+    deal = { x = 1, y = by3, w = bw2, h = padH },
+    quit = { x = bw2 + 1, y = by3, w = tw - bw2, h = padH },
+  }
+  drawBtn(state.btns.m100, " -100 ", color and colors.brown or colors.black)
+  drawBtn(state.btns.m50, " -50 ", color and colors.brown or colors.black)
+  drawBtn(state.btns.m10, " -10 ", color and colors.brown or colors.black)
+  drawBtn(state.btns.b10, " +10 ", color and colors.gray or colors.black)
+  drawBtn(state.btns.b50, " +50 ", color and colors.lightGray or colors.black)
+  drawBtn(state.btns.b100, " +100 ", color and colors.white or colors.black, colors.black)
+  drawBtn(state.btns.deal, dealLabel or " DEAL ",
+    color and colors.lime or colors.white, colors.black)
+  drawBtn(state.btns.quit, FROM_LAUNCHER and " CLOSE " or " QUIT ",
+    color and colors.red or colors.black)
 end
 
 local function drawScreen(state)
@@ -433,94 +462,65 @@ local function drawScreen(state)
 
   local hdr = color and colors.cyan or colors.gray
   fill(1, 1, tw, 1, hdr)
-  textAt(2, 1, " HIGHER/LOWER ", colors.white, hdr)
+  textAt(2, 1, " POKER → H/L ", colors.white, hdr)
   local unit = USE_CASINO and "Chips" or "Coins"
-  textAt(2, 2, ("%s:%d  Bet:%d  Best:%d"):format(unit, COINS, state.bet, BEST):sub(1, tw - 2),
+  textAt(2, 2, ("%s:%d Bet:%d JP:%d"):format(unit, COINS, state.bet, JACKPOT):sub(1, tw - 2),
     colors.yellow, colors.black)
 
   local phase = state.phase
   local cardW = math.max(3, math.min(5, math.floor((tw - 6) / 5)))
-  local cardH = math.max(3, math.min(5, math.floor(th / 5)))
-
+  local cardH = math.max(3, math.min(4, math.floor(th / 6)))
   state.cardBoxes = {}
-  state.hlBoxes = {}
   state.btns = {}
 
   if phase == "bet" or phase == "result" then
-    textAt(2, 4, "Beat the dealer, then guess", colors.lightGray, colors.black)
-    textAt(2, 5, "if the hidden card is H or L.", colors.lightGray, colors.black)
+    textAt(2, 4, "Jacks+ poker → H/L streak", colors.lightGray, colors.black)
+    textAt(2, 5, ("10 correct = jackpot (%d)"):format(JACKPOT):sub(1, tw - 2),
+      colors.orange, colors.black)
     if state.message then
       local fg = (state.lastWin or 0) > 0 and colors.lime
         or ((state.lastWin or 0) < 0 and colors.red or colors.white)
       textAt(2, 7, tostring(state.message):sub(1, tw - 2), fg, colors.black)
     end
-  elseif phase == "hold" or phase == "show" then
-    textAt(2, 3, "Dealer hand hidden", colors.gray, colors.black)
-    textAt(2, 4, ("You: " .. (state.playerName or "?")):sub(1, tw - 2),
+    drawBetButtons(state, tw, th, color, phase == "result" and " NEXT " or " DEAL ")
+
+  elseif phase == "hold" then
+    textAt(2, 3, ("Hand: " .. (state.playerName or "?")):sub(1, tw - 2),
       colors.white, colors.black)
-    local pBoxes = layoutCards(tw, 5, cardW, cardH, 5)
+    local pBoxes = layoutCards(tw, 5, cardW, cardH, 4)
     state.cardBoxes = pBoxes
     for i = 1, 5 do
       drawCardFace(pBoxes[i].x, pBoxes[i].y, pBoxes[i].w, pBoxes[i].h,
         state.player[i], state.held[i], false)
     end
-    if state.message then
-      textAt(2, 5 + cardH + 1, tostring(state.message):sub(1, tw - 2),
-        colors.yellow, colors.black)
-    end
-  elseif phase == "hl" or phase == "hl_reveal" then
-    textAt(2, 3, ("Pot:%d  — Guess Higher or Lower"):format(state.pot or 0):sub(1, tw - 2),
-      colors.lime, colors.black)
-    local boxes = layoutCards(tw, 2, math.max(5, cardW + 2), math.max(4, cardH + 1), 5)
-    state.hlBoxes = boxes
-    drawCardFace(boxes[1].x, boxes[1].y, boxes[1].w, boxes[1].h, state.shown, false, false)
-    local hide = phase == "hl"
-    drawCardFace(boxes[2].x, boxes[2].y, boxes[2].w, boxes[2].h, state.hidden, false, hide)
-    textAt(boxes[1].x, boxes[1].y + boxes[1].h + 1, "SHOWN", colors.lightGray, colors.black)
-    textAt(boxes[2].x, boxes[2].y + boxes[2].h + 1, hide and "HIDDEN" or "REVEAL",
-      colors.lightGray, colors.black)
-    if state.message then
-      local fg = (state.lastWin or 0) > 0 and colors.lime
-        or ((state.lastWin or 0) < 0 and colors.red or colors.white)
-      textAt(2, boxes[1].y + boxes[1].h + 3, tostring(state.message):sub(1, tw - 2),
-        fg, colors.black)
-    end
-  end
-
-  local padH = math.max(2, math.min(3, 3))
-  local by = th - padH + 1
-  local bw = math.floor(tw / 4)
-
-  if phase == "bet" or phase == "result" then
-    local rows = 2
-    padH = math.max(2, math.min(3, math.floor(th / 6)))
-    local byBet = th - padH * 2 + 1
-    local byAct = th - padH + 1
-    local bw3 = math.floor(tw / 3)
-    local bw2 = math.floor(tw / 2)
+    textAt(2, 4 + cardH + 1, tostring(state.message or "Hold, then DRAW"):sub(1, tw - 2),
+      colors.yellow, colors.black)
+    local padH = 2
+    local by = th - padH + 1
+    local half = math.floor(tw / 2)
     state.btns = {
-      b10  = { x = 1, y = byBet, w = bw3, h = padH },
-      b50  = { x = bw3 + 1, y = byBet, w = bw3, h = padH },
-      b100 = { x = 2 * bw3 + 1, y = byBet, w = tw - 2 * bw3, h = padH },
-      deal = { x = 1, y = byAct, w = bw2, h = padH },
-      quit = { x = bw2 + 1, y = byAct, w = tw - bw2, h = padH },
-    }
-    drawBtn(state.btns.b10, " +10 ", color and colors.gray or colors.black)
-    drawBtn(state.btns.b50, " +50 ", color and colors.lightGray or colors.black)
-    drawBtn(state.btns.b100, " +100 ", color and colors.white or colors.black, colors.black)
-    drawBtn(state.btns.deal, phase == "result" and " NEXT " or " DEAL ",
-      color and colors.lime or colors.white, colors.black)
-    drawBtn(state.btns.quit, FROM_LAUNCHER and " CLOSE " or " QUIT ",
-      color and colors.red or colors.black)
-  elseif phase == "hold" then
-    state.btns = {
-      draw = { x = 1, y = by, w = math.floor(tw / 2), h = padH },
-      quit = { x = math.floor(tw / 2) + 1, y = by, w = tw - math.floor(tw / 2), h = padH },
+      draw = { x = 1, y = by, w = half, h = padH },
+      quit = { x = half + 1, y = by, w = tw - half, h = padH },
     }
     drawBtn(state.btns.draw, " DRAW ", color and colors.lime or colors.white, colors.black)
     drawBtn(state.btns.quit, FROM_LAUNCHER and " CLOSE " or " QUIT ",
       color and colors.red or colors.black)
+
   elseif phase == "hl" then
+    textAt(2, 3, ("Earn:%d  Streak %d/%d  JP:%d"):format(
+      state.earnings or 0, state.streak or 0, STREAK_GOAL, JACKPOT):sub(1, tw - 2),
+      colors.lime, colors.black)
+    local boxes = layoutCards(tw, 2, math.max(5, cardW + 1), math.max(3, cardH), 5)
+    drawCardFace(boxes[1].x, boxes[1].y, boxes[1].w, boxes[1].h, state.shown, false, false)
+    drawCardFace(boxes[2].x, boxes[2].y, boxes[2].w, boxes[2].h, state.hidden, false, true)
+    textAt(boxes[1].x, boxes[1].y + boxes[1].h, "SHOWN", colors.lightGray, colors.black)
+    textAt(boxes[2].x, boxes[2].y + boxes[2].h, "???", colors.lightGray, colors.black)
+    textAt(2, boxes[1].y + boxes[1].h + 2,
+      tostring(state.message or "Higher or Lower?"):sub(1, tw - 2),
+      colors.yellow, colors.black)
+    local padH = 2
+    local by = th - padH + 1
+    local bw = math.floor(tw / 3)
     state.btns = {
       high = { x = 1, y = by, w = bw, h = padH },
       low  = { x = bw + 1, y = by, w = bw, h = padH },
@@ -530,131 +530,179 @@ local function drawScreen(state)
     drawBtn(state.btns.low, " LOW ", color and colors.orange or colors.white, colors.black)
     drawBtn(state.btns.quit, FROM_LAUNCHER and " CLOSE " or " QUIT ",
       color and colors.red or colors.black)
-  else -- hl_reveal / show
+
+  elseif phase == "hl_choice" then
+    textAt(2, 3, ("Correct! Streak %d/%d"):format(state.streak or 0, STREAK_GOAL):sub(1, tw - 2),
+      colors.lime, colors.black)
+    textAt(2, 5, ("Earnings: %d"):format(state.earnings or 0), colors.yellow, colors.black)
+    textAt(2, 6, ("Jackpot:  %d"):format(JACKPOT), colors.orange, colors.black)
+    textAt(2, 8, "Cash out now, or risk another", colors.lightGray, colors.black)
+    textAt(2, 9, ("round for the jackpot (%d left)."):format(
+      STREAK_GOAL - (state.streak or 0)):sub(1, tw - 2), colors.lightGray, colors.black)
+    local padH = 3
+    local by = th - padH + 1
+    local half = math.floor(tw / 2)
     state.btns = {
-      next = { x = 1, y = by, w = math.floor(tw * 2 / 3), h = padH },
-      quit = { x = math.floor(tw * 2 / 3) + 1, y = by, w = tw - math.floor(tw * 2 / 3), h = padH },
+      cash = { x = 1, y = by, w = half, h = padH },
+      go   = { x = half + 1, y = by, w = tw - half, h = padH },
     }
-    drawBtn(state.btns.next, " NEXT ", color and colors.lime or colors.white, colors.black)
-    drawBtn(state.btns.quit, FROM_LAUNCHER and " CLOSE " or " QUIT ",
-      color and colors.red or colors.black)
+    drawBtn(state.btns.cash, " CASH OUT ", color and colors.lime or colors.white, colors.black)
+    drawBtn(state.btns.go, " GAMBLE ", color and colors.orange or colors.white, colors.black)
   end
 end
 
 --------------------------------------------------------------------------------
--- Game logic
+-- Logic
 --------------------------------------------------------------------------------
-local function refillIfBroke(state)
-  -- No auto-refill; bet only what you have.
+local function dealHLCards(state)
+  if not state.deck or #state.deck < 2 then state.deck = newDeck() end
+  state.shown = drawCard(state.deck)
+  state.hidden = drawCard(state.deck)
 end
 
 local function beginDeal(state)
   local ok, err = spendBet(state.bet)
   if not ok then
-    state.message = USE_CASINO and ("Casino: " .. tostring(err)) or "Not enough coins!"
+    state.message = USE_CASINO and ("Casino: " .. tostring(err)) or "Not enough chips!"
     return false
   end
   if not USE_CASINO then saveCfg() end
   state.deck = newDeck()
-  state.player, state.dealer = {}, {}
+  state.player = {}
   state.held = { false, false, false, false, false }
-  for i = 1, 5 do
-    state.player[i] = drawCard(state.deck)
-    state.dealer[i] = drawCard(state.deck)
-  end
-  local pk, pn = handRank(state.player)
-  local dk, dn = handRank(state.dealer)
-  state.playerKey, state.playerName = pk, pn
-  state.dealerKey, state.dealerName = dk, dn
+  for i = 1, 5 do state.player[i] = drawCard(state.deck) end
+  local cat, name = evaluateHand(state.player)
+  state.playerCat, state.playerName = cat, name
   state.phase = "hold"
-  state.pot = 0
+  state.earnings = 0
+  state.streak = 0
   state.lastWin = 0
-  state.message = "Hold cards (1-5), then DRAW"
+  state.message = "Hold (1-5), then DRAW"
   state.shown, state.hidden = nil, nil
   sfx("deal")
   return true
 end
 
 local function finishPoker(state)
-  -- Redraw unheld
   for i = 1, 5 do
     if not state.held[i] then
       state.player[i] = drawCard(state.deck)
     end
   end
-  local pk, pn = handRank(state.player)
-  local dk, dn = handRank(state.dealer)
-  state.playerKey, state.playerName = pk, pn
-  state.dealerKey, state.dealerName = dk, dn
-  local cmp = cmpKey(pk, dk)
-  if cmp < 0 then
+  local cat, name = evaluateHand(state.player)
+  state.playerCat, state.playerName = cat, name
+  local pay, payName = pokerPayout(cat, state.bet)
+  if pay <= 0 then
     state.phase = "result"
     state.lastWin = -state.bet
-    state.message = "Dealer wins (" .. tostring(dn) .. ")"
+    state.message = "No hand — " .. tostring(name)
     sfx("lose")
-    refillIfBroke(state)
-    if not USE_CASINO then saveCfg() end
-  elseif cmp == 0 then
-    creditWin(state.bet)
-    state.phase = "result"
-    state.lastWin = 0
-    state.message = "Push — bet returned"
-    sfx("coin")
-    if not USE_CASINO then saveCfg() end
-  else
-    state.pot = state.bet * 2
-    state.phase = "hl"
-    state.shown = drawCard(state.deck)
-    state.hidden = drawCard(state.deck)
-    state.message = ("You win (" .. tostring(pn) .. ")! Guess H/L")
-    sfx("win")
+    return
   end
+  state.earnings = pay
+  state.streak = 0
+  state.phase = "hl"
+  dealHLCards(state)
+  state.message = (payName or name) .. " +" .. pay .. " → H/L"
+  sfx("win")
+end
+
+local function cashOut(state)
+  local n = math.floor(tonumber(state.earnings) or 0)
+  if n > 0 then creditWin(n) end
+  state.lastWin = n
+  state.message = ("Cashed out +%d"):format(n)
+  state.earnings = 0
+  state.streak = 0
+  state.phase = "result"
+  sfx("coin")
+  saveCfg()
+end
+
+local function startNextHL(state)
+  state.phase = "hl"
+  dealHLCards(state)
+  state.message = ("Streak %d/%d — Higher or Lower?"):format(state.streak, STREAK_GOAL)
+  sfx("deal")
 end
 
 local function resolveHL(state, guessHigher)
   if state.phase ~= "hl" then return end
   local shown, hidden = state.shown, state.hidden
   if not shown or not hidden then return end
-  state.phase = "hl_reveal"
   sfx("flip")
   local sr, hr = shown.rank, hidden.rank
   if hr == sr then
-    creditWin(state.pot)
-    state.lastWin = state.pot
-    state.message = ("Tie %s=%s — pot kept +%d"):format(cardLabel(shown), cardLabel(hidden), state.pot)
+    -- Tie: redraw, same streak / earnings
+    dealHLCards(state)
+    state.message = ("Tie %s=%s — try again"):format(cardLabel(shown), cardLabel(hidden))
     sfx("coin")
-  elseif (hr > sr) == guessHigher then
-    local win = state.pot * 2
-    creditWin(win)
-    state.lastWin = win
-    state.message = ("Correct! %s → %s  +%d"):format(cardLabel(shown), cardLabel(hidden), win)
-    sfx("big")
-  else
-    state.lastWin = -state.pot
-    state.message = ("Wrong! %s → %s  pot lost"):format(cardLabel(shown), cardLabel(hidden))
-    sfx("lose")
-    refillIfBroke(state)
+    return
   end
-  state.pot = 0
-  if not USE_CASINO then saveCfg() end
+  local correct = (hr > sr) == guessHigher
+  if not correct then
+    JACKPOT = JACKPOT + (state.earnings or 0)
+    state.lastWin = -(state.earnings or 0)
+    state.message = ("Wrong %s→%s — +%d to jackpot"):format(
+      cardLabel(shown), cardLabel(hidden), state.earnings or 0)
+    state.earnings = 0
+    state.streak = 0
+    state.phase = "result"
+    sfx("lose")
+    saveCfg()
+    return
+  end
+
+  -- Correct: double earnings, advance streak
+  state.earnings = math.floor((state.earnings or 0) * 2)
+  state.streak = (state.streak or 0) + 1
+  state.message = ("Yes! %s→%s  earn=%d"):format(
+    cardLabel(shown), cardLabel(hidden), state.earnings)
+
+  if state.streak >= STREAK_GOAL then
+    local jp = JACKPOT
+    creditWin(jp)
+    state.lastWin = jp
+    state.message = ("JACKPOT! +%d  (10 streak)"):format(jp)
+    JACKPOT = JACKPOT_SEED
+    state.earnings = 0
+    state.streak = 0
+    state.phase = "result"
+    sfx("big")
+    saveCfg()
+    return
+  end
+
+  state.phase = "hl_choice"
+  sfx("win")
 end
 
 --------------------------------------------------------------------------------
 -- Main
 --------------------------------------------------------------------------------
+local function handleBetClick(state, b, mx, my)
+  if inBtn(b.m10, mx, my) then addBet(state, -10); sfx("coin"); return true end
+  if inBtn(b.m50, mx, my) then addBet(state, -50); sfx("coin"); return true end
+  if inBtn(b.m100, mx, my) then addBet(state, -100); sfx("coin"); return true end
+  if inBtn(b.b10, mx, my) then addBet(state, 10); sfx("coin"); return true end
+  if inBtn(b.b50, mx, my) then addBet(state, 50); sfx("coin"); return true end
+  if inBtn(b.b100, mx, my) then addBet(state, 100); sfx("coin"); return true end
+  return false
+end
+
 local function main()
   attachMonitor()
   refreshSpeaker()
   initEconomy()
   local state = {
     phase = "bet",
-    bet = clampBet(1),
+    bet = clampBet(10),
     player = {},
-    dealer = {},
     held = { false, false, false, false, false },
-    message = "Bet +10/+50/+100 then DEAL",
+    message = "Bet ±10/50/100 — Jacks+ to play H/L",
     lastWin = 0,
-    pot = 0,
+    earnings = 0,
+    streak = 0,
     btns = {},
     cardBoxes = {},
   }
@@ -671,15 +719,11 @@ local function main()
         for i, box in ipairs(state.cardBoxes or {}) do
           if inBtn(box, mx, my) then
             state.held[i] = not state.held[i]
-            sfx("hold")
-            drawScreen(state)
-            break
+            sfx("hold"); drawScreen(state); break
           end
         end
         if inBtn(b.draw, mx, my) then
-          finishPoker(state)
-          state.bet = clampBet(state.bet)
-          drawScreen(state)
+          finishPoker(state); drawScreen(state)
         elseif inBtn(b.quit, mx, my) then
           return
         end
@@ -691,21 +735,15 @@ local function main()
         elseif inBtn(b.quit, mx, my) then
           return
         end
-      elseif state.phase == "hl_reveal" or state.phase == "show" then
-        if inBtn(b.next, mx, my) then
-          state.phase = "bet"
-          state.bet = clampBet(state.bet)
-          drawScreen(state)
-        elseif inBtn(b.quit, mx, my) then
-          return
+      elseif state.phase == "hl_choice" then
+        if inBtn(b.cash, mx, my) then
+          cashOut(state); drawScreen(state)
+        elseif inBtn(b.go, mx, my) then
+          startNextHL(state); drawScreen(state)
         end
       elseif state.phase == "bet" or state.phase == "result" then
-        if inBtn(b.b10, mx, my) then
-          addBet(state, 10); sfx("coin"); drawScreen(state)
-        elseif inBtn(b.b50, mx, my) then
-          addBet(state, 50); sfx("coin"); drawScreen(state)
-        elseif inBtn(b.b100, mx, my) then
-          addBet(state, 100); sfx("coin"); drawScreen(state)
+        if handleBetClick(state, b, mx, my) then
+          drawScreen(state)
         elseif inBtn(b.deal, mx, my) then
           if state.phase == "result" then
             state.phase = "bet"
@@ -726,29 +764,32 @@ local function main()
         MUSIC_ON = not MUSIC_ON; saveCfg()
         if not MUSIC_ON then stopMusic() end
       elseif state.phase == "hold" then
-        if p1 == K.d then
-          finishPoker(state); state.bet = clampBet(state.bet); drawScreen(state)
+        if p1 == K.d then finishPoker(state); drawScreen(state)
         elseif p1 >= K.one and p1 <= K.five then
           local i = (p1 - K.one) + 1
           state.held[i] = not state.held[i]
           sfx("hold"); drawScreen(state)
         end
       elseif state.phase == "hl" then
-        if p1 == K.h then
-          resolveHL(state, true); drawScreen(state)
-        elseif p1 == K.l then
-          resolveHL(state, false); drawScreen(state)
+        if p1 == K.h then resolveHL(state, true); drawScreen(state)
+        elseif p1 == K.l then resolveHL(state, false); drawScreen(state)
         end
-      elseif state.phase == "hl_reveal" or state.phase == "result" or state.phase == "show" then
+      elseif state.phase == "hl_choice" then
+        if p1 == K.c then cashOut(state); drawScreen(state)
+        elseif p1 == K.g or p1 == K.space or p1 == K.enter then
+          startNextHL(state); drawScreen(state)
+        end
+      elseif state.phase == "result" then
         if p1 == K.space or p1 == K.enter then
-          state.phase = "bet"
-          state.bet = clampBet(state.bet)
-          drawScreen(state)
+          state.phase = "bet"; state.bet = clampBet(state.bet); drawScreen(state)
         end
       elseif state.phase == "bet" then
         if p1 == K.one then addBet(state, 10); drawScreen(state)
         elseif p1 == K.two then addBet(state, 50); drawScreen(state)
         elseif p1 == K.three then addBet(state, 100); drawScreen(state)
+        elseif p1 == K.four then addBet(state, -10); drawScreen(state)
+        elseif p1 == K.five then addBet(state, -50); drawScreen(state)
+        elseif p1 == K.six then addBet(state, -100); drawScreen(state)
         elseif p1 == K.space or p1 == K.enter then
           state.bet = clampBet(state.bet)
           beginDeal(state); drawScreen(state)
@@ -771,10 +812,17 @@ local function main()
         if ch == "h" then resolveHL(state, true); drawScreen(state)
         elseif ch == "l" then resolveHL(state, false); drawScreen(state)
         end
+      elseif state.phase == "hl_choice" then
+        if ch == "c" then cashOut(state); drawScreen(state)
+        elseif ch == "g" then startNextHL(state); drawScreen(state)
+        end
       elseif state.phase == "bet" then
         if ch == "1" then addBet(state, 10); drawScreen(state)
         elseif ch == "2" then addBet(state, 50); drawScreen(state)
         elseif ch == "3" then addBet(state, 100); drawScreen(state)
+        elseif ch == "4" then addBet(state, -10); drawScreen(state)
+        elseif ch == "5" then addBet(state, -50); drawScreen(state)
+        elseif ch == "6" then addBet(state, -100); drawScreen(state)
         end
       end
     elseif ev == "terminate" then
