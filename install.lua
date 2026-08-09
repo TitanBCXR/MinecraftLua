@@ -1,6 +1,6 @@
 --[[
   install.lua  -  Titan network installer (CC: Tweaked)
-  Titan-Version: 1.2.8
+  Titan-Version: 1.2.9
 
   Downloads the Titan bot-network system onto this device from a running
   `host.lua` on the same rednet network (no pastebin / external web host).
@@ -171,7 +171,7 @@ print(("Host: %s (#%d) - %d files available."):format(
 local function pickFromList(list, opts)
   opts = opts or {}
   local promptHint = opts.promptHint or "What is this device?"
-  local cancelKey = (opts.cancelKey or "q"):lower()
+  local cancelKey = (opts.cancelKey or "exit"):lower()
   local backKey = opts.backKey and tostring(opts.backKey):lower() or nil
   local clearFirst = opts.clearFirst
   while true do
@@ -191,15 +191,14 @@ local function pickFromList(list, opts)
         idx = idx + 1
         shown = shown + 1
       end
-      local qHint = backKey and ("B back, " .. cancelKey:upper() .. " cancel")
-        or (cancelKey:upper() .. " cancel")
+      local qHint = backKey and ("B back, exit quit") or "exit quit"
       if idx <= #list then
         write("Enter #, or Enter=more (" .. qHint .. "): ")
       else
         write("Choose (" .. qHint .. "): ")
       end
       local choice = tostring(read() or ""):lower()
-      if choice == cancelKey then return nil end
+      if choice == cancelKey or choice == "quit" then return nil end
       if backKey and choice == backKey then return false end
       if choice ~= "" then
         for _, r in ipairs(list) do

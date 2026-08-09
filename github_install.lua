@@ -1,6 +1,6 @@
 --[[
   github_install.lua  -  Install the Titan system straight from a GitHub repo
-  Titan-Version: 1.2.11
+  Titan-Version: 1.2.12
 
   Point RAW_BASE at your repo's raw content root, then on each Minecraft device:
 
@@ -345,7 +345,7 @@ local function pickFromListGui(list, opts)
         sel = sel < #list and sel + 1 or 1
       elseif p1 == K.enter or p1 == K.space then
         return list[sel]
-      elseif p1 == K.q then
+      elseif p1 == K.x then
         return nil
       elseif allowBack and (p1 == K.b or p1 == K.backspace) then
         return false
@@ -358,7 +358,7 @@ local function pickFromListGui(list, opts)
       end
     elseif ev == "char" then
       local ch = tostring(p1 or ""):lower()
-      if ch == "q" then return nil end
+      if ch == "x" then return nil end
       if allowBack and ch == "b" then return false end
       for i, item in ipairs(list) do
         if tostring(item.key):lower() == ch then return item end
@@ -408,7 +408,7 @@ local function pickFromListText(list, opts)
   local title = opts.title or "== Install =="
   local sourceLine = opts.sourceLine
   local promptHint = opts.promptHint or "What is this device?"
-  local cancelKey = (opts.cancelKey or "q"):lower()
+  local cancelKey = (opts.cancelKey or "exit"):lower()
   local backKey = opts.backKey and tostring(opts.backKey):lower() or nil
   while true do
     local idx = 1
@@ -428,15 +428,14 @@ local function pickFromListText(list, opts)
         shown = shown + 1
       end
       print("")
-      local qHint = backKey and ("B back, " .. cancelKey:upper() .. " cancel")
-        or (cancelKey:upper() .. " cancel")
+      local qHint = backKey and ("B back, exit quit") or "exit quit"
       if idx <= #list then
         write("Enter #, or Enter=more (" .. qHint .. "): ")
       else
         write("Choose (" .. qHint .. "): ")
       end
       local choice = tostring(read() or ""):lower()
-      if choice == cancelKey then return nil end
+      if choice == cancelKey or choice == "quit" then return nil end
       if backKey and choice == backKey then return false end
       if choice ~= "" then
         for _, r in ipairs(list) do

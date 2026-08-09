@@ -1,6 +1,6 @@
 --[[
   pastebin_install.lua  -  Pastebin bootstrap installer for the Titan system
-  Titan-Version: 1.2.8
+  Titan-Version: 1.2.9
 
   Pulls the Titan files straight from Pastebin (no in-game host needed). Upload
   each file to pastebin.com once, paste its CODE into the table below, then
@@ -166,7 +166,7 @@ local function pickFromList(list, opts)
   opts = opts or {}
   local title = opts.title or "== Titan Pastebin Installer =="
   local promptHint = opts.promptHint or "What is this device?"
-  local cancelKey = (opts.cancelKey or "q"):lower()
+  local cancelKey = (opts.cancelKey or "exit"):lower()
   local backKey = opts.backKey and tostring(opts.backKey):lower() or nil
   while true do
     local idx = 1
@@ -185,15 +185,14 @@ local function pickFromList(list, opts)
         shown = shown + 1
       end
       print("")
-      local qHint = backKey and ("B back, " .. cancelKey:upper() .. " cancel")
-        or (cancelKey:upper() .. " cancel")
+      local qHint = backKey and ("B back, exit quit") or "exit quit"
       if idx <= #list then
         write("Enter #, or Enter=more (" .. qHint .. "): ")
       else
         write("Choose (" .. qHint .. "): ")
       end
       local choice = tostring(read() or ""):lower()
-      if choice == cancelKey then return nil end
+      if choice == cancelKey or choice == "quit" then return nil end
       if backKey and choice == backKey then return false end
       if choice ~= "" then
         for _, r in ipairs(list) do
