@@ -1,6 +1,6 @@
 --[[
   github_install.lua  -  Install the Titan system straight from a GitHub repo
-  Titan-Version: 1.2.14
+  Titan-Version: 1.2.16
 
   Point RAW_BASE at your repo's raw content root, then on each Minecraft device:
 
@@ -35,12 +35,14 @@ local KEEP_ALL = {
   "quarry/workers/offline_miner.lua", "quarry/workers/strip_miner.lua",
   "quarry/managers/offline_site.lua",
   "storage/managers/storage_manager.lua", "storage/workers/storage_builder.lua",
-  "storage_manager.lua", "storage_builder.lua",
+  "storage/managers/storage_atm.lua",
+  "storage_manager.lua", "storage_builder.lua", "storage_atm.lua",
   "offline_miner.lua", "offline_site.lua", "exclude.txt",
   "perimeter_sensor.lua", "perimeter_manager.lua", "tetris.lua", "minesweeper.lua",
   "sandstorm.lua", "luigi_poker.lua", "higher_lower.lua", "slots.lua",
   "lib/casino.lua", "lib/games_economy.lua",
   "games/managers/currency_manager.lua", "currency_manager.lua",
+  "games/managers/casino_atm.lua", "casino_atm.lua",
   "games.lua", "games_catalog.lua", "games_install.lua", "host.lua", "versions.lua",
 }
 
@@ -64,8 +66,10 @@ local GAMES = {
     files = { "higher_lower.lua", "lib/casino.lua" } },
   { key = "5", name = "Slots (3-reel)", run = "slots.lua",
     files = { "slots.lua", "lib/casino.lua" } },
-  { key = "c", name = "Currency Manager (casino chips)", run = "games/managers/currency_manager.lua",
+  { key = "c", name = "Currency Manager (casino ledger)", run = "games/managers/currency_manager.lua",
     files = { "lib/titan.lua", "games/managers/currency_manager.lua", "currency_manager.lua" } },
+  { key = "a", name = "Casino ATM (deposit / Create ticker withdraw)", run = "games/managers/casino_atm.lua",
+    files = { "lib/titan.lua", "games/managers/casino_atm.lua", "casino_atm.lua" } },
 }
 
 local QUARRY_WORKERS = {
@@ -93,6 +97,8 @@ local STORAGE_WORKERS = {
 local STORAGE_MANAGERS = {
   { key = "1", name = "Storage Manager (vault + I/O)", run = "storage/managers/storage_manager.lua",
     files = { "lib/titan.lua", "storage/managers/storage_manager.lua", "storage_manager.lua" } },
+  { key = "2", name = "Storage ATM (Create ticker only)", run = "storage/managers/storage_atm.lua",
+    files = { "storage/managers/storage_atm.lua", "storage_atm.lua" } },
 }
 
 local STORAGE = {
@@ -651,6 +657,8 @@ local function runInstaller()
     ["quarry/workers/strip_miner.lua"] = "StripMiner",
     ["quarry/managers/offline_site.lua"] = "QuarrySite",
     ["storage/managers/storage_manager.lua"] = "StorageManager",
+    ["storage/managers/storage_atm.lua"] = "StorageATM",
+    ["storage_atm.lua"] = "StorageATM",
     ["storage/workers/storage_builder.lua"] = "StorageBuilder",
     ["perimeter_sensor.lua"] = "PerimSensor",
     ["perimeter_manager.lua"] = "PerimMgr",
@@ -662,6 +670,8 @@ local function runInstaller()
   ["slots.lua"] = "Slots",
   ["games/managers/currency_manager.lua"] = "Casino",
   ["currency_manager.lua"] = "Casino",
+  ["games/managers/casino_atm.lua"] = "ATM",
+  ["casino_atm.lua"] = "ATM",
   ["games.lua"] = "Games",
   ["host.lua"] = "TitanHost",
 }

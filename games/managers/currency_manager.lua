@@ -1,39 +1,26 @@
 --[[
   games/managers/currency_manager.lua  -  Casino currency vault
-  Titan-Version: 1.0.2
+  Titan-Version: 1.0.5
 
-  Accepts in-game items as tender for gambling chips. Password-protects every
-  currency command. Persists accepted items, rates, balances, and password on
-  a floppy disk (casino_currency.cfg).
+  Ledger / admin for casino chips. Persists accepted items, rates, balances,
+  and password on floppy (casino_currency.cfg).
 
-  Layout (vanilla chests/barrels — modded storage rarely connects CC modems):
+  Players use casino_atm.lua (Create Stock Ticker + frogports). This PC:
+    - scan / rates (auth)
+    - mesh API for games + ATMs
+    - optional emergency deposit/withdraw against bound chests (auth for withdraw)
 
-    [Deposit chest] --touching/wired--> [Currency Manager PC] --disk--> floppy
-    [Storage chest] --touching/wired-->/              |
-                                                 wireless mesh
+  Layout:
+    [Currency Manager PC] --disk--> floppy
+            | wireless mesh
+            +-- games (bet/payout)
+            +-- ATMs (rates / credit / debit)
 
-  - storage  sample accepted currency (scan) + vault for deposited tender
-  - deposit  players drop items here; deposit <player> moves accepted types
-             into storage and credits chips. Unaccepted items stay put.
-
-  Commands (password required except help/status/exit/setpass first-time):
-    setpass                 set / change floppy password
-    login                   unlock session (5 min)
-    logout
-    bind storage|deposit|drive <name|side>
-    bind chest <name>       alias for bind storage (legacy)
-    invs | drives
-    scan | accept           read STORAGE → accepted item list → floppy
-    rates                   interactive chips-per-item settings
-    rate <item> <chips>
-    deposit <player>        move accepted from DEPOSIT → STORAGE + credit
-    withdraw <player> <n>   remove chips from player balance
-    balance [player]
-    status | help | exit
-
-  Rednet (protocol titan_install + titan_router):
+  Rednet:
     casino_ping / casino_hello
     casino_balance_req / casino_balance
+    casino_rates_req / casino_rates
+    casino_credit / casino_ack     ATM deposit credit (explicit deposit only)
     casino_bet / casino_payout + ack
 ]]
 
@@ -48,7 +35,8 @@ local ROUTER_PROTOCOL = "titan_router"
 local DISK_FILE = "casino_currency.cfg"
 local LOCAL_CFG = "currency_manager.cfg"
 local SESSION_MS = 5 * 60 * 1000
-local VERSION = "1.0.2"
+local PLAYER_RANGE = 8
+local VERSION = "1.0.5"
 
 local cfg = { storage = nil, deposit = nil, chest = nil, drive = nil, label = nil }
 local data = {
@@ -214,6 +202,117 @@ local function wrapDeposit()
   return wrapRole("deposit")
 end
 
+local function normalizePlayer(p)
+  if type(p) == "string" then
+    p = p:gsub("[%c%z]", ""):match("^%s*(.-)%s*$") or ""
+    if p == "" then return nil end
+    return p:sub(1, 24)
+  end
+  if type(p) == "table" then
+    return normalizePlayer(p.name or p.displayName or p.username)
+  end
+  return nil
+end
+
+local function findDetector()
+  local pd = peripheral.find("playerDetector")
+  if pd then return pd end
+  return peripheral.find("player_detector")
+end
+
+--- Nearby players via Advanced Peripherals Player Detector (closest first).
+local function listNearbyPlayers(range)
+  range = tonumber(range) or PLAYER_RANGE
+  local pd = findDetector()
+  if not pd then return {}, "no detector" end
+  local names, seen = {}, {}
+  local ok, players = pcall(function() return pd.getPlayersInRange(range) end)
+  if ok and type(players) == "table" then
+    for _, p in ipairs(players) do
+      local n = normalizePlayer(p)
+      if n and not seen[n:lower()] then
+        seen[n:lower()] = true
+        names[#names + 1] = n
+      end
+    end
+  end
+  if #names > 1 and type(pd.getPlayerPos) == "function" then
+    local dist = {}
+    for _, n in ipairs(names) do
+      local okp, pos = pcall(function() return pd.getPlayerPos(n) end)
+      if okp and type(pos) == "table" then
+        local x = tonumber(pos.x or pos.X) or 0
+        local y = tonumber(pos.y or pos.Y) or 0
+        local z = tonumber(pos.z or pos.Z) or 0
+        dist[n] = x * x + y * y + z * z
+      else
+        dist[n] = math.huge
+      end
+    end
+    table.sort(names, function(a, b)
+      local da, db = dist[a] or math.huge, dist[b] or math.huge
+      if da ~= db then return da < db end
+      return a:lower() < b:lower()
+    end)
+  else
+    table.sort(names, function(a, b) return a:lower() < b:lower() end)
+  end
+  return names, nil
+end
+
+--- Pick depositor: optional arg (name or #), else interactive list from detector.
+local function pickDepositPlayer(arg)
+  local nearby = listNearbyPlayers(PLAYER_RANGE)
+  local asNum = tonumber(arg)
+
+  if arg and asNum and asNum >= 1 and asNum == math.floor(asNum) then
+    if nearby[asNum] then return nearby[asNum] end
+    print("No player #" .. tostring(asNum) .. " in range.")
+  elseif arg and tostring(arg):match("%S") then
+    local want = normalizePlayer(arg)
+    if want then return want end
+  end
+
+  if #nearby == 0 then
+    if not findDetector() then
+      print("No Player Detector — place one next to this PC, or: deposit <player>")
+    else
+      print("No players in range. Stand closer, or: deposit <player>")
+    end
+    write("Player name (blank cancel): ")
+    local line = read()
+    return normalizePlayer(line)
+  end
+
+  print("Nearby players:")
+  for i, n in ipairs(nearby) do
+    print(("  %d) %s"):format(i, n))
+  end
+  if #nearby == 1 then
+    write(("Select # / name [1=%s]: "):format(nearby[1]))
+  else
+    write("Select # or name: ")
+  end
+  local line = read()
+  if not line or not line:match("%S") then
+    if #nearby == 1 then return nearby[1] end
+    print("Cancelled.")
+    return nil
+  end
+  local n = tonumber(line)
+  if n and nearby[n] then return nearby[n] end
+  local named = normalizePlayer(line)
+  if named then
+    for _, p in ipairs(nearby) do
+      if p:lower() == named:lower() then return p end
+    end
+    -- Allow typing a name not in the list (manual override).
+    return named
+  end
+  print("Cancelled.")
+  return nil
+end
+
 local function playerKey(name)
   name = tostring(name or ""):gsub("[%c%z]", ""):match("^%s*(.-)%s*$") or ""
   if name == "" then return nil end
@@ -283,6 +382,7 @@ local function cmdLogout()
 end
 
 local function cmdBind(a)
+  if not requireAuth("bind") then return end
   local role = tostring(a[2] or ""):lower()
   local name = a[3]
   if role == "chest" then role = "storage" end -- legacy alias
@@ -442,9 +542,9 @@ local function cmdRate(a)
 end
 
 local function cmdDeposit(a)
-  if not requireAuth("deposit") then return end
-  local player = a[2]
-  if not player then print("Usage: deposit <player>"); return end
+  -- Public: no password. Credit goes to a nearby (or named) player.
+  local player = pickDepositPlayer(a[2])
+  if not player then return end
   local dep, dname = wrapDeposit()
   local stor, sname = wrapStorage()
   if not dep then
@@ -462,6 +562,7 @@ local function cmdDeposit(a)
   loadDisk()
   local accept = acceptedSet()
   if not next(accept) then print("No accepted currency — scan storage first."); return end
+  print("Depositing for: " .. player)
 
   local list = dep.list() or {}
   local gained, movedCount = 0, 0
@@ -544,6 +645,80 @@ local function cmdDeposit(a)
   if not ok then print("Save failed: " .. tostring(err)) end
 end
 
+--- Count accepted currency currently in storage (item → count) + total chip value.
+local function storageStock(inv)
+  local accept = acceptedSet()
+  local stock, value = {}, 0
+  local list = inv.list() or {}
+  for _, detail in pairs(list) do
+    if type(detail) == "table" and detail.name and accept[detail.name] then
+      local c = tonumber(detail.count) or 0
+      local rate = tonumber(data.rates[detail.name]) or 0
+      if c > 0 and rate > 0 then
+        stock[detail.name] = (stock[detail.name] or 0) + c
+        value = value + rate * c
+      end
+    end
+  end
+  return stock, value
+end
+
+--- Greedy plan: chips → item counts using highest rates first (exact amount).
+local function planWithdrawItems(amount, stock)
+  local denoms = {}
+  for item, rate in pairs(data.rates) do
+    rate = tonumber(rate) or 0
+    if rate > 0 and (stock[item] or 0) > 0 then
+      denoms[#denoms + 1] = { item = item, rate = rate }
+    end
+  end
+  table.sort(denoms, function(a, b)
+    if a.rate ~= b.rate then return a.rate > b.rate end
+    return a.item < b.item
+  end)
+
+  local plan, left = {}, amount
+  local avail = {}
+  for item, c in pairs(stock) do avail[item] = c end
+
+  for _, d in ipairs(denoms) do
+    if left <= 0 then break end
+    local maxTake = math.min(math.floor(left / d.rate), avail[d.item] or 0)
+    if maxTake > 0 then
+      plan[d.item] = maxTake
+      avail[d.item] = (avail[d.item] or 0) - maxTake
+      left = left - maxTake * d.rate
+    end
+  end
+  return plan, left
+end
+
+--- Move `need` of `item` from storage → deposit. Returns moved count.
+local function pushItemToDeposit(stor, sname, dname, item, need)
+  local moved = 0
+  local list = stor.list() or {}
+  local slots = {}
+  for slot, detail in pairs(list) do
+    if type(detail) == "table" and detail.name == item then
+      slots[#slots + 1] = slot
+    end
+  end
+  table.sort(slots)
+  for _, slot in ipairs(slots) do
+    if moved >= need then break end
+    local detail = stor.list()[slot]
+    local have = (type(detail) == "table" and tonumber(detail.count)) or 0
+    local want = math.min(need - moved, have)
+    if want > 0 then
+      local okp, n = pcall(stor.pushItems, dname, slot, want)
+      n = (okp and tonumber(n)) or 0
+      moved = moved + n
+      if n <= 0 then break end
+    end
+  end
+  return moved
+end
+
 local function cmdWithdraw(a)
   if not requireAuth("withdraw") then return end
   local player, n = a[2], tonumber(a[3])
@@ -552,12 +727,76 @@ local function cmdWithdraw(a)
   end
   n = math.floor(n)
   if n <= 0 then print("Need positive chips."); return end
+
+  local stor, sname = wrapStorage()
+  local dep, dname = wrapDeposit()
+  if not stor then
+    print("Bind storage chest: bind storage <name|side>"); return
+  end
+  if not dep then
+    print("Bind deposit chest: bind deposit <name|side>"); return
+  end
+  if dname == sname then
+    print("Deposit and storage must be different chests."); return
+  end
+  if type(stor.pushItems) ~= "function" then
+    print("Storage cannot pushItems (need inventory peripheral)."); return
+  end
+
   loadDisk()
   local bal = getBal(player)
-  if bal < n then print(("Insufficient (%d)."):format(bal)); return end
-  setBal(player, bal - n)
+  if bal < n then
+    print(("Insufficient player chips (%d)."):format(bal))
+    return
+  end
+
+  local stock, vaultValue = storageStock(stor)
+  if vaultValue < n then
+    print(("Not enough money in storage (have %d chips worth, need %d)."):format(
+      vaultValue, n))
+    return
+  end
+
+  local plan, leftover = planWithdrawItems(n, stock)
+  if leftover > 0 then
+    print(("Cannot make exact %d chips from storage stock (short %d)."):format(
+      n, leftover))
+    print(("Storage vault value: %d chips."):format(vaultValue))
+    return
+  end
+
+  print("Paying out from storage → deposit:")
+  local paidValue, totalItems = 0, 0
+  for item, count in pairs(plan) do
+    local rate = tonumber(data.rates[item]) or 0
+    local moved = pushItemToDeposit(stor, sname, dname, item, count)
+    if moved < count then
+      -- Partial physical move — credit only what left storage; abort cleanly.
+      print(("Moved only %d/%d of %s — deposit may be full."):format(
+        moved, count, item))
+      if moved > 0 then
+        paidValue = paidValue + rate * moved
+        totalItems = totalItems + moved
+      end
+      if paidValue <= 0 then
+        print("Nothing withdrawn."); return
+      end
+      print(("Partial withdraw: debiting %d chips for moved items."):format(paidValue))
+      setBal(player, bal - paidValue)
+      local ok, err = saveDisk()
+      print(("Balance=%d"):format(select(1, getBal(player))))
+      if not ok then print("Save failed: " .. tostring(err)) end
+      return
+    end
+    paidValue = paidValue + rate * moved
+    totalItems = totalItems + moved
+    print(("  %dx %s (%d chips)"):format(moved, item, rate * moved))
+  end
+
+  setBal(player, bal - paidValue)
   local ok, err = saveDisk()
-  print(("Withdrew %d from %s. Balance=%d"):format(n, player, select(1, getBal(player))))
+  print(("Withdrew %d chips for %s (%d items → deposit). Balance=%d"):format(
+    paidValue, player, totalItems, select(1, getBal(player))))
   if not ok then print("Save failed: " .. tostring(err)) end
 end
 
@@ -584,6 +823,7 @@ local function cmdStatus()
   print("== Currency Manager v" .. VERSION .. " ==")
   print("Storage: " .. tostring(cfg.storage or cfg.chest or "(unbound)"))
   print("Deposit: " .. tostring(cfg.deposit or "(unbound)"))
+  print("Detect:  " .. (findDetector() and ("OK (range " .. PLAYER_RANGE .. ")") or "NONE"))
   print("Drive:   " .. tostring(cfg.drive or "(auto)"))
   print("Floppy:  " .. tostring(diskPath() or "NONE"))
   print("Pass:    " .. (hasPass() and "set" or "NOT SET"))
@@ -596,23 +836,21 @@ end
 
 local function cmdHelp()
   print([[
+Currency Manager = ledger/admin. Players use casino_atm.
+
 setpass | login | logout
-bind storage|deposit|drive <name|side>
+bind storage|deposit|drive <name|side>   (password)
 invs | drives | status
-  storage = accepted samples + vault
-  deposit = player drop-off (vanilla chests)
-scan          STORAGE → accepted list (floppy)
-rates         set chips per item
-rate <item> <chips>
-deposit <player>   move accepted DEPOSIT→STORAGE + credit
-withdraw <player> <chips>
-balance [player]
+scan / rates / rate …                    (password)
+deposit [player|#]   emergency chest credit (prefer ATM)
+withdraw <player> <chips>  (password) emergency chest payout
+balance [player]                         (password)
 help | exit
 ]])
 end
 
 --------------------------------------------------------------------------------
--- Rednet casino API (no password — chips already credited by auth'd deposit)
+-- Rednet casino API (games spend/payout chips already on the floppy ledger)
 --------------------------------------------------------------------------------
 local function announce()
   local payload = {
@@ -646,6 +884,39 @@ local function handleNet(from, msg)
       player = player,
       chips = bal,
       from = os.getComputerID(),
+    }, PROTO)
+  elseif t == "casino_rates_req" then
+    loadDisk()
+    rednet.send(replyTo, {
+      type = "casino_rates",
+      ok = true,
+      accepted = data.accepted,
+      rates = data.rates,
+      from = os.getComputerID(),
+    }, PROTO)
+  elseif t == "casino_credit" then
+    -- ATM explicit deposit: trust mesh ATM after it verified chest contents.
+    loadDisk()
+    local player = msg.player or msg.name
+    local amount = math.floor(tonumber(msg.amount or msg.count) or 0)
+    local disp = select(2, playerKey(player))
+    if not disp then
+      rednet.send(replyTo, { type = "casino_ack", ok = false, err = "bad player", op = "credit" }, PROTO)
+      return
+    end
+    if amount <= 0 then
+      rednet.send(replyTo, {
+        type = "casino_ack", ok = false, err = "bad amount", op = "credit",
+        chips = select(1, getBal(player)),
+      }, PROTO)
+      return
+    end
+    local bal = getBal(player)
+    setBal(player, bal + amount)
+    saveDisk()
+    rednet.send(replyTo, {
+      type = "casino_ack", ok = true, op = "credit",
+      player = player, amount = amount, chips = select(1, getBal(player)),
     }, PROTO)
   elseif t == "casino_bet" then
     loadDisk()
@@ -745,7 +1016,7 @@ if not hasPass() then
 else
   print("Floppy OK. login to manage currency.")
 end
-print("Bind storage + deposit chests, scan storage, then deposit <player>.")
+print("Bind storage + deposit (+ Player Detector). Public: deposit")
 print("Type help. Mesh casino API online.")
 print("")
 

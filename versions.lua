@@ -5,11 +5,11 @@
   The console `packages` command shows these names + versions.
   Installers / OTA updates ship this file so devices know what they have.
 
-  Titan-Version: 1.6.73
+  Titan-Version: 1.6.77
 ]]
 
 return {
-  system = "1.6.73",
+  system = "1.6.77",
   packages = {
     ["lib/titan.lua"]      = "1.2.26",
     ["lib/casino.lua"]     = "1.0.1",
@@ -21,9 +21,9 @@ return {
     ["lib/router_hub_net.lua"] = "1.4.6",
     ["lib/router_hub_ui.lua"]  = "1.4.3",
     ["lib/router_hub_cmd.lua"] = "1.4.3",
-    ["install.lua"]        = "1.2.11",
-    ["github_install.lua"] = "1.2.14",
-    ["pastebin_install.lua"]= "1.2.11",
+    ["install.lua"]        = "1.2.13",
+    ["github_install.lua"] = "1.2.16",
+    ["pastebin_install.lua"]= "1.2.13",
     ["datacenter.lua"]     = "1.2.14",
     ["admin.lua"]          = "1.5.9",
     ["quarry/workers/offline_miner.lua"] = "1.6.0",
@@ -33,10 +33,14 @@ return {
     ["offline_site.lua"]   = "1.0.0",
     ["storage/managers/storage_manager.lua"] = "1.0.0",
     ["storage/workers/storage_builder.lua"] = "1.0.0",
+    ["storage/managers/storage_atm.lua"] = "1.0.0",
     ["storage_manager.lua"] = "1.0.0",
     ["storage_builder.lua"] = "1.0.0",
-    ["games/managers/currency_manager.lua"] = "1.0.2",
-    ["currency_manager.lua"] = "1.0.2",
+    ["storage_atm.lua"] = "1.0.0",
+    ["games/managers/currency_manager.lua"] = "1.0.5",
+    ["currency_manager.lua"] = "1.0.5",
+    ["games/managers/casino_atm.lua"] = "1.0.0",
+    ["casino_atm.lua"] = "1.0.0",
     ["perimeter_sensor.lua"] = "1.2.8",
     ["perimeter_manager.lua"]= "1.3.8",
     ["tetris.lua"]         = "1.2.8",
@@ -48,8 +52,8 @@ return {
     ["games.lua"]          = "1.0.7",
     ["games_catalog.lua"]  = "1.0.6",
     ["games_install.lua"]  = "1.0.3",
-    ["host.lua"]           = "1.2.13",
+    ["host.lua"]           = "1.2.15",
     ["exclude.txt"]        = "1.0.1",
-    ["versions.lua"]       = "1.6.73",
+    ["versions.lua"]       = "1.6.77",
   },
 }

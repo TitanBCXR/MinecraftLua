@@ -22,7 +22,9 @@ A wireless dispatch system for Minecraft's **CC: Tweaked** mod (active packages)
 - **`higher_lower.lua`** — Pair of Jacks+ video poker → Higher/Lower streak (cash out or risk for jackpot at 10).
 - **`slots.lua`** — 3-reel slots (bet/spin animation, coin bank; monitor tap UI).
 - **`games.lua`** + **`games_catalog.lua`** — Games launcher: HTTP updates; **S** settings for speaker vs modem (global LB / casino chips).
-- **`games/managers/currency_manager.lua`** — password-protected casino: scan chest tender → floppy rates; deposit chips for gambling games.
+- **`games/managers/currency_manager.lua`** — casino ledger (floppy rates/balances); mesh API for games + ATMs.
+- **`games/managers/casino_atm.lua`** — casino ATM (chips + Create ticker).
+- **`storage/managers/storage_atm.lua`** — solo Create storage ATM (items only, no casino/mesh).
 - **`games_install.lua`** — **Games-only** installer (separate from the fleet installer).
 - **`github_install.lua`** — Fleet / Titan role installer (routers, quarry, admin, …).
 - **`lib/titan.lua`** — shared library (protocol, messaging, navigation).
@@ -513,45 +515,71 @@ game, **U** update, **S** settings, **Q** quit. Closing a game returns here.
 
 **Host leaderboards:** floppy `games_leaderboard.cfg` (migrates old Tetris LB).
 
-**Currency Manager** (installer → Games → **c**):
+**Currency Manager** (installer → Games → **c**) — ledger only (floppy + mesh).
+
+**Casino ATM** (installer → Games → **a**) — player deposit / withdraw.
 
 ```text
-[Deposit chest]  --touching/wired--> [Currency Manager PC] --disk--> floppy
-[Storage chest]  --touching/wired-->/           |
-                                           wireless mesh
-                                                v
-                                      slots / poker / higher_lower
+[ATM intake chest] --frogport--> Create vault network
+[ATM + detector + Stock Ticker] --mesh--> [Currency Manager + floppy]
+        | requestFiltered(address) only if chips + Create stock cover it
+        v
+   package → frogport @ ATM address (withdraw output)
 ```
 
-Use **vanilla** chests/barrels. Most modded storage will not connect a CC modem.
+**Manager setup:** floppy → `setpass` → bind a sample chest → `scan` → `rates`.
 
-- **storage** — sample accepted currency (`scan`) and vault for deposited tender  
-- **deposit** — players drop items here; `deposit <player>` moves accepted items
-  into storage and credits chips. Unaccepted items stay in deposit (warned).
-
-1. Insert floppy → `setpass`.
-2. `invs` → `bind storage <side|name>` and `bind deposit <side|name>`.
-3. Put sample coins in **storage** → `scan` → `rates`.
-4. Players put tender in **deposit** → `deposit <player>` (moves accepted → storage).
-5. On game cabinets: Games **S** → modem mode → play gambling games.
-
-**Player identity (managed games):** put an Advanced Peripherals **Player Detector**
-next to each gambling PC (slots / poker / higher-lower). On launch the game reads
-the nearby player and fetches their chip balance from the Currency Manager over
-the mesh. Closest player wins if several are in range (~8 blocks). If a detector
-is present but empty, the game asks you to stand closer (does not reuse the last
-saved name). Without a detector, it falls back to typed / saved name.
+**ATM setup:** modem + Player Detector + vanilla **intake** chest + Create **Stock
+Ticker**. Frogport watches the intake (hauls to vault after credit). Set this
+ATM’s Create package address for withdraws:
 
 ```text
-[Player] → [Player Detector] → [Game PC + modem] --mesh--> [Currency Manager]
+bind intake left
+address ATM-1
+deposit
+withdraw
 ```
+
+- **Deposit:** put coins in intake → `deposit` → pick player → confirm **y**.
+  Chips credit **only after confirm**. Items stay for the frogport → vault.
+- **Withdraw:** checks player chips **and** Create `stock()`. Stock Ticker is
+  called **only if** both cover the amount; then chips are debited and a
+  package is sent to `address`.
+
+**Player identity (managed games):** Player Detector on each gambling PC; games
+load that player’s balance from the Currency Manager over the mesh.
 
 ---
 
 # Storage (`storage/managers` + `storage/workers`)
 
 Installer: **s → Storage → Managers / Workers**. Root `storage_manager.lua` /
-`storage_builder.lua` are thin shims.
+`storage_builder.lua` / `storage_atm.lua` are thin shims.
+
+## Storage ATM (Create only)
+
+Installer: **s → Storage → Managers → 2**. Standalone item ATM — **no** casino,
+**no** Currency Manager, **no** mesh required.
+
+```text
+[Intake chest] --frogport--> Create vault network
+[Storage ATM + Stock Ticker]
+        | requestFiltered only if stock has enough
+        v
+   package → frogport @ ATM address
+```
+
+```text
+bind intake left
+address Warehouse-1
+stock iron
+deposit
+withdraw minecraft:iron_ingot 64
+```
+
+- **deposit** — confirm what’s in the intake; items stay for the frogport  
+- **withdraw** — checks Create `stock()` first; ticker is called only if enough  
+- **stock [filter]** — browse the Create network
 
 Bulk storage cell (v1 — no auto-crafting, no GPS courier):
 
