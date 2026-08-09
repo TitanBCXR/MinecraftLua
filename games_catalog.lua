@@ -1,6 +1,6 @@
 --[[
   games_catalog.lua  -  Titan games suite catalog
-  Titan-Version: 1.0.2
+  Titan-Version: 1.0.5
 
   Source of truth for the Games launcher (`games.lua`).
   Add a new game here (+ versions.lua + ship the .lua) and every launcher
@@ -12,11 +12,14 @@
 ]]
 
 return {
-  version = "1.0.2",
+  version = "1.0.5",
   base = "https://raw.githubusercontent.com/TitanBCXR/MinecraftLua/main/",
   -- Launcher self-update files (always kept current).
   launcher = {
-    files = { "games.lua", "games_catalog.lua", "versions.lua" },
+    files = {
+      "games.lua", "games_catalog.lua", "versions.lua",
+      "lib/casino.lua", "lib/games_economy.lua",
+    },
   },
   games = {
     {
@@ -38,14 +41,21 @@ return {
       name = "Luigi Picture Poker",
       run = "luigi_poker.lua",
       desc = "Beat Luigi's hand (pocket-first)",
-      files = { "luigi_poker.lua" },
+      files = { "luigi_poker.lua", "lib/casino.lua", "lib/games_economy.lua" },
+    },
+    {
+      id = "higher_lower",
+      name = "Higher / Lower Poker",
+      run = "higher_lower.lua",
+      desc = "Win the hand, then guess Higher or Lower",
+      files = { "higher_lower.lua", "lib/casino.lua", "lib/games_economy.lua" },
     },
     {
       id = "slots",
       name = "Slots",
       run = "slots.lua",
       desc = "3-reel slots",
-      files = { "slots.lua" },
+      files = { "slots.lua", "lib/casino.lua", "lib/games_economy.lua" },
     },
   },
 }

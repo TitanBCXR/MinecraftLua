@@ -1,39 +1,51 @@
 --[[
   slots.lua  -  3-reel slots for CC: Tweaked
-  Titan-Version: 1.0.1
+  Titan-Version: 1.0.3
 
   Run:
 
       slots
-      slots --launcher   (from Games launcher: Close returns, no shutdown)
+      slots --launcher [--managed|--unmanaged]
+      slots --speaker --launcher --unmanaged
 
-  Bet coins, spin three reels, win on matching lines. Pocket / advanced PC;
-  color monitor gets a tap UI with spinning reels.
+  Bet chips (no hard cap — only what you have). Buttons +10 / +50 / +100.
 
   Controls:
-    +/- or [ ]   change bet
-    Space / SPIN spin
+    +10 +50 +100   raise bet (capped at balance)
+    Space / SPIN   spin
     M mute   Q / CLOSE quit
 ]]
 
 local CFG = "slots.cfg"
 local START_COINS = 100
-local MAX_BET = 10
 
 local NATIVE = term.current()
 local USING_MONITOR = false
 local FROM_LAUNCHER = false
+local SPEAKER_ONLY = false
+local FORCE_MANAGED = false
+local FORCE_UNMANAGED = false
 do
   local argv = { ... }
   for i = 1, #argv do
     local s = tostring(argv[i] or ""):lower()
     if s == "--launcher" or s == "launcher" then FROM_LAUNCHER = true end
+    if s == "--speaker" or s == "speaker" then SPEAKER_ONLY = true end
+    if s == "--managed" or s == "managed" then FORCE_MANAGED = true end
+    if s == "--unmanaged" or s == "unmanaged" then FORCE_UNMANAGED = true end
   end
 end
 local SPEAKER = nil
 local MUSIC_ON = true
 local COINS = START_COINS
 local BEST = START_COINS
+local CASINO, USE_CASINO = nil, false
+local USE_WALLET = false
+local econ = nil
+if fs.exists("lib/games_economy.lua") then
+  local ok, e = pcall(dofile, "lib/games_economy.lua")
+  if ok then econ = e; econ.load() end
+end
 
 -- Symbol weights (higher = more common). Payouts for 3-of-a-kind / 2-of-a-kind.
 local SYMBOLS = {
@@ -124,9 +136,77 @@ local function saveCfg()
   local f = fs.open(CFG, "w")
   f.write(textutils.serialize({ coins = COINS, best = BEST, music = MUSIC_ON }))
   f.close()
+  if USE_WALLET and econ then econ.setCoins(COINS) end
 end
 
 loadCfg()
+
+local function clampBet(bet)
+  local max = math.max(0, COINS)
+  if max < 1 then return 1 end
+  bet = math.floor(tonumber(bet) or 1)
+  if bet < 1 then bet = 1 end
+  if bet > max then bet = max end
+  return bet
+end
+
+local function addBet(state, delta)
+  state.bet = clampBet((state.bet or 1) + delta)
+end
+
+local function initEconomy()
+  local managed = FORCE_MANAGED or (econ and econ.isManaged() and not FORCE_UNMANAGED)
+  local unmanaged = FORCE_UNMANAGED or (econ and econ.isUnmanaged() and not FORCE_MANAGED)
+  if unmanaged and econ then
+    USE_WALLET = true
+    local w = econ.getCoins()
+    if w == nil then w = econ.ensureWallet(econ.grant, false) end
+    COINS = w
+    if COINS > BEST then BEST = COINS end
+    return
+  end
+  if managed and not SPEAKER_ONLY and fs.exists("lib/casino.lua") then
+    local ok, c = pcall(dofile, "lib/casino.lua")
+    if ok and type(c) == "table" then
+      CASINO = c
+      if CASINO.open and CASINO.open() then
+        print("Casino mesh…")
+        local bal = CASINO.ensurePlayer()
+        if bal ~= nil then
+          USE_CASINO = true
+          COINS = bal
+          print(("Chips: %d (%s)"):format(COINS, tostring(CASINO.player)))
+          sleep(0.6)
+          return
+        end
+      end
+    end
+  end
+end
+
+local function spendBet(n)
+  if USE_CASINO and CASINO then
+    local ok, err = CASINO.bet(n)
+    if not ok then return false, err end
+    COINS = CASINO.chips()
+    return true
+  end
+  if COINS < n then return false, "broke" end
+  COINS = COINS - n
+  if USE_WALLET and econ then econ.setCoins(COINS) end
+  return true
+end
+
+local function creditWin(n)
+  n = math.floor(tonumber(n) or 0)
+  if USE_CASINO and CASINO then
+    if n > 0 then CASINO.payout(n) end
+    COINS = CASINO.chips()
+    return
+  end
+  COINS = COINS + n
+  if USE_WALLET and econ then econ.setCoins(COINS) end
+end
 
 --------------------------------------------------------------------------------
 -- Audio
@@ -241,7 +321,8 @@ local function drawScreen(state)
   local hdr = color and colors.purple or colors.gray
   fill(1, 1, tw, 1, hdr)
   textAt(2, 1, " SLOTS ", colors.white, hdr)
-  textAt(2, 2, ("Coins:%d  Bet:%d  Best:%d"):format(COINS, state.bet, BEST):sub(1, tw - 2),
+  local unit = USE_CASINO and "Chips" or "Coins"
+  textAt(2, 2, ("%s:%d  Bet:%d  Best:%d"):format(unit, COINS, state.bet, BEST):sub(1, tw - 2),
     colors.yellow, colors.black)
 
   -- Three reels
@@ -275,19 +356,24 @@ local function drawScreen(state)
     textAt(2, msgY, "3 Diamonds = 50x   3 Sevens = 25x", colors.gray, colors.black)
   end
 
-  -- Buttons
-  local padH = math.max(2, math.min(4, th - (msgY + 1)))
-  local by = th - padH + 1
-  local bw = math.floor(tw / 4)
+  -- Bet row (+10/+50/+100) + action row (SPIN / CLOSE)
+  local rows = 2
+  local padH = math.max(2, math.min(3, math.floor((th - msgY - 1) / rows)))
+  local byBet = th - padH * 2 + 1
+  local byAct = th - padH + 1
+  local bw3 = math.floor(tw / 3)
+  local bw2 = math.floor(tw / 2)
   state.btns = {
-    minus = { x = 1, y = by, w = bw, h = padH },
-    plus  = { x = bw + 1, y = by, w = bw, h = padH },
-    spin  = { x = 2 * bw + 1, y = by, w = bw, h = padH },
-    quit  = { x = 3 * bw + 1, y = by, w = tw - 3 * bw, h = padH },
+    b10  = { x = 1, y = byBet, w = bw3, h = padH },
+    b50  = { x = bw3 + 1, y = byBet, w = bw3, h = padH },
+    b100 = { x = 2 * bw3 + 1, y = byBet, w = tw - 2 * bw3, h = padH },
+    spin = { x = 1, y = byAct, w = bw2, h = padH },
+    quit = { x = bw2 + 1, y = byAct, w = tw - bw2, h = padH },
   }
   local busy = state.spinning
-  drawBtn(state.btns.minus, " -BET ", color and colors.gray or colors.black)
-  drawBtn(state.btns.plus, " +BET ", color and colors.gray or colors.black)
+  drawBtn(state.btns.b10, " +10 ", color and colors.gray or colors.black)
+  drawBtn(state.btns.b50, " +50 ", color and colors.lightGray or colors.black)
+  drawBtn(state.btns.b100, " +100 ", color and colors.white or colors.black, colors.black)
   drawBtn(state.btns.spin, busy and " ..." or " SPIN ",
     color and (busy and colors.gray or colors.lime) or colors.white, colors.black)
   drawBtn(state.btns.quit, FROM_LAUNCHER and " CLOSE " or " QUIT ",
@@ -299,12 +385,12 @@ end
 --------------------------------------------------------------------------------
 local function beginSpin(state)
   if state.spinning then return false end
-  if COINS < state.bet then
-    state.message = "Not enough coins!"
+  local ok, err = spendBet(state.bet)
+  if not ok then
+    state.message = USE_CASINO and ("Casino: " .. tostring(err)) or "Not enough coins!"
     return false
   end
-  COINS = COINS - state.bet
-  saveCfg()
+  if not USE_CASINO then saveCfg() end
   state.spinning = true
   state.stopped = 0
   state.reels = { rollSymbol(), rollSymbol(), rollSymbol() }
@@ -338,18 +424,15 @@ local function spinTick(state)
     local win, msg, big = payout(state.reels[1], state.reels[2], state.reels[3], state.bet)
     state.lastWin = win
     if win > 0 then
-      COINS = COINS + win
+      creditWin(win)
       state.message = msg .. "  +" .. win
       if big then sfx("big") else sfx("win") end
     else
       state.message = msg
       sfx("lose")
     end
-    if COINS <= 0 then
-      COINS = START_COINS
-      state.message = (state.message or "") .. "  (refilled)"
-    end
-    saveCfg()
+    if not USE_CASINO then saveCfg() end
+    state.bet = clampBet(state.bet)
     return false
   end
   return true
@@ -361,12 +444,13 @@ end
 local function main()
   attachMonitor()
   refreshSpeaker()
+  initEconomy()
   local state = {
-    bet = 1,
+    bet = clampBet(1),
     reels = { 1, 2, 3 },
     spinning = false,
     stopped = 3,
-    message = "Tap SPIN to play",
+    message = "Bet +10/+50/+100 then SPIN",
     lastWin = 0,
     btns = {},
   }
@@ -390,12 +474,14 @@ local function main()
       else
         local b = state.btns
         local mx, my = p2, p3
-        if inBtn(b.minus, mx, my) then
-          state.bet = math.max(1, state.bet - 1); sfx("coin"); drawScreen(state)
-        elseif inBtn(b.plus, mx, my) then
-          state.bet = math.min(MAX_BET, state.bet + 1, math.max(1, COINS))
-          sfx("coin"); drawScreen(state)
+        if inBtn(b.b10, mx, my) then
+          addBet(state, 10); sfx("coin"); drawScreen(state)
+        elseif inBtn(b.b50, mx, my) then
+          addBet(state, 50); sfx("coin"); drawScreen(state)
+        elseif inBtn(b.b100, mx, my) then
+          addBet(state, 100); sfx("coin"); drawScreen(state)
         elseif inBtn(b.spin, mx, my) then
+          state.bet = clampBet(state.bet)
           if beginSpin(state) then
             drawScreen(state)
             spinTimer = os.startTimer(0.09)
@@ -413,11 +499,11 @@ local function main()
         MUSIC_ON = not MUSIC_ON; saveCfg()
         if not MUSIC_ON then stopMusic() end
       elseif not state.spinning then
-        if p1 == K.left or p1 == K.minus then
-          state.bet = math.max(1, state.bet - 1); drawScreen(state)
-        elseif p1 == K.right or p1 == K.equals then
-          state.bet = math.min(MAX_BET, state.bet + 1, math.max(1, COINS)); drawScreen(state)
+        if p1 == K.one then addBet(state, 10); drawScreen(state)
+        elseif p1 == K.two then addBet(state, 50); drawScreen(state)
+        elseif p1 == K.three then addBet(state, 100); drawScreen(state)
         elseif p1 == K.space or p1 == K.enter then
+          state.bet = clampBet(state.bet)
           if beginSpin(state) then
             drawScreen(state)
             spinTimer = os.startTimer(0.09)
@@ -432,10 +518,12 @@ local function main()
       elseif ch == "m" then
         MUSIC_ON = not MUSIC_ON; saveCfg()
         if not MUSIC_ON then stopMusic() end
-      elseif not state.spinning and (ch == "+" or ch == "]") then
-        state.bet = math.min(MAX_BET, state.bet + 1, math.max(1, COINS)); drawScreen(state)
-      elseif not state.spinning and (ch == "-" or ch == "[") then
-        state.bet = math.max(1, state.bet - 1); drawScreen(state)
+      elseif not state.spinning and ch == "1" then
+        addBet(state, 10); drawScreen(state)
+      elseif not state.spinning and ch == "2" then
+        addBet(state, 50); drawScreen(state)
+      elseif not state.spinning and ch == "3" then
+        addBet(state, 100); drawScreen(state)
       end
     elseif ev == "terminate" then
       return

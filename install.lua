@@ -1,6 +1,6 @@
 --[[
   install.lua  -  Titan network installer (CC: Tweaked)
-  Titan-Version: 1.2.9
+  Titan-Version: 1.2.11
 
   Downloads the Titan bot-network system onto this device from a running
   `host.lua` on the same rednet network (no pastebin / external web host).
@@ -27,16 +27,21 @@ local KEEP_ALL = {
   "lib/router_hub_net.lua", "lib/router_hub_ui.lua", "lib/router_hub_cmd.lua",
   "quarry/workers/offline_miner.lua", "quarry/workers/strip_miner.lua",
   "quarry/managers/offline_site.lua",
+  "storage/managers/storage_manager.lua", "storage/workers/storage_builder.lua",
+  "storage_manager.lua", "storage_builder.lua",
   "offline_miner.lua", "offline_site.lua", "exclude.txt",
   "perimeter_sensor.lua", "perimeter_manager.lua", "tetris.lua", "minesweeper.lua",
-  "sandstorm.lua", "luigi_poker.lua", "slots.lua",
+  "sandstorm.lua", "luigi_poker.lua", "higher_lower.lua", "slots.lua",
+  "lib/casino.lua", "lib/games_economy.lua",
+  "games/managers/currency_manager.lua", "currency_manager.lua",
   "games.lua", "games_catalog.lua",
   "host.lua", "versions.lua", "install.lua",
 }
 
 local GAMES_SUITE = {
   "games.lua", "games_catalog.lua", "versions.lua", "lib/titan.lua",
-  "tetris.lua", "minesweeper.lua", "luigi_poker.lua", "slots.lua",
+  "lib/casino.lua", "lib/games_economy.lua",
+  "tetris.lua", "minesweeper.lua", "luigi_poker.lua", "higher_lower.lua", "slots.lua",
 }
 
 local GAMES = {
@@ -47,9 +52,13 @@ local GAMES = {
   { key = "2", name = "Minesweeper (pocket / monitor)", run = "minesweeper.lua",
     files = { "minesweeper.lua" } },
   { key = "3", name = "Luigi Picture Poker (pocket)", run = "luigi_poker.lua",
-    files = { "luigi_poker.lua" } },
-  { key = "4", name = "Slots (3-reel)", run = "slots.lua",
-    files = { "slots.lua" } },
+    files = { "luigi_poker.lua", "lib/casino.lua" } },
+  { key = "4", name = "Higher / Lower Poker", run = "higher_lower.lua",
+    files = { "higher_lower.lua", "lib/casino.lua" } },
+  { key = "5", name = "Slots (3-reel)", run = "slots.lua",
+    files = { "slots.lua", "lib/casino.lua" } },
+  { key = "c", name = "Currency Manager (casino chips)", run = "games/managers/currency_manager.lua",
+    files = { "lib/titan.lua", "games/managers/currency_manager.lua", "currency_manager.lua" } },
 }
 
 local QUARRY_WORKERS = {
@@ -69,11 +78,29 @@ local QUARRY = {
   { key = "m", name = "Managers...", submenu = "quarry_managers" },
 }
 
+local STORAGE_WORKERS = {
+  { key = "1", name = "Storage builder turtle", run = "storage/workers/storage_builder.lua",
+    files = { "lib/titan.lua", "storage/workers/storage_builder.lua", "storage_builder.lua" } },
+}
+
+local STORAGE_MANAGERS = {
+  { key = "1", name = "Storage Manager (vault + I/O)", run = "storage/managers/storage_manager.lua",
+    files = { "lib/titan.lua", "storage/managers/storage_manager.lua", "storage_manager.lua" } },
+}
+
+local STORAGE = {
+  { key = "w", name = "Workers...", submenu = "storage_workers" },
+  { key = "m", name = "Managers...", submenu = "storage_managers" },
+}
+
 local SUBMENUS = {
   games = GAMES,
   quarry = QUARRY,
   quarry_workers = QUARRY_WORKERS,
   quarry_managers = QUARRY_MANAGERS,
+  storage = STORAGE,
+  storage_workers = STORAGE_WORKERS,
+  storage_managers = STORAGE_MANAGERS,
 }
 
 local ROLES = {
@@ -88,6 +115,7 @@ local ROLES = {
               "lib/router_hub_net.lua", "lib/router_hub_ui.lua", "lib/router_hub_cmd.lua",
               "versions.lua" } },
   { key = "q", name = "Quarry (workers & managers)...", submenu = "quarry" },
+  { key = "s", name = "Storage (workers & managers)...", submenu = "storage" },
   { key = "7", name = "Perimeter sensor (Player Detector gate)", run = "perimeter_sensor.lua",
     files = { "lib/titan.lua", "perimeter_sensor.lua" } },
   { key = "8", name = "Perimeter manager (territory board)", run = "perimeter_manager.lua",
@@ -221,7 +249,7 @@ local function pickRole()
     local list = stack[depth]
     local role = pickFromList(list, {
       title = titles[depth],
-      promptHint = depth == 1 and "What is this device?  (q = Quarry, g = Games)"
+      promptHint = depth == 1 and "What is this device?  (q = Quarry, s = Storage, g = Games)"
         or "Pick an option:",
       backKey = depth > 1 and "b" or nil,
       clearFirst = true,
@@ -318,13 +346,18 @@ local LABELS = {
   ["quarry/workers/offline_miner.lua"] = "OfflineMiner",
   ["quarry/workers/strip_miner.lua"] = "StripMiner",
   ["quarry/managers/offline_site.lua"] = "QuarrySite",
+  ["storage/managers/storage_manager.lua"] = "StorageManager",
+  ["storage/workers/storage_builder.lua"] = "StorageBuilder",
   ["perimeter_sensor.lua"] = "PerimSensor",
   ["perimeter_manager.lua"] = "PerimMgr",
   ["tetris.lua"] = "Tetris",
   ["minesweeper.lua"] = "Mines",
   ["sandstorm.lua"] = "Sandstorm",
   ["luigi_poker.lua"] = "LuigiPoker",
+  ["higher_lower.lua"] = "HigherLower",
   ["slots.lua"] = "Slots",
+  ["games/managers/currency_manager.lua"] = "Casino",
+  ["currency_manager.lua"] = "Casino",
   ["games.lua"] = "Games",
   ["host.lua"] = "TitanHost",
 }

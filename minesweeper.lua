@@ -1,6 +1,6 @@
 --[[
   minesweeper.lua  -  Lightweight Minesweeper for CC: Tweaked
-  Titan-Version: 1.2.2
+  Titan-Version: 1.2.3
 
   Run:
 
@@ -28,11 +28,13 @@ local MUSIC_ON = true
 local NATIVE = term.current()
 local USING_MONITOR = false
 local FROM_LAUNCHER = false
+local SPEAKER_ONLY = false
 do
   local argv = { ... }
   for i = 1, #argv do
     local s = tostring(argv[i] or ""):lower()
     if s == "--launcher" or s == "launcher" then FROM_LAUNCHER = true end
+    if s == "--speaker" or s == "speaker" then SPEAKER_ONLY = true end
   end
 end
 
@@ -109,6 +111,36 @@ local function saveCfg()
 end
 
 loadCfg()
+
+local function submitMinesLb(seconds)
+  if SPEAKER_ONLY then return end
+  local hasModem = false
+  for _, side in ipairs(peripheral.getNames()) do
+    if peripheral.getType(side) == "modem" then
+      if not rednet.isOpen(side) then pcall(rednet.open, side) end
+      hasModem = true
+    end
+  end
+  if not hasModem then return end
+  local name = os.getComputerLabel() or ("P" .. os.getComputerID())
+  if fs.exists("casino_player.cfg") then
+    local f = fs.open("casino_player.cfg", "r")
+    local d = textutils.unserialize(f.readAll() or "")
+    f.close()
+    if type(d) == "table" and d.name then name = d.name end
+  end
+  local payload = {
+    type = "games_lb_submit",
+    game = "minesweeper",
+    score = math.floor(tonumber(seconds) or 0),
+    name = name,
+    lowerIsBetter = true,
+    replyTo = os.getComputerID(),
+    from = os.getComputerID(),
+  }
+  pcall(rednet.broadcast, payload, "titan_install")
+  pcall(rednet.broadcast, payload, "titan_router")
+end
 
 --------------------------------------------------------------------------------
 -- Speaker music (menu + gameplay). No audio files — tiny note tables.
@@ -566,6 +598,7 @@ local function openCell(state, x, y)
     if not prev or state.finalTime < prev then
       BEST[state.diff.key] = state.finalTime
       saveCfg()
+      submitMinesLb(state.finalTime)
     end
     for i = 1, #state.grid do
       if state.grid[i].mine then state.grid[i].flag = true end
@@ -762,7 +795,9 @@ local function drawMenu(sel)
 
   if color then term.setTextColor(colors.gray) end
   term.setCursorPos(2, th)
-  term.write("1-3 play   M mute   Q quit")
+  term.write(FROM_LAUNCHER
+    and "1-3 play   M mute   Q close"
+    or "1-3 play   M mute   Q quit")
 end
 
 local function mainMenu()
@@ -804,9 +839,7 @@ local function mainMenu()
         if MUSIC_ON then resumeMenuMusic() else stopMusic() end
       elseif p1 == keys.q or p1 == keys.backspace then
         stopMusic()
-        term.setBackgroundColor(colors.black)
-        term.clear()
-        term.setCursorPos(1, 1)
+        drainInput()
         return
       end
     elseif ev == "char" then
@@ -820,9 +853,7 @@ local function mainMenu()
         if MUSIC_ON then resumeMenuMusic() else stopMusic() end
       elseif ch == "q" then
         stopMusic()
-        term.setBackgroundColor(colors.black)
-        term.clear()
-        term.setCursorPos(1, 1)
+        drainInput()
         return
       end
     elseif ev == "mouse_click" then
@@ -840,9 +871,30 @@ local function mainMenu()
   end
 end
 
+local function cleanExit()
+  stopMusic()
+  detachMonitor()
+  term.setBackgroundColor(colors.black)
+  term.setTextColor(colors.white)
+  term.clear()
+  term.setCursorPos(1, 1)
+  -- Drop leftover quit keys so the Games launcher does not instantly exit.
+  local t = os.startTimer(0.05)
+  while true do
+    local ev, p1 = os.pullEvent()
+    if ev == "timer" and p1 == t then break end
+  end
+end
+
 math.randomseed(os.epoch("utc") % 2147483647)
 attachMonitor()
 local ok, err = pcall(mainMenu)
-stopMusic()
-detachMonitor()
-if not ok then error(err, 0) end
+cleanExit()
+if not ok then
+  if FROM_LAUNCHER then
+    printError(tostring(err))
+    sleep(1.5)
+  else
+    error(err, 0)
+  end
+end

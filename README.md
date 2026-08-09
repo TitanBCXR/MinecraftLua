@@ -10,13 +10,19 @@ A wireless dispatch system for Minecraft's **CC: Tweaked** mod (active packages)
   - **Workers:** `quarry/workers/offline_miner.lua` (cell fleet) · `quarry/workers/strip_miner.lua` (branch tunnels)
   - **Managers:** `quarry/managers/offline_site.lua` (cell site board + optional Geo Scanner)
   - Root `offline_miner.lua` / `offline_site.lua` are compat shims.
+- **Storage** (`storage/`) — installer submenu **s**:
+  - **Managers:** `storage/managers/storage_manager.lua` (Create vault + Sophisticated I/O)
+  - **Workers:** `storage/workers/storage_builder.lua` (places the vault cell)
+  - Root `storage_manager.lua` / `storage_builder.lua` are compat shims.
 - **`perimeter_sensor.lua` / `perimeter_manager.lua`** — Player Detector territory (one manager + admin alerts).
 - **`tetris.lua`** — Tetris for pocket / advanced PC + monitor (local LB; note music; monitor bottom half = touch pad).
 - **`minesweeper.lua`** — Minesweeper for pocket / advanced PC + monitor (no modem; monitor bottom half = Open/Flag touch pad).
 - **`sandstorm.lua`** — Darude Sandstorm note-block knockoff + desert pixel visualizer (speaker + color monitor).
 - **`luigi_poker.lua`** — Luigi Picture Poker (beat Luigi’s visible hand; pocket-first; hold/draw).
+- **`higher_lower.lua`** — Poker → Higher/Lower (standard deck; your hand only; then guess H/L).
 - **`slots.lua`** — 3-reel slots (bet/spin animation, coin bank; monitor tap UI).
-- **`games.lua`** + **`games_catalog.lua`** — Games launcher: suite update over HTTP; launches games in speaker-only mode (no modem).
+- **`games.lua`** + **`games_catalog.lua`** — Games launcher: HTTP updates; **S** settings for speaker vs modem (global LB / casino chips).
+- **`games/managers/currency_manager.lua`** — password-protected casino: scan chest tender → floppy rates; deposit chips for gambling games.
 - **`games_install.lua`** — **Games-only** installer (separate from the fleet installer).
 - **`github_install.lua`** — Fleet / Titan role installer (routers, quarry, admin, …).
 - **`lib/titan.lua`** — shared library (protocol, messaging, navigation).
@@ -112,6 +118,8 @@ Each device needs (active installer roles):
 | Quarry → Workers → Cell miner | `quarry/workers/offline_miner.lua`, `lib/titan.lua`, `exclude.txt` |
 | Quarry → Workers → Strip miner | `quarry/workers/strip_miner.lua`, `lib/titan.lua`, `exclude.txt` |
 | Quarry → Managers → Site board | `quarry/managers/offline_site.lua`, `lib/titan.lua` (+ modem; Geo Scanner optional) |
+| Storage → Managers → Vault hub | `storage/managers/storage_manager.lua`, `lib/titan.lua` (+ wired modems to vault/I/O) |
+| Storage → Workers → Builder | `storage/workers/storage_builder.lua`, `lib/titan.lua` |
 | Perimeter sensor/manager | `perimeter_*.lua`, `lib/titan.lua`  |
 | Games launcher (**g**) | `games.lua` + catalog + all games (auto-update / auto-add) |
 | One game (**i**) | individual `tetris` / `minesweeper` / … |
@@ -491,6 +499,72 @@ Overlapping gates use a grace timer so walking between detectors doesn’t false
 
 ---
 
+# Games launcher + Casino currency
+
+**Launcher** (`games`): first run asks **Managed** vs **Unmanaged**, then tap a
+game, **U** update, **S** settings, **Q** quit. Closing a game returns here.
+
+**Economy (first install):**
+- **Managed** — in-game items via Currency Manager (mesh); gambling games use casino chips.
+- **Unmanaged** — grants **10,000** local chips (shared wallet); no hard bet cap —
+  only what you have. Bet buttons **+10 / +50 / +100**.
+
+**Settings (S):** mesh speaker/modem toggle + **ECON** to re-run economy setup.
+
+**Host leaderboards:** floppy `games_leaderboard.cfg` (migrates old Tetris LB).
+
+**Currency Manager** (installer → Games → **c**):
+
+```text
+[Chest] --wired--> [Currency Manager PC] --disk--> floppy (casino_currency.cfg)
+                              |
+                         wireless mesh
+                              v
+                    slots / poker / higher_lower
+```
+
+1. Insert floppy → `setpass` (password protects all currency commands).
+2. `bind chest <name>` → put sample tender items in the chest → `scan`.
+3. `rates` — set chips per item type.
+4. `deposit <player>` — credit that name from matching chest items.
+5. On pockets: Games **S** → modem mode → play gambling games (asks player name).
+
+---
+
+# Storage (`storage/managers` + `storage/workers`)
+
+Installer: **s → Storage → Managers / Workers**. Root `storage_manager.lua` /
+`storage_builder.lua` are thin shims.
+
+Bulk storage cell (v1 — no auto-crafting, no GPS courier):
+
+```text
+[Input chest]  -->  [Create Vault]  -->  [Output chest]
+  Sophisticated        mass storage       Sophisticated
+       ^                     ^                  ^
+       +------ wired modems / cable to Storage Manager PC ------+
+```
+
+1. Place (or run the builder turtle `bom` / `build`) vault + Sophisticated input
+   and output chests in a line; put a computer pad at the front.
+2. Right-click wired modems on vault, both chests, and the Storage Manager PC
+   (same cable network). Attach a wireless modem on the PC for the Titan mesh.
+3. On the manager: `invs` then bind peripherals:
+   ```
+   bind vault <peripheralName|side>
+   bind input <peripheralName|side>
+   bind output <peripheralName|side>
+   ```
+4. Drop items in the **input** chest — `ingest` (or the timer) pulls them into
+   the vault. Stock is read from the vault inventory.
+5. From the admin pocket: tile **Storage**, or advanced `stock [filter]` /
+   `request <item> [count]`. Orders go over rednet (`STORAGE_REQUEST`); the
+   manager `pushItems` into the **output** chest for you to pick up.
+
+Manager commands: `status`, `stock`, `find`, `ingest`, `request`, `monitor`.
+
+---
+
 # Quarry (`quarry/workers` + `quarry/managers`)
 
 Installer: **q → Quarry → Workers / Managers**. Scripts live under those folders;
@@ -702,8 +776,8 @@ from the install source (GitHub / pastebin / `host.lua`). Extras on disk that
 aren’t listed show as `*` and are not updated.
 
 Bump versions in `versions.lua` (and each file’s `Titan-Version:` header) when
-you ship a change; current system version is **1.6.0** (`offline_site` **1.3.0**,
-`offline_miner` **1.5.0**, `admin` **1.5.0**).
+you ship a change; current system version is **1.6.67** (`currency_manager` **1.0.0**,
+`higher_lower` **1.0.2**, `games` **1.0.6**).
 
 **Cell fleet:** the site board owns unique XZ cells; miners obey cell assigns and
 drop stale local jobs. Archived packages are under `archive/` (not in installers).
@@ -766,7 +840,7 @@ the floppy is up. **Lock** returns you to the login screen.
 | **Simple** (default) | Anyone — phone home with app tiles | Boot choice / `mode simple` |
 | **Advanced** | Terminal users — command line | Boot choice / `mode advanced` |
 
-**Simple (phone home):** colored app tiles (Stats, Miners, Deploy, Quarry, …).
+**Simple (phone home):** colored app tiles (Stats, Miners, Deploy, Quarry, Storage, …).
 Tap a tile or press `1`–`0`. Left/right (or `a`/`d`) flips pages (10 apps each).
 `E` exits. Wizards and live boards open from the matching app.
 

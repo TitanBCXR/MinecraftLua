@@ -1,6 +1,6 @@
 --[[
   games.lua  -  Titan Games Launcher (CC: Tweaked)
-  Titan-Version: 1.0.4
+  Titan-Version: 1.0.7
 
   Run:
 
@@ -10,19 +10,24 @@
   auto-adds newly published games, removes games dropped from the catalog,
   and launches them from a tap-friendly menu.
 
-  Games are started in --speaker mode (notes / SFX only — no modem or mesh).
-  Updates use HTTP to GitHub, not rednet.
-
-  Pocket + advanced PC (+ color monitor). Needs HTTP enabled.
+  First run: choose Managed (in-game casino currency) or Unmanaged (granted
+  local chips). Settings (S): speaker/modem + economy reminder.
 
   Controls:
-    Tap / Enter  play   U update   Q quit
+    Tap / Enter  play   U update   S settings   Q quit
 ]]
 
 local RAW_FALLBACK = "https://raw.githubusercontent.com/TitanBCXR/MinecraftLua/main/"
 local CAT_FILE = "games_catalog.lua"
 local VER_FILE = "versions.lua"
 local STATE_FILE = "games_launcher.cfg"
+local PREFER_MODEM = false -- false = speaker-only launch
+
+local econ = nil
+if fs.exists("lib/games_economy.lua") then
+  local ok, e = pcall(dofile, "lib/games_economy.lua")
+  if ok then econ = e; econ.load() end
+end
 
 -- Never delete these when pruning removed catalog games.
 local PROTECTED = {
@@ -31,6 +36,10 @@ local PROTECTED = {
   ["versions.lua"] = true,
   ["games_install.lua"] = true,
   ["lib/titan.lua"] = true,
+  ["lib/casino.lua"] = true,
+  ["lib/games_economy.lua"] = true,
+  ["games_economy.cfg"] = true,
+  ["games_wallet.cfg"] = true,
   ["startup.lua"] = true,
   [STATE_FILE] = true,
 }
@@ -116,6 +125,7 @@ local function loadState()
   f.close()
   if type(d) ~= "table" then return end
   LAST_SYNC = tonumber(d.lastSync) or 0
+  PREFER_MODEM = d.preferModem == true
   MANAGED_FILES = {}
   if type(d.managedFiles) == "table" then
     for _, p in ipairs(d.managedFiles) do
@@ -148,8 +158,17 @@ local function saveState()
     lastSync = LAST_SYNC,
     managedFiles = files,
     managedIds = ids,
+    preferModem = PREFER_MODEM == true,
   }))
   f.close()
+end
+
+local function drainEvents(secs)
+  local t = os.startTimer(secs or 0.08)
+  while true do
+    local ev, p1 = os.pullEvent()
+    if ev == "timer" and p1 == t then return end
+  end
 end
 
 local function catalogGameFiles(catalog)
@@ -393,6 +412,7 @@ local TILE = {
   tetris = colors.magenta,
   minesweeper = colors.lightGray,
   luigi_poker = colors.lime,
+  higher_lower = colors.cyan,
   slots = colors.purple,
 }
 
@@ -479,12 +499,143 @@ local function drawMenu(state)
   else
     -- Slim pocket footer hint (no nav buttons).
     fill(1, th, tw, 1, colors.gray)
-    textAt(2, th, "Tap game  U update  Q quit", colors.white, colors.gray)
+    local mode = PREFER_MODEM and "modem" or "spk"
+    textAt(2, th, ("Tap  U upd  S set(%s)  Q"):format(mode):sub(1, tw - 2),
+      colors.white, colors.gray)
   end
 end
 
 local function inRect(mx, my, r)
   return r and mx >= r.x and mx <= r.x + r.w - 1 and my >= r.y and my <= r.y + r.h - 1
+end
+
+local function runEconomySetup()
+  if not econ then return end
+  while true do
+    local tw, th = term.getSize()
+    local color = isColor()
+    fill(1, 1, tw, th, colors.black)
+    fill(1, 1, tw, 1, color and colors.purple or colors.gray)
+    textAt(2, 1, " ECONOMY SETUP ", colors.white, color and colors.purple or colors.gray)
+    textAt(2, 3, "Is this a managed casino?", colors.white, colors.black)
+    textAt(2, 5, "MANAGED", colors.lime, colors.black)
+    textAt(2, 6, " In-game items via Currency", colors.lightGray, colors.black)
+    textAt(2, 7, " Manager (mesh + password).", colors.lightGray, colors.black)
+    textAt(2, 9, "UNMANAGED", colors.yellow, colors.black)
+    textAt(2, 10, (" Local chips — grant %d"):format(econ.DEFAULT_GRANT or 10000),
+      colors.lightGray, colors.black)
+    textAt(2, 11, " once. Bet only what you have.", colors.lightGray, colors.black)
+    local by = th - 3
+    local half = math.floor(tw / 2)
+    local mBtn = { x = 1, y = by, w = half, h = 3 }
+    local uBtn = { x = half + 1, y = by, w = tw - half, h = 3 }
+    fill(1, by, half, 3, color and colors.lime or colors.white)
+    fill(half + 1, by, tw - half, 3, color and colors.orange or colors.gray)
+    textAt(2, by + 1, " MANAGED ", colors.black, color and colors.lime or colors.white)
+    textAt(half + 2, by + 1, " UNMANAGED ", colors.black, color and colors.orange or colors.gray)
+
+    local ev, p1, p2, p3 = pullEv()
+    if ev == "key" then
+      if p1 == keys.one or p1 == keys.m then
+        econ.setMode("managed")
+        PREFER_MODEM = true
+        saveState()
+        STATUS = "Managed casino"
+        return
+      elseif p1 == keys.two or p1 == keys.u then
+        econ.setMode("unmanaged")
+        PREFER_MODEM = false
+        saveState()
+        STATUS = ("Unmanaged +%d chips"):format(econ.grant or 10000)
+        return
+      end
+    elseif ev == "char" then
+      local ch = tostring(p1 or ""):lower()
+      if ch == "1" or ch == "m" then
+        econ.setMode("managed"); PREFER_MODEM = true; saveState()
+        STATUS = "Managed casino"; return
+      elseif ch == "2" or ch == "u" then
+        econ.setMode("unmanaged"); PREFER_MODEM = false; saveState()
+        STATUS = ("Unmanaged +%d chips"):format(econ.grant or 10000); return
+      end
+    elseif ev == "mouse_click" then
+      if inRect(p2, p3, mBtn) then
+        econ.setMode("managed"); PREFER_MODEM = true; saveState()
+        STATUS = "Managed casino"; return
+      elseif inRect(p2, p3, uBtn) then
+        econ.setMode("unmanaged"); PREFER_MODEM = false; saveState()
+        STATUS = ("Unmanaged +%d chips"):format(econ.grant or 10000); return
+      end
+    end
+  end
+end
+
+local function runSettings()
+  if econ then econ.load() end
+  while true do
+    local tw, th = term.getSize()
+    local color = isColor()
+    fill(1, 1, tw, th, colors.black)
+    fill(1, 1, tw, 1, color and colors.orange or colors.gray)
+    textAt(2, 1, " SETTINGS ", colors.white, color and colors.orange or colors.gray)
+    textAt(2, 3, "Launch / mesh:", colors.white, colors.black)
+    local modeLine = PREFER_MODEM
+      and "Modem + global LB / casino"
+      or "Speaker only (local music)"
+    textAt(2, 4, modeLine:sub(1, tw - 2),
+      PREFER_MODEM and colors.lime or colors.yellow, colors.black)
+    local econLine = "(economy not set)"
+    if econ and econ.setupDone then
+      econLine = econ.isManaged() and "Economy: MANAGED (in-game)"
+        or ("Economy: UNMANAGED (%d chips)"):format(econ.getCoins() or econ.grant or 0)
+    end
+    textAt(2, 6, econLine:sub(1, tw - 2), colors.lightGray, colors.black)
+    textAt(2, 8, "Space  toggle modem/speaker", colors.white, colors.black)
+    textAt(2, 9, "E      re-run economy setup", colors.white, colors.black)
+    textAt(2, 10, "Q      back", colors.white, colors.black)
+    local by = th - 2
+    local third = math.floor(tw / 3)
+    local tog = { x = 1, y = by, w = third, h = 2 }
+    local eco = { x = third + 1, y = by, w = third, h = 2 }
+    local back = { x = 2 * third + 1, y = by, w = tw - 2 * third, h = 2 }
+    fill(1, by, third, 2, color and colors.lime or colors.white)
+    fill(third + 1, by, third, 2, color and colors.purple or colors.gray)
+    fill(2 * third + 1, by, tw - 2 * third, 2, color and colors.red or colors.gray)
+    textAt(2, by, " MESH ", colors.black, color and colors.lime or colors.white)
+    textAt(third + 2, by, " ECON ", colors.white, color and colors.purple or colors.gray)
+    textAt(2 * third + 2, by, " BACK ", colors.white, color and colors.red or colors.gray)
+
+    local ev, p1, p2, p3 = pullEv()
+    if ev == "key" then
+      if p1 == keys.q or p1 == keys.backspace then return
+      elseif p1 == keys.space or p1 == keys.enter then
+        PREFER_MODEM = not PREFER_MODEM
+        saveState()
+      elseif p1 == keys.e then
+        runEconomySetup()
+      end
+    elseif ev == "char" then
+      local ch = tostring(p1 or ""):lower()
+      if ch == "q" then return
+      elseif ch == " " or ch == "t" then
+        PREFER_MODEM = not PREFER_MODEM
+        saveState()
+      elseif ch == "e" then
+        runEconomySetup()
+      end
+    elseif ev == "mouse_click" then
+      if inRect(p2, p3, tog) then
+        PREFER_MODEM = not PREFER_MODEM
+        saveState()
+      elseif inRect(p2, p3, eco) then
+        runEconomySetup()
+      elseif inRect(p2, p3, back) then
+        return
+      end
+    elseif ev == "terminate" then
+      return
+    end
+  end
 end
 
 local function launchGame(game)
@@ -493,17 +644,43 @@ local function launchGame(game)
     STATUS = "Missing " .. game.run .. " — press U"
     return
   end
+  if econ then econ.load() end
   detachMonitor()
   term.setBackgroundColor(colors.black)
   term.setTextColor(colors.white)
   term.clear()
   term.setCursorPos(1, 1)
   print("Starting " .. (game.name or game.run) .. "…")
-  print("(speaker mode — Close returns here)")
+  local econFlag = nil
+  if econ and econ.isManaged() then
+    econFlag = "--managed"
+    print("(managed — casino currency)")
+  elseif econ and econ.isUnmanaged() then
+    econFlag = "--unmanaged"
+    print("(unmanaged — local chip wallet)")
+  end
+  if PREFER_MODEM or (econ and econ.isManaged()) then
+    print("(modem mode — Close returns here)")
+  else
+    print("(speaker mode — Close returns here)")
+  end
   sleep(0.2)
-  -- Speaker-only + launcher: Close/Q exits the game (no tablet shutdown).
-  shell.run(game.run, "--speaker", "--launcher")
-  -- Return to launcher UI
+  drainEvents(0.05)
+  local useModem = PREFER_MODEM or (econ and econ.isManaged())
+  if useModem then
+    if econFlag then
+      shell.run(game.run, "--launcher", econFlag)
+    else
+      shell.run(game.run, "--launcher")
+    end
+  else
+    if econFlag then
+      shell.run(game.run, "--speaker", "--launcher", econFlag)
+    else
+      shell.run(game.run, "--speaker", "--launcher")
+    end
+  end
+  drainEvents(0.12)
   attachMonitor()
   STATUS = "Back from " .. (game.name or game.run)
 end
@@ -519,6 +696,12 @@ local function main()
 
   loadState()
   attachMonitor()
+  if econ then
+    econ.load()
+    if not econ.setupDone then
+      runEconomySetup()
+    end
+  end
 
   local state = {
     catalog = loadLocalCatalog(),
@@ -578,6 +761,9 @@ local function main()
         if games[state.sel] then launchGame(games[state.sel]) end
       elseif p1 == K.u then
         doSync()
+      elseif p1 == K.s then
+        runSettings()
+        STATUS = PREFER_MODEM and "Modem mode on" or "Speaker mode on"
       elseif p1 == K.q then
         return
       elseif p1 == K.pageUp then
@@ -590,6 +776,9 @@ local function main()
       local ch = tostring(p1 or ""):lower()
       if ch == "q" then return
       elseif ch == "u" then doSync()
+      elseif ch == "s" then
+        runSettings()
+        STATUS = PREFER_MODEM and "Modem mode on" or "Speaker mode on"
       elseif tonumber(ch) and games[tonumber(ch)] then
         launchGame(games[tonumber(ch)])
       end

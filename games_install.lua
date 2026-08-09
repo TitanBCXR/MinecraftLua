@@ -1,6 +1,6 @@
 --[[
   games_install.lua  -  Titan Games suite installer (CC: Tweaked)
-  Titan-Version: 1.0.1
+  Titan-Version: 1.0.3
 
   Games only — not the fleet / router installer.
 
@@ -23,7 +23,10 @@ local FILES = {
   "tetris.lua",
   "minesweeper.lua",
   "luigi_poker.lua",
+  "higher_lower.lua",
   "slots.lua",
+  "lib/casino.lua",
+  "lib/games_economy.lua",
 }
 
 local function fetch(path)

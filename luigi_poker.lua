@@ -1,45 +1,57 @@
 --[[
   luigi_poker.lua  -  Luigi Picture Poker (SMB3-style) for CC: Tweaked
-  Titan-Version: 1.2.2
+  Titan-Version: 1.2.4
 
   Run:
 
       luigi_poker
-      luigi_poker --launcher   (from Games launcher: Close returns, no shutdown)
+      luigi_poker --launcher [--managed|--unmanaged]
 
   Beat Luigi: he shows a 5-card hand you must beat. Hold/draw once, then
   compare. Win pays 2x (or more if you also hit a bonus hand). Push returns
-  the bet. Pocket-first tap UI; desk PCs may use a color monitor.
+  the bet. Bet with +10 / +50 / +100 (capped at balance).
 
   Cards (low → high): Cloud  Mushroom  Flower  Star  Mario  Luigi
 
   Controls:
     1-5 / tap card   toggle HOLD
     D / DRAW         redraw unheld cards
-    +/- or [ ]       change bet (before deal)
+    +10 +50 +100     raise bet
     Space / DEAL     deal or next hand
     M mute   Q quit
 ]]
 
 local CFG = "luigi_poker.cfg"
 local START_COINS = 100
-local MAX_BET = 5
 
 local NATIVE = term.current()
 local USING_MONITOR = false
 local IS_POCKET = (pocket ~= nil)
 local FROM_LAUNCHER = false
+local SPEAKER_ONLY = false
+local FORCE_MANAGED = false
+local FORCE_UNMANAGED = false
 do
   local argv = { ... }
   for i = 1, #argv do
     local s = tostring(argv[i] or ""):lower()
     if s == "--launcher" or s == "launcher" then FROM_LAUNCHER = true end
+    if s == "--speaker" or s == "speaker" then SPEAKER_ONLY = true end
+    if s == "--managed" or s == "managed" then FORCE_MANAGED = true end
+    if s == "--unmanaged" or s == "unmanaged" then FORCE_UNMANAGED = true end
   end
 end
 local SPEAKER = nil
 local MUSIC_ON = true
 local COINS = START_COINS
 local BEST = START_COINS
+local CASINO, USE_CASINO = nil, false
+local USE_WALLET = false
+local econ = nil
+if fs.exists("lib/games_economy.lua") then
+  local ok, e = pcall(dofile, "lib/games_economy.lua")
+  if ok then econ = e; econ.load() end
+end
 
 -- Rank id 1..6 (Cloud lowest, Luigi highest)
 local RANKS = {
@@ -152,9 +164,76 @@ local function saveCfg()
   local f = fs.open(CFG, "w")
   f.write(textutils.serialize({ coins = COINS, best = BEST, music = MUSIC_ON }))
   f.close()
+  if USE_WALLET and econ then econ.setCoins(COINS) end
 end
 
 loadCfg()
+
+local function clampBet(bet)
+  local max = math.max(0, COINS)
+  if max < 1 then return 1 end
+  bet = math.floor(tonumber(bet) or 1)
+  if bet < 1 then bet = 1 end
+  if bet > max then bet = max end
+  return bet
+end
+
+local function addBet(state, delta)
+  state.bet = clampBet((state.bet or 1) + delta)
+end
+
+local function initEconomy()
+  local managed = FORCE_MANAGED or (econ and econ.isManaged() and not FORCE_UNMANAGED)
+  local unmanaged = FORCE_UNMANAGED or (econ and econ.isUnmanaged() and not FORCE_MANAGED)
+  if unmanaged and econ then
+    USE_WALLET = true
+    local w = econ.getCoins()
+    if w == nil then w = econ.ensureWallet(econ.grant, false) end
+    COINS = w
+    if COINS > BEST then BEST = COINS end
+    return
+  end
+  if managed and not SPEAKER_ONLY and fs.exists("lib/casino.lua") then
+    local ok, c = pcall(dofile, "lib/casino.lua")
+    if ok and type(c) == "table" then
+      CASINO = c
+      if CASINO.open and CASINO.open() then
+        print("Casino mesh…")
+        local bal = CASINO.ensurePlayer()
+        if bal ~= nil then
+          USE_CASINO = true
+          COINS = bal
+          print(("Chips: %d (%s)"):format(COINS, tostring(CASINO.player)))
+          sleep(0.6)
+        end
+      end
+    end
+  end
+end
+
+local function spendBet(n)
+  if USE_CASINO and CASINO then
+    local ok, err = CASINO.bet(n)
+    if not ok then return false, err end
+    COINS = CASINO.chips()
+    return true
+  end
+  if COINS < n then return false, "broke" end
+  COINS = COINS - n
+  if USE_WALLET and econ then econ.setCoins(COINS) end
+  return true
+end
+
+local function creditWin(n)
+  n = math.floor(tonumber(n) or 0)
+  if USE_CASINO and CASINO then
+    if n > 0 then CASINO.payout(n) end
+    COINS = CASINO.chips()
+    return
+  end
+  COINS = COINS + n
+  if USE_WALLET and econ then econ.setCoins(COINS) end
+end
 
 --------------------------------------------------------------------------------
 -- Tiny casino bed (optional speaker)
@@ -490,17 +569,23 @@ local function drawScreen(state)
     textAt(2, below, (msg .. extra):sub(1, tw - 2), fg, colors.black)
   end
 
-  padH = math.max(pocket and 3 or 2, math.min(pocket and 3 or 4, padH))
+  padH = math.max(pocket and 2 or 2, math.min(3, padH))
   local by = th - padH + 1
   local bw = math.floor(tw / 4)
   state.btns = {}
   if state.phase == "bet" then
-    state.btns.minus = { x = 1, y = by, w = bw, h = padH }
-    state.btns.plus = { x = bw + 1, y = by, w = bw, h = padH }
-    state.btns.deal = { x = 2 * bw + 1, y = by, w = bw, h = padH }
-    state.btns.quit = { x = 3 * bw + 1, y = by, w = tw - 3 * bw, h = padH }
-    drawBtn(state.btns.minus, pocket and " - " or " -BET ", color and colors.gray or colors.black)
-    drawBtn(state.btns.plus, pocket and " + " or " +BET ", color and colors.gray or colors.black)
+    local bw3 = math.floor(tw / 3)
+    local bw2 = math.floor(tw / 2)
+    local byBet = th - padH * 2 + 1
+    local byAct = th - padH + 1
+    state.btns.b10  = { x = 1, y = byBet, w = bw3, h = padH }
+    state.btns.b50  = { x = bw3 + 1, y = byBet, w = bw3, h = padH }
+    state.btns.b100 = { x = 2 * bw3 + 1, y = byBet, w = tw - 2 * bw3, h = padH }
+    state.btns.deal = { x = 1, y = byAct, w = bw2, h = padH }
+    state.btns.quit = { x = bw2 + 1, y = byAct, w = tw - bw2, h = padH }
+    drawBtn(state.btns.b10, " +10 ", color and colors.gray or colors.black)
+    drawBtn(state.btns.b50, " +50 ", color and colors.lightGray or colors.black)
+    drawBtn(state.btns.b100, " +100 ", color and colors.white or colors.black, colors.black)
     drawBtn(state.btns.deal, " DEAL ", color and colors.lime or colors.white, colors.black)
     local qLab = FROM_LAUNCHER and (pocket and " X " or " CLOSE ") or (pocket and " Q " or " QUIT ")
     drawBtn(state.btns.quit, qLab, color and colors.red or colors.black)
@@ -541,9 +626,9 @@ local function newState()
 end
 
 local function dealHand(state)
-  if COINS < state.bet then return false end
-  COINS = COINS - state.bet
-  saveCfg()
+  local ok = spendBet(state.bet)
+  if not ok then return false end
+  if not USE_CASINO then saveCfg() end
   state.deck = newDeck()
   state.hand = {}
   state.luigi = {}
@@ -576,13 +661,13 @@ local function doDraw(state)
     state.win = state.bet * mult
     state.outcome = "win"
     state.resultName = "Beat Luigi! " .. pName
-    COINS = COINS + state.win
+    creditWin(state.win)
     sfx("win")
   elseif cmp == 0 then
     state.win = state.bet
     state.outcome = "push"
     state.resultName = "Push — " .. pName
-    COINS = COINS + state.win
+    creditWin(state.win)
     sfx("coin")
   else
     state.win = 0
@@ -590,24 +675,18 @@ local function doDraw(state)
     state.resultName = "Luigi wins — " .. lName
     sfx("lose")
   end
-  saveCfg()
+  if not USE_CASINO then saveCfg() end
   state.phase = "result"
 end
 
 local function main()
   attachMonitor()
   refreshSpeaker()
+  initEconomy()
   local state = newState()
+  state.bet = clampBet(state.bet or 1)
   local musicTimer = os.startTimer(MUSIC_ON and 0.05 or 3600)
   drawScreen(state)
-
-  local function bankruptReset()
-    if COINS <= 0 then
-      COINS = START_COINS
-      saveCfg()
-      state.bet = 1
-    end
-  end
 
   while true do
     local ev, p1, p2, p3 = pullEv()
@@ -626,26 +705,30 @@ local function main()
           drawScreen(state)
         elseif inBtn(b.draw, mx, my) then
           doDraw(state)
+          state.bet = clampBet(state.bet)
           drawScreen(state)
         elseif inBtn(b.quit, mx, my) then
           return
         end
       elseif state.phase == "bet" then
-        if inBtn(b.minus, mx, my) then
-          state.bet = math.max(1, state.bet - 1); sfx("coin"); drawScreen(state)
-        elseif inBtn(b.plus, mx, my) then
-          state.bet = math.min(MAX_BET, state.bet + 1, COINS); sfx("coin"); drawScreen(state)
+        if inBtn(b.b10, mx, my) then
+          addBet(state, 10); sfx("coin"); drawScreen(state)
+        elseif inBtn(b.b50, mx, my) then
+          addBet(state, 50); sfx("coin"); drawScreen(state)
+        elseif inBtn(b.b100, mx, my) then
+          addBet(state, 100); sfx("coin"); drawScreen(state)
         elseif inBtn(b.deal, mx, my) then
+          state.bet = clampBet(state.bet)
           if dealHand(state) then drawScreen(state) end
         elseif inBtn(b.quit, mx, my) then
           return
         end
       else
         if inBtn(b.deal, mx, my) then
-          bankruptReset()
           state.phase = "bet"
           state.hand, state.luigi = {}, {}
           state.outcome = nil
+          state.bet = clampBet(state.bet)
           drawScreen(state)
         elseif inBtn(b.quit, mx, my) then
           return
@@ -659,17 +742,12 @@ local function main()
         saveCfg()
         if not MUSIC_ON then stopMusic() end
       elseif state.phase == "bet" then
-        if p1 == K.left or p1 == K.minus then
-          state.bet = math.max(1, state.bet - 1); drawScreen(state)
-        elseif p1 == K.right or p1 == K.equals or p1 == K.plus then
-          state.bet = math.min(MAX_BET, state.bet + 1, COINS); drawScreen(state)
+        if p1 == K.one then addBet(state, 10); drawScreen(state)
+        elseif p1 == K.two then addBet(state, 50); drawScreen(state)
+        elseif p1 == K.three then addBet(state, 100); drawScreen(state)
         elseif p1 == K.space or p1 == K.enter then
+          state.bet = clampBet(state.bet)
           if dealHand(state) then drawScreen(state) end
-        elseif p1 == K.one then state.bet = math.min(1, COINS); drawScreen(state)
-        elseif p1 == K.two then state.bet = math.min(2, COINS, MAX_BET); drawScreen(state)
-        elseif p1 == K.three then state.bet = math.min(3, COINS, MAX_BET); drawScreen(state)
-        elseif p1 == K.four then state.bet = math.min(4, COINS, MAX_BET); drawScreen(state)
-        elseif p1 == K.five then state.bet = math.min(5, COINS, MAX_BET); drawScreen(state)
         end
       elseif state.phase == "hold" then
         if p1 == K.one then state.held[1] = not state.held[1]; sfx("hold"); drawScreen(state)
@@ -682,10 +760,10 @@ local function main()
         end
       else
         if p1 == K.space or p1 == K.enter then
-          bankruptReset()
           state.phase = "bet"
           state.hand, state.luigi = {}, {}
           state.outcome = nil
+          state.bet = clampBet(state.bet)
           drawScreen(state)
         end
       end
@@ -697,10 +775,12 @@ local function main()
         if not MUSIC_ON then stopMusic() end
       elseif state.phase == "hold" and ch == "d" then
         doDraw(state); drawScreen(state)
-      elseif state.phase == "bet" and (ch == "+" or ch == "]") then
-        state.bet = math.min(MAX_BET, state.bet + 1, COINS); drawScreen(state)
-      elseif state.phase == "bet" and (ch == "-" or ch == "[") then
-        state.bet = math.max(1, state.bet - 1); drawScreen(state)
+      elseif state.phase == "bet" and ch == "1" then
+        addBet(state, 10); drawScreen(state)
+      elseif state.phase == "bet" and ch == "2" then
+        addBet(state, 50); drawScreen(state)
+      elseif state.phase == "bet" and ch == "3" then
+        addBet(state, 100); drawScreen(state)
       end
     elseif ev == "terminate" then
       return

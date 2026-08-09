@@ -1,6 +1,6 @@
 --[[
-  host.lua  -  Titan install / update host + Tetris leaderboard (CC: Tweaked)
-  Titan-Version: 1.2.10
+  host.lua  -  Titan install / update host + games leaderboards (CC: Tweaked)
+  Titan-Version: 1.2.13
 
   Run this on ONE computer that already has the Titan files (your "update
   server"). It serves those files over rednet so pockets and other devices can
@@ -10,9 +10,8 @@
     * titan_install  — direct / local RF
     * titan_router   — mesh hops through your MAIN / extender / modem cells
 
-  Tetris leaderboard lives on a floppy disk in an attached disk drive
-  (tetris_leaderboard.cfg), keyed by player name. Attach a drive + leave a
-  disk inserted. Tablets sync on boot / after games via titan_install + mesh.
+  Leaderboards live on a floppy (`games_leaderboard.cfg`, multi-game). Legacy
+  `tetris_leaderboard.cfg` is migrated once. Tetris still uses tetris_lb_* msgs.
 
   Usage:
     1. Keep this machine updated (you may wget/GitHub here — clients never see it).
@@ -25,10 +24,11 @@
 
 local PROTOCOL = "titan_install"
 local ROUTER_PROTOCOL = "titan_router"
-local LB_NAME = "tetris_leaderboard.cfg"
+local LB_NAME = "games_leaderboard.cfg"
+local LB_LEGACY_TETRIS = "tetris_leaderboard.cfg"
 local LB_LOCAL_LEGACY = "tetris_leaderboard.cfg" -- migrate once from computer FS
 local LB_MAX = 25 -- keep extras; tablets only display top 3
-local LB_DISK_LABEL = "Tetris LB"
+local LB_DISK_LABEL = "Games LB"
 
 local FILES = {
   "install.lua",
@@ -46,6 +46,10 @@ local FILES = {
   "quarry/workers/offline_miner.lua",
   "quarry/workers/strip_miner.lua",
   "quarry/managers/offline_site.lua",
+  "storage/managers/storage_manager.lua",
+  "storage/workers/storage_builder.lua",
+  "storage_manager.lua",
+  "storage_builder.lua",
   "offline_miner.lua",
   "offline_site.lua",
   "perimeter_sensor.lua",
@@ -54,7 +58,12 @@ local FILES = {
   "minesweeper.lua",
   "sandstorm.lua",
   "luigi_poker.lua",
+  "higher_lower.lua",
   "slots.lua",
+  "lib/casino.lua",
+  "lib/games_economy.lua",
+  "games/managers/currency_manager.lua",
+  "currency_manager.lua",
   "games.lua",
   "games_catalog.lua",
   "games_install.lua",
@@ -104,10 +113,19 @@ local function relayLoop()
 end
 
 --------------------------------------------------------------------------------
--- Tetris leaderboard (persisted on floppy disk)
+-- Multi-game leaderboards (persisted on floppy disk)
 --------------------------------------------------------------------------------
-local leaderboard = {} -- sorted descending: { id, name, score, at }
+local boards = { tetris = {} } -- [gameId] = sorted { id, name, score, at }
+local leaderboard = boards.tetris -- alias for Tetris compat
 local lbDriveName, lbMount, lbPath = nil, nil, nil
+
+local function ensureGame(gameId)
+  gameId = tostring(gameId or "tetris"):lower()
+  if gameId == "" then gameId = "tetris" end
+  if type(boards[gameId]) ~= "table" then boards[gameId] = {} end
+  if gameId == "tetris" then leaderboard = boards.tetris end
+  return gameId, boards[gameId]
+end
 
 -- Prefer a floppy that already has the board file; else any present disk.
 local function findLbDisk()
@@ -121,6 +139,10 @@ local function findLbDisk()
           local path = fs.combine(mount, LB_NAME)
           if fs.exists(path) and not fs.isDir(path) then
             return name, mount, path
+          end
+          local legacy = fs.combine(mount, LB_LEGACY_TETRIS)
+          if fs.exists(legacy) and not fs.isDir(legacy) and not anyMount then
+            anyName, anyMount = name, mount
           end
           if not anyMount then
             anyName, anyMount = name, mount
@@ -140,16 +162,32 @@ local function refreshLbDisk()
   return lbPath ~= nil
 end
 
-local function readBoardFile(path)
+local function readEntriesList(d)
+  if type(d) ~= "table" then return {} end
+  if type(d.entries) == "table" then return d.entries end
+  -- bare array?
+  if d[1] and type(d[1]) == "table" and d[1].score ~= nil then return d end
+  return {}
+end
+
+local function readAllBoards(path)
   if not path or not fs.exists(path) or fs.isDir(path) then return {} end
   local f = fs.open(path, "r")
   if not f then return {} end
   local d = textutils.unserialize(f.readAll() or "")
   f.close()
-  if type(d) == "table" and type(d.entries) == "table" then
-    return d.entries
-  elseif type(d) == "table" then
-    return d
+  if type(d) ~= "table" then return {} end
+  if type(d.games) == "table" then
+    local out = {}
+    for gid, block in pairs(d.games) do
+      out[tostring(gid)] = readEntriesList(type(block) == "table" and block or {})
+    end
+    return out
+  end
+  -- Legacy single-board tetris file
+  local entries = readEntriesList(d)
+  if #entries > 0 or d.entries then
+    return { tetris = entries }
   end
   return {}
 end
@@ -158,7 +196,7 @@ local function writeBoardFile(path)
   if not path then return false, "no disk" end
   local f = fs.open(path, "w")
   if not f then return false, "open failed" end
-  f.write(textutils.serialize({ entries = leaderboard }))
+  f.write(textutils.serialize({ games = boards }))
   f.close()
   if lbDriveName then
     pcall(function()
@@ -171,20 +209,56 @@ local function writeBoardFile(path)
   return true
 end
 
+local function sortBoard(gameId)
+  local _, list = ensureGame(gameId or "tetris")
+  table.sort(list, function(a, b)
+    if (a.score or 0) ~= (b.score or 0) then
+      return (a.score or 0) > (b.score or 0)
+    end
+    return (a.at or 0) < (b.at or 0)
+  end)
+  while #list > LB_MAX do table.remove(list) end
+end
+
+local function sortAllBoards()
+  for gid in pairs(boards) do sortBoard(gid) end
+  leaderboard = boards.tetris or {}
+end
+
+local function boardCount()
+  local n = 0
+  for _, list in pairs(boards) do n = n + #list end
+  return n
+end
+
 local function loadLeaderboard()
-  leaderboard = {}
+  boards = { tetris = {} }
+  leaderboard = boards.tetris
   refreshLbDisk()
   if lbPath and fs.exists(lbPath) then
-    leaderboard = readBoardFile(lbPath)
+    boards = readAllBoards(lbPath)
+    ensureGame("tetris")
+    sortAllBoards()
     return "disk"
   end
-  -- One-time migrate from computer-local file onto the floppy.
-  if fs.exists(LB_LOCAL_LEGACY) and not fs.isDir(LB_LOCAL_LEGACY) then
-    leaderboard = readBoardFile(LB_LOCAL_LEGACY)
+  -- Migrate legacy tetris file on floppy or computer FS.
+  local legacyPath = nil
+  if lbMount then
+    local p = fs.combine(lbMount, LB_LEGACY_TETRIS)
+    if fs.exists(p) and not fs.isDir(p) then legacyPath = p end
+  end
+  if not legacyPath and fs.exists(LB_LOCAL_LEGACY) and not fs.isDir(LB_LOCAL_LEGACY) then
+    legacyPath = LB_LOCAL_LEGACY
+  end
+  if legacyPath then
+    local old = readAllBoards(legacyPath)
+    if old.tetris then boards.tetris = old.tetris else boards.tetris = {} end
+    ensureGame("tetris")
+    sortAllBoards()
     if lbPath then
       local ok = writeBoardFile(lbPath)
       if ok then
-        pcall(fs.delete, LB_LOCAL_LEGACY)
+        if legacyPath == LB_LOCAL_LEGACY then pcall(fs.delete, LB_LOCAL_LEGACY) end
         return "migrated"
       end
     end
@@ -195,24 +269,14 @@ end
 
 local function saveLeaderboard()
   if not refreshLbDisk() then
-    print("[tetris_lb] no floppy — score kept in RAM until a disk is inserted")
+    print("[games_lb] no floppy — score kept in RAM until a disk is inserted")
     return false
   end
   local ok, err = writeBoardFile(lbPath)
   if not ok then
-    print("[tetris_lb] save failed: " .. tostring(err))
+    print("[games_lb] save failed: " .. tostring(err))
   end
   return ok
-end
-
-local function sortBoard()
-  table.sort(leaderboard, function(a, b)
-    if (a.score or 0) ~= (b.score or 0) then
-      return (a.score or 0) > (b.score or 0)
-    end
-    return (a.at or 0) < (b.at or 0)
-  end)
-  while #leaderboard > LB_MAX do table.remove(leaderboard) end
 end
 
 -- Watch disk insert/eject so the board follows the floppy.
@@ -220,33 +284,35 @@ local function diskWatchLoop()
   while true do
     local ev = os.pullEvent()
     if ev == "disk" or ev == "disk_eject" or ev == "peripheral" or ev == "peripheral_detach" then
-      local had = #leaderboard
+      local had = boardCount()
       refreshLbDisk()
       if lbPath then
         if fs.exists(lbPath) then
-          leaderboard = readBoardFile(lbPath)
-          sortBoard()
-          print(("[tetris_lb] disk ready (%s) — %d entr%s"):format(
-            tostring(lbMount), #leaderboard, #leaderboard == 1 and "y" or "ies"))
+          boards = readAllBoards(lbPath)
+          ensureGame("tetris")
+          sortAllBoards()
+          print(("[games_lb] disk ready (%s) — %d entr%s"):format(
+            tostring(lbMount), boardCount(), boardCount() == 1 and "y" or "ies"))
         elseif had > 0 then
-          -- Blank floppy: flush in-memory board onto it.
           writeBoardFile(lbPath)
-          print(("[tetris_lb] wrote RAM board to %s (%d)"):format(tostring(lbMount), had))
+          print(("[games_lb] wrote RAM board to %s (%d)"):format(tostring(lbMount), had))
         else
-          leaderboard = {}
-          print(("[tetris_lb] disk ready (%s) — empty board"):format(tostring(lbMount)))
+          boards = { tetris = {} }
+          leaderboard = boards.tetris
+          print(("[games_lb] disk ready (%s) — empty board"):format(tostring(lbMount)))
         end
       else
-        print("[tetris_lb] floppy removed — serving last scores from RAM (not saving)")
+        print("[games_lb] floppy removed — serving last scores from RAM (not saving)")
       end
     end
   end
 end
 
-local function boardSnapshot()
+local function boardSnapshot(gameId)
+  local _, list = ensureGame(gameId or "tetris")
   local out = {}
-  for i = 1, #leaderboard do
-    local e = leaderboard[i]
+  for i = 1, #list do
+    local e = list[i]
     out[i] = {
       id = e.id, name = e.name, score = e.score, at = e.at, rank = i,
     }
@@ -254,8 +320,9 @@ local function boardSnapshot()
   return out
 end
 
--- Upsert by player name (case-insensitive) so shared pockets track people, not HW.
-local function submitScore(id, name, score)
+-- Upsert by player name (case-insensitive). Lower score is better when lowerIsBetter.
+local function submitScore(id, name, score, gameId, lowerIsBetter)
+  local gid, list = ensureGame(gameId or "tetris")
   id = tonumber(id)
   score = math.floor(tonumber(score) or 0)
   if score < 0 then return false, "bad score" end
@@ -264,29 +331,33 @@ local function submitScore(id, name, score)
   name = name:sub(1, 16)
   local key = name:lower()
   local found = nil
-  for i = 1, #leaderboard do
-    if tostring(leaderboard[i].name or ""):lower() == key then
+  for i = 1, #list do
+    if tostring(list[i].name or ""):lower() == key then
       found = i
       break
     end
   end
+  local function better(new, old)
+    if lowerIsBetter then return new < old end
+    return new > old
+  end
   if found then
-    if score > (leaderboard[found].score or 0) then
-      leaderboard[found].score = score
-      leaderboard[found].name = name
-      leaderboard[found].at = os.epoch("utc")
-      if id then leaderboard[found].id = id end
+    if better(score, list[found].score or (lowerIsBetter and 1e12 or -1)) then
+      list[found].score = score
+      list[found].name = name
+      list[found].at = os.epoch("utc")
+      if id then list[found].id = id end
     else
-      -- keep best score; refresh display casing / last tablet id
-      leaderboard[found].name = name
-      if id then leaderboard[found].id = id end
+      list[found].name = name
+      if id then list[found].id = id end
     end
   else
-    leaderboard[#leaderboard + 1] = {
+    list[#list + 1] = {
       id = id, name = name, score = score, at = os.epoch("utc"),
     }
   end
-  sortBoard()
+  sortBoard(gid)
+  if gid == "tetris" then leaderboard = boards.tetris end
   saveLeaderboard()
   return true
 end
@@ -317,19 +388,18 @@ end
 openModem()
 os.setComputerLabel(os.getComputerLabel() or ("TitanHost-" .. os.getComputerID()))
 local lbSrc = loadLeaderboard()
-sortBoard()
+sortAllBoards()
 
 term.clear(); term.setCursorPos(1, 1)
 print("== Titan Install Host ==")
 print(("Serving %d files as '%s' (#%d)."):format(#manifest(), os.getComputerLabel(), os.getComputerID()))
 if lbPath then
-  print(("Tetris LB disk: %s (%s)"):format(tostring(lbMount), tostring(lbDriveName)))
-  print(("Tetris leaderboard: %d entr%s [%s]"):format(
-    #leaderboard, #leaderboard == 1 and "y" or "ies", tostring(lbSrc)))
+  print(("Games LB disk: %s (%s)"):format(tostring(lbMount), tostring(lbDriveName)))
+  print(("Leaderboard entries: %d [%s]"):format(boardCount(), tostring(lbSrc)))
 else
-  print("Tetris LB: NO FLOPPY — insert a disk in the drive to persist scores.")
-  print(("Tetris leaderboard (RAM): %d entr%s"):format(
-    #leaderboard, #leaderboard == 1 and "y" or "ies"))
+  print("Games LB: NO FLOPPY — insert a disk in the drive to persist scores.")
+  print(("Leaderboard (RAM): %d entr%s"):format(
+    boardCount(), boardCount() == 1 and "y" or "ies"))
 end
 print("Clients update over rednet + titan_router mesh (no GitHub URL on tablets).")
 print("Mesh relay on. Ctrl+T to stop.")
@@ -409,7 +479,7 @@ local function replyLb(dest, viaId)
   local payload = {
     type = "tetris_lb",
     ok = true,
-    entries = boardSnapshot(),
+    entries = boardSnapshot("tetris"),
     replyTo = dest,
     from = os.getComputerID(),
   }
@@ -441,17 +511,17 @@ local function handleServeMsg(id, msg, proto)
   elseif t == "tetris_lb_get" then
     local dest = tonumber(msg.replyTo) or tonumber(msg.originId) or id
     replyLb(dest, id)
-    print(("[tetris_lb] get -> #%d (%d)"):format(dest, #leaderboard))
+    print(("[tetris_lb] get -> #%d (%d)"):format(dest, #(boards.tetris or {})))
 
   elseif t == "tetris_lb_submit" then
     local dest = tonumber(msg.replyTo) or tonumber(msg.originId) or id
     local score = tonumber(msg.score) or 0
     local name = msg.name or msg.hostname or ("#" .. tostring(id))
-    local ok = submitScore(msg.playerId or id, name, score)
+    local ok = submitScore(msg.playerId or id, name, score, "tetris", false)
     local payload = {
       type = "tetris_lb",
       ok = ok,
-      entries = boardSnapshot(),
+      entries = boardSnapshot("tetris"),
       accepted = ok,
       replyTo = dest,
       from = os.getComputerID(),
@@ -467,6 +537,41 @@ local function handleServeMsg(id, msg, proto)
       }, ROUTER_PROTOCOL)
     end
     print(("[tetris_lb] #%d %s = %d"):format(id, tostring(name):sub(1, 12), score))
+
+  elseif t == "games_lb_get" then
+    local dest = tonumber(msg.replyTo) or tonumber(msg.originId) or id
+    local game = tostring(msg.game or "tetris"):lower()
+    local payload = {
+      type = "games_lb",
+      ok = true,
+      game = game,
+      entries = boardSnapshot(game),
+      replyTo = dest,
+      from = os.getComputerID(),
+    }
+    rednet.send(dest, payload, PROTOCOL)
+    rednet.send(dest, payload, ROUTER_PROTOCOL)
+    print(("[games_lb] get %s -> #%d (%d)"):format(game, dest, #boardSnapshot(game)))
+
+  elseif t == "games_lb_submit" then
+    local dest = tonumber(msg.replyTo) or tonumber(msg.originId) or id
+    local game = tostring(msg.game or "tetris"):lower()
+    local score = tonumber(msg.score) or 0
+    local name = msg.name or msg.hostname or ("#" .. tostring(id))
+    local lower = msg.lowerIsBetter == true or game == "minesweeper"
+    local ok = submitScore(msg.playerId or id, name, score, game, lower)
+    local payload = {
+      type = "games_lb",
+      ok = ok,
+      game = game,
+      entries = boardSnapshot(game),
+      accepted = ok,
+      replyTo = dest,
+      from = os.getComputerID(),
+    }
+    rednet.send(dest, payload, PROTOCOL)
+    rednet.send(dest, payload, ROUTER_PROTOCOL)
+    print(("[games_lb] %s #%d %s = %d"):format(game, id, tostring(name):sub(1, 12), score))
   end
 end
 

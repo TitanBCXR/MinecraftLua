@@ -1,6 +1,6 @@
 --[[
   admin.lua  -  Titan admin console for a POCKET computer ("Live" tablet)
-  Titan-Version: 1.5.8
+  Titan-Version: 1.5.9
 
   Pocket remote for the whole fleet. Keep it on you; it joins the mesh like
   every other Titan device (MAIN router + modem hops).
@@ -16,6 +16,7 @@
     connections | hosts | list   - who is reachable for SSH
     connect | ssh <id|label>     - remote shell (full device commands)
     say <id|label> <message>     - print on that device's screen
+    storage | stock | request    - Storage Manager browse / request to output
     link                         - network topology (routers + modems)
     link <a> <b>                 - peer two routers OR attach modem->router
     link auto                    - GPS auto: peer routers, modems->nearest hub
@@ -108,6 +109,7 @@ local openWhereSoon = nil  -- unlocked: open from console UI thread
 local lastWhereMsg = nil
 local trackWhereView       -- assigned later
 local flushWhereTrack      -- assigned later
+local storageManagers = {} -- [id] = { name, seen, types, units }
 
 local function now() return os.epoch("utc") end
 local function ago(ts) return math.floor((now() - (ts or 0)) / 1000) end
@@ -2166,6 +2168,208 @@ local function sshOneShot(target, line)
 end
 
 --------------------------------------------------------------------------------
+-- Storage Manager (vault + I/O chests)
+--------------------------------------------------------------------------------
+local function discoverStorage(timeout)
+  timeout = timeout or 2.5
+  rednet.broadcast({ type = "storage_ping", from = os.getComputerID() }, PROTO_NET)
+  local deadline = os.clock() + timeout
+  local found = {}
+  while os.clock() < deadline do
+    local id, msg = rednet.receive(PROTO_NET, math.max(0.05, deadline - os.clock()))
+    if id and type(msg) == "table" then
+      local t = msg.type
+      if t == "storage_status" or t == "storage_hello"
+          or t == (MSG and MSG.STORAGE_STATUS) or t == (MSG and MSG.STORAGE_HELLO) then
+        local data = msg.data or msg
+        storageManagers[id] = {
+          id = id,
+          name = data.name or msg.name or ("Storage-" .. id),
+          types = data.types or msg.types,
+          units = data.units or msg.units,
+          vault = data.vault or msg.vault,
+          seen = now(),
+        }
+        found[#found + 1] = storageManagers[id]
+      end
+    end
+  end
+  table.sort(found, function(a, b) return (a.id or 0) < (b.id or 0) end)
+  return found
+end
+
+local function pickStorageManager()
+  local list = discoverStorage(2)
+  if #list == 0 then
+    -- Fall back to remembered
+    for id, row in pairs(storageManagers) do
+      list[#list + 1] = row
+      row.id = id
+    end
+    table.sort(list, function(a, b) return (a.id or 0) < (b.id or 0) end)
+  end
+  if #list == 0 then return nil end
+  if #list == 1 then return list[1].id, list[1] end
+  print("Storage managers:")
+  for i, row in ipairs(list) do
+    print(("  %d) #%d %s  types=%s"):format(
+      i, row.id, tostring(row.name), tostring(row.types or "?")))
+  end
+  write("Pick # (Enter=1): ")
+  local n = tonumber(read() or "") or 1
+  local row = list[n] or list[1]
+  return row and row.id, row
+end
+
+local function storageStockReq(managerId, filter, limit, timeout)
+  timeout = timeout or 3
+  rednet.send(managerId, {
+    type = "storage_stock_req",
+    from = os.getComputerID(),
+    filter = filter,
+    limit = limit or 40,
+  }, PROTO_NET)
+  local deadline = os.clock() + timeout
+  while os.clock() < deadline do
+    local id, msg = rednet.receive(PROTO_NET, math.max(0.05, deadline - os.clock()))
+    if id == managerId and type(msg) == "table" and msg.type == "storage_stock" then
+      return msg
+    end
+  end
+  return nil, "timeout"
+end
+
+local function storageRequest(managerId, item, count, timeout)
+  timeout = timeout or 8
+  rednet.send(managerId, {
+    type = "storage_request",
+    from = os.getComputerID(),
+    item = item,
+    name = item,
+    count = count or 64,
+  }, PROTO_NET)
+  local deadline = os.clock() + timeout
+  while os.clock() < deadline do
+    local id, msg = rednet.receive(PROTO_NET, math.max(0.05, deadline - os.clock()))
+    if id == managerId and type(msg) == "table" and msg.type == "storage_request_ack" then
+      return msg
+    end
+  end
+  return nil, "timeout"
+end
+
+local function runStorageApp()
+  print("== Storage ==")
+  local mid, row = pickStorageManager()
+  if not mid then
+    print("No Storage Manager on the mesh.")
+    print("Install storage/managers/storage_manager and bind vault/input/output.")
+    return
+  end
+  print(("Manager #%d %s"):format(mid, tostring(row and row.name or "?")))
+  while true do
+    print("  1) Stock list")
+    print("  2) Find item")
+    print("  3) Request to output chest")
+    print("  0) Back")
+    write("Pick: ")
+    local choice = tostring(read() or ""):lower()
+    if choice == "0" or choice == "b" or choice == "back" then return
+    elseif choice == "1" then
+      local msg, err = storageStockReq(mid, nil, 40, 3)
+      if not msg then print("stock failed: " .. tostring(err))
+      else
+        print(("Stock (%d types):"):format(tonumber(msg.types) or #(msg.items or {})))
+        for _, it in ipairs(msg.items or {}) do
+          print(("  %6d  %s"):format(
+            it.count or 0, tostring(it.displayName or it.name)))
+        end
+      end
+    elseif choice == "2" then
+      write("Filter: ")
+      local filter = read()
+      local msg, err = storageStockReq(mid, filter, 40, 3)
+      if not msg then print("find failed: " .. tostring(err))
+      else
+        for _, it in ipairs(msg.items or {}) do
+          print(("  %6d  %s  %s"):format(
+            it.count or 0, tostring(it.displayName or "?"), tostring(it.name)))
+        end
+        if #(msg.items or {}) == 0 then print("  (no matches)") end
+      end
+    elseif choice == "3" then
+      write("Item: ")
+      local item = read()
+      if item and item:match("%S") then
+        write("Count [64]: ")
+        local count = tonumber(read() or "") or 64
+        print("Requesting...")
+        local ack, err = storageRequest(mid, item, count, 10)
+        if not ack then print("request failed: " .. tostring(err))
+        elseif ack.ok then
+          print(("Sent %d x %s -> output chest"):format(
+            tonumber(ack.moved) or 0, tostring(ack.item or item)))
+        else
+          print("Denied: " .. tostring(ack.err or "?"))
+        end
+      end
+    end
+  end
+end
+
+local function handleStorageCommand(a)
+  local cmd = tostring(a[1] or ""):lower()
+  if cmd == "storage" and not a[2] then
+    runStorageApp()
+    return true
+  end
+  local mid = select(1, pickStorageManager())
+  if not mid then
+    print("No Storage Manager found.")
+    return true
+  end
+  if cmd == "stock" or (cmd == "storage" and tostring(a[2] or ""):lower() == "stock") then
+    local filter = nil
+    if cmd == "stock" then
+      filter = a[2] and table.concat(a, " ", 2) or nil
+    else
+      filter = a[3] and table.concat(a, " ", 3) or nil
+    end
+    local msg, err = storageStockReq(mid, filter, 50, 3)
+    if not msg then print("stock: " .. tostring(err)); return true end
+    for _, it in ipairs(msg.items or {}) do
+      print(("  %6d  %s"):format(it.count or 0, tostring(it.displayName or it.name)))
+    end
+    if #(msg.items or {}) == 0 then print("  (empty / no matches)") end
+  elseif cmd == "request" or cmd == "req"
+      or (cmd == "storage" and (tostring(a[2] or ""):lower() == "request" or tostring(a[2] or ""):lower() == "req")) then
+    local start = (cmd == "storage") and 3 or 2
+    if not a[start] then
+      print("Usage: request <item> [count]")
+      return true
+    end
+    local item, count
+    if tonumber(a[#a]) and #a > start then
+      count = tonumber(a[#a])
+      item = table.concat(a, " ", start, #a - 1)
+    else
+      item = table.concat(a, " ", start)
+      count = 64
+    end
+    local ack, err = storageRequest(mid, item, count, 10)
+    if not ack then print("request: " .. tostring(err))
+    elseif ack.ok then
+      print(("Sent %d x %s -> output"):format(tonumber(ack.moved) or 0, tostring(ack.item or item)))
+    else
+      print("request failed: " .. tostring(ack.err))
+    end
+  else
+    runStorageApp()
+  end
+  return true
+end
+
+--------------------------------------------------------------------------------
 -- Network link (ender routers + local RF modems)
 --------------------------------------------------------------------------------
 scanNetTopology = function(timeout, quiet)
@@ -2409,6 +2613,9 @@ local HELP_ENTRIES = {
   { "link <a> <b>", "Peer or attach by role" },
   { "connect <id>", "SSH shell (alias: ssh)" },
   { "say <id> <msg>", "Print message on device screen" },
+  { "storage", "Storage Manager app" },
+  { "stock [filter]", "List vault stock" },
+  { "request <item> [n]", "Send items to storage output" },
   { "goto <id> x y z", "Send turtle to coords" },
   { "return|park <id>", "Send turtle home / park" },
   { "refuel <id>", "Ask turtle to refuel" },
@@ -2722,6 +2929,9 @@ local function handleCommand(a)
     else
       printError("say: " .. tostring(err))
     end
+
+  elseif cmd == "storage" or cmd == "stock" or cmd == "request" or cmd == "req" then
+    return handleStorageCommand(a)
 
   elseif cmd == "dc" or cmd == "center" or cmd == "datacenter" or cmd == "parent" then
     local id, row = findByKind("datacenter")
@@ -3157,6 +3367,7 @@ local PHONE_APPS = {
   { id = "continue", name = "Resume",   sub = "mining",   bg = colors.lime },
   { id = "boards",   name = "Boards",   sub = "live",     bg = colors.yellow },
   { id = "quarry",   name = "Quarry",   sub = "offline",  bg = colors.green },
+  { id = "storage",  name = "Storage",  sub = "vault",    bg = colors.orange },
   { id = "advanced", name = "Terminal", sub = "commands", bg = colors.lightGray },
   { id = "lock",     name = "Lock",     sub = "screen",   bg = colors.black },
 }
@@ -3249,6 +3460,9 @@ local function runPhoneApp(id)
       handleCommand({ "quarry", "pending" })
       pauseSimple()
     end
+  elseif id == "storage" then
+    runStorageApp()
+    pauseSimple()
   elseif id == "advanced" then
     cfg.mode = "advanced"
     saveAdminCfg()
