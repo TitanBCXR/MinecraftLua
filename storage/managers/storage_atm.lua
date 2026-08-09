@@ -1,6 +1,6 @@
 --[[
   storage/managers/storage_atm.lua  -  Standalone vault ATM (wired modem)
-  Titan-Version: 1.2.0
+  Titan-Version: 1.2.1
 
   Solo item ATM. No casino, no Currency Manager, no Create Stock Ticker.
   Moves items over the wired modem network with pushItems / pullItems.
@@ -22,7 +22,7 @@
 ]]
 
 local LOCAL_CFG = "storage_atm.cfg"
-local VERSION = "1.2.0"
+local VERSION = "1.2.1"
 
 local cfg = {
   chest = nil,   -- shared deposit + withdraw tray
@@ -251,16 +251,78 @@ local function matchStock(stockMap, query)
   return nil, nil
 end
 
+local function isSideName(name)
+  name = tostring(name or ""):lower()
+  return SIDES[name] == true
+end
+
+--- Network name usable as a push/pull target. Side names (left/…) only work
+--- as the wrapped source on this computer — remotes cannot pullItems("left").
+local function networkTargetName(name)
+  if not name or isSideName(name) then return nil end
+  return name
+end
+
+local function pushSlot(fromWrap, fromName, toName, slot, limit)
+  if not toName then return 0, "no destination" end
+  -- Prefer peripheral.call so side names resolve on THIS computer.
+  if fromName and peripheral.isPresent(fromName)
+      and type(peripheral.call) == "function" then
+    local ok, r
+    if limit then
+      ok, r = pcall(peripheral.call, fromName, "pushItems", toName, slot, limit)
+    else
+      ok, r = pcall(peripheral.call, fromName, "pushItems", toName, slot)
+    end
+    if ok then return tonumber(r) or 0, nil end
+    -- fall through to wrap method
+  end
+  if fromWrap and type(fromWrap.pushItems) == "function" then
+    local ok, r = pcall(function()
+      if limit then return fromWrap.pushItems(toName, slot, limit) end
+      return fromWrap.pushItems(toName, slot)
+    end)
+    if ok then return tonumber(r) or 0, nil end
+    return 0, tostring(r)
+  end
+  return 0, "no pushItems"
+end
+
+local function pullSlot(toWrap, toName, fromName, slot, limit)
+  -- Remote inventories cannot see computer side names like "left".
+  if not fromName or isSideName(fromName) then
+    return 0, nil
+  end
+  if toName and peripheral.isPresent(toName) and type(peripheral.call) == "function" then
+    local ok, r
+    if limit then
+      ok, r = pcall(peripheral.call, toName, "pullItems", fromName, slot, limit)
+    else
+      ok, r = pcall(peripheral.call, toName, "pullItems", fromName, slot)
+    end
+    if ok then return tonumber(r) or 0, nil end
+  end
+  if toWrap and type(toWrap.pullItems) == "function" then
+    local ok, r = pcall(function()
+      if limit then return toWrap.pullItems(fromName, slot, limit) end
+      return toWrap.pullItems(fromName, slot)
+    end)
+    if ok then return tonumber(r) or 0, nil end
+    return 0, tostring(r)
+  end
+  return 0, nil
+end
+
 --- Move everything from source → dest over the modem network.
---- Tries source.pushItems(dest), then dest.pullItems(source).
 local function transferAll(source, sourceName, dest, destName)
   local moved, lastErr = 0, nil
+  local destNet = networkTargetName(destName) or destName
   local guard = 0
   while guard < 256 do
     guard = guard + 1
     local okList, list = pcall(function() return source.list() end)
     if not okList or type(list) ~= "table" then
-      return moved, lastErr or "intake list failed"
+      return moved, lastErr or "chest list failed"
     end
     local slots = {}
     for slot, detail in pairs(list) do
@@ -273,36 +335,36 @@ local function transferAll(source, sourceName, dest, destName)
 
     local progressed = false
     for _, slot in ipairs(slots) do
-      local n = 0
-      if type(source.pushItems) == "function" then
-        local ok, r = pcall(source.pushItems, destName, slot)
-        if ok then
-          n = tonumber(r) or 0
-        else
-          lastErr = tostring(r)
-        end
-      end
-      if n <= 0 and dest and type(dest.pullItems) == "function" then
-        local ok, r = pcall(dest.pullItems, sourceName, slot)
-        if ok then
-          n = tonumber(r) or 0
-        else
-          lastErr = tostring(r)
-        end
+      local n, err = pushSlot(source, sourceName, destNet, slot, nil)
+      if err then lastErr = err end
+      if n <= 0 then
+        local n2, err2 = pullSlot(dest, destName, sourceName, slot, nil)
+        if err2 then lastErr = err2 end
+        n = n2
       end
       if n > 0 then
         moved = moved + n
         progressed = true
       end
     end
-    if not progressed then break end
+    if not progressed then
+      if moved <= 0 and isSideName(sourceName) then
+        lastErr = (lastErr and (lastErr .. " | ") or "")
+          .. "Chest is bound as side '" .. sourceName
+          .. "'. Put a wired modem on the chest (connect it), then: bind chest <name from invs>"
+      elseif moved <= 0 and not lastErr then
+        lastErr = "Vault accepted 0 items (full, filtered, or not linked on this cable)"
+      end
+      break
+    end
   end
   return moved, lastErr
 end
 
---- Move `need` of `item` from vault → output. Returns moved count.
-local function transferItem(vault, vname, output, oname, item, need)
+--- Move `need` of `item` from vault → chest. Returns moved count.
+local function transferItem(vault, vname, chest, cname, item, need)
   local moved, lastErr = 0, nil
+  local chestNet = networkTargetName(cname) or cname
   local guard = 0
   while moved < need and guard < 256 do
     guard = guard + 1
@@ -322,14 +384,17 @@ local function transferItem(vault, vname, output, oname, item, need)
     for _, row in ipairs(slots) do
       if moved >= need then break end
       local want = math.min(need - moved, row.count)
-      local n = 0
-      if type(vault.pushItems) == "function" then
-        local ok, r = pcall(vault.pushItems, oname, row.slot, want)
-        if ok then n = tonumber(r) or 0 else lastErr = tostring(r) end
+      -- Push from vault to chest (chest may be side name — OK as push target on this PC).
+      local n, err = pushSlot(vault, vname, chestNet, row.slot, want)
+      if (not n or n <= 0) and isSideName(cname) then
+        -- Side-named chest: push target must be the side string on this computer.
+        n, err = pushSlot(vault, vname, cname, row.slot, want)
       end
-      if n <= 0 and output and type(output.pullItems) == "function" then
-        local ok, r = pcall(output.pullItems, vname, row.slot, want)
-        if ok then n = tonumber(r) or 0 else lastErr = tostring(r) end
+      if err then lastErr = err end
+      if n <= 0 then
+        local n2, err2 = pullSlot(chest, cname, vname, row.slot, want)
+        if err2 then lastErr = err2 end
+        n = n2
       end
       if n > 0 then
         moved = moved + n
