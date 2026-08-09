@@ -562,26 +562,24 @@ Installer: **s → Storage → Managers → 2**. Standalone item ATM — **no** 
 **no** Stock Ticker, **no** wireless mesh required.
 
 ```text
-[Intake chest]  --touching/wired--> [ATM PC]
-[Output chest]  --touching/wired-->/
-[Create vault]  --wired modem----/
+[I/O chest]    --touching/wired--> [ATM PC]
+[Create vault] --wired modem----/
 ```
 
 ```text
 invs
-bind intake left
-bind output right
+bind chest left
 bind vault create:item_vault_0
 stock iron
 deposit
-withdraw minecraft:iron_ingot 64
+withdraw minecraft:iron_ingot 256
 ```
 
-- **deposit** — confirm → `pushItems` intake → vault  
-- **withdraw** — only if vault has enough → vault → output  
+- **deposit** — confirm → move chest → vault  
+- **withdraw** — if vault has enough → vault → same chest; if the chest fills,
+  wait for you to collect, then continue the next batch  
 - **stock [filter]** — list vault contents  
-Right-click wired modems on the vault so they connect; use vanilla chests for
-intake/output (modded storage often won’t activate CC modems).
+Right-click the vault modem until connected; use a vanilla chest for I/O.
 
 Bulk storage cell (v1 — no auto-crafting, no GPS courier):
 

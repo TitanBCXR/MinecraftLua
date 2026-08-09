@@ -1,35 +1,36 @@
 --[[
   storage/managers/storage_atm.lua  -  Standalone vault ATM (wired modem)
-  Titan-Version: 1.1.0
+  Titan-Version: 1.2.0
 
   Solo item ATM. No casino, no Currency Manager, no Create Stock Ticker.
-  Talks to a Create vault (or any inventory) over a wired modem network.
+  Moves items over the wired modem network with pushItems / pullItems.
 
-  Hardware:
-    [Intake chest]  --touching/wired--> [ATM PC]
-    [Output chest]  --touching/wired-->/
-    [Vault]         --wired modem----/
+  Hardware (same cable network):
+    [I/O chest]    --touching or wired--> [ATM PC]
+    [Create vault] --wired modem (right-click to connect) --/
 
-  Deposit: put items in intake → `deposit` → confirm → pushItems into vault.
-  Withdraw: if vault has enough → pushItems vault → output. No move if short.
+  One chest is both deposit and withdraw tray (`bind chest`).
+  Deposit: chest → vault.
+  Withdraw: vault → chest; if the chest fills mid-request, wait for the
+  player to collect, then continue the next batch.
 
   Setup:
     invs
-    bind intake <side|name>
-    bind output <side|name>
-    bind vault <side|name>
+    bind chest <side|name>
+    bind vault <name>
     deposit | withdraw | stock | status | help
 ]]
 
 local LOCAL_CFG = "storage_atm.cfg"
-local VERSION = "1.1.0"
+local VERSION = "1.2.0"
 
 local cfg = {
-  intake = nil,
-  output = nil,
+  chest = nil,   -- shared deposit + withdraw tray
   vault = nil,
   label = nil,
-  -- legacy Create ticker fields ignored if present
+  -- legacy fields (migrated on load)
+  intake = nil,
+  output = nil,
   address = nil,
 }
 
@@ -42,6 +43,9 @@ local function loadCfg()
   f.close()
   if ok and type(d) == "table" then
     for k, v in pairs(d) do cfg[k] = v end
+  end
+  if (not cfg.chest or cfg.chest == "") then
+    cfg.chest = cfg.intake or cfg.output
   end
 end
 
@@ -57,10 +61,108 @@ local function isInventory(name)
   return w and type(w.list) == "function"
 end
 
+local function canTransfer(name)
+  if not isInventory(name) then return false end
+  local w = peripheral.wrap(name)
+  return w and (type(w.pushItems) == "function" or type(w.pullItems) == "function")
+end
+
+local SIDES = {
+  left = true, right = true, front = true, back = true, top = true, bottom = true,
+}
+
+local function resolveInventory(ref)
+  if not ref or ref == "" then return nil end
+  local s = tostring(ref)
+  if isInventory(s) then return s end
+
+  local side = s:lower()
+  if SIDES[side] and peripheral.isPresent(side) then
+    if isInventory(side) then return side end
+    local t = peripheral.getType(side)
+    local wrap = peripheral.wrap(side)
+    if t == "modem" and wrap and type(wrap.getNamesRemote) == "function" then
+      for _, n in ipairs(wrap.getNamesRemote() or {}) do
+        if isInventory(n) then return n end
+      end
+    end
+  end
+
+  local want = s:lower()
+  local hits = {}
+  for _, name in ipairs(peripheral.getNames()) do
+    if isInventory(name) and name:lower():find(want, 1, true) then
+      hits[#hits + 1] = name
+    end
+  end
+  -- Also scan modem remotes (some CC builds list them only here).
+  for _, sideName in ipairs(peripheral.getNames()) do
+    if peripheral.getType(sideName) == "modem" then
+      local m = peripheral.wrap(sideName)
+      if m and type(m.getNamesRemote) == "function" then
+        for _, n in ipairs(m.getNamesRemote() or {}) do
+          if isInventory(n) and n:lower():find(want, 1, true) then
+            local dup = false
+            for _, h in ipairs(hits) do if h == n then dup = true; break end end
+            if not dup then hits[#hits + 1] = n end
+          end
+        end
+      end
+    end
+  end
+  if #hits == 1 then return hits[1] end
+  if #hits > 1 then return nil, hits end
+  return nil
+end
+
 local function wrapRole(role)
   local n = cfg[role]
-  if not n or not isInventory(n) then return nil end
+  if role == "chest" and (not n or n == "") then
+    n = cfg.intake or cfg.output
+  end
+  if not n then return nil end
+  -- Re-resolve in case modem remotes renamed after reboot.
+  local resolved = resolveInventory(n)
+  if resolved then n = resolved end
+  if not isInventory(n) then return nil end
   return peripheral.wrap(n), n
+end
+
+local function chestFreeSlots(inv)
+  local size = 27
+  if type(inv.size) == "function" then
+    local ok, s = pcall(inv.size)
+    if ok and tonumber(s) then size = tonumber(s) end
+  end
+  local list = inv.list() or {}
+  local used = 0
+  for _ in pairs(list) do used = used + 1 end
+  return math.max(0, size - used), size
+end
+
+--- Wait until the I/O chest has at least one empty slot (or user cancels).
+local function waitForChestSpace(cname)
+  print(("Chest full (%s) — collect items."):format(cname))
+  print("Waiting for space (auto every 1s, Enter = check, C = cancel)…")
+  while true do
+    local timer = os.startTimer(1)
+    while true do
+      local ev, p1 = os.pullEvent()
+      if ev == "timer" and p1 == timer then
+        break
+      elseif ev == "key" and p1 == keys.enter then
+        break
+      elseif ev == "char" and tostring(p1 or ""):lower() == "c" then
+        print("Cancelled remaining withdraw.")
+        return false
+      end
+    end
+    local chest = select(1, wrapRole("chest"))
+    if chest and select(1, chestFreeSlots(chest)) > 0 then
+      print("Space available — continuing…")
+      return true
+    end
+  end
 end
 
 local function shortName(id)
@@ -149,55 +251,94 @@ local function matchStock(stockMap, query)
   return nil, nil
 end
 
---- Push all slots from `from` into peripheral `toName`. Returns moved count.
-local function pushAll(from, toName)
-  if type(from.pushItems) ~= "function" then return 0, "no pushItems" end
-  local moved = 0
-  local rows = listContents(from)
-  for _, r in ipairs(rows) do
-    local left = r.count
-    while left > 0 do
-      local ok, n = pcall(from.pushItems, toName, r.slot, left)
-      n = (ok and tonumber(n)) or 0
-      if n <= 0 then break end
-      moved = moved + n
-      left = left - n
+--- Move everything from source → dest over the modem network.
+--- Tries source.pushItems(dest), then dest.pullItems(source).
+local function transferAll(source, sourceName, dest, destName)
+  local moved, lastErr = 0, nil
+  local guard = 0
+  while guard < 256 do
+    guard = guard + 1
+    local okList, list = pcall(function() return source.list() end)
+    if not okList or type(list) ~= "table" then
+      return moved, lastErr or "intake list failed"
     end
-  end
-  return moved, nil
-end
-
---- Move `need` of `item` from vault → output. Returns moved count.
-local function pullItem(vault, vname, oname, item, need)
-  local moved = 0
-  while moved < need do
-    local list = vault.list() or {}
     local slots = {}
     for slot, detail in pairs(list) do
-      if type(detail) == "table" and detail.name == item then
+      if type(detail) == "table" and detail.name and (tonumber(detail.count) or 0) > 0 then
         slots[#slots + 1] = slot
       end
     end
-    table.sort(slots)
     if #slots == 0 then break end
+    table.sort(slots)
+
     local progressed = false
     for _, slot in ipairs(slots) do
-      if moved >= need then break end
-      local detail = (vault.list() or {})[slot]
-      local have = (type(detail) == "table" and tonumber(detail.count)) or 0
-      local want = math.min(need - moved, have)
-      if want > 0 then
-        local ok, n = pcall(vault.pushItems, oname, slot, want)
-        n = (ok and tonumber(n)) or 0
-        if n > 0 then
-          moved = moved + n
-          progressed = true
+      local n = 0
+      if type(source.pushItems) == "function" then
+        local ok, r = pcall(source.pushItems, destName, slot)
+        if ok then
+          n = tonumber(r) or 0
+        else
+          lastErr = tostring(r)
         end
+      end
+      if n <= 0 and dest and type(dest.pullItems) == "function" then
+        local ok, r = pcall(dest.pullItems, sourceName, slot)
+        if ok then
+          n = tonumber(r) or 0
+        else
+          lastErr = tostring(r)
+        end
+      end
+      if n > 0 then
+        moved = moved + n
+        progressed = true
       end
     end
     if not progressed then break end
   end
-  return moved
+  return moved, lastErr
+end
+
+--- Move `need` of `item` from vault → output. Returns moved count.
+local function transferItem(vault, vname, output, oname, item, need)
+  local moved, lastErr = 0, nil
+  local guard = 0
+  while moved < need and guard < 256 do
+    guard = guard + 1
+    local okList, list = pcall(function() return vault.list() end)
+    if not okList or type(list) ~= "table" then break end
+    local slots = {}
+    for slot, detail in pairs(list) do
+      if type(detail) == "table" and detail.name == item
+          and (tonumber(detail.count) or 0) > 0 then
+        slots[#slots + 1] = { slot = slot, count = tonumber(detail.count) or 0 }
+      end
+    end
+    if #slots == 0 then break end
+    table.sort(slots, function(a, b) return a.slot < b.slot end)
+
+    local progressed = false
+    for _, row in ipairs(slots) do
+      if moved >= need then break end
+      local want = math.min(need - moved, row.count)
+      local n = 0
+      if type(vault.pushItems) == "function" then
+        local ok, r = pcall(vault.pushItems, oname, row.slot, want)
+        if ok then n = tonumber(r) or 0 else lastErr = tostring(r) end
+      end
+      if n <= 0 and output and type(output.pullItems) == "function" then
+        local ok, r = pcall(output.pullItems, vname, row.slot, want)
+        if ok then n = tonumber(r) or 0 else lastErr = tostring(r) end
+      end
+      if n > 0 then
+        moved = moved + n
+        progressed = true
+      end
+    end
+    if not progressed then break end
+  end
+  return moved, lastErr
 end
 
 --------------------------------------------------------------------------------
@@ -205,30 +346,50 @@ end
 --------------------------------------------------------------------------------
 local function cmdBind(a)
   local role = tostring(a[2] or ""):lower()
-  local name = a[3]
-  if role ~= "intake" and role ~= "output" and role ~= "vault" then
-    print("Usage: bind intake|output|vault <peripheralName|side>")
-    return
+  local ref = a[3]
+  -- `bind left` → chest; `bind chest left` / `bind vault name`
+  if role ~= "chest" and role ~= "vault" and role ~= "intake" and role ~= "output"
+      and role ~= "io" then
+    if a[2] and not a[3] then
+      ref = a[2]
+      role = "chest"
+    else
+      print("Usage: bind chest|vault <peripheralName|side>")
+      print("       bind <side>     (same as bind chest <side>)")
+      return
+    end
   end
-  if not name then
+  if role == "intake" or role == "output" or role == "io" then role = "chest" end
+  if not ref then
     print("Usage: bind " .. role .. " <peripheralName|side>")
     return
   end
-  if not isInventory(name) then
-    print("Not an inventory: " .. tostring(name))
-    print("Tip: invs — use a vanilla chest or a modem-linked Create vault.")
+  local name, hits = resolveInventory(ref)
+  if not name then
+    if type(hits) == "table" then
+      print("Multiple matches for '" .. ref .. "':")
+      for _, h in ipairs(hits) do print("  " .. h) end
+      return
+    end
+    print("Not an inventory: " .. tostring(ref))
+    print("Run invs — right-click the vault modem until it connects.")
     return
   end
-  if role == "intake" and (name == cfg.vault or name == cfg.output) then
-    print("Intake must be a different chest than vault/output."); return
+  if not canTransfer(name) then
+    print("Inventory has no pushItems/pullItems: " .. name)
+    return
   end
-  if role == "output" and (name == cfg.vault or name == cfg.intake) then
-    print("Output must be a different chest than vault/intake."); return
+  if role == "chest" and name == cfg.vault then
+    print("Chest must be different from the vault."); return
   end
-  if role == "vault" and (name == cfg.intake or name == cfg.output) then
-    print("Vault must be different from intake/output."); return
+  if role == "vault" and name == (cfg.chest or cfg.intake or cfg.output) then
+    print("Vault must be different from the I/O chest."); return
   end
   cfg[role] = name
+  if role == "chest" then
+    cfg.intake = name
+    cfg.output = name
+  end
   saveCfg()
   print("Bound " .. role .. " = " .. name)
 end
@@ -238,13 +399,13 @@ local function cmdInvs()
   local list = collectInventories()
   if #list == 0 then
     print("  (none)")
-    print("Put chests against this PC, or cable a wired modem to the vault.")
+    print("Put a chest against this PC, or cable a wired modem to the vault.")
     return
   end
+  local chestName = cfg.chest or cfg.intake or cfg.output
   for _, row in ipairs(list) do
     local marks = ""
-    if row.name == cfg.intake then marks = marks .. " [intake]" end
-    if row.name == cfg.output then marks = marks .. " [output]" end
+    if row.name == chestName then marks = marks .. " [chest]" end
     if row.name == cfg.vault then marks = marks .. " [vault]" end
     local note = row.note and ("  (" .. row.note .. ")") or ""
     print("  " .. row.name .. marks .. note)
@@ -253,10 +414,16 @@ end
 
 local function cmdStatus()
   print("== Storage ATM v" .. VERSION .. " ==")
-  print("Mode:   wired modem ↔ vault (no ticker / casino)")
-  print("Intake: " .. tostring(cfg.intake or "(unbound)"))
-  print("Output: " .. tostring(cfg.output or "(unbound)"))
-  print("Vault:  " .. tostring(cfg.vault or "(unbound)"))
+  print("Mode:   one I/O chest + modem vault")
+  local function line(role, label)
+    local w, n = wrapRole(role)
+    local stored = cfg[role] or (role == "chest" and (cfg.intake or cfg.output)) or nil
+    if not stored then return label .. ": (unbound)" end
+    if not w then return label .. ": " .. tostring(stored) .. " MISSING" end
+    return label .. ": " .. tostring(n) .. " OK"
+  end
+  print(line("chest", "Chest"))
+  print(line("vault", "Vault"))
 end
 
 local function cmdStock(a)
@@ -288,44 +455,53 @@ local function cmdStock(a)
 end
 
 local function cmdDeposit()
-  local intake, iname = wrapRole("intake")
+  local chest, cname = wrapRole("chest")
   local vault, vname = wrapRole("vault")
-  if not intake then print("Bind intake: bind intake <side|name>"); return end
-  if not vault then print("Bind vault: bind vault <side|name>"); return end
-  if type(intake.pushItems) ~= "function" then
-    print("Intake cannot pushItems."); return
+  if not chest then print("Bind chest: bind chest <side|name>"); return end
+  if not vault then print("Bind vault: bind vault <name>  (from invs)"); return end
+  if cname == vname then
+    print("Chest and vault are the same peripheral — rebind."); return
+  end
+  if type(chest.pushItems) ~= "function" and type(vault.pullItems) ~= "function" then
+    print("Neither chest.pushItems nor vault.pullItems available.")
+    return
   end
 
-  local rows, total = listContents(intake)
+  local rows, total = listContents(chest)
   if total <= 0 then
-    print("Intake empty — put items in, then deposit."); return
+    print("Chest empty — put items in, then deposit."); return
   end
-  print(("Intake (%s) — %d item(s):"):format(iname, total))
+  print(("Chest (%s) — %d item(s):"):format(cname, total))
   for _, r in ipairs(rows) do
     print(("  %dx %s"):format(r.count, r.name))
   end
-  write("Move into vault? (y/N): ")
+  print(("Target vault: %s"):format(vname))
+  write("Move into vault over modem? (y/N): ")
   local ans = tostring(read() or ""):lower()
   if ans ~= "y" and ans ~= "yes" then
-    print("Cancelled — items left in intake."); return
+    print("Cancelled — items left in chest."); return
   end
 
-  local moved, err = pushAll(intake, vname)
-  if err then print(err); return end
-  local left = select(2, listContents(intake))
+  local moved, err = transferAll(chest, cname, vault, vname)
+  local left = select(2, listContents(chest))
   print(("Moved %d item(s) → vault %s."):format(moved, vname))
-  if left > 0 then
-    print(("Vault full? %d item(s) still in intake."):format(left))
+  if moved <= 0 then
+    print("Nothing transferred.")
+    if err then print("Last error: " .. tostring(err)) end
+    print("Check: vault modem connected (right-click), same cable as ATM,")
+    print("       and bind vault to the name shown in invs.")
+  elseif left > 0 then
+    print(("Partial — %d item(s) still in chest (vault full?)."):format(left))
   end
 end
 
 local function cmdWithdraw(a)
   local vault, vname = wrapRole("vault")
-  local output, oname = wrapRole("output")
-  if not vault then print("Bind vault: bind vault <side|name>"); return end
-  if not output then print("Bind output: bind output <side|name>"); return end
-  if type(vault.pushItems) ~= "function" then
-    print("Vault cannot pushItems."); return
+  local chest, cname = wrapRole("chest")
+  if not vault then print("Bind vault: bind vault <name>"); return end
+  if not chest then print("Bind chest: bind chest <side|name>"); return end
+  if vname == cname then
+    print("Vault and chest are the same peripheral — rebind."); return
   end
 
   local itemQ = a[2]
@@ -364,32 +540,61 @@ local function cmdWithdraw(a)
     return
   end
 
-  print(("Withdraw %dx %s → output %s"):format(count, item, oname))
+  print(("Withdraw %dx %s → chest %s"):format(count, item, cname))
+  print("If the chest fills, collect items — withdraw will continue.")
   write("Confirm? (y/N): ")
   local ans = tostring(read() or ""):lower()
   if ans ~= "y" and ans ~= "yes" then
     print("Cancelled."); return
   end
 
-  local moved = pullItem(vault, vname, oname, item, count)
-  if moved <= 0 then
-    print("Nothing moved — output may be full."); return
+  local moved, lastErr = 0, nil
+  while moved < count do
+    chest, cname = wrapRole("chest")
+    vault, vname = wrapRole("vault")
+    if not chest or not vault then
+      print("Chest/vault missing mid-withdraw."); break
+    end
+
+    local need = count - moved
+    local n, err = transferItem(vault, vname, chest, cname, item, need)
+    lastErr = err or lastErr
+    if n > 0 then
+      moved = moved + n
+      print(("  … %d/%d in chest (+%d)"):format(moved, count, n))
+    else
+      local free = select(1, chestFreeSlots(chest))
+      if free > 0 then
+        print("Transfer stalled with free slots — check modem/vault.")
+        if lastErr then print("Last error: " .. tostring(lastErr)) end
+        break
+      end
+      if not waitForChestSpace(cname) then break end
+    end
   end
-  print(("Moved %d/%d → output."):format(moved, count))
+
+  if moved <= 0 then
+    print("Nothing moved — chest full or modem path failed.")
+    if lastErr then print("Last error: " .. tostring(lastErr)) end
+    return
+  end
+  print(("Done: moved %d/%d → chest."):format(moved, count))
   if moved < count then
-    print("Partial — output full or vault changed.")
+    print(("Stopped early — %d still in vault."):format(count - moved))
   end
 end
 
 local function cmdHelp()
   print([[
-Storage ATM — wired modem to vault (no Create ticker).
+Storage ATM — one I/O chest + modem vault.
 
-bind intake|output|vault <side|name>
+bind chest <side|name>      deposit + withdraw tray (same chest)
+bind <side>                 same as bind chest <side>
+bind vault <name>
 invs | status
 stock [filter]              list vault contents
-deposit                     confirm → move intake → vault
-withdraw [item] [count]     if vault has enough → vault → output
+deposit                     confirm → chest → vault
+withdraw [item] [count]     vault → chest (waits if chest full)
 help | exit
 ]])
 end
@@ -400,10 +605,9 @@ os.setComputerLabel(cfg.label or os.getComputerLabel() or ("StorageATM-" .. os.g
 
 term.clear(); term.setCursorPos(1, 1)
 print("== Storage ATM v" .. VERSION .. " ==")
-print("Wired modem ↔ vault — no ticker / casino.")
-if not cfg.intake then print("bind intake <side>") end
-if not cfg.output then print("bind output <side>") end
-if not cfg.vault then print("bind vault <name>  (modem-linked Create vault)") end
+print("One I/O chest + vault over wired modem.")
+if not (cfg.chest or cfg.intake or cfg.output) then print("bind chest <side>") end
+if not cfg.vault then print("bind vault <name from invs>") end
 print("Type help.")
 print("")
 
