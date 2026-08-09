@@ -1,37 +1,40 @@
 --[[
   storage/managers/storage_atm.lua  -  Standalone vault ATM (wired modem)
-  Titan-Version: 1.2.1
+  Titan-Version: 1.3.0
 
-  Solo item ATM. No casino, no Currency Manager, no Create Stock Ticker.
-  Moves items over the wired modem network with pushItems / pullItems.
+  Solo item ATM. No casino / Currency Manager / Stock Ticker.
+  One I/O chest + one or more Create vaults on the same wired modem network,
+  treated as a single linked stock pool.
 
-  Hardware (same cable network):
-    [I/O chest]    --touching or wired--> [ATM PC]
-    [Create vault] --wired modem (right-click to connect) --/
-
-  One chest is both deposit and withdraw tray (`bind chest`).
-  Deposit: chest → vault.
-  Withdraw: vault → chest; if the chest fills mid-request, wait for the
-  player to collect, then continue the next batch.
+  Hardware:
+    [I/O chest]     --touching or wired--> [ATM PC]
+    [Vault A/B/…]   --wired modems-------/
 
   Setup:
     invs
     bind chest <side|name>
-    bind vault <name>
-    deposit | withdraw | stock | status | help
+    bind vault <name>          -- add one vault (repeat)
+    link                       -- auto-add every create:*vault* on the network
+    unbind vault <name|#|all>
+    deposit | withdraw | stock | vaults | status | help
 ]]
 
 local LOCAL_CFG = "storage_atm.cfg"
-local VERSION = "1.2.1"
+local VERSION = "1.3.0"
 
 local cfg = {
-  chest = nil,   -- shared deposit + withdraw tray
-  vault = nil,
+  chest = nil,
+  vaults = {},   -- list of peripheral names
   label = nil,
-  -- legacy fields (migrated on load)
+  -- legacy
+  vault = nil,
   intake = nil,
   output = nil,
   address = nil,
+}
+
+local SIDES = {
+  left = true, right = true, front = true, back = true, top = true, bottom = true,
 }
 
 --------------------------------------------------------------------------------
@@ -47,9 +50,20 @@ local function loadCfg()
   if (not cfg.chest or cfg.chest == "") then
     cfg.chest = cfg.intake or cfg.output
   end
+  if type(cfg.vaults) ~= "table" then cfg.vaults = {} end
+  -- Migrate single vault → list
+  if cfg.vault and cfg.vault ~= "" then
+    local found = false
+    for _, n in ipairs(cfg.vaults) do
+      if n == cfg.vault then found = true; break end
+    end
+    if not found then cfg.vaults[#cfg.vaults + 1] = cfg.vault end
+  end
 end
 
 local function saveCfg()
+  -- Keep legacy field synced to first vault for old tools/configs.
+  cfg.vault = cfg.vaults[1]
   local f = fs.open(LOCAL_CFG, "w")
   if f then f.write(textutils.serialize(cfg)); f.close() end
 end
@@ -67,9 +81,19 @@ local function canTransfer(name)
   return w and (type(w.pushItems) == "function" or type(w.pullItems) == "function")
 end
 
-local SIDES = {
-  left = true, right = true, front = true, back = true, top = true, bottom = true,
-}
+local function isSideName(name)
+  return SIDES[tostring(name or ""):lower()] == true
+end
+
+local function shortName(id)
+  id = tostring(id or "")
+  return id:match("([^:]+)$") or id
+end
+
+local function looksLikeVault(name)
+  local low = tostring(name or ""):lower()
+  return low:find("vault", 1, true) ~= nil
+end
 
 local function resolveInventory(ref)
   if not ref or ref == "" then return nil end
@@ -90,23 +114,18 @@ local function resolveInventory(ref)
 
   local want = s:lower()
   local hits = {}
-  for _, name in ipairs(peripheral.getNames()) do
-    if isInventory(name) and name:lower():find(want, 1, true) then
-      hits[#hits + 1] = name
+  local function consider(n)
+    if isInventory(n) and n:lower():find(want, 1, true) then
+      for _, h in ipairs(hits) do if h == n then return end end
+      hits[#hits + 1] = n
     end
   end
-  -- Also scan modem remotes (some CC builds list them only here).
+  for _, name in ipairs(peripheral.getNames()) do consider(name) end
   for _, sideName in ipairs(peripheral.getNames()) do
     if peripheral.getType(sideName) == "modem" then
       local m = peripheral.wrap(sideName)
       if m and type(m.getNamesRemote) == "function" then
-        for _, n in ipairs(m.getNamesRemote() or {}) do
-          if isInventory(n) and n:lower():find(want, 1, true) then
-            local dup = false
-            for _, h in ipairs(hits) do if h == n then dup = true; break end end
-            if not dup then hits[#hits + 1] = n end
-          end
-        end
+        for _, n in ipairs(m.getNamesRemote() or {}) do consider(n) end
       end
     end
   end
@@ -115,17 +134,77 @@ local function resolveInventory(ref)
   return nil
 end
 
-local function wrapRole(role)
-  local n = cfg[role]
-  if role == "chest" and (not n or n == "") then
-    n = cfg.intake or cfg.output
+local function wrapInv(name)
+  if not name then return nil end
+  local resolved = resolveInventory(name)
+  if resolved then name = resolved end
+  if not isInventory(name) then return nil end
+  return peripheral.wrap(name), name
+end
+
+local function wrapChest()
+  local n = cfg.chest or cfg.intake or cfg.output
+  return wrapInv(n)
+end
+
+local function vaultSet()
+  local s = {}
+  for _, n in ipairs(cfg.vaults or {}) do s[n] = true end
+  return s
+end
+
+local function listVaults()
+  local out = {}
+  for _, name in ipairs(cfg.vaults or {}) do
+    local w, n = wrapInv(name)
+    if w and n then
+      out[#out + 1] = { wrap = w, name = n, ok = true }
+    else
+      out[#out + 1] = { wrap = nil, name = name, ok = false }
+    end
   end
-  if not n then return nil end
-  -- Re-resolve in case modem remotes renamed after reboot.
-  local resolved = resolveInventory(n)
-  if resolved then n = resolved end
-  if not isInventory(n) then return nil end
-  return peripheral.wrap(n), n
+  return out
+end
+
+local function liveVaults()
+  local out = {}
+  for _, v in ipairs(listVaults()) do
+    if v.ok then out[#out + 1] = v end
+  end
+  return out
+end
+
+local function addVault(name)
+  for _, n in ipairs(cfg.vaults) do
+    if n == name then return false, "already linked" end
+  end
+  cfg.vaults[#cfg.vaults + 1] = name
+  saveCfg()
+  return true
+end
+
+local function removeVault(ref)
+  ref = tostring(ref or "")
+  if ref:lower() == "all" then
+    local n = #cfg.vaults
+    cfg.vaults = {}
+    saveCfg()
+    return n
+  end
+  local idx = tonumber(ref)
+  if idx and cfg.vaults[idx] then
+    table.remove(cfg.vaults, idx)
+    saveCfg()
+    return 1
+  end
+  for i, n in ipairs(cfg.vaults) do
+    if n == ref or n:lower() == ref:lower() then
+      table.remove(cfg.vaults, i)
+      saveCfg()
+      return 1
+    end
+  end
+  return 0
 end
 
 local function chestFreeSlots(inv)
@@ -140,7 +219,6 @@ local function chestFreeSlots(inv)
   return math.max(0, size - used), size
 end
 
---- Wait until the I/O chest has at least one empty slot (or user cancels).
 local function waitForChestSpace(cname)
   print(("Chest full (%s) — collect items."):format(cname))
   print("Waiting for space (auto every 1s, Enter = check, C = cancel)…")
@@ -148,26 +226,19 @@ local function waitForChestSpace(cname)
     local timer = os.startTimer(1)
     while true do
       local ev, p1 = os.pullEvent()
-      if ev == "timer" and p1 == timer then
-        break
-      elseif ev == "key" and p1 == keys.enter then
-        break
+      if ev == "timer" and p1 == timer then break
+      elseif ev == "key" and p1 == keys.enter then break
       elseif ev == "char" and tostring(p1 or ""):lower() == "c" then
         print("Cancelled remaining withdraw.")
         return false
       end
     end
-    local chest = select(1, wrapRole("chest"))
+    local chest = select(1, wrapChest())
     if chest and select(1, chestFreeSlots(chest)) > 0 then
       print("Space available — continuing…")
       return true
     end
   end
-end
-
-local function shortName(id)
-  id = tostring(id or "")
-  return id:match("([^:]+)$") or id
 end
 
 local function collectInventories()
@@ -177,9 +248,7 @@ local function collectInventories()
     seen[n] = true
     names[#names + 1] = { name = n, note = note }
   end
-  for _, n in ipairs(peripheral.getNames()) do
-    add(n, nil)
-  end
+  for _, n in ipairs(peripheral.getNames()) do add(n, nil) end
   for _, side in ipairs(peripheral.getNames()) do
     if peripheral.getType(side) == "modem" then
       local m = peripheral.wrap(side)
@@ -195,7 +264,7 @@ local function collectInventories()
 end
 
 --------------------------------------------------------------------------------
--- Vault stock / transfer
+-- Stock / transfer
 --------------------------------------------------------------------------------
 local function inventoryStock(inv)
   local map = {}
@@ -203,9 +272,17 @@ local function inventoryStock(inv)
   for _, detail in pairs(list) do
     if type(detail) == "table" and detail.name then
       local c = tonumber(detail.count) or 0
-      if c > 0 then
-        map[detail.name] = (map[detail.name] or 0) + c
-      end
+      if c > 0 then map[detail.name] = (map[detail.name] or 0) + c end
+    end
+  end
+  return map
+end
+
+local function poolStock()
+  local map = {}
+  for _, v in ipairs(liveVaults()) do
+    for item, count in pairs(inventoryStock(v.wrap)) do
+      map[item] = (map[item] or 0) + count
     end
   end
   return map
@@ -238,9 +315,7 @@ local function matchStock(stockMap, query)
   for name, count in pairs(stockMap) do
     local low = name:lower()
     local bare = shortName(name):lower()
-    if low == query or bare == query then
-      return name, count
-    end
+    if low == query or bare == query then return name, count end
     if low:find(query, 1, true) or bare:find(query, 1, true) then
       hits[#hits + 1] = { name = name, count = count }
     end
@@ -251,13 +326,6 @@ local function matchStock(stockMap, query)
   return nil, nil
 end
 
-local function isSideName(name)
-  name = tostring(name or ""):lower()
-  return SIDES[name] == true
-end
-
---- Network name usable as a push/pull target. Side names (left/…) only work
---- as the wrapped source on this computer — remotes cannot pullItems("left").
 local function networkTargetName(name)
   if not name or isSideName(name) then return nil end
   return name
@@ -265,9 +333,7 @@ end
 
 local function pushSlot(fromWrap, fromName, toName, slot, limit)
   if not toName then return 0, "no destination" end
-  -- Prefer peripheral.call so side names resolve on THIS computer.
-  if fromName and peripheral.isPresent(fromName)
-      and type(peripheral.call) == "function" then
+  if fromName and peripheral.isPresent(fromName) and type(peripheral.call) == "function" then
     local ok, r
     if limit then
       ok, r = pcall(peripheral.call, fromName, "pushItems", toName, slot, limit)
@@ -275,7 +341,6 @@ local function pushSlot(fromWrap, fromName, toName, slot, limit)
       ok, r = pcall(peripheral.call, fromName, "pushItems", toName, slot)
     end
     if ok then return tonumber(r) or 0, nil end
-    -- fall through to wrap method
   end
   if fromWrap and type(fromWrap.pushItems) == "function" then
     local ok, r = pcall(function()
@@ -289,10 +354,7 @@ local function pushSlot(fromWrap, fromName, toName, slot, limit)
 end
 
 local function pullSlot(toWrap, toName, fromName, slot, limit)
-  -- Remote inventories cannot see computer side names like "left".
-  if not fromName or isSideName(fromName) then
-    return 0, nil
-  end
+  if not fromName or isSideName(fromName) then return 0, nil end
   if toName and peripheral.isPresent(toName) and type(peripheral.call) == "function" then
     local ok, r
     if limit then
@@ -313,12 +375,14 @@ local function pullSlot(toWrap, toName, fromName, slot, limit)
   return 0, nil
 end
 
---- Move everything from source → dest over the modem network.
-local function transferAll(source, sourceName, dest, destName)
+--- Deposit: push chest slots into any linked vault that will take them.
+local function transferAllToPool(source, sourceName)
   local moved, lastErr = 0, nil
-  local destNet = networkTargetName(destName) or destName
+  local vaults = liveVaults()
+  if #vaults == 0 then return 0, "no live vaults" end
+
   local guard = 0
-  while guard < 256 do
+  while guard < 512 do
     guard = guard + 1
     local okList, list = pcall(function() return source.list() end)
     if not okList or type(list) ~= "table" then
@@ -335,70 +399,84 @@ local function transferAll(source, sourceName, dest, destName)
 
     local progressed = false
     for _, slot in ipairs(slots) do
-      local n, err = pushSlot(source, sourceName, destNet, slot, nil)
-      if err then lastErr = err end
-      if n <= 0 then
-        local n2, err2 = pullSlot(dest, destName, sourceName, slot, nil)
-        if err2 then lastErr = err2 end
-        n = n2
+      local n = 0
+      for _, v in ipairs(vaults) do
+        local destNet = networkTargetName(v.name) or v.name
+        local got, err = pushSlot(source, sourceName, destNet, slot, nil)
+        if err then lastErr = err end
+        if got <= 0 then
+          local got2, err2 = pullSlot(v.wrap, v.name, sourceName, slot, nil)
+          if err2 then lastErr = err2 end
+          got = got2
+        end
+        if got > 0 then
+          n = n + got
+          progressed = true
+          -- Slot may still have leftovers; try next vaults / next loop.
+          break
+        end
       end
-      if n > 0 then
-        moved = moved + n
-        progressed = true
-      end
+      if n > 0 then moved = moved + n end
     end
+
     if not progressed then
       if moved <= 0 and isSideName(sourceName) then
         lastErr = (lastErr and (lastErr .. " | ") or "")
-          .. "Chest is bound as side '" .. sourceName
-          .. "'. Put a wired modem on the chest (connect it), then: bind chest <name from invs>"
+          .. "Chest is side '" .. sourceName
+          .. "'. Modem-link the chest, then: bind chest <name from invs>"
       elseif moved <= 0 and not lastErr then
-        lastErr = "Vault accepted 0 items (full, filtered, or not linked on this cable)"
+        lastErr = "All vaults accepted 0 items (full or not linked)"
       end
       break
     end
+    vaults = liveVaults()
   end
   return moved, lastErr
 end
 
---- Move `need` of `item` from vault → chest. Returns moved count.
-local function transferItem(vault, vname, chest, cname, item, need)
+--- Withdraw one item type from the pool into the chest.
+local function transferItemFromPool(chest, cname, item, need)
   local moved, lastErr = 0, nil
   local chestNet = networkTargetName(cname) or cname
   local guard = 0
-  while moved < need and guard < 256 do
+  while moved < need and guard < 512 do
     guard = guard + 1
-    local okList, list = pcall(function() return vault.list() end)
-    if not okList or type(list) ~= "table" then break end
-    local slots = {}
-    for slot, detail in pairs(list) do
-      if type(detail) == "table" and detail.name == item
-          and (tonumber(detail.count) or 0) > 0 then
-        slots[#slots + 1] = { slot = slot, count = tonumber(detail.count) or 0 }
-      end
-    end
-    if #slots == 0 then break end
-    table.sort(slots, function(a, b) return a.slot < b.slot end)
+    local vaults = liveVaults()
+    if #vaults == 0 then break end
 
     local progressed = false
-    for _, row in ipairs(slots) do
+    for _, v in ipairs(vaults) do
       if moved >= need then break end
-      local want = math.min(need - moved, row.count)
-      -- Push from vault to chest (chest may be side name — OK as push target on this PC).
-      local n, err = pushSlot(vault, vname, chestNet, row.slot, want)
-      if (not n or n <= 0) and isSideName(cname) then
-        -- Side-named chest: push target must be the side string on this computer.
-        n, err = pushSlot(vault, vname, cname, row.slot, want)
-      end
-      if err then lastErr = err end
-      if n <= 0 then
-        local n2, err2 = pullSlot(chest, cname, vname, row.slot, want)
-        if err2 then lastErr = err2 end
-        n = n2
-      end
-      if n > 0 then
-        moved = moved + n
-        progressed = true
+      local okList, list = pcall(function() return v.wrap.list() end)
+      if okList and type(list) == "table" then
+        local slots = {}
+        for slot, detail in pairs(list) do
+          if type(detail) == "table" and detail.name == item
+              and (tonumber(detail.count) or 0) > 0 then
+            slots[#slots + 1] = {
+              slot = slot, count = tonumber(detail.count) or 0,
+            }
+          end
+        end
+        table.sort(slots, function(a, b) return a.slot < b.slot end)
+        for _, row in ipairs(slots) do
+          if moved >= need then break end
+          local want = math.min(need - moved, row.count)
+          local n, err = pushSlot(v.wrap, v.name, chestNet, row.slot, want)
+          if (not n or n <= 0) and isSideName(cname) then
+            n, err = pushSlot(v.wrap, v.name, cname, row.slot, want)
+          end
+          if err then lastErr = err end
+          if n <= 0 then
+            local n2, err2 = pullSlot(chest, cname, v.name, row.slot, want)
+            if err2 then lastErr = err2 end
+            n = n2
+          end
+          if n > 0 then
+            moved = moved + n
+            progressed = true
+          end
+        end
       end
     end
     if not progressed then break end
@@ -412,7 +490,6 @@ end
 local function cmdBind(a)
   local role = tostring(a[2] or ""):lower()
   local ref = a[3]
-  -- `bind left` → chest; `bind chest left` / `bind vault name`
   if role ~= "chest" and role ~= "vault" and role ~= "intake" and role ~= "output"
       and role ~= "io" then
     if a[2] and not a[3] then
@@ -420,7 +497,8 @@ local function cmdBind(a)
       role = "chest"
     else
       print("Usage: bind chest|vault <peripheralName|side>")
-      print("       bind <side>     (same as bind chest <side>)")
+      print("       bind <side>     (= bind chest)")
+      print("       link            auto-add all vaults on the network")
       return
     end
   end
@@ -429,6 +507,7 @@ local function cmdBind(a)
     print("Usage: bind " .. role .. " <peripheralName|side>")
     return
   end
+
   local name, hits = resolveInventory(ref)
   if not name then
     if type(hits) == "table" then
@@ -437,26 +516,85 @@ local function cmdBind(a)
       return
     end
     print("Not an inventory: " .. tostring(ref))
-    print("Run invs — right-click the vault modem until it connects.")
     return
   end
   if not canTransfer(name) then
     print("Inventory has no pushItems/pullItems: " .. name)
     return
   end
-  if role == "chest" and name == cfg.vault then
-    print("Chest must be different from the vault."); return
-  end
-  if role == "vault" and name == (cfg.chest or cfg.intake or cfg.output) then
-    print("Vault must be different from the I/O chest."); return
-  end
-  cfg[role] = name
+
+  local chestName = cfg.chest or cfg.intake or cfg.output
   if role == "chest" then
+    if vaultSet()[name] then
+      print("That peripheral is already a linked vault."); return
+    end
+    cfg.chest = name
     cfg.intake = name
     cfg.output = name
+    saveCfg()
+    print("Bound chest = " .. name)
+    return
   end
-  saveCfg()
-  print("Bound " .. role .. " = " .. name)
+
+  -- vault
+  if name == chestName then
+    print("Vault must be different from the I/O chest."); return
+  end
+  local ok, err = addVault(name)
+  if not ok then
+    print("Vault " .. name .. " — " .. tostring(err))
+  else
+    print("Linked vault = " .. name .. ("  (pool size %d)"):format(#cfg.vaults))
+  end
+end
+
+local function cmdUnbind(a)
+  local role = tostring(a[2] or ""):lower()
+  local ref = a[3]
+  if role ~= "vault" then
+    print("Usage: unbind vault <name|#|all>")
+    return
+  end
+  if not ref then
+    print("Usage: unbind vault <name|#|all>")
+    return
+  end
+  local n = removeVault(ref)
+  print(n > 0 and ("Removed " .. n .. " vault(s). Pool=" .. #cfg.vaults)
+    or "No matching vault.")
+end
+
+local function cmdLink()
+  local chestName = cfg.chest or cfg.intake or cfg.output
+  local added = 0
+  for _, row in ipairs(collectInventories()) do
+    local n = row.name
+    if looksLikeVault(n) and n ~= chestName and canTransfer(n) then
+      local ok = addVault(n)
+      if ok then
+        added = added + 1
+        print("  + " .. n)
+      end
+    end
+  end
+  if added == 0 then
+    print("No new vaults found (names containing 'vault').")
+    print("Or: bind vault <name> for each one from invs.")
+  else
+    print(("Linked %d vault(s). Pool size=%d"):format(added, #cfg.vaults))
+  end
+end
+
+local function cmdVaults()
+  print(("Vault pool (%d):"):format(#cfg.vaults))
+  if #cfg.vaults == 0 then
+    print("  (none) — bind vault <name>  or  link")
+    return
+  end
+  for i, v in ipairs(listVaults()) do
+    local mark = v.ok and "OK" or "MISSING"
+    print(("  %d) %s  [%s]"):format(i, v.name, mark))
+  end
 end
 
 local function cmdInvs()
@@ -464,14 +602,14 @@ local function cmdInvs()
   local list = collectInventories()
   if #list == 0 then
     print("  (none)")
-    print("Put a chest against this PC, or cable a wired modem to the vault.")
     return
   end
   local chestName = cfg.chest or cfg.intake or cfg.output
+  local vset = vaultSet()
   for _, row in ipairs(list) do
     local marks = ""
     if row.name == chestName then marks = marks .. " [chest]" end
-    if row.name == cfg.vault then marks = marks .. " [vault]" end
+    if vset[row.name] then marks = marks .. " [vault]" end
     local note = row.note and ("  (" .. row.note .. ")") or ""
     print("  " .. row.name .. marks .. note)
   end
@@ -479,23 +617,30 @@ end
 
 local function cmdStatus()
   print("== Storage ATM v" .. VERSION .. " ==")
-  print("Mode:   one I/O chest + modem vault")
-  local function line(role, label)
-    local w, n = wrapRole(role)
-    local stored = cfg[role] or (role == "chest" and (cfg.intake or cfg.output)) or nil
-    if not stored then return label .. ": (unbound)" end
-    if not w then return label .. ": " .. tostring(stored) .. " MISSING" end
-    return label .. ": " .. tostring(n) .. " OK"
+  print("Mode:   linked vault pool over wired modem")
+  local chest, cname = wrapChest()
+  if not (cfg.chest or cfg.intake or cfg.output) then
+    print("Chest:  (unbound)")
+  elseif not chest then
+    print("Chest:  " .. tostring(cfg.chest) .. " MISSING")
+  else
+    print("Chest:  " .. cname .. " OK")
   end
-  print(line("chest", "Chest"))
-  print(line("vault", "Vault"))
+  local live = liveVaults()
+  print(("Vaults: %d linked, %d online"):format(#cfg.vaults, #live))
+  for i, v in ipairs(listVaults()) do
+    print(("  %d) %s %s"):format(i, v.name, v.ok and "OK" or "MISSING"))
+  end
 end
 
 local function cmdStock(a)
-  local vault = wrapRole("vault")
-  if not vault then print("Bind vault: bind vault <name|side>"); return end
+  local vaults = liveVaults()
+  if #vaults == 0 then
+    print("No vaults online. bind vault <name>  or  link")
+    return
+  end
   local filter = a[2] and table.concat(a, " ", 2):lower() or nil
-  local map = inventoryStock(vault)
+  local map = poolStock()
   local rows = {}
   for name, count in pairs(map) do
     if not filter or name:lower():find(filter, 1, true)
@@ -507,7 +652,8 @@ local function cmdStock(a)
     if x.count ~= y.count then return x.count > y.count end
     return x.name < y.name
   end)
-  print(("Vault stock%s:"):format(filter and (" filter=" .. filter) or ""))
+  print(("Linked stock (%d vaults)%s:"):format(
+    #vaults, filter and (" filter=" .. filter) or ""))
   if #rows == 0 then print("  (none)"); return end
   local limit = math.min(#rows, 40)
   for i = 1, limit do
@@ -520,16 +666,14 @@ local function cmdStock(a)
 end
 
 local function cmdDeposit()
-  local chest, cname = wrapRole("chest")
-  local vault, vname = wrapRole("vault")
+  local chest, cname = wrapChest()
+  local vaults = liveVaults()
   if not chest then print("Bind chest: bind chest <side|name>"); return end
-  if not vault then print("Bind vault: bind vault <name>  (from invs)"); return end
-  if cname == vname then
-    print("Chest and vault are the same peripheral — rebind."); return
-  end
-  if type(chest.pushItems) ~= "function" and type(vault.pullItems) ~= "function" then
-    print("Neither chest.pushItems nor vault.pullItems available.")
-    return
+  if #vaults == 0 then print("Link vaults: bind vault <name>  or  link"); return end
+  for _, v in ipairs(vaults) do
+    if v.name == cname then
+      print("Chest is also listed as a vault — unbind it from the pool."); return
+    end
   end
 
   local rows, total = listContents(chest)
@@ -540,34 +684,29 @@ local function cmdDeposit()
   for _, r in ipairs(rows) do
     print(("  %dx %s"):format(r.count, r.name))
   end
-  print(("Target vault: %s"):format(vname))
-  write("Move into vault over modem? (y/N): ")
+  print(("Target: %d linked vault(s)"):format(#vaults))
+  write("Move into vault pool? (y/N): ")
   local ans = tostring(read() or ""):lower()
   if ans ~= "y" and ans ~= "yes" then
     print("Cancelled — items left in chest."); return
   end
 
-  local moved, err = transferAll(chest, cname, vault, vname)
+  local moved, err = transferAllToPool(chest, cname)
   local left = select(2, listContents(chest))
-  print(("Moved %d item(s) → vault %s."):format(moved, vname))
+  print(("Moved %d item(s) → vault pool."):format(moved))
   if moved <= 0 then
     print("Nothing transferred.")
     if err then print("Last error: " .. tostring(err)) end
-    print("Check: vault modem connected (right-click), same cable as ATM,")
-    print("       and bind vault to the name shown in invs.")
   elseif left > 0 then
-    print(("Partial — %d item(s) still in chest (vault full?)."):format(left))
+    print(("Partial — %d item(s) still in chest (pool full?)."):format(left))
   end
 end
 
 local function cmdWithdraw(a)
-  local vault, vname = wrapRole("vault")
-  local chest, cname = wrapRole("chest")
-  if not vault then print("Bind vault: bind vault <name>"); return end
+  local chest, cname = wrapChest()
+  local vaults = liveVaults()
   if not chest then print("Bind chest: bind chest <side|name>"); return end
-  if vname == cname then
-    print("Vault and chest are the same peripheral — rebind."); return
-  end
+  if #vaults == 0 then print("Link vaults first."); return end
 
   local itemQ = a[2]
   local count = tonumber(a[3])
@@ -585,7 +724,7 @@ local function cmdWithdraw(a)
   count = math.floor(tonumber(count) or 0)
   if count <= 0 then print("Need a positive count."); return end
 
-  local stockMap = inventoryStock(vault)
+  local stockMap = poolStock()
   local item, availOrHits = matchStock(stockMap, itemQ)
   if type(availOrHits) == "table" then
     print("Multiple matches — be more specific:")
@@ -596,16 +735,17 @@ local function cmdWithdraw(a)
     return
   end
   if not item then
-    print("Not in vault: " .. tostring(itemQ))
+    print("Not in vault pool: " .. tostring(itemQ))
     return
   end
   local avail = tonumber(availOrHits) or 0
   if avail < count then
-    print(("Not enough in vault (have %d, need %d)."):format(avail, count))
+    print(("Not enough in pool (have %d, need %d)."):format(avail, count))
     return
   end
 
-  print(("Withdraw %dx %s → chest %s"):format(count, item, cname))
+  print(("Withdraw %dx %s from %d vault(s) → %s"):format(
+    count, item, #vaults, cname))
   print("If the chest fills, collect items — withdraw will continue.")
   write("Confirm? (y/N): ")
   local ans = tostring(read() or ""):lower()
@@ -615,14 +755,12 @@ local function cmdWithdraw(a)
 
   local moved, lastErr = 0, nil
   while moved < count do
-    chest, cname = wrapRole("chest")
-    vault, vname = wrapRole("vault")
-    if not chest or not vault then
-      print("Chest/vault missing mid-withdraw."); break
-    end
+    chest, cname = wrapChest()
+    if not chest then print("Chest missing mid-withdraw."); break end
+    if #liveVaults() == 0 then print("No vaults online."); break end
 
     local need = count - moved
-    local n, err = transferItem(vault, vname, chest, cname, item, need)
+    local n, err = transferItemFromPool(chest, cname, item, need)
     lastErr = err or lastErr
     if n > 0 then
       moved = moved + n
@@ -630,7 +768,7 @@ local function cmdWithdraw(a)
     else
       local free = select(1, chestFreeSlots(chest))
       if free > 0 then
-        print("Transfer stalled with free slots — check modem/vault.")
+        print("Transfer stalled with free slots — check modem/vaults.")
         if lastErr then print("Last error: " .. tostring(lastErr)) end
         break
       end
@@ -645,21 +783,22 @@ local function cmdWithdraw(a)
   end
   print(("Done: moved %d/%d → chest."):format(moved, count))
   if moved < count then
-    print(("Stopped early — %d still in vault."):format(count - moved))
+    print(("Stopped early — %d still in pool."):format(count - moved))
   end
 end
 
 local function cmdHelp()
   print([[
-Storage ATM — one I/O chest + modem vault.
+Storage ATM — linked multi-vault pool + one I/O chest.
 
-bind chest <side|name>      deposit + withdraw tray (same chest)
-bind <side>                 same as bind chest <side>
-bind vault <name>
-invs | status
-stock [filter]              list vault contents
-deposit                     confirm → chest → vault
-withdraw [item] [count]     vault → chest (waits if chest full)
+bind chest <side|name>
+bind vault <name>           add vault to the pool (repeat)
+link                        auto-add every *vault* on the network
+unbind vault <name|#|all>
+vaults | invs | status
+stock [filter]              combined stock across all vaults
+deposit                     chest → any vault with space
+withdraw [item] [count]     pull from any vault (waits if chest full)
 help | exit
 ]])
 end
@@ -670,9 +809,9 @@ os.setComputerLabel(cfg.label or os.getComputerLabel() or ("StorageATM-" .. os.g
 
 term.clear(); term.setCursorPos(1, 1)
 print("== Storage ATM v" .. VERSION .. " ==")
-print("One I/O chest + vault over wired modem.")
+print("Linked vault pool over wired modem.")
 if not (cfg.chest or cfg.intake or cfg.output) then print("bind chest <side>") end
-if not cfg.vault then print("bind vault <name from invs>") end
+if #cfg.vaults == 0 then print("bind vault <name>  or  link") end
 print("Type help.")
 print("")
 
@@ -687,13 +826,16 @@ while true do
   elseif cmd == "exit" or cmd == "quit" then break
   elseif cmd == "help" or cmd == "?" then cmdHelp()
   elseif cmd == "bind" then cmdBind(a)
+  elseif cmd == "unbind" then cmdUnbind(a)
+  elseif cmd == "link" then cmdLink()
+  elseif cmd == "vaults" then cmdVaults()
   elseif cmd == "invs" then cmdInvs()
   elseif cmd == "status" then cmdStatus()
   elseif cmd == "stock" or cmd == "list" then cmdStock(a)
   elseif cmd == "deposit" or cmd == "dep" then cmdDeposit()
   elseif cmd == "withdraw" or cmd == "wd" or cmd == "get" then cmdWithdraw(a)
   elseif cmd == "address" or cmd == "addr" then
-    print("Address/ticker mode removed — use: bind vault <name>")
+    print("Use: bind vault <name>  or  link")
   else
     print("Unknown. help")
   end
