@@ -516,15 +516,22 @@ game, **U** update, **S** settings, **Q** quit. Closing a game returns here.
 **Currency Manager** (installer → Games → **c**):
 
 ```text
-[Chest] --wired--> [Currency Manager PC] --disk--> floppy (casino_currency.cfg)
-                              |
-                         wireless mesh
-                              v
-                    slots / poker / higher_lower
+[Vanilla chest/barrel] --touching or wired--> [Currency Manager PC] --disk--> floppy
+                                                      |
+                                                 wireless mesh
+                                                      v
+                                            slots / poker / higher_lower
 ```
 
+Use a **vanilla** chest or barrel. Most modded storage (Sophisticated, drawers,
+AE, …) will **not** activate a CC wired modem, so `invs` stays empty.
+
+Easiest bind: place the chest against the PC, then `bind chest left` (or
+`right` / `front` / `back` / `top` / `bottom`). Or network a vanilla chest with
+a wired modem + cable (right-click the modem until it connects).
+
 1. Insert floppy → `setpass` (password protects all currency commands).
-2. `bind chest <name>` → put sample tender items in the chest → `scan`.
+2. `invs` → `bind chest <name|side>` → put sample tender in the chest → `scan`.
 3. `rates` — set chips per item type.
 4. `deposit <player>` — credit that name from matching chest items.
 5. On pockets: Games **S** → modem mode → play gambling games (asks player name).

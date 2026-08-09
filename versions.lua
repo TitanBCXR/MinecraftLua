@@ -5,11 +5,11 @@
   The console `packages` command shows these names + versions.
   Installers / OTA updates ship this file so devices know what they have.
 
-  Titan-Version: 1.6.70
+  Titan-Version: 1.6.71
 ]]
 
 return {
-  system = "1.6.70",
+  system = "1.6.71",
   packages = {
     ["lib/titan.lua"]      = "1.2.26",
     ["lib/casino.lua"]     = "1.0.0",
@@ -35,8 +35,8 @@ return {
     ["storage/workers/storage_builder.lua"] = "1.0.0",
     ["storage_manager.lua"] = "1.0.0",
     ["storage_builder.lua"] = "1.0.0",
-    ["games/managers/currency_manager.lua"] = "1.0.0",
-    ["currency_manager.lua"] = "1.0.0",
+    ["games/managers/currency_manager.lua"] = "1.0.1",
+    ["currency_manager.lua"] = "1.0.1",
     ["perimeter_sensor.lua"] = "1.2.8",
     ["perimeter_manager.lua"]= "1.3.8",
     ["tetris.lua"]         = "1.2.8",
@@ -50,6 +50,6 @@ return {
     ["games_install.lua"]  = "1.0.3",
     ["host.lua"]           = "1.2.13",
     ["exclude.txt"]        = "1.0.1",
-    ["versions.lua"]       = "1.6.70",
+    ["versions.lua"]       = "1.6.71",
   },
 }

@@ -1,17 +1,19 @@
 --[[
   games/managers/currency_manager.lua  -  Casino currency vault
-  Titan-Version: 1.0.0
+  Titan-Version: 1.0.1
 
   Accepts in-game items as tender for gambling chips. Password-protects every
   currency command. Persists accepted items, rates, balances, and password on
   a floppy disk (casino_currency.cfg).
 
-  Layout:
-    [Chest] --wired modem--> [Currency Manager PC] --disk drive--> floppy
-                                    |
-                               wireless mesh
-                                    v
-                          slots / poker / higher_lower
+  Layout (easiest — no modem on the chest):
+    [Vanilla chest/barrel] --touching--> [Currency Manager PC] --disk--> floppy
+                                              |
+                                         wireless mesh
+
+  Or network a vanilla chest with a wired modem + cable (right-click modem
+  until it connects). Modded storage (Sophisticated, drawers, AE, …) usually
+  will NOT activate a CC modem — use a vanilla chest/barrel as the tender box.
 
   Commands (password required except help/status/exit/setpass first-time):
     setpass                 set / change floppy password
@@ -44,7 +46,7 @@ local ROUTER_PROTOCOL = "titan_router"
 local DISK_FILE = "casino_currency.cfg"
 local LOCAL_CFG = "currency_manager.cfg"
 local SESSION_MS = 5 * 60 * 1000
-local VERSION = "1.0.0"
+local VERSION = "1.0.1"
 
 local cfg = { chest = nil, drive = nil, label = nil }
 local data = {
@@ -288,13 +290,46 @@ local function cmdBind(a)
   print("Bound " .. role .. " = " .. name)
 end
 
+local function collectInventories()
+  local seen, names = {}, {}
+  local function add(n, note)
+    if not n or seen[n] or not isInventory(n) then return end
+    seen[n] = true
+    names[#names + 1] = { name = n, note = note }
+  end
+  for _, n in ipairs(peripheral.getNames()) do
+    add(n, nil)
+  end
+  -- Wired modems: list remotes even if they are not yet in getNames().
+  for _, side in ipairs(peripheral.getNames()) do
+    if peripheral.getType(side) == "modem" then
+      local m = peripheral.wrap(side)
+      if m and type(m.getNamesRemote) == "function" then
+        local rem = m.getNamesRemote()
+        for _, n in ipairs(rem or {}) do
+          add(n, "via " .. side)
+        end
+      end
+    end
+  end
+  table.sort(names, function(a, b) return a.name < b.name end)
+  return names
+end
+
 local function cmdInvs()
   print("Inventories:")
-  for _, n in ipairs(peripheral.getNames()) do
-    if isInventory(n) then
-      local mark = (n == cfg.chest) and " [chest]" or ""
-      print("  " .. n .. mark)
-    end
+  local list = collectInventories()
+  if #list == 0 then
+    print("  (none)")
+    print("Tip: place a VANILLA chest/barrel touching this PC, then:")
+    print("  bind chest left   (or right/front/back/top/bottom)")
+    print("Modded storage usually will not connect a CC wired modem.")
+    return
+  end
+  for _, row in ipairs(list) do
+    local mark = (row.name == cfg.chest) and " [chest]" or ""
+    local note = row.note and ("  (" .. row.note .. ")") or ""
+    print("  " .. row.name .. mark .. note)
   end
 end
 
@@ -483,8 +518,9 @@ end
 local function cmdHelp()
   print([[
 setpass | login | logout
-bind chest|drive <name>
+bind chest|drive <name|side>
 invs | drives | status
+  (use a vanilla chest/barrel; modded storage rarely works)
 scan          chest → accepted currency list (floppy)
 rates         set chips per item
 rate <item> <chips>
