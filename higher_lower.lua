@@ -1,6 +1,6 @@
 --[[
   higher_lower.lua  -  Video Poker → Higher / Lower streak (CC: Tweaked)
-  Titan-Version: 1.1.1
+  Titan-Version: 1.1.2
 
   Run:
 
@@ -196,7 +196,9 @@ local function initEconomy()
         if bal ~= nil then
           USE_CASINO = true
           COINS = bal
-          print(("Chips: %d (%s)"):format(COINS, tostring(CASINO.player)))
+          local tag = CASINO.detected and "Detected" or "Player"
+          print(("%s: %s"):format(tag, tostring(CASINO.player)))
+          print(("Chips: %d"):format(COINS))
           sleep(0.6)
         end
       end

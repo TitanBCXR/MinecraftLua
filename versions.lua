@@ -5,14 +5,14 @@
   The console `packages` command shows these names + versions.
   Installers / OTA updates ship this file so devices know what they have.
 
-  Titan-Version: 1.6.71
+  Titan-Version: 1.6.73
 ]]
 
 return {
-  system = "1.6.71",
+  system = "1.6.73",
   packages = {
     ["lib/titan.lua"]      = "1.2.26",
-    ["lib/casino.lua"]     = "1.0.0",
+    ["lib/casino.lua"]     = "1.0.1",
     ["lib/games_economy.lua"] = "1.0.0",
     ["console.lua"]        = "1.1.9",
     ["router.lua"]         = "1.4.4",
@@ -35,21 +35,21 @@ return {
     ["storage/workers/storage_builder.lua"] = "1.0.0",
     ["storage_manager.lua"] = "1.0.0",
     ["storage_builder.lua"] = "1.0.0",
-    ["games/managers/currency_manager.lua"] = "1.0.1",
-    ["currency_manager.lua"] = "1.0.1",
+    ["games/managers/currency_manager.lua"] = "1.0.2",
+    ["currency_manager.lua"] = "1.0.2",
     ["perimeter_sensor.lua"] = "1.2.8",
     ["perimeter_manager.lua"]= "1.3.8",
     ["tetris.lua"]         = "1.2.8",
     ["minesweeper.lua"]    = "1.2.3",
     ["sandstorm.lua"]      = "1.0.1",
-    ["luigi_poker.lua"]    = "1.2.5",
-    ["higher_lower.lua"]   = "1.1.1",
-    ["slots.lua"]          = "1.0.4",
+    ["luigi_poker.lua"]    = "1.2.6",
+    ["higher_lower.lua"]   = "1.1.2",
+    ["slots.lua"]          = "1.0.5",
     ["games.lua"]          = "1.0.7",
     ["games_catalog.lua"]  = "1.0.6",
     ["games_install.lua"]  = "1.0.3",
     ["host.lua"]           = "1.2.13",
     ["exclude.txt"]        = "1.0.1",
-    ["versions.lua"]       = "1.6.71",
+    ["versions.lua"]       = "1.6.73",
   },
 }

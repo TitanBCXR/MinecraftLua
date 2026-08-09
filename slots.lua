@@ -1,6 +1,6 @@
 --[[
   slots.lua  -  3-reel slots for CC: Tweaked
-  Titan-Version: 1.0.4
+  Titan-Version: 1.0.5
 
   Run:
 
@@ -175,7 +175,9 @@ local function initEconomy()
         if bal ~= nil then
           USE_CASINO = true
           COINS = bal
-          print(("Chips: %d (%s)"):format(COINS, tostring(CASINO.player)))
+          local tag = CASINO.detected and "Detected" or "Player"
+          print(("%s: %s"):format(tag, tostring(CASINO.player)))
+          print(("Chips: %d"):format(COINS))
           sleep(0.6)
           return
         end

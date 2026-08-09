@@ -516,25 +516,35 @@ game, **U** update, **S** settings, **Q** quit. Closing a game returns here.
 **Currency Manager** (installer → Games → **c**):
 
 ```text
-[Vanilla chest/barrel] --touching or wired--> [Currency Manager PC] --disk--> floppy
-                                                      |
-                                                 wireless mesh
-                                                      v
-                                            slots / poker / higher_lower
+[Deposit chest]  --touching/wired--> [Currency Manager PC] --disk--> floppy
+[Storage chest]  --touching/wired-->/           |
+                                           wireless mesh
+                                                v
+                                      slots / poker / higher_lower
 ```
 
-Use a **vanilla** chest or barrel. Most modded storage (Sophisticated, drawers,
-AE, …) will **not** activate a CC wired modem, so `invs` stays empty.
+Use **vanilla** chests/barrels. Most modded storage will not connect a CC modem.
 
-Easiest bind: place the chest against the PC, then `bind chest left` (or
-`right` / `front` / `back` / `top` / `bottom`). Or network a vanilla chest with
-a wired modem + cable (right-click the modem until it connects).
+- **storage** — sample accepted currency (`scan`) and vault for deposited tender  
+- **deposit** — players drop items here; `deposit <player>` moves accepted items
+  into storage and credits chips. Unaccepted items stay in deposit (warned).
 
-1. Insert floppy → `setpass` (password protects all currency commands).
-2. `invs` → `bind chest <name|side>` → put sample tender in the chest → `scan`.
-3. `rates` — set chips per item type.
-4. `deposit <player>` — credit that name from matching chest items.
-5. On pockets: Games **S** → modem mode → play gambling games (asks player name).
+1. Insert floppy → `setpass`.
+2. `invs` → `bind storage <side|name>` and `bind deposit <side|name>`.
+3. Put sample coins in **storage** → `scan` → `rates`.
+4. Players put tender in **deposit** → `deposit <player>` (moves accepted → storage).
+5. On game cabinets: Games **S** → modem mode → play gambling games.
+
+**Player identity (managed games):** put an Advanced Peripherals **Player Detector**
+next to each gambling PC (slots / poker / higher-lower). On launch the game reads
+the nearby player and fetches their chip balance from the Currency Manager over
+the mesh. Closest player wins if several are in range (~8 blocks). If a detector
+is present but empty, the game asks you to stand closer (does not reuse the last
+saved name). Without a detector, it falls back to typed / saved name.
+
+```text
+[Player] → [Player Detector] → [Game PC + modem] --mesh--> [Currency Manager]
+```
 
 ---
 

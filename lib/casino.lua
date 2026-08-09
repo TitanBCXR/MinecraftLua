@@ -1,24 +1,33 @@
 --[[
   lib/casino.lua  -  Thin client for Currency Manager chips
-  Titan-Version: 1.0.0
+  Titan-Version: 1.0.1
 
   Usage from a game (modem mode, not --speaker):
 
     local casino = dofile("lib/casino.lua")
     casino.open()
-    local chips = casino.ensurePlayer()  -- prompts name, fetches balance
+    local chips = casino.ensurePlayer()  -- detector / name, then balance
     if casino.bet(5) then ... end
     casino.payout(10)
     local n = casino.chips()
+
+  Identity (managed cabinets):
+    Advanced Peripherals Player Detector next to the game PC → nearby player
+    name, then Currency Manager balance over the mesh. Falls back to typed
+    name only when no detector is present (or none in range → prompt).
 ]]
 
 local PROTO = "titan_install"
 local ROUTER = "titan_router"
+local PLAYER_RANGE = 8
+local PLAYER_CFG = "casino_player.cfg"
+
 local M = {
   player = nil,
   managerId = nil,
   balance = nil,
   online = false,
+  detected = false, -- true when name came from Player Detector this session
 }
 
 local function openModem()
@@ -90,33 +99,130 @@ function M.chips()
   return tonumber(M.balance) or 0
 end
 
+local function normalizePlayer(p)
+  if type(p) == "string" then
+    p = p:gsub("[%c%z]", ""):match("^%s*(.-)%s*$") or ""
+    if p == "" then return nil end
+    return p:sub(1, 24)
+  end
+  if type(p) == "table" then
+    return normalizePlayer(p.name or p.displayName or p.username)
+  end
+  return nil
+end
+
+local function findDetector()
+  local pd = peripheral.find("playerDetector")
+  if pd then return pd end
+  return peripheral.find("player_detector")
+end
+
+local function playerDistanceSq(pd, name)
+  if type(pd.getPlayerPos) ~= "function" then return nil end
+  local ok, pos = pcall(function() return pd.getPlayerPos(name) end)
+  if not ok or type(pos) ~= "table" then return nil end
+  local x = tonumber(pos.x or pos.X)
+  local y = tonumber(pos.y or pos.Y)
+  local z = tonumber(pos.z or pos.Z)
+  if not x or not y or not z then return nil end
+  -- Detector is block-centric; distance from detector origin is fine for ranking.
+  return x * x + y * y + z * z
+end
+
+--- Nearby player via Advanced Peripherals Player Detector (or nil).
+function M.detectPlayer(range)
+  range = tonumber(range) or PLAYER_RANGE
+  local pd = findDetector()
+  if not pd then return nil, "no detector" end
+
+  local names = {}
+  local ok, players = pcall(function() return pd.getPlayersInRange(range) end)
+  if ok and type(players) == "table" then
+    for _, p in ipairs(players) do
+      local n = normalizePlayer(p)
+      if n then names[#names + 1] = n end
+    end
+  end
+
+  if #names == 0 then
+    return nil, "none in range"
+  end
+  if #names == 1 then
+    return names[1]
+  end
+
+  local best, bestD = names[1], nil
+  for i = 1, #names do
+    local d = playerDistanceSq(pd, names[i])
+    if d and (not bestD or d < bestD) then
+      best, bestD = names[i], d
+    end
+  end
+  return best
+end
+
+local function savePlayerCfg(name)
+  local f = fs.open(PLAYER_CFG, "w")
+  if f then
+    f.write(textutils.serialize({ name = name }))
+    f.close()
+  end
+end
+
+local function loadPlayerCfg()
+  if not fs.exists(PLAYER_CFG) then return nil end
+  local f = fs.open(PLAYER_CFG, "r")
+  if not f then return nil end
+  local d = textutils.unserialize(f.readAll() or "")
+  f.close()
+  if type(d) == "table" then return normalizePlayer(d.name) end
+  return nil
+end
+
 function M.setPlayer(name)
-  name = tostring(name or ""):gsub("[%c%z]", ""):match("^%s*(.-)%s*$") or ""
-  if name == "" then return false end
-  M.player = name:sub(1, 24)
+  local n = normalizePlayer(name)
+  if not n then return false end
+  M.player = n
+  return true
+end
+
+local function promptPlayer(hint)
+  if hint then print(hint) end
+  print("Casino player name:")
+  write("> ")
+  local n = read()
+  if not M.setPlayer(n) then return false end
+  M.detected = false
+  savePlayerCfg(M.player)
   return true
 end
 
 function M.ensurePlayer()
-  if M.player then
-    M.fetchBalance()
-    return M.chips()
+  M.detected = false
+  local pd = findDetector()
+  local detected = select(1, M.detectPlayer(PLAYER_RANGE))
+
+  if detected then
+    M.setPlayer(detected)
+    M.detected = true
+    savePlayerCfg(M.player)
+  elseif pd then
+    -- Detector present but nobody in range: never reuse a sticky cfg name.
+    print("Stand closer to the Player Detector.")
+    if not promptPlayer(nil) then return nil, "no name" end
+  else
+    -- No detector: cfg, then typed name.
+    if not M.player then
+      local cached = loadPlayerCfg()
+      if cached then M.player = cached end
+    end
+    if not M.player then
+      if not promptPlayer("No Player Detector — enter name.") then
+        return nil, "no name"
+      end
+    end
   end
-  if fs.exists("casino_player.cfg") then
-    local f = fs.open("casino_player.cfg", "r")
-    local d = textutils.unserialize(f.readAll() or "")
-    f.close()
-    if type(d) == "table" and d.name then M.player = d.name end
-  end
-  if not M.player then
-    print("Casino player name:")
-    write("> ")
-    local n = read()
-    if not M.setPlayer(n) then return nil, "no name" end
-    local f = fs.open("casino_player.cfg", "w")
-    f.write(textutils.serialize({ name = M.player }))
-    f.close()
-  end
+
   if not M.discover(2) then
     return nil, "no casino manager on mesh"
   end

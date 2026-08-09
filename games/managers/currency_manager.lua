@@ -1,30 +1,32 @@
 --[[
   games/managers/currency_manager.lua  -  Casino currency vault
-  Titan-Version: 1.0.1
+  Titan-Version: 1.0.2
 
   Accepts in-game items as tender for gambling chips. Password-protects every
   currency command. Persists accepted items, rates, balances, and password on
   a floppy disk (casino_currency.cfg).
 
-  Layout (easiest — no modem on the chest):
-    [Vanilla chest/barrel] --touching--> [Currency Manager PC] --disk--> floppy
-                                              |
-                                         wireless mesh
+  Layout (vanilla chests/barrels — modded storage rarely connects CC modems):
 
-  Or network a vanilla chest with a wired modem + cable (right-click modem
-  until it connects). Modded storage (Sophisticated, drawers, AE, …) usually
-  will NOT activate a CC modem — use a vanilla chest/barrel as the tender box.
+    [Deposit chest] --touching/wired--> [Currency Manager PC] --disk--> floppy
+    [Storage chest] --touching/wired-->/              |
+                                                 wireless mesh
+
+  - storage  sample accepted currency (scan) + vault for deposited tender
+  - deposit  players drop items here; deposit <player> moves accepted types
+             into storage and credits chips. Unaccepted items stay put.
 
   Commands (password required except help/status/exit/setpass first-time):
     setpass                 set / change floppy password
     login                   unlock session (5 min)
     logout
-    bind chest|drive <name|side>
+    bind storage|deposit|drive <name|side>
+    bind chest <name>       alias for bind storage (legacy)
     invs | drives
-    scan | accept           read chest → accepted item list → floppy
+    scan | accept           read STORAGE → accepted item list → floppy
     rates                   interactive chips-per-item settings
     rate <item> <chips>
-    deposit <player>        convert matching chest items → player chips
+    deposit <player>        move accepted from DEPOSIT → STORAGE + credit
     withdraw <player> <n>   remove chips from player balance
     balance [player]
     status | help | exit
@@ -46,9 +48,9 @@ local ROUTER_PROTOCOL = "titan_router"
 local DISK_FILE = "casino_currency.cfg"
 local LOCAL_CFG = "currency_manager.cfg"
 local SESSION_MS = 5 * 60 * 1000
-local VERSION = "1.0.1"
+local VERSION = "1.0.2"
 
-local cfg = { chest = nil, drive = nil, label = nil }
+local cfg = { storage = nil, deposit = nil, chest = nil, drive = nil, label = nil }
 local data = {
   accepted = {}, -- list of item names
   rates = {},    -- item -> chips
@@ -82,6 +84,10 @@ local function loadLocal()
   f.close()
   if ok and type(d) == "table" then
     for k, v in pairs(d) do cfg[k] = v end
+  end
+  -- Legacy: single `chest` becomes storage vault.
+  if (not cfg.storage or cfg.storage == "") and cfg.chest and cfg.chest ~= "" then
+    cfg.storage = cfg.chest
   end
 end
 
@@ -194,10 +200,18 @@ local function isInventory(name)
   return w and type(w.list) == "function"
 end
 
-local function wrapChest()
-  local n = cfg.chest
+local function wrapRole(role)
+  local n = cfg[role]
   if not n or not isInventory(n) then return nil end
   return peripheral.wrap(n), n
+end
+
+local function wrapStorage()
+  return wrapRole("storage")
+end
+
+local function wrapDeposit()
+  return wrapRole("deposit")
 end
 
 local function playerKey(name)
@@ -271,8 +285,9 @@ end
 local function cmdBind(a)
   local role = tostring(a[2] or ""):lower()
   local name = a[3]
-  if (role ~= "chest" and role ~= "drive") or not name then
-    print("Usage: bind chest|drive <peripheralName|side>")
+  if role == "chest" then role = "storage" end -- legacy alias
+  if (role ~= "storage" and role ~= "deposit" and role ~= "drive") or not name then
+    print("Usage: bind storage|deposit|drive <peripheralName|side>")
     return
   end
   if role == "drive" then
@@ -284,7 +299,14 @@ local function cmdBind(a)
     if not isInventory(name) then
       print("Not an inventory: " .. tostring(name)); return
     end
-    cfg.chest = name
+    if role == "storage" and cfg.deposit == name then
+      print("That peripheral is already the deposit chest."); return
+    end
+    if role == "deposit" and cfg.storage == name then
+      print("That peripheral is already the storage chest."); return
+    end
+    cfg[role] = name
+    if role == "storage" then cfg.chest = name end -- keep legacy field in sync
   end
   saveLocal()
   print("Bound " .. role .. " = " .. name)
@@ -321,15 +343,21 @@ local function cmdInvs()
   local list = collectInventories()
   if #list == 0 then
     print("  (none)")
-    print("Tip: place a VANILLA chest/barrel touching this PC, then:")
-    print("  bind chest left   (or right/front/back/top/bottom)")
+    print("Tip: place VANILLA chests/barrels touching this PC, then:")
+    print("  bind storage left")
+    print("  bind deposit right")
     print("Modded storage usually will not connect a CC wired modem.")
     return
   end
   for _, row in ipairs(list) do
-    local mark = (row.name == cfg.chest) and " [chest]" or ""
+    local marks = ""
+    if row.name == cfg.storage then marks = marks .. " [storage]" end
+    if row.name == cfg.deposit then marks = marks .. " [deposit]" end
     local note = row.note and ("  (" .. row.note .. ")") or ""
-    print("  " .. row.name .. mark .. note)
+    print("  " .. row.name .. marks .. note)
+  end
+  if not cfg.storage or not cfg.deposit then
+    print("Bind:  bind storage <name>   then   bind deposit <name>")
   end
 end
 
@@ -347,8 +375,11 @@ end
 
 local function cmdScan()
   if not requireAuth("scan") then return end
-  local inv, name = wrapChest()
-  if not inv then print("Bind a chest first: bind chest <name>"); return end
+  local inv, name = wrapStorage()
+  if not inv then
+    print("Bind storage first: bind storage <name|side>")
+    return
+  end
   local list = inv.list() or {}
   local seen, order = {}, {}
   for _, slot in pairs(list) do
@@ -369,7 +400,7 @@ local function cmdScan()
     if not seen[item] then data.rates[item] = nil end
   end
   local ok, err = saveDisk()
-  print(("Accepted %d item type(s) from %s"):format(#order, name))
+  print(("Accepted %d item type(s) from storage %s"):format(#order, name))
   for _, item in ipairs(order) do
     print(("  %s  = %d chips"):format(item, data.rates[item] or 0))
   end
@@ -414,55 +445,102 @@ local function cmdDeposit(a)
   if not requireAuth("deposit") then return end
   local player = a[2]
   if not player then print("Usage: deposit <player>"); return end
-  local inv, cname = wrapChest()
-  if not inv then print("No chest bound."); return end
+  local dep, dname = wrapDeposit()
+  local stor, sname = wrapStorage()
+  if not dep then
+    print("Bind deposit chest: bind deposit <name|side>"); return
+  end
+  if not stor then
+    print("Bind storage chest: bind storage <name|side>"); return
+  end
+  if dname == sname then
+    print("Deposit and storage must be different chests."); return
+  end
+  if type(dep.pushItems) ~= "function" then
+    print("Deposit chest cannot pushItems (need inventory peripheral)."); return
+  end
   loadDisk()
   local accept = acceptedSet()
-  if not next(accept) then print("No accepted currency — scan first."); return end
-  local list = inv.list() or {}
-  local gained = 0
-  local moved = 0
-  for slot, detail in pairs(list) do
-    if type(detail) == "table" and detail.name and accept[detail.name] then
-      local rate = tonumber(data.rates[detail.name]) or 0
+  if not next(accept) then print("No accepted currency — scan storage first."); return end
+
+  local list = dep.list() or {}
+  local gained, movedCount = 0, 0
+  local unaccepted = {}
+  local storageFull = false
+
+  -- Stable slot order so partial stacks behave predictably.
+  local slots = {}
+  for slot in pairs(list) do slots[#slots + 1] = slot end
+  table.sort(slots)
+
+  for _, slot in ipairs(slots) do
+    local detail = list[slot]
+    if type(detail) == "table" and detail.name then
       local count = tonumber(detail.count) or 0
-      if rate > 0 and count > 0 then
-        -- Consume items from chest (drop into void via suck into a null — CC can't delete;
-        -- move to a "void" by pushing into a non-inventory fails. Instead: leave in chest
-        -- but track credit only if we can pull into a temp? Better: use inv.pushItems to self
-        -- if we had a vault. For v1: credit chips AND leave items — bad.
-        -- Correct approach: require a second vault or destroy via turtle.
-        -- Plan: "store items in vault" — use same chest as vault after counting, OR
-        -- pullItems into a peripheral named vault. We only have one chest.
-        -- Credit based on count and clear slot by pushing to... we can use
-        -- inventory drop? Not available. Use peripheral call to push into
-        -- an optional "burn" — simplest v1: move items into a virtual sink by
-        -- transferring to a drive? No.
-        -- Use: if chest has size, take count into credit and set slot empty via
-        -- pushItems to a wired "trash" can — document that leftover stays.
-        -- Better: credit and pushItems to the computer's own inventory if turtle —
-        -- this is a computer. 
-        -- CC:Tweaked computers don't have inventory.
-        -- Solution: credit chips and remove via inv.pushItems to a bound "sink"
-        -- or just document that operator must empty. 
-        -- Plan says "store items in vault" - use same chest but mark as deposited
-        -- by moving to end slots... messy.
-        -- Practical v1: credit = sum; operator keeps physical items in chest as vault
-        -- storage. Don't remove. Print "left in chest (vault)".
-        gained = gained + rate * count
-        moved = moved + count
+      if count > 0 then
+        if accept[detail.name] then
+          local rate = tonumber(data.rates[detail.name]) or 0
+          if rate > 0 then
+            local left = count
+            while left > 0 do
+              local okp, n = pcall(dep.pushItems, sname, slot, left)
+              n = (okp and tonumber(n)) or 0
+              if n <= 0 then
+                storageFull = true
+                break
+              end
+              gained = gained + rate * n
+              movedCount = movedCount + n
+              left = left - n
+            end
+          else
+            unaccepted[detail.name] = true
+          end
+        else
+          unaccepted[detail.name] = true
+        end
       end
     end
   end
-  if gained <= 0 then
-    print("No accepted items in chest."); return
+
+  -- Re-check deposit for leftover unaccepted / unmoved stacks.
+  local leftList = dep.list() or {}
+  local leftoverAccepted = 0
+  for _, detail in pairs(leftList) do
+    if type(detail) == "table" and detail.name then
+      if accept[detail.name] then
+        leftoverAccepted = leftoverAccepted + (tonumber(detail.count) or 0)
+      else
+        unaccepted[detail.name] = true
+      end
+    end
   end
+
+  if next(unaccepted) then
+    print("Unaccepted item in deposit chest:")
+    local names = {}
+    for n in pairs(unaccepted) do names[#names + 1] = n end
+    table.sort(names)
+    for _, n in ipairs(names) do print("  " .. n) end
+  end
+
+  if gained <= 0 then
+    if next(unaccepted) then
+      print("No accepted items moved — nothing credited.")
+    else
+      print("Deposit chest empty (or nothing transferable).")
+    end
+    return
+  end
+
   local bal = getBal(player)
   setBal(player, bal + gained)
   local ok, err = saveDisk()
-  print(("Credited %s +%d chips (%d items). Balance=%d"):format(
-    player, gained, moved, select(1, getBal(player))))
-  print("Items left in chest as vault stock.")
+  print(("Credited %s +%d chips (%d items → storage %s). Balance=%d"):format(
+    player, gained, movedCount, sname, select(1, getBal(player))))
+  if leftoverAccepted > 0 or storageFull then
+    print(("Storage full? %d accepted item(s) still in deposit."):format(leftoverAccepted))
+  end
   if not ok then print("Save failed: " .. tostring(err)) end
 end
 
@@ -504,11 +582,12 @@ end
 local function cmdStatus()
   loadDisk()
   print("== Currency Manager v" .. VERSION .. " ==")
-  print("Chest:  " .. tostring(cfg.chest or "(unbound)"))
-  print("Drive:  " .. tostring(cfg.drive or "(auto)"))
-  print("Floppy: " .. tostring(diskPath() or "NONE"))
-  print("Pass:   " .. (hasPass() and "set" or "NOT SET"))
-  print("Session:" .. (sessionOk() and " unlocked" or " locked"))
+  print("Storage: " .. tostring(cfg.storage or cfg.chest or "(unbound)"))
+  print("Deposit: " .. tostring(cfg.deposit or "(unbound)"))
+  print("Drive:   " .. tostring(cfg.drive or "(auto)"))
+  print("Floppy:  " .. tostring(diskPath() or "NONE"))
+  print("Pass:    " .. (hasPass() and "set" or "NOT SET"))
+  print("Session: " .. (sessionOk() and "unlocked" or "locked"))
   print("Accepted types: " .. tostring(#data.accepted))
   local players = 0
   for _ in pairs(data.balances) do players = players + 1 end
@@ -518,13 +597,14 @@ end
 local function cmdHelp()
   print([[
 setpass | login | logout
-bind chest|drive <name|side>
+bind storage|deposit|drive <name|side>
 invs | drives | status
-  (use a vanilla chest/barrel; modded storage rarely works)
-scan          chest → accepted currency list (floppy)
+  storage = accepted samples + vault
+  deposit = player drop-off (vanilla chests)
+scan          STORAGE → accepted list (floppy)
 rates         set chips per item
 rate <item> <chips>
-deposit <player>
+deposit <player>   move accepted DEPOSIT→STORAGE + credit
 withdraw <player> <chips>
 balance [player]
 help | exit
@@ -665,6 +745,7 @@ if not hasPass() then
 else
   print("Floppy OK. login to manage currency.")
 end
+print("Bind storage + deposit chests, scan storage, then deposit <player>.")
 print("Type help. Mesh casino API online.")
 print("")
 

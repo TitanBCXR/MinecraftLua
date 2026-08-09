@@ -1,6 +1,6 @@
 --[[
   luigi_poker.lua  -  Luigi Picture Poker (SMB3-style) for CC: Tweaked
-  Titan-Version: 1.2.5
+  Titan-Version: 1.2.6
 
   Run:
 
@@ -203,7 +203,9 @@ local function initEconomy()
         if bal ~= nil then
           USE_CASINO = true
           COINS = bal
-          print(("Chips: %d (%s)"):format(COINS, tostring(CASINO.player)))
+          local tag = CASINO.detected and "Detected" or "Player"
+          print(("%s: %s"):format(tag, tostring(CASINO.player)))
+          print(("Chips: %d"):format(COINS))
           sleep(0.6)
         end
       end
