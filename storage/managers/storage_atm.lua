@@ -1,6 +1,6 @@
 --[[
   storage/managers/storage_atm.lua  -  Standalone vault ATM (wired modem)
-  Titan-Version: 1.3.0
+  Titan-Version: 1.4.0
 
   Solo item ATM. No casino / Currency Manager / Stock Ticker.
   One I/O chest + one or more Create vaults on the same wired modem network,
@@ -9,6 +9,9 @@
   Hardware:
     [I/O chest]     --touching or wired--> [ATM PC]
     [Vault A/B/…]   --wired modems-------/
+
+  Item names display without mod id (oak_log not minecraft:oak_log).
+  Withdraw supports multiple items; Tab autocompletes item names.
 
   Setup:
     invs
@@ -20,7 +23,7 @@
 ]]
 
 local LOCAL_CFG = "storage_atm.cfg"
-local VERSION = "1.3.0"
+local VERSION = "1.4.0"
 
 local cfg = {
   chest = nil,
@@ -88,6 +91,57 @@ end
 local function shortName(id)
   id = tostring(id or "")
   return id:match("([^:]+)$") or id
+end
+
+local function modId(id)
+  id = tostring(id or "")
+  local m = id:match("^([^:]+):")
+  return m
+end
+
+--- Pretty label: strip namespace. If two mods share the same item id, append (mod).
+local function displayName(full, stockMap)
+  local short = shortName(full)
+  if type(stockMap) ~= "table" then return short end
+  local collisions = 0
+  for name in pairs(stockMap) do
+    if shortName(name) == short then collisions = collisions + 1 end
+  end
+  if collisions > 1 then
+    return short .. " (" .. (modId(full) or "?") .. ")"
+  end
+  return short
+end
+
+local function itemCompleteFn(stockMap)
+  local labels = {}
+  for full in pairs(stockMap) do
+    labels[#labels + 1] = displayName(full, stockMap)
+  end
+  table.sort(labels)
+  return function(line)
+    line = tostring(line or "")
+    local partial = line:match("(%S*)$") or line
+    local pl = partial:lower()
+    local out, seen = {}, {}
+    for _, lab in ipairs(labels) do
+      if pl == "" or lab:lower():sub(1, #pl) == pl then
+        local suffix = lab:sub(#partial + 1)
+        if suffix ~= "" and not seen[suffix] then
+          seen[suffix] = true
+          out[#out + 1] = suffix
+        elseif pl ~= "" and lab:lower() == pl and not seen[""] then
+          -- exact match already typed; no suffix
+        end
+      end
+    end
+    return out
+  end
+end
+
+local function readItemName(stockMap, prompt)
+  write(prompt or "Item: ")
+  return read(nil, nil, itemCompleteFn(stockMap))
 end
 
 local function looksLikeVault(name)
@@ -308,15 +362,33 @@ local function listContents(inv)
 end
 
 local function matchStock(stockMap, query)
-  query = tostring(query or ""):lower()
+  query = tostring(query or ""):gsub("^%s+", ""):gsub("%s+$", "")
   if query == "" then return nil end
+  local q = query:lower()
+  -- Strip accidental namespace if user typed minecraft:foo
+  local qBare = shortName(q):lower()
+  -- Exact full id
   if stockMap[query] then return query, stockMap[query] end
+  for name, count in pairs(stockMap) do
+    if name:lower() == q then return name, count end
+  end
+  -- Exact short name / display label
   local hits = {}
   for name, count in pairs(stockMap) do
-    local low = name:lower()
     local bare = shortName(name):lower()
-    if low == query or bare == query then return name, count end
-    if low:find(query, 1, true) or bare:find(query, 1, true) then
+    local disp = displayName(name, stockMap):lower()
+    if bare == q or bare == qBare or disp == q or disp == qBare then
+      hits[#hits + 1] = { name = name, count = count }
+    end
+  end
+  if #hits == 1 then return hits[1].name, hits[1].count end
+  if #hits > 1 then return nil, hits end
+  -- Prefix / substring on short name
+  for name, count in pairs(stockMap) do
+    local bare = shortName(name):lower()
+    local disp = displayName(name, stockMap):lower()
+    if bare:sub(1, #qBare) == qBare or disp:sub(1, #q) == q
+        or bare:find(qBare, 1, true) or disp:find(q, 1, true) then
       hits[#hits + 1] = { name = name, count = count }
     end
   end
@@ -324,6 +396,90 @@ local function matchStock(stockMap, query)
   if #hits == 1 then return hits[1].name, hits[1].count end
   if #hits > 1 then return nil, hits end
   return nil, nil
+end
+
+--- Parse "item count item count …" into { {full, count, label}, … }
+local function parseWithdrawArgs(args, stockMap)
+  -- args is list of words after "withdraw"
+  local reqs, i = {}, 1
+  while i <= #args do
+    local token = args[i]
+    local n = tonumber(token)
+    if n and reqs[#reqs] and not reqs[#reqs].count then
+      reqs[#reqs].count = math.floor(n)
+      i = i + 1
+    else
+      local full, availOrHits = matchStock(stockMap, token)
+      if type(availOrHits) == "table" then
+        return nil, "ambiguous:" .. token, availOrHits
+      end
+      if not full then
+        return nil, "unknown:" .. token
+      end
+      local count = tonumber(args[i + 1])
+      if count then
+        reqs[#reqs + 1] = {
+          item = full,
+          count = math.floor(count),
+          label = displayName(full, stockMap),
+          avail = stockMap[full] or 0,
+        }
+        i = i + 2
+      else
+        reqs[#reqs + 1] = {
+          item = full,
+          count = nil, -- fill later = all
+          label = displayName(full, stockMap),
+          avail = stockMap[full] or 0,
+        }
+        i = i + 1
+      end
+    end
+  end
+  for _, r in ipairs(reqs) do
+    if not r.count or r.count <= 0 then r.count = r.avail end
+  end
+  return reqs
+end
+
+local function interactiveWithdrawList(stockMap)
+  print("Add items (Tab = autocomplete). Blank item name when done.")
+  local reqs = {}
+  while true do
+    local itemQ = readItemName(stockMap, "Item: ")
+    if not itemQ or not itemQ:match("%S") then break end
+    local full, availOrHits = matchStock(stockMap, itemQ)
+    if type(availOrHits) == "table" then
+      print("Multiple matches — be more specific:")
+      for i = 1, math.min(#availOrHits, 12) do
+        local h = availOrHits[i]
+        print(("  %6d  %s"):format(h.count, displayName(h.name, stockMap)))
+      end
+    elseif not full then
+      print("Not in stock: " .. tostring(itemQ))
+    else
+      local avail = stockMap[full] or 0
+      write(("Count [all=%d]: "):format(avail))
+      local cLine = read()
+      local count = tonumber(cLine)
+      if not cLine or not cLine:match("%S") then count = avail end
+      count = math.floor(tonumber(count) or 0)
+      if count <= 0 then
+        print("Skipped (need positive count).")
+      elseif count > avail then
+        print(("Only %d available — skipped."):format(avail))
+      else
+        reqs[#reqs + 1] = {
+          item = full,
+          count = count,
+          label = displayName(full, stockMap),
+          avail = avail,
+        }
+        print(("  + %dx %s"):format(count, displayName(full, stockMap)))
+      end
+    end
+  end
+  return reqs
 end
 
 local function networkTargetName(name)
@@ -643,14 +799,16 @@ local function cmdStock(a)
   local map = poolStock()
   local rows = {}
   for name, count in pairs(map) do
+    local lab = displayName(name, map)
     if not filter or name:lower():find(filter, 1, true)
+        or lab:lower():find(filter, 1, true)
         or shortName(name):lower():find(filter, 1, true) then
-      rows[#rows + 1] = { name = name, count = count }
+      rows[#rows + 1] = { name = name, label = lab, count = count }
     end
   end
   table.sort(rows, function(x, y)
     if x.count ~= y.count then return x.count > y.count end
-    return x.name < y.name
+    return x.label < y.label
   end)
   print(("Linked stock (%d vaults)%s:"):format(
     #vaults, filter and (" filter=" .. filter) or ""))
@@ -658,7 +816,7 @@ local function cmdStock(a)
   local limit = math.min(#rows, 40)
   for i = 1, limit do
     local r = rows[i]
-    print(("  %6d  %s"):format(r.count, r.name))
+    print(("  %6d  %s"):format(r.count, r.label))
   end
   if #rows > limit then
     print(("  … %d more (stock <filter>)"):format(#rows - limit))
@@ -680,9 +838,14 @@ local function cmdDeposit()
   if total <= 0 then
     print("Chest empty — put items in, then deposit."); return
   end
-  print(("Chest (%s) — %d item(s):"):format(cname, total))
+  -- Aggregate chest by short name for display
+  local byFull = {}
   for _, r in ipairs(rows) do
-    print(("  %dx %s"):format(r.count, r.name))
+    byFull[r.name] = (byFull[r.name] or 0) + r.count
+  end
+  print(("Chest (%s) — %d item(s):"):format(cname, total))
+  for name, count in pairs(byFull) do
+    print(("  %dx %s"):format(count, displayName(name, byFull)))
   end
   print(("Target: %d linked vault(s)"):format(#vaults))
   write("Move into vault pool? (y/N): ")
@@ -702,89 +865,98 @@ local function cmdDeposit()
   end
 end
 
-local function cmdWithdraw(a)
-  local chest, cname = wrapChest()
-  local vaults = liveVaults()
-  if not chest then print("Bind chest: bind chest <side|name>"); return end
-  if #vaults == 0 then print("Link vaults first."); return end
-
-  local itemQ = a[2]
-  local count = tonumber(a[3])
-  if not itemQ then
-    write("Item name (or filter): ")
-    itemQ = read()
-  end
-  if not itemQ or not tostring(itemQ):match("%S") then
-    print("Cancelled."); return
-  end
-  if not count then
-    write("Count: ")
-    count = tonumber(read())
-  end
-  count = math.floor(tonumber(count) or 0)
-  if count <= 0 then print("Need a positive count."); return end
-
-  local stockMap = poolStock()
-  local item, availOrHits = matchStock(stockMap, itemQ)
-  if type(availOrHits) == "table" then
-    print("Multiple matches — be more specific:")
-    for i = 1, math.min(#availOrHits, 12) do
-      local h = availOrHits[i]
-      print(("  %6d  %s"):format(h.count, h.name))
-    end
-    return
-  end
-  if not item then
-    print("Not in vault pool: " .. tostring(itemQ))
-    return
-  end
-  local avail = tonumber(availOrHits) or 0
-  if avail < count then
-    print(("Not enough in pool (have %d, need %d)."):format(avail, count))
-    return
-  end
-
-  print(("Withdraw %dx %s from %d vault(s) → %s"):format(
-    count, item, #vaults, cname))
-  print("If the chest fills, collect items — withdraw will continue.")
-  write("Confirm? (y/N): ")
-  local ans = tostring(read() or ""):lower()
-  if ans ~= "y" and ans ~= "yes" then
-    print("Cancelled."); return
-  end
-
+local function fulfillOne(item, count, label)
   local moved, lastErr = 0, nil
   while moved < count do
-    chest, cname = wrapChest()
-    if not chest then print("Chest missing mid-withdraw."); break end
-    if #liveVaults() == 0 then print("No vaults online."); break end
+    local chest, cname = wrapChest()
+    if not chest then return moved, "Chest missing mid-withdraw." end
+    if #liveVaults() == 0 then return moved, "No vaults online." end
 
     local need = count - moved
     local n, err = transferItemFromPool(chest, cname, item, need)
     lastErr = err or lastErr
     if n > 0 then
       moved = moved + n
-      print(("  … %d/%d in chest (+%d)"):format(moved, count, n))
+      print(("  … %s %d/%d (+%d)"):format(label, moved, count, n))
     else
       local free = select(1, chestFreeSlots(chest))
       if free > 0 then
-        print("Transfer stalled with free slots — check modem/vaults.")
-        if lastErr then print("Last error: " .. tostring(lastErr)) end
-        break
+        return moved, lastErr or "Transfer stalled"
       end
-      if not waitForChestSpace(cname) then break end
+      if not waitForChestSpace(cname) then
+        return moved, "cancelled"
+      end
+    end
+  end
+  return moved, lastErr
+end
+
+local function cmdWithdraw(a)
+  local chest, cname = wrapChest()
+  local vaults = liveVaults()
+  if not chest then print("Bind chest: bind chest <side|name>"); return end
+  if #vaults == 0 then print("Link vaults first."); return end
+
+  local stockMap = poolStock()
+  local reqs
+
+  -- Words after "withdraw"
+  local args = {}
+  for i = 2, #a do args[#args + 1] = a[i] end
+
+  if #args == 0 then
+    reqs = interactiveWithdrawList(stockMap)
+  else
+    local parsed, err, hits = parseWithdrawArgs(args, stockMap)
+    if not parsed then
+      if err and err:sub(1, 9) == "ambiguous" then
+        print("Multiple matches — be more specific:")
+        for i = 1, math.min(#(hits or {}), 12) do
+          local h = hits[i]
+          print(("  %6d  %s"):format(h.count, displayName(h.name, stockMap)))
+        end
+      else
+        print("Unknown item: " .. tostring(err and err:match("^unknown:(.*)") or args[1]))
+      end
+      return
+    end
+    reqs = parsed
+    for _, r in ipairs(reqs) do
+      if r.count > r.avail then
+        print(("Not enough %s (have %d, need %d)."):format(r.label, r.avail, r.count))
+        return
+      end
     end
   end
 
-  if moved <= 0 then
-    print("Nothing moved — chest full or modem path failed.")
-    if lastErr then print("Last error: " .. tostring(lastErr)) end
-    return
+  if not reqs or #reqs == 0 then
+    print("Nothing to withdraw."); return
   end
-  print(("Done: moved %d/%d → chest."):format(moved, count))
-  if moved < count then
-    print(("Stopped early — %d still in pool."):format(count - moved))
+
+  print("Withdraw list:")
+  for _, r in ipairs(reqs) do
+    print(("  %dx %s"):format(r.count, r.label))
   end
+  print("If the chest fills, collect items — withdraw will continue.")
+  write("Confirm all? (y/N): ")
+  local ans = tostring(read() or ""):lower()
+  if ans ~= "y" and ans ~= "yes" then
+    print("Cancelled."); return
+  end
+
+  local totalMoved = 0
+  for _, r in ipairs(reqs) do
+    print(("— %s"):format(r.label))
+    local moved, err = fulfillOne(r.item, r.count, r.label)
+    totalMoved = totalMoved + moved
+    if moved < r.count then
+      print(("  stopped at %d/%d (%s)"):format(moved, r.count, tostring(err or "short")))
+      if err == "cancelled" then break end
+    else
+      print(("  done %d"):format(moved))
+    end
+  end
+  print(("Finished. Moved %d item(s) total → chest."):format(totalMoved))
 end
 
 local function cmdHelp()
@@ -796,9 +968,10 @@ bind vault <name>           add vault to the pool (repeat)
 link                        auto-add every *vault* on the network
 unbind vault <name|#|all>
 vaults | invs | status
-stock [filter]              combined stock across all vaults
+stock [filter]              combined stock (short names, no minecraft:)
 deposit                     chest → any vault with space
-withdraw [item] [count]     pull from any vault (waits if chest full)
+withdraw                    multi-item wizard (Tab = autocomplete)
+withdraw <item> <n> [...]   e.g. withdraw oak_log 64 cobblestone 128
 help | exit
 ]])
 end

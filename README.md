@@ -575,12 +575,13 @@ link                          # or auto-add every *vault* on the network
 vaults
 stock iron
 deposit
-withdraw minecraft:iron_ingot 256
+withdraw oak_log 64 cobblestone 128
+withdraw                  # multi-item wizard; Tab autocompletes names
 ```
 
 - **deposit** — chest → any linked vault with space  
-- **withdraw** — pull from any vault in the pool → I/O chest (waits if full)  
-- **stock** — combined totals across all linked vaults  
+- **withdraw** — one or many items (short names, Tab complete); waits if chest full  
+- **stock** — combined totals; shows `oak_log` not `minecraft:oak_log`  
 - **link** / **unbind vault** — manage the vault pool  
 Right-click each vault modem until connected; use a vanilla chest for I/O.
 
