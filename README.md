@@ -748,9 +748,10 @@ requirescan on    # miners only claim cells the scanner has mapped
 clearscans        # wipe per-cell maps
 ```
 
-Scanner turtle: modem in slot 15, coal in 16, Geo Scanner in cargo; `setup` at
-origin, then `join` / `scan`. The scanner block needs enough FE/fuel for AP’s
-`cost(radius)`.
+Scanner turtle slots: **16+15** coal (2 stacks), **14** pickaxe, **13** Geo
+Scanner; wireless modem stays on RIGHT (parks in cargo only while retrieving).
+`setup` at origin, then `join` / `scan`. The scanner block needs enough FE for
+AP’s `cost(radius)`.
 
 ### Depot Geo Scanner (optional)
 

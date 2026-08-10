@@ -1,6 +1,6 @@
 --[[
   quarry/workers/cell_scanner.lua  -  Per-cell Geo Scanner turtle
-  Titan-Version: 1.0.3
+  Titan-Version: 1.0.5
 
   Places an Advanced Peripherals Geo Scanner at the center of each free
   unscanned quarry cell, runs scan(radius), reports solids to the site board,
@@ -9,9 +9,11 @@
 
   Setup (same depot as miners):
     * Stand at quarry origin 0,0,0 facing into the mine (+Z)
-    * Fuel chest LEFT → slot 16 (coal/charcoal)
-    * Slot 15 = wireless modem (stays on RIGHT most of the time)
-    * Inventory: Geo Scanner + pickaxe (for retrieve only)
+    * Fuel chest LEFT → slots 16 + 15 (two stacks coal/charcoal)
+    * Slot 14 = pickaxe (retrieve only)
+    * Slot 13 = Geo Scanner item
+    * Wireless modem stays on RIGHT most of the time (parks in cargo 1-12
+      only while the pickaxe is briefly equipped)
     * Site board online; `origin` set on the board
 
   Tooling:
@@ -30,13 +32,16 @@
 ]]
 
 local CFG = "cell_scanner.cfg"
-local FUEL_SLOT = 16
-local MODEM_SLOT = 15
+local FUEL_SLOT = 16       -- primary fuel stack
+local FUEL_SLOT2 = 15      -- second fuel stack
+local PICK_SLOT = 14
+local SCANNER_SLOT = 13
+local CARGO_MAX = 12       -- slots 1-12: modem park / misc (never fuel/tools)
 local PICK_SIDE = "right"
-local FUEL_KEEP = 64
+local FUEL_KEEP = 64       -- per fuel slot
 local MIN_FUEL = 200
 local HOME_MARGIN = 24
-local VERSION = "1.0.3"
+local VERSION = "1.0.5"
 local PROTO = "titan_quarry"
 local NET = "titan_net"
 
@@ -97,34 +102,55 @@ local function isPickaxeItem(detail)
   return n:find("pickaxe", 1, true) ~= nil
 end
 
+local function isFuelSlot(s)
+  return s == FUEL_SLOT or s == FUEL_SLOT2
+end
+
+local function findEmptyCargo()
+  for s = 1, CARGO_MAX do
+    if turtle.getItemCount(s) == 0 then return s end
+  end
+  return nil
+end
+
 local function findPickSlot()
-  for s = 1, 16 do
-    if s ~= FUEL_SLOT and turtle.getItemCount(s) > 0 then
-      local d = turtle.getItemDetail(s)
-      if isPickaxeItem(d) then return s end
+  if turtle.getItemCount(PICK_SLOT) > 0 and isPickaxeItem(turtle.getItemDetail(PICK_SLOT)) then
+    return PICK_SLOT
+  end
+  for s = 1, CARGO_MAX do
+    if turtle.getItemCount(s) > 0 and isPickaxeItem(turtle.getItemDetail(s)) then
+      return s
     end
   end
   return nil
 end
 
-local function parkModemInSlot15()
-  local slot = findModemSlot()
-  if not slot then return isModemItem(turtle.getItemDetail(MODEM_SLOT)) end
-  if slot == MODEM_SLOT then return true end
-  if turtle.getItemCount(MODEM_SLOT) == 0 then
+local function parkPickInSlot14()
+  local slot = findPickSlot()
+  if not slot then return true end
+  if slot == PICK_SLOT then return true end
+  if turtle.getItemCount(PICK_SLOT) == 0 then
     turtle.select(slot)
-    return turtle.transferTo(MODEM_SLOT) or false
+    return turtle.transferTo(PICK_SLOT) or false
   end
-  -- Slot 15 occupied — swap into an empty cargo slot first.
-  for s = 1, 14 do
-    if turtle.getItemCount(s) == 0 then
-      turtle.select(MODEM_SLOT)
-      turtle.transferTo(s)
-      turtle.select(slot)
-      return turtle.transferTo(MODEM_SLOT) or false
-    end
-  end
-  return false
+  if isPickaxeItem(turtle.getItemDetail(PICK_SLOT)) then return true end
+  local empty = findEmptyCargo()
+  if not empty then return false end
+  turtle.select(PICK_SLOT)
+  turtle.transferTo(empty)
+  turtle.select(slot)
+  return turtle.transferTo(PICK_SLOT) or false
+end
+
+-- Modem has no reserved slot — park in cargo 1-12 while pickaxe is on RIGHT.
+local function parkModemInCargo()
+  local slot = findModemSlot()
+  if not slot then return false end
+  if slot <= CARGO_MAX then return true end
+  local empty = findEmptyCargo()
+  if not empty then return false end
+  turtle.select(slot)
+  return turtle.transferTo(empty) or false
 end
 
 -- RIGHT = pickaxe for digging / retrieving the Geo Scanner.
@@ -137,7 +163,7 @@ local function ensurePick()
     if not slot then return true end
   end
   if not slot then
-    print("No pickaxe in inventory — cannot dig up Geo Scanner.")
+    print("No pickaxe in slot " .. PICK_SLOT .. " — cannot dig up Geo Scanner.")
     return false
   end
   turtle.select(slot)
@@ -145,15 +171,12 @@ local function ensurePick()
     print("Could not equip pickaxe on RIGHT.")
     return false
   end
-  -- Unequipped modem lands in the selected slot — park it in 15.
+  -- Unequipped modem lands in the selected slot — park in cargo 1-12.
   if turtle.getItemCount(slot) > 0 and isModemItem(turtle.getItemDetail(slot)) then
-    if slot ~= MODEM_SLOT then
-      if turtle.getItemCount(MODEM_SLOT) == 0 then
-        turtle.transferTo(MODEM_SLOT)
-      else
-        parkModemInSlot15()
-      end
-    end
+    if slot > CARGO_MAX then parkModemInCargo() end
+  else
+    local m = findModemSlot()
+    if m and m > CARGO_MAX then parkModemInCargo() end
   end
   return true
 end
@@ -162,13 +185,10 @@ end
 local function ensureModem()
   local ptype = peripheral.getType(PICK_SIDE)
   if (ptype == "modem" or ptype == "wireless_modem") and openModem() then
+    parkPickInSlot14()
     return true
   end
-  parkModemInSlot15()
-  local slot = MODEM_SLOT
-  if turtle.getItemCount(MODEM_SLOT) == 0 or not isModemItem(turtle.getItemDetail(MODEM_SLOT)) then
-    slot = findModemSlot()
-  end
+  local slot = findModemSlot()
   if not slot then
     return openModem()
   end
@@ -176,7 +196,18 @@ local function ensureModem()
   if not turtle.equipRight() then
     return openModem()
   end
-  -- Pickaxe came off into selected slot — leave it in inventory until retrieve.
+  -- Pickaxe came off into selected slot — home it in 14.
+  if turtle.getItemCount(slot) > 0 and isPickaxeItem(turtle.getItemDetail(slot)) then
+    if slot ~= PICK_SLOT then
+      if turtle.getItemCount(PICK_SLOT) == 0 then
+        turtle.transferTo(PICK_SLOT)
+      else
+        parkPickInSlot14()
+      end
+    end
+  else
+    parkPickInSlot14()
+  end
   return openModem()
 end
 
@@ -201,14 +232,8 @@ local function labelSelf()
 end
 
 --------------------------------------------------------------------------------
--- Fuel (coal slot 16)
+-- Fuel (coal slots 16 + 15 — two stacks)
 --------------------------------------------------------------------------------
-local function selectedIsFuel()
-  local ok = false
-  pcall(function() ok = turtle.refuel(0) end)
-  return ok == true
-end
-
 local function isCoalName(name)
   name = tostring(name or ""):lower()
   if name == "" or name:find("ore", 1, true) then return false end
@@ -220,28 +245,53 @@ local function slotIsCoal(slot)
   return d ~= nil and isCoalName(d.name)
 end
 
+local function fuelCount()
+  local n = 0
+  if slotIsCoal(FUEL_SLOT) then n = n + turtle.getItemCount(FUEL_SLOT) end
+  if slotIsCoal(FUEL_SLOT2) then n = n + turtle.getItemCount(FUEL_SLOT2) end
+  return n
+end
+
 local function selectCargo()
-  for s = 1, 14 do
-    if turtle.getItemCount(s) == 0 then turtle.select(s); return end
-  end
+  local empty = findEmptyCargo()
+  if empty then turtle.select(empty); return end
   turtle.select(1)
 end
 
 local function protectFuel()
-  if turtle.getItemCount(FUEL_SLOT) > 0 and not slotIsCoal(FUEL_SLOT) then
-    turtle.select(FUEL_SLOT)
-    for s = 1, 14 do
-      if turtle.getItemCount(s) == 0 then turtle.transferTo(s); break end
+  for _, fs in ipairs({ FUEL_SLOT, FUEL_SLOT2 }) do
+    if turtle.getItemCount(fs) > 0 and not slotIsCoal(fs) then
+      turtle.select(fs)
+      local empty = findEmptyCargo()
+      if empty then turtle.transferTo(empty) end
     end
   end
-  for s = 1, 14 do
-    if turtle.getItemCount(FUEL_SLOT) >= FUEL_KEEP then break end
-    if turtle.getItemCount(s) > 0 and slotIsCoal(s) then
-      turtle.select(s)
-      turtle.transferTo(FUEL_SLOT)
+  for _, fs in ipairs({ FUEL_SLOT, FUEL_SLOT2 }) do
+    for s = 1, CARGO_MAX do
+      if turtle.getItemCount(fs) >= FUEL_KEEP then break end
+      if turtle.getItemCount(s) > 0 and slotIsCoal(s) then
+        turtle.select(s)
+        turtle.transferTo(fs)
+      end
     end
   end
   selectCargo()
+end
+
+local function burnFuelFromSlots()
+  for _, fs in ipairs({ FUEL_SLOT, FUEL_SLOT2 }) do
+    if slotIsCoal(fs) then
+      turtle.select(fs)
+      local n = turtle.getItemCount(fs)
+      local leave = ((tonumber(turtle.getFuelLevel()) or 0) < 1) and 0 or 1
+      local burn = math.min(math.max(0, n - leave), 8)
+      if burn >= 1 then
+        turtle.refuel(burn)
+        return true
+      end
+    end
+  end
+  return false
 end
 
 local function ensureFuel()
@@ -249,13 +299,7 @@ local function ensureFuel()
   if level == "unlimited" then return true end
   protectFuel()
   if (tonumber(level) or 0) >= MIN_FUEL then return true end
-  if slotIsCoal(FUEL_SLOT) then
-    turtle.select(FUEL_SLOT)
-    local n = turtle.getItemCount(FUEL_SLOT)
-    local leave = ((tonumber(turtle.getFuelLevel()) or 0) < 1) and 0 or 1
-    local burn = math.min(math.max(0, n - leave), 8)
-    if burn >= 1 then turtle.refuel(burn) end
-  end
+  burnFuelFromSlots()
   selectCargo()
   level = turtle.getFuelLevel()
   return level == "unlimited" or (tonumber(level) or 0) > 0
@@ -264,6 +308,9 @@ end
 --------------------------------------------------------------------------------
 -- Movement (quarry coords: +Y down)
 --------------------------------------------------------------------------------
+-- Forward decl: digDir must refuse to path-dig a placed Geo Scanner.
+local inspectIsGeoDown
+
 local function turnRight()
   turtle.turnRight()
   facing = (facing + 1) % 4
@@ -286,11 +333,13 @@ local function suckFuelLeft()
   local saved = facing
   turnTo(3)
   protectFuel()
-  turtle.select(FUEL_SLOT)
-  if turtle.getItemCount(FUEL_SLOT) == 0 or slotIsCoal(FUEL_SLOT) then
-    local space = turtle.getItemCount(FUEL_SLOT) == 0 and FUEL_KEEP
-      or math.min(turtle.getItemSpace(FUEL_SLOT) or 0, FUEL_KEEP - turtle.getItemCount(FUEL_SLOT))
-    if space and space > 0 then turtle.suck(space) end
+  for _, fs in ipairs({ FUEL_SLOT, FUEL_SLOT2 }) do
+    turtle.select(fs)
+    if turtle.getItemCount(fs) == 0 or slotIsCoal(fs) then
+      local space = turtle.getItemCount(fs) == 0 and FUEL_KEEP
+        or math.min(turtle.getItemSpace(fs) or 0, FUEL_KEEP - turtle.getItemCount(fs))
+      if space and space > 0 then turtle.suck(space) end
+    end
   end
   protectFuel()
   ensureFuel()
@@ -306,6 +355,8 @@ local function digDir(dir)
       if not turtle.detectUp() then return true end
       if not turtle.digUp() then return false end
     elseif dir == "down" then
+      -- Never path-dig a Geo Scanner (place/pickup handle that intentionally).
+      if inspectIsGeoDown() then return false end
       if not turtle.detectDown() then return true end
       if not turtle.digDown() then return false end
     end
@@ -382,13 +433,40 @@ local function isGeoScannerItem(detail)
 end
 
 local function findScannerSlot()
+  if turtle.getItemCount(SCANNER_SLOT) > 0
+    and isGeoScannerItem(turtle.getItemDetail(SCANNER_SLOT)) then
+    return SCANNER_SLOT
+  end
+  for s = 1, CARGO_MAX do
+    if turtle.getItemCount(s) > 0 and isGeoScannerItem(turtle.getItemDetail(s)) then
+      return s
+    end
+  end
+  -- Last resort: anywhere except fuel slots (misplaced item).
   for s = 1, 16 do
-    if s ~= FUEL_SLOT and turtle.getItemCount(s) > 0 then
-      local d = turtle.getItemDetail(s)
-      if isGeoScannerItem(d) then return s end
+    if not isFuelSlot(s) and turtle.getItemCount(s) > 0
+      and isGeoScannerItem(turtle.getItemDetail(s)) then
+      return s
     end
   end
   return nil
+end
+
+local function parkScannerInSlot13()
+  local slot = findScannerSlot()
+  if not slot then return false end
+  if slot == SCANNER_SLOT then return true end
+  if turtle.getItemCount(SCANNER_SLOT) == 0 then
+    turtle.select(slot)
+    return turtle.transferTo(SCANNER_SLOT) or false
+  end
+  if isGeoScannerItem(turtle.getItemDetail(SCANNER_SLOT)) then return true end
+  local empty = findEmptyCargo()
+  if not empty then return false end
+  turtle.select(SCANNER_SLOT)
+  turtle.transferTo(empty)
+  turtle.select(slot)
+  return turtle.transferTo(SCANNER_SLOT) or false
 end
 
 local function wrapGeoDown()
@@ -400,13 +478,57 @@ local function wrapGeoDown()
   return nil
 end
 
+-- True if the block below is a Geo Scanner (even before peripheral wrap is ready).
+inspectIsGeoDown = function()
+  if not turtle.inspectDown then
+    return wrapGeoDown() ~= nil
+  end
+  local ok, info = turtle.inspectDown()
+  if not ok or type(info) ~= "table" then return false end
+  local n = tostring(info.name or ""):lower()
+  return (n:find("geo_scanner", 1, true) ~= nil)
+    or (n:find("geoscanner", 1, true) ~= nil)
+    or (n:find("geo", 1, true) ~= nil and n:find("scanner", 1, true) ~= nil)
+end
+
+local function waitPeripheralGeo(timeout)
+  timeout = timeout or 3
+  local deadline = os.clock() + timeout
+  while os.clock() < deadline do
+    local geo = wrapGeoDown()
+    if geo then return geo end
+    if not inspectIsGeoDown() and not turtle.detectDown() then return nil end
+    sleep(0.1)
+  end
+  return wrapGeoDown()
+end
+
 local function waitScanCooldown(geo)
   if not geo or type(geo.getScanCooldown) ~= "function" then return end
-  for _ = 1, 60 do
+  for _ = 1, 80 do
     local ok, cd = pcall(geo.getScanCooldown)
     if not ok or type(cd) ~= "number" or cd <= 0 then return end
     sleep(math.min(0.5, cd + 0.05))
   end
+end
+
+-- After geo.scan() returns, briefly confirm the scan was consumed (cooldown > 0).
+-- Do NOT wait for the full cooldown to expire — that delays pickup unnecessarily.
+local function waitScanFinished(geo)
+  if not geo then return end
+  if type(geo.getScanCooldown) ~= "function" then
+    sleep(0.35)
+    return
+  end
+  for _ = 1, 40 do
+    local ok, cd = pcall(geo.getScanCooldown)
+    if ok and type(cd) == "number" and cd > 0 then
+      sleep(0.15)
+      return
+    end
+    sleep(0.1)
+  end
+  sleep(0.25)
 end
 
 local function isAirName(name)
@@ -431,46 +553,63 @@ local function relToQuarry(bx, by, bz)
 end
 
 local function placeScannerDown()
+  parkScannerInSlot13()
   local slot = findScannerSlot()
   if not slot then
-    print("No Geo Scanner item in inventory.")
+    print("No Geo Scanner in slot " .. SCANNER_SLOT .. ".")
     return false
   end
-  -- Keep modem on. Only borrow pickaxe if something blocks the place spot.
-  if turtle.detectDown() and not wrapGeoDown() then
+  -- Already a scanner below — never dig it up while "clearing".
+  if inspectIsGeoDown() or wrapGeoDown() then
+    local geo = waitPeripheralGeo(2)
+    return geo ~= nil
+  end
+  -- Keep modem on. Only borrow pickaxe if non-scanner block blocks the spot.
+  if turtle.detectDown() then
     local cleared = withPickaxe(function()
+      if inspectIsGeoDown() then return true end
       digDir("down")
-      return not turtle.detectDown() or wrapGeoDown() ~= nil
+      return not turtle.detectDown()
     end)
-    if not cleared then
+    if not cleared and turtle.detectDown() and not inspectIsGeoDown() then
       print("Could not clear space under turtle for Geo Scanner.")
       return false
     end
   end
   slot = findScannerSlot()
   if not slot then
+    if inspectIsGeoDown() then return waitPeripheralGeo(2) ~= nil end
     print("Geo Scanner missing after clearing space.")
     return false
   end
   ensureModem()
   turtle.select(slot)
   if not turtle.placeDown() then
-    if wrapGeoDown() then return true end
+    if inspectIsGeoDown() or wrapGeoDown() then
+      return waitPeripheralGeo(2) ~= nil
+    end
     print("Could not place Geo Scanner down.")
     return false
   end
-  sleep(0.2)
-  return wrapGeoDown() ~= nil
+  local geo = waitPeripheralGeo(3)
+  if not geo then
+    print("Geo Scanner placed but peripheral not ready.")
+    return false
+  end
+  return true
 end
 
--- Modem stays on until this moment → brief pickaxe dig → modem before move.
+-- ONLY call after site has acked the report. Brief pickaxe dig → modem before move.
 local function pickupScannerDown()
+  if not inspectIsGeoDown() and not wrapGeoDown() and not turtle.detectDown() then
+    if findScannerSlot() then return true end
+  end
   print("Retrieving Geo Scanner (brief pickaxe swap)...")
   local ok = withPickaxe(function()
     selectCargo()
     for _ = 1, 10 do
-      if findScannerSlot() then return true end
-      if turtle.detectDown() then
+      if findScannerSlot() and not inspectIsGeoDown() then return true end
+      if turtle.detectDown() or inspectIsGeoDown() then
         turtle.digDown()
       else
         break
@@ -490,6 +629,7 @@ local function pickupScannerDown()
     return findScannerSlot() ~= nil
   end)
   if ok then
+    parkScannerInSlot13()
     print("Geo Scanner recovered — modem back on.")
   else
     print("WARNING: Geo Scanner not in inventory after dig — check ground.")
@@ -498,7 +638,25 @@ local function pickupScannerDown()
   return ok == true
 end
 
--- Travel with modem → place → scan. Leaves scanner placed for report, then pickup.
+local function solidsFromScanData(data, x0, x1, z0, z1, y1)
+  local solids, seen = {}, {}
+  for _, b in ipairs(data or {}) do
+    if type(b) == "table" and type(b.name) == "string" and not isAirName(b.name) then
+      local qx, qy, qz = relToQuarry(
+        tonumber(b.x) or 0, tonumber(b.y) or 0, tonumber(b.z) or 0)
+      if qx >= x0 and qx <= x1 and qz >= z0 and qz <= z1 and qy >= 0 and qy <= y1 then
+        local key = qx .. ":" .. qy .. ":" .. qz
+        if not seen[key] then
+          seen[key] = true
+          solids[#solids + 1] = { x = qx, y = qy, z = qz }
+        end
+      end
+    end
+  end
+  return solids
+end
+
+-- Travel (modem) → place → FULL scan. Never picks up — caller reports first.
 -- Returns solids, err, radius, scannerStillPlaced
 local function runCellScan(claim)
   local radius = math.max(1, math.min(16, math.floor(tonumber(claim.radius) or 8)))
@@ -525,12 +683,11 @@ local function runCellScan(claim)
   turnTo(0)
 
   if not placeScannerDown() then
-    return nil, "place", radius, false
+    return nil, "place", radius, inspectIsGeoDown()
   end
-  local geo = wrapGeoDown()
+  local geo = waitPeripheralGeo(3)
   if not geo then
-    pickupScannerDown()
-    return nil, "no peripheral", radius, false
+    return nil, "no peripheral", radius, inspectIsGeoDown()
   end
 
   waitScanCooldown(geo)
@@ -541,37 +698,38 @@ local function runCellScan(claim)
     end
   end
 
+  print("  Scanning… (waiting for results)")
   local ok, data, err = pcall(function()
     if geo.scan then return geo.scan(radius) end
     return geo.scanBlocks(radius)
   end)
+  waitScanFinished(geo)
+
+  -- Peripheral must still be present — never treat a mid-scan dig as success.
+  if not wrapGeoDown() and not inspectIsGeoDown() then
+    return nil, "scanner broken during scan", radius, false
+  end
 
   if not ok then
-    pickupScannerDown()
-    return nil, tostring(data), radius, false
+    return nil, tostring(data), radius, true
   end
   if data == nil then
-    pickupScannerDown()
-    return nil, tostring(err or "scan failed"), radius, false
-  end
-
-  local solids = {}
-  local seen = {}
-  for _, b in ipairs(data) do
-    if type(b) == "table" and type(b.name) == "string" and not isAirName(b.name) then
-      local qx, qy, qz = relToQuarry(
-        tonumber(b.x) or 0, tonumber(b.y) or 0, tonumber(b.z) or 0)
-      if qx >= x0 and qx <= x1 and qz >= z0 and qz <= z1 and qy >= 0 and qy <= y1 then
-        local key = qx .. ":" .. qy .. ":" .. qz
-        if not seen[key] then
-          seen[key] = true
-          solids[#solids + 1] = { x = qx, y = qy, z = qz }
-        end
-      end
+    -- Retry once after cooldown — first call sometimes returns early.
+    print("  Scan returned empty — retrying once…")
+    geo = waitPeripheralGeo(2) or geo
+    waitScanCooldown(geo)
+    ok, data, err = pcall(function()
+      if geo.scan then return geo.scan(radius) end
+      return geo.scanBlocks(radius)
+    end)
+    waitScanFinished(geo)
+    if not ok or data == nil then
+      return nil, tostring(err or data or "scan failed"), radius, true
     end
   end
-  print(("  indexed %d solid(s) in cell"):format(#solids))
-  -- Scanner stays placed until after site report; modem stays on for travel/report.
+
+  local solids = solidsFromScanData(data, x0, x1, z0, z1, y1)
+  print(("  Scan complete — %d solid(s). Reporting before pickup."):format(#solids))
   return solids, nil, radius, true
 end
 
@@ -609,9 +767,9 @@ end
 
 local function joinSite()
   if not ensureModem() then
-    print("Need a WIRELESS MODEM inside the turtle.")
-    print("  Put it in the turtle inventory (slot 15), then `join` again.")
-    print("  (Items in your player inventory do not count.)")
+    print("Need a WIRELESS MODEM on RIGHT (or in cargo slots 1-12).")
+    print("  Equip it / put it in the turtle, then `join` again.")
+    print("  (Slots 13-16 are geo / pick / fuel — not for the modem.)")
     return false
   end
   send({ type = "quarry_join", bpc = 1 })
@@ -631,32 +789,51 @@ local function claimScanCell()
   return msg
 end
 
--- Returns next scan-cell claim if the site chained one after the ack.
+-- Returns nextClaim, sawAck. Retries send until site acks (or attempts exhausted).
 local function reportScan(claim, solids, radius, failed)
-  send({
-    type = "quarry_scan_report",
-    cellId = claim.cellId,
-    solids = solids or {},
-    radius = radius,
-    x0 = claim.x0, x1 = claim.x1, z0 = claim.z0, z1 = claim.z1,
-    failed = failed == true,
-    next = true,
-  })
   local nextClaim, sawAck = nil, false
-  local deadline = os.clock() + 8
-  while os.clock() < deadline do
-    local id, msg = rednet.receive(PROTO, math.max(0.05, deadline - os.clock()))
-    if id and type(msg) == "table" then
-      if not siteId then siteId = id end
-      if msg.type == "quarry_scan_ack" then
-        sawAck = true
-        if msg.autoComplete then print("Site auto-completed empty cell.") end
-        if msg.ok == false and failed then break end
-      elseif msg.type == "quarry_scan_cell" then
-        nextClaim = msg
-        break
+  for attempt = 1, 3 do
+    send({
+      type = "quarry_scan_report",
+      cellId = claim.cellId,
+      solids = solids or {},
+      radius = radius,
+      x0 = claim.x0, x1 = claim.x1, z0 = claim.z0, z1 = claim.z1,
+      failed = failed == true,
+      next = true,
+    })
+    local deadline = os.clock() + 10
+    while os.clock() < deadline do
+      local id, msg = rednet.receive(PROTO, math.max(0.05, deadline - os.clock()))
+      if id and type(msg) == "table" then
+        if not siteId then siteId = id end
+        if msg.type == "quarry_scan_ack" then
+          sawAck = true
+          if msg.autoComplete then print("Site auto-completed empty cell.") end
+          if msg.ok == false and failed then
+            return nextClaim, true
+          end
+        elseif msg.type == "quarry_scan_cell" then
+          nextClaim = msg
+          -- Next cell after ack is enough proof the report landed.
+          return nextClaim, true
+        end
+        if sawAck and nextClaim then return nextClaim, true end
+        if sawAck and failed then return nextClaim, true end
+        -- Success path: ack alone is enough; next cell may arrive shortly.
+        if sawAck and not failed then
+          local d2 = os.clock() + 2
+          while os.clock() < d2 do
+            local id2, msg2 = rednet.receive(PROTO, math.max(0.05, d2 - os.clock()))
+            if id2 and type(msg2) == "table" and msg2.type == "quarry_scan_cell" then
+              return msg2, true
+            end
+          end
+          return nextClaim, true
+        end
       end
     end
+    print(("  Site ack timeout (try %d/3)…"):format(attempt))
   end
   return nextClaim, sawAck
 end
@@ -673,12 +850,12 @@ local function scanLoop()
       print("Out of fuel — depot.")
       goHome()
       if not ensureFuel() then
-        print("Still no fuel. Stock left chest / slot 16.")
+        print("Still no fuel. Stock left chest / slots 16+15.")
         return
       end
     end
     if not findScannerSlot() then
-      print("Missing Geo Scanner item — put one in inventory.")
+      print("Missing Geo Scanner — put one in slot 13.")
       return
     end
 
@@ -706,22 +883,33 @@ local function scanLoop()
     end
     send({ type = "quarry_leave_origin", status = "travel", cellId = claim.cellId })
 
-    -- Travel / place / scan with pickaxe; leave Geo Scanner placed.
+    -- Travel / place / scan with modem. Geo Scanner stays placed until report acks.
     local solids, err, radius, placed = runCellScan(claim)
-    -- Report with modem while scanner is still down (or after failed recovery).
     if not ensureModem() then
       print("Could not equip modem to report — trying anyway.")
     end
     if not solids then
       print("Scan failed: " .. tostring(err))
-      if placed then pickupScannerDown() end
-      goHome()
+      print("Reporting failure to site (scanner still placed)…")
       pending = select(1, reportScan(claim, {}, radius, true))
+      if placed or inspectIsGeoDown() then pickupScannerDown() end
+      goHome()
     else
-      print("Uploading scan to site board...")
-      pending = select(1, reportScan(claim, solids, radius, false))
-      if placed then
-        pickupScannerDown() -- only pickaxe moment; modem restored before move
+      print("Uploading scan to site board (scanner still placed)…")
+      local nextClaim, acked = reportScan(claim, solids, radius, false)
+      pending = nextClaim
+      if not acked then
+        print("WARNING: site did not ack — not moving yet; retrying report…")
+        nextClaim, acked = reportScan(claim, solids, radius, false)
+        pending = nextClaim or pending
+      end
+      if acked then
+        print("Site acked — retrieving Geo Scanner…")
+      else
+        print("WARNING: no ack after retries — retrieving scanner anyway.")
+      end
+      if placed or inspectIsGeoDown() then
+        pickupScannerDown()
       end
     end
     ensureModem() -- modem on before walking to next cell
@@ -732,31 +920,36 @@ local function scanLoop()
 end
 
 local function setup()
-  print("Scanner setup — these must be IN THE TURTLE (left 16 slots):")
-  print("  slot 15 = wireless modem  |  slot 16 = coal")
-  print("  cargo   = Geo Scanner + pickaxe (RIGHT swap)")
-  print("Origin = current pose. Facing into mine (+Z).")
+  print("Scanner setup — reserved slots:")
+  print("  16+15 = coal (2 stacks)  |  14 = pickaxe  |  13 = Geo Scanner")
+  print("  RIGHT = wireless modem (parks in 1-12 only while picking up scanner)")
+  print("Origin = current pose. Facing into mine (+Z). Fuel chest LEFT.")
   turnTo(0)
   pos.x, pos.y, pos.z = 0, 0, 0
   protectFuel()
   suckFuelLeft()
+  parkScannerInSlot13()
+  parkPickInSlot14()
   local pickOk = findPickSlot() ~= nil or (
     peripheral.getType(PICK_SIDE) and peripheral.getType(PICK_SIDE) ~= "modem"
       and peripheral.getType(PICK_SIDE) ~= "wireless_modem")
   local modemOk = ensureModem()
   cfg.setupDone = true
   saveCfg()
-  print(("Ready. fuel=%s  modem=%s  pick=%s  scanner=%s  coal16=%d"):format(
+  print(("Ready. fuel=%s  coal=%d  modem=%s  pick14=%s  geo13=%s"):format(
     tostring(turtle.getFuelLevel()),
+    fuelCount(),
     modemOk and "yes" or "MISSING",
     pickOk and "yes" or "MISSING",
-    findScannerSlot() and "yes" or "MISSING",
-    turtle.getItemCount(FUEL_SLOT)))
+    findScannerSlot() and "yes" or "MISSING"))
   if not modemOk then
-    print("Put a wireless modem into the turtle, then `join`.")
+    print("Equip a wireless modem on RIGHT (or put one in cargo 1-12), then `join`.")
   end
   if not pickOk then
-    print("Put a pickaxe in the turtle (needed to dig up the Geo Scanner).")
+    print("Put a pickaxe in slot " .. PICK_SLOT .. ".")
+  end
+  if not findScannerSlot() then
+    print("Put an AP Geo Scanner in slot " .. SCANNER_SLOT .. ".")
   end
 end
 
@@ -764,15 +957,16 @@ local function status()
   print(("Scanner v%s  site=%s  pose=%d,%d,%d face=%d fuel=%s"):format(
     VERSION, tostring(siteId or "-"), pos.x, pos.y, pos.z, facing,
     tostring(turtle.getFuelLevel())))
-  print(("  geo=%s  pick=%s  modemOpen=%s  cell=%s"):format(
+  print(("  coal15/16=%d  geo13=%s  pick14=%s  modemOpen=%s  cell=%s"):format(
+    fuelCount(),
     findScannerSlot() and "yes" or "no",
-    findPickSlot() and "inv" or "?",
+    findPickSlot() and "yes" or "no",
     tostring(openModem()),
     tostring(activeScan and activeScan.cellId or "-")))
 end
 
 local function help()
-  print("Cell scanner — modem on for travel/scan/report.")
+  print("Cell scanner — slots: 16+15 fuel, 14 pick, 13 geo; modem on RIGHT.")
   print("  Pickaxe only to dig up the Geo Scanner, then modem before moving.")
   print("  join | scan | stop | home | refuel | setup | status | help | exit")
   print("Site: requirescan on  (miners wait for maps)")
@@ -787,8 +981,8 @@ print("== Cell Scanner v" .. VERSION .. " ==")
 if not cfg.setupDone then
   print("Tip: stand at quarry origin, then `setup`.")
 end
-if findScannerSlot() then print("Geo Scanner item found.")
-else print("Put an AP Geo Scanner in inventory.") end
+if findScannerSlot() then print("Geo Scanner in slot 13 (or cargo).")
+else print("Put an AP Geo Scanner in slot 13.") end
 print("Type help.")
 
 while true do
