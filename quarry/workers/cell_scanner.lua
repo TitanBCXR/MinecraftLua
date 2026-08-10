@@ -1,6 +1,6 @@
 --[[
   quarry/workers/cell_scanner.lua  -  Per-cell Geo Scanner turtle
-  Titan-Version: 1.0.0
+  Titan-Version: 1.0.1
 
   Places an Advanced Peripherals Geo Scanner at the center of each free
   unscanned quarry cell, runs scan(radius), reports solids to the site board,
@@ -29,7 +29,7 @@ local MODEM_SLOT = 15
 local FUEL_KEEP = 64
 local MIN_FUEL = 200
 local HOME_MARGIN = 24
-local VERSION = "1.0.0"
+local VERSION = "1.0.1"
 local PROTO = "titan_quarry"
 local NET = "titan_net"
 
@@ -58,12 +58,53 @@ end
 
 local function openModem()
   for _, side in ipairs(redstone.getSides()) do
-    if peripheral.getType(side) == "modem" then
+    local t = peripheral.getType(side)
+    if t == "modem" or t == "wireless_modem" then
       if not rednet.isOpen(side) then pcall(rednet.open, side) end
       return true
     end
   end
   return false
+end
+
+local function isModemItem(detail)
+  if type(detail) ~= "table" then return false end
+  local n = tostring(detail.name or ""):lower()
+  if n == "" then return false end
+  if n:find("wired", 1, true) then return false end
+  return n:find("modem", 1, true) ~= nil or n:find("wireless", 1, true) ~= nil
+end
+
+local function findModemSlot()
+  for s = 1, 16 do
+    if turtle.getItemCount(s) > 0 and isModemItem(turtle.getItemDetail(s)) then
+      return s
+    end
+  end
+  return nil
+end
+
+-- Equip wireless modem from inventory (prefer RIGHT; fall back LEFT).
+local function ensureModem()
+  if openModem() then return true end
+  local slot = findModemSlot()
+  if not slot then
+    if turtle.getItemCount(MODEM_SLOT) > 0 and isModemItem(turtle.getItemDetail(MODEM_SLOT)) then
+      slot = MODEM_SLOT
+    end
+  end
+  if not slot then return false end
+  -- Park modem in slot 15 when possible.
+  if slot ~= MODEM_SLOT and turtle.getItemCount(MODEM_SLOT) == 0 then
+    turtle.select(slot)
+    turtle.transferTo(MODEM_SLOT)
+    slot = MODEM_SLOT
+  end
+  turtle.select(slot)
+  if turtle.equipRight() and openModem() then return true end
+  turtle.select(slot)
+  if turtle.equipLeft() and openModem() then return true end
+  return openModem()
 end
 
 local function labelSelf()
@@ -430,14 +471,16 @@ local function waitReply(types, timeout)
 end
 
 local function joinSite()
-  if not openModem() then
-    print("Need a wireless modem (slot " .. MODEM_SLOT .. " / upgrade).")
+  if not ensureModem() then
+    print("Need a WIRELESS MODEM inside the turtle.")
+    print("  Put it in the turtle inventory (slot 15), then `join` again.")
+    print("  (Items in your player inventory do not count.)")
     return false
   end
   send({ type = "quarry_join", bpc = 1 })
   local id, msg = waitReply({ "quarry_welcome" }, 6)
   if not msg then
-    print("No site board reply.")
+    print("No site board reply — is the site board on and in range?")
     return false
   end
   siteId = id or msg.siteId or siteId
@@ -535,16 +578,24 @@ local function scanLoop()
 end
 
 local function setup()
-  print("Scanner setup: modem slot 15, coal slot 16, Geo Scanner in cargo.")
+  print("Scanner setup — these must be IN THE TURTLE (left 16 slots):")
+  print("  slot 15 = wireless modem  |  slot 16 = coal  |  cargo = Geo Scanner")
   print("Origin = current pose. Facing into mine (+Z).")
   turnTo(0)
   pos.x, pos.y, pos.z = 0, 0, 0
+  protectFuel()
   suckFuelLeft()
+  local modemOk = ensureModem()
   cfg.setupDone = true
   saveCfg()
-  print(("Ready. fuel=%s scanner=%s"):format(
+  print(("Ready. fuel=%s  modem=%s  scanner=%s  coal16=%d"):format(
     tostring(turtle.getFuelLevel()),
-    findScannerSlot() and "yes" or "MISSING"))
+    modemOk and "yes" or "MISSING",
+    findScannerSlot() and "yes" or "MISSING",
+    turtle.getItemCount(FUEL_SLOT)))
+  if not modemOk then
+    print("Put a wireless modem into the turtle, then `join`.")
+  end
 end
 
 local function status()
