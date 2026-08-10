@@ -1,6 +1,6 @@
 --[[
   quarry/managers/offline_site.lua  -  Quarry site board (XZ cell fleet)
-  Titan-Version: 1.7.0
+  Titan-Version: 1.7.1
 
   Place LEFT of the storage chest (storage behind turtle origin). Modem required.
   Attach a **monitor** for the live status board — the computer terminal stays
@@ -662,23 +662,6 @@ local function loadCellScanSolids(cellId)
   return {}
 end
 
-local function clearAllCellScans()
-  for _, c in ipairs(cfg.cells or {}) do
-    c.scanned = nil
-    c.scanSolidCount = nil
-    c.scanAt = nil
-    c.scanRadius = nil
-    c.scanningBy = nil
-    c.scanLockAt = nil
-  end
-  if fs.exists(SCAN_DIR) then
-    for _, name in ipairs(fs.list(SCAN_DIR)) do
-      pcall(fs.delete, SCAN_DIR .. "/" .. name)
-    end
-  end
-  saveCfg()
-end
-
 local function cellScanLocked(c)
   if not c or c.scanningBy == nil then return false end
   local age = ago(c.scanLockAt or 0)
@@ -728,6 +711,23 @@ end
 -- Back-compat name used throughout; routine callers should prefer markCfgDirty.
 local function saveCfg()
   saveCfgNow()
+end
+
+local function clearAllCellScans()
+  for _, c in ipairs(cfg.cells or {}) do
+    c.scanned = nil
+    c.scanSolidCount = nil
+    c.scanAt = nil
+    c.scanRadius = nil
+    c.scanningBy = nil
+    c.scanLockAt = nil
+  end
+  if fs.exists(SCAN_DIR) then
+    for _, name in ipairs(fs.list(SCAN_DIR)) do
+      pcall(fs.delete, SCAN_DIR .. "/" .. name)
+    end
+  end
+  saveCfg()
 end
 
 local function loadCfg()
