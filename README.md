@@ -731,27 +731,30 @@ geo              # last summary
 
 ### Cell scanner turtle (large sites)
 
-For quarries bigger than a depot scanner can cover, install
-**Quarry → Workers → Cell scanner**. That turtle carries an AP Geo Scanner item:
+**Standard fleet:** **1 site board + 1 cell scanner + N cell miners.** Use this
+when the footprint is too big for a depot Geo Scanner alone.
 
-1. Claims an unscanned free cell from the site board  
-2. Travels to the **cell center (top layer)**  
-3. Places the Geo Scanner down, runs `scan(radius)` sized to the cell  
-4. Reports the solid index to the site (`quarry_scans/`)  
-5. Picks the scanner back up and takes the next cell  
+**Ordered setup (do in this order):**
 
-Empty scanned cells are **auto-completed** on the board. Miners prefer scanned
-cells and dig the solid index. On the site board:
+1. **Site board** — `setup WxL H`, then `origin` (GPS + facing into the mine).
+   **`requireScan` defaults on** (miners wait for per-cell maps). Use
+   `requirescan off` only for **depot-geo-only** fleets (no scanner turtle).
+2. **Cell scanner turtle** at quarry origin — `setup`, `join`, then `scan` (loops:
+   claim unscanned cell → cell center → place AP Geo Scanner → `scan(radius)` →
+   report solids to `quarry_scans/` → pickup → next cell).
+3. **Cell miners** — `join`, then `mine` (claim **scanned** free cells only when
+   `requireScan` is on; dig solid index + full-cell verify; `cell_done` → next).
+
+Empty scanned cells are **auto-completed** on the board. Site commands:
 
 ```
-requirescan on    # miners only claim cells the scanner has mapped
-clearscans        # wipe per-cell maps
+requirescan on|off   # default on; off = depot geo hints only
+clearscans           # wipe per-cell maps
 ```
 
 Scanner turtle slots: **16+15** coal (2 stacks), **14** pickaxe, **13** Geo
 Scanner; wireless modem stays on RIGHT (parks in cargo only while retrieving).
-`setup` at origin, then `join` / `scan`. The scanner block needs enough FE for
-AP’s `cost(radius)`.
+The scanner block needs enough FE for AP’s `cost(radius)`.
 
 ### Depot Geo Scanner (optional)
 

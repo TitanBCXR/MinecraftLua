@@ -1,6 +1,6 @@
 --[[
   offline_miner.lua  -  Local quarry turtle (optional site board)
-  Titan-Version: 1.8.0
+  Titan-Version: 1.8.1
 
   Place the turtle at the TOP-FRONT-LEFT corner of the dig, facing into the
   mine. That cell is origin 0,0,0:
@@ -66,7 +66,7 @@ local WORK_RESERVE = 48      -- keep digging only with this much above home cost
 local MIN_FUEL = 200
 local TRAFFIC_Y = -1         -- cruise / traffic layer (+Y = down, so -1 is one above origin)
 -- Keep in sync with Titan-Version header (label uses major.minor → V1.5-Miner12).
-local MINER_VERSION = "1.8.0"
+local MINER_VERSION = "1.8.1"
 -- "outbound" = to cell (overtake) | "homebound" = to origin (yield) | "dig" = wait/retry
 local travelIntent = "dig"
 -- Other miners' last known quarry-relative poses (rednet). Used to tell turtle vs mob/player.
@@ -81,6 +81,7 @@ local modemSwapSide = nil  -- only "right" while modem is over the pick
 local knownPeers = {}      -- [computerId] = true  (site board + admin tablets)
 local pendingReturnHome = nil  -- quarry_return_home reason
 local activeCell = nil         -- current site cell assign
+local pendingNextClaim = nil   -- site-pushed quarry_cell after cell_done (avoid forceNew churn)
 local titanLib = nil
 if fs.exists("lib/titan.lua") then
   local ok, t = pcall(dofile, "lib/titan.lua")
@@ -2621,6 +2622,24 @@ function site.printSiteInfo()
   end
 end
 
+-- Build claim table from site quarry_cell push (next cell after cell_done).
+local function claimFromQuarryCellMsg(msg)
+  if type(msg) ~= "table" or msg.x0 == nil then return nil end
+  return {
+    ok = true,
+    cellId = msg.cellId,
+    x0 = msg.x0, x1 = msg.x1, z0 = msg.z0, z1 = msg.z1,
+    y0 = msg.y0, y1 = msg.y1,
+    W = msg.W, L = msg.L, H = msg.H,
+    pattern = msg.pattern or "cell",
+    resume = msg.resume,
+    digMode = msg.digMode, dig = msg.dig,
+    geo = msg.geo, solids = msg.solids,
+    geoCoverage = msg.geoCoverage, emptyY = msg.emptyY,
+    maxTravel = msg.maxTravel,
+  }
+end
+
 -- Listen for site/admin even while digging (reband must interrupt).
 handleQuarryNetMsg = function(id, msg)
   if type(msg) ~= "table" then return end
@@ -2699,6 +2718,7 @@ handleQuarryNetMsg = function(id, msg)
     STOP = true
     digging = false
     activeCell = nil
+    pendingNextClaim = nil
     clearLocalMineMemory({ keepSite = true })
     cfg.pattern = "cell"
     siteInfo = siteInfo or {}
@@ -2711,12 +2731,20 @@ handleQuarryNetMsg = function(id, msg)
   elseif t == "quarry_cell" then
     if msg.ok ~= false and msg.x0 ~= nil then
       siteInfo = msg
-      activeCell = {
-        cellId = msg.cellId,
-        x0 = msg.x0, x1 = msg.x1, z0 = msg.z0, z1 = msg.z1,
-        y0 = msg.y0 or 0, y1 = msg.y1 or 0,
-        W = msg.W, L = msg.L, H = msg.H,
-      }
+      maxTravel = tonumber(msg.maxTravel) or maxTravel
+      local pushed = claimFromQuarryCellMsg(msg)
+      local sameDigCell = digging and activeCell
+          and pushed and tonumber(pushed.cellId) == tonumber(activeCell.cellId)
+      if sameDigCell then
+        activeCell = {
+          cellId = msg.cellId,
+          x0 = msg.x0, x1 = msg.x1, z0 = msg.z0, z1 = msg.z1,
+          y0 = msg.y0 or 0, y1 = msg.y1 or 0,
+          W = msg.W, L = msg.L, H = msg.H,
+        }
+      elseif pushed then
+        pendingNextClaim = pushed
+      end
     end
   end
 end
@@ -3649,6 +3677,9 @@ function site.verifyCellClear(box, startIdx)
     if detectAnyHere() then
       excavateHere()
     end
+    if detectAnyHere() then
+      return false, "residual", i
+    end
     if activeJob then
       activeJob.phase = "verify"
       activeJob.verifyIdx = i + 1
@@ -3694,16 +3725,13 @@ function site.runCellClaim(claim, existingJob)
   local coverage = tostring(claim.geoCoverage or geo.coverage or "none")
   local solidList = normalizeSolidList(claim.solids or geo.solids)
   local units
-  local verifyUnits = nil -- nil = full AABB verify
 
   if digMode == "solids" and coverage == "full" then
     units = solidList
-    verifyUnits = solidList
     print(("Geo solids: %d indexed block(s), coverage=full."):format(#units))
   elseif digMode == "hybrid" then
     local solidUnits
     units, solidUnits = hybridCellUnits(x0, x1, z0, z1, y0, y1, solidList, skipY, geo)
-    verifyUnits = units
     print(("Geo hybrid: %d solids + uncovered voxels → %d work items."):format(
       #solidUnits, #units))
   else
@@ -3944,33 +3972,11 @@ function site.runCellClaim(claim, existingJob)
     siteSendJob(j)
   end
 
-  -- Solids mode with nothing left to check → complete (scan was empty / all air).
-  if digMode == "solids" and coverage == "full"
-      and type(verifyUnits) == "table" and #verifyUnits == 0 then
-    print("Geo solids empty after dig — marking cell complete.")
-    site.finishJob(true)
-    digging = false
-    site.ensureModemForComms(true)
-    goHome()
-    dumpToStorage()
-    suckFuelFromLeft()
-    site.sendTyped("quarry_cell_done", {
-      status = "idle", cellDone = true, finished = true,
-      cellId = claim.cellId, y0 = y0, y1 = y1,
-      x0 = x0, x1 = x1, z0 = z0, z1 = z1,
-      geoEmpty = true,
-    })
-    activeCell = nil
-    clearJobFile({ keepSite = true })
-    return "done"
-  end
-
   print(("Verify cell #%s before marking done..."):format(tostring(claim.cellId or "?")))
   site.sendTyped("quarry_progress", { status = "verify", cellId = claim.cellId })
   local vOk, vErr, vAt = site.verifyCellClear({
     cellId = claim.cellId,
     x0 = x0, x1 = x1, z0 = z0, z1 = z1, y0 = y0, y1 = y1,
-    units = verifyUnits,
   }, j.verifyIdx or 1)
   if not vOk then
     j.phase = "verify"
@@ -4060,6 +4066,12 @@ function site.digSiteMine(opts)
 
     local claim = rebandClaim
     rebandClaim = nil
+    if not claim and pendingNextClaim then
+      claim = pendingNextClaim
+      pendingNextClaim = nil
+      print(("Using site-pushed cell #%s (no forceNew claim)"):format(
+        tostring(claim.cellId or "?")))
+    end
     if not claim and activeCell and prior and prior.status ~= "done"
         and tonumber(prior.x0) == tonumber(activeCell.x0)
         and tonumber(prior.z0) == tonumber(activeCell.z0) then
@@ -4119,6 +4131,12 @@ function site.digSiteMine(opts)
     else
       cellsDone = cellsDone + 1
       print("Cell complete — requesting next...")
+      if not pendingNextClaim then
+        local waitUntil = os.clock() + 1.5
+        while not pendingNextClaim and os.clock() < waitUntil do
+          sleep(0.1)
+        end
+      end
     end
   end
 end

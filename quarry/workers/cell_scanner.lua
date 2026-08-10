@@ -1,6 +1,6 @@
 --[[
   quarry/workers/cell_scanner.lua  -  Per-cell Geo Scanner turtle
-  Titan-Version: 1.0.5
+  Titan-Version: 1.0.6
 
   Places an Advanced Peripherals Geo Scanner at the center of each free
   unscanned quarry cell, runs scan(radius), reports solids to the site board,
@@ -41,9 +41,13 @@ local PICK_SIDE = "right"
 local FUEL_KEEP = 64       -- per fuel slot
 local MIN_FUEL = 200
 local HOME_MARGIN = 24
-local VERSION = "1.0.5"
+local VERSION = "1.0.6"
 local PROTO = "titan_quarry"
 local NET = "titan_net"
+local GEO_SOLID_MAX = 400   -- align with site board rednet cap
+local FORWARD_RETRY = 10
+local FORWARD_WAIT = 0.4
+local HEARTBEAT_INTERVAL = 45
 
 local STOP = false
 local siteId = nil
@@ -367,13 +371,18 @@ end
 
 local function forward()
   if not ensureFuel() then return false end
-  digDir("forward")
-  if not turtle.forward() then return false end
-  if facing == 0 then pos.z = pos.z + 1
-  elseif facing == 1 then pos.x = pos.x + 1
-  elseif facing == 2 then pos.z = pos.z - 1
-  else pos.x = pos.x - 1 end
-  return true
+  for attempt = 1, FORWARD_RETRY do
+    digDir("forward")
+    if turtle.forward() then
+      if facing == 0 then pos.z = pos.z + 1
+      elseif facing == 1 then pos.x = pos.x + 1
+      elseif facing == 2 then pos.z = pos.z - 1
+      else pos.x = pos.x - 1 end
+      return true
+    end
+    if attempt < FORWARD_RETRY then sleep(FORWARD_WAIT) end
+  end
+  return false
 end
 
 local function up()
@@ -656,6 +665,37 @@ local function solidsFromScanData(data, x0, x1, z0, z1, y1)
   return solids
 end
 
+-- Cap solids for rednet; hint miners when the cell is too dense for a full index.
+local function prepareSolidsForReport(solids)
+  local total = #(solids or {})
+  if total <= GEO_SOLID_MAX then
+    return solids, {
+      digMode = "solids",
+      solidsTruncated = false,
+      scanSolidCount = total,
+    }
+  end
+  local capped = {}
+  for i = 1, GEO_SOLID_MAX do capped[i] = solids[i] end
+  print(("  WARNING: %d solids — capping report at %d (hybrid dig hint)."):format(
+    total, GEO_SOLID_MAX))
+  return capped, {
+    digMode = "hybrid",
+    solidsTruncated = true,
+    scanSolidCount = total,
+  }
+end
+
+local function sendScanHeartbeat(claim, phase)
+  if not claim or claim.cellId == nil then return end
+  if not ensureModem() then return end
+  send({
+    type = "quarry_scan_heartbeat",
+    cellId = claim.cellId,
+    phase = phase,
+  })
+end
+
 -- Travel (modem) → place → FULL scan. Never picks up — caller reports first.
 -- Returns solids, err, radius, scannerStillPlaced
 local function runCellScan(claim)
@@ -690,20 +730,38 @@ local function runCellScan(claim)
     return nil, "no peripheral", radius, inspectIsGeoDown()
   end
 
-  waitScanCooldown(geo)
-  if type(geo.cost) == "function" then
-    local okc, cost = pcall(geo.cost, radius)
-    if okc and type(cost) == "number" then
-      print(("  scan cost ~%s FE"):format(tostring(cost)))
-    end
-  end
+  sendScanHeartbeat(claim, "placed")
 
-  print("  Scanning… (waiting for results)")
-  local ok, data, err = pcall(function()
-    if geo.scan then return geo.scan(radius) end
-    return geo.scanBlocks(radius)
-  end)
-  waitScanFinished(geo)
+  local scanState = { done = false, ok = false, data = nil, err = nil }
+  parallel.waitForAny(
+    function()
+      while not scanState.done do
+        sendScanHeartbeat(claim, "scanning")
+        for _ = 1, HEARTBEAT_INTERVAL * 10 do
+          if scanState.done then return end
+          sleep(0.1)
+        end
+      end
+    end,
+    function()
+      waitScanCooldown(geo)
+      if type(geo.cost) == "function" then
+        local okc, cost = pcall(geo.cost, radius)
+        if okc and type(cost) == "number" then
+          print(("  scan cost ~%s FE"):format(tostring(cost)))
+        end
+      end
+
+      print("  Scanning… (waiting for results)")
+      scanState.ok, scanState.data, scanState.err = pcall(function()
+        if geo.scan then return geo.scan(radius) end
+        return geo.scanBlocks(radius)
+      end)
+      waitScanFinished(geo)
+      scanState.done = true
+    end
+  )
+  local ok, data, err = scanState.ok, scanState.data, scanState.err
 
   -- Peripheral must still be present — never treat a mid-scan dig as success.
   if not wrapGeoDown() and not inspectIsGeoDown() then
@@ -717,12 +775,14 @@ local function runCellScan(claim)
     -- Retry once after cooldown — first call sometimes returns early.
     print("  Scan returned empty — retrying once…")
     geo = waitPeripheralGeo(2) or geo
+    sendScanHeartbeat(claim, "scanning")
     waitScanCooldown(geo)
     ok, data, err = pcall(function()
       if geo.scan then return geo.scan(radius) end
       return geo.scanBlocks(radius)
     end)
     waitScanFinished(geo)
+    sendScanHeartbeat(claim, "scanning")
     if not ok or data == nil then
       return nil, tostring(err or data or "scan failed"), radius, true
     end
@@ -790,9 +850,11 @@ local function claimScanCell()
 end
 
 -- Returns nextClaim, sawAck. Retries send until site acks (or attempts exhausted).
-local function reportScan(claim, solids, radius, failed)
+local function reportScan(claim, solids, radius, failed, reportMeta)
   local nextClaim, sawAck = nil, false
+  reportMeta = reportMeta or {}
   for attempt = 1, 3 do
+    sendScanHeartbeat(claim, "reporting")
     send({
       type = "quarry_scan_report",
       cellId = claim.cellId,
@@ -801,9 +863,17 @@ local function reportScan(claim, solids, radius, failed)
       x0 = claim.x0, x1 = claim.x1, z0 = claim.z0, z1 = claim.z1,
       failed = failed == true,
       next = true,
+      digMode = reportMeta.digMode,
+      solidsTruncated = reportMeta.solidsTruncated == true,
+      scanSolidCount = reportMeta.scanSolidCount,
     })
     local deadline = os.clock() + 10
+    local lastHb = os.clock()
     while os.clock() < deadline do
+      if os.clock() - lastHb >= HEARTBEAT_INTERVAL then
+        sendScanHeartbeat(claim, "reporting")
+        lastHb = os.clock()
+      end
       local id, msg = rednet.receive(PROTO, math.max(0.05, deadline - os.clock()))
       if id and type(msg) == "table" then
         if not siteId then siteId = id end
@@ -824,6 +894,10 @@ local function reportScan(claim, solids, radius, failed)
         if sawAck and not failed then
           local d2 = os.clock() + 2
           while os.clock() < d2 do
+            if os.clock() - lastHb >= HEARTBEAT_INTERVAL then
+              sendScanHeartbeat(claim, "reporting")
+              lastHb = os.clock()
+            end
             local id2, msg2 = rednet.receive(PROTO, math.max(0.05, d2 - os.clock()))
             if id2 and type(msg2) == "table" and msg2.type == "quarry_scan_cell" then
               return msg2, true
@@ -896,11 +970,12 @@ local function scanLoop()
       goHome()
     else
       print("Uploading scan to site board (scanner still placed)…")
-      local nextClaim, acked = reportScan(claim, solids, radius, false)
+      local reportSolids, reportMeta = prepareSolidsForReport(solids)
+      local nextClaim, acked = reportScan(claim, reportSolids, radius, false, reportMeta)
       pending = nextClaim
       if not acked then
         print("WARNING: site did not ack — not moving yet; retrying report…")
-        nextClaim, acked = reportScan(claim, solids, radius, false)
+        nextClaim, acked = reportScan(claim, reportSolids, radius, false, reportMeta)
         pending = nextClaim or pending
       end
       if acked then

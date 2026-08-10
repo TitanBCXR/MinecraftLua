@@ -1,6 +1,6 @@
 --[[
   quarry/managers/offline_site.lua  -  Quarry site board (XZ cell fleet)
-  Titan-Version: 1.7.1
+  Titan-Version: 1.8.1
 
   Place LEFT of the storage chest (storage behind turtle origin). Modem required.
   Attach a **monitor** for the live status board — the computer terminal stays
@@ -51,7 +51,7 @@ local STATUS_MIN_MS = 1500   -- min gap between full status broadcasts
 local CFG_MIN_MS = 2000      -- debounce routine cfg writes
 local CLAIM_DEDUPE_MS = 900  -- ignore dual cell_req+claim_req from same bot
 local JOB_PERSIST_MS = 5000  -- throttle per-turtle job file writes
-local SCAN_LOCK_SECS = 180   -- scanner claim lock timeout
+local SCAN_LOCK_SECS = 600   -- scanner claim lock timeout (refreshed via heartbeat)
 
 local titan = nil
 if fs.exists("lib/titan.lua") then
@@ -66,7 +66,7 @@ local cfg = {
   label = nil,
   originX = nil, originY = nil, originZ = nil, originFacing = 0,
   cells = {},
-  requireScan = false, -- when true, miners only get cells scanned by a scanner bot
+  requireScan = true, -- when true, miners only get cells scanned by a scanner bot
 }
 
 local turtles = {}
@@ -539,6 +539,8 @@ local function buildCellGrid(opts)
           scanSolidCount = c.scanSolidCount,
           scanAt = c.scanAt,
           scanRadius = c.scanRadius,
+          digMode = c.digMode,
+          solidsTruncated = c.solidsTruncated,
           oldId = c.id,
         }
       end
@@ -567,6 +569,8 @@ local function buildCellGrid(opts)
         row.scanSolidCount = scan.scanSolidCount
         row.scanAt = scan.scanAt
         row.scanRadius = scan.scanRadius
+        row.digMode = scan.digMode
+        row.solidsTruncated = scan.solidsTruncated == true
         -- Solids files are keyed by cell id — copy old → new if id changed.
         if scan.oldId and tonumber(scan.oldId) ~= id and fs.exists(SCAN_DIR) then
           local oldPath = SCAN_DIR .. "/" .. tostring(scan.oldId) .. ".scan"
@@ -662,6 +666,37 @@ local function loadCellScanSolids(cellId)
   return {}
 end
 
+local function rebuildScannedFromScanFiles()
+  ensureScanDir()
+  if not fs.exists(SCAN_DIR) then return end
+  for _, c in ipairs(cfg.cells or {}) do
+    if c.scanned ~= true and fs.exists(cellScanPath(c.id)) then
+      c.scanned = true
+      local solids = loadCellScanSolids(c.id)
+      if c.scanSolidCount == nil then c.scanSolidCount = #solids end
+      if c.scanAt == nil then
+        local f = fs.open(cellScanPath(c.id), "r")
+        if f then
+          local ok, data = pcall(textutils.unserialize, f.readAll())
+          f.close()
+          if ok and type(data) == "table" and type(data.at) == "number" then
+            c.scanAt = data.at
+          end
+        end
+      end
+    end
+  end
+end
+
+local function ensureRequireScanForScanner(msg)
+  if cfg.requireScan == true then return end
+  if msg and tostring(msg.role or "") == "scanner" then
+    cfg.requireScan = true
+    markCfgDirty()
+    print("[scan] requireScan auto-enabled (scanner fleet)")
+  end
+end
+
 local function cellScanLocked(c)
   if not c or c.scanningBy == nil then return false end
   local age = ago(c.scanLockAt or 0)
@@ -684,6 +719,29 @@ local function cellCenter(c)
   local span = math.max(x1 - x0, z1 - z0, H - 1)
   local radius = math.max(1, math.min(GEO_RADIUS_MAX, math.ceil(span / 2) + 1))
   return cx, 0, cz, radius
+end
+
+local function turtleQuarryXZ(id, t)
+  t = t or turtles[id]
+  if t and t.posX ~= nil and t.posZ ~= nil then
+    return tonumber(t.posX) or 0, tonumber(t.posZ) or 0
+  end
+  return 0, 0
+end
+
+local function cellDistXZ2(c, qx, qz)
+  local cx, _, cz = cellCenter(c)
+  local dx, dz = cx - qx, cz - qz
+  return dx * dx + dz * dz
+end
+
+local function pickNearestCell(candidates, qx, qz)
+  local best, bestD = nil, nil
+  for _, c in ipairs(candidates or {}) do
+    local d = cellDistXZ2(c, qx, qz)
+    if not best or d < bestD then best, bestD = c, d end
+  end
+  return best
 end
 
 local function saveCfgNow()
@@ -719,6 +777,8 @@ local function clearAllCellScans()
     c.scanSolidCount = nil
     c.scanAt = nil
     c.scanRadius = nil
+    c.digMode = nil
+    c.solidsTruncated = nil
     c.scanningBy = nil
     c.scanLockAt = nil
   end
@@ -746,6 +806,7 @@ local function loadCfg()
   cfg.originY = tonumber(cfg.originY)
   cfg.originZ = tonumber(cfg.originZ)
   cfg.originFacing = math.floor(tonumber(cfg.originFacing) or 0) % 4
+  if cfg.requireScan == nil then cfg.requireScan = true end
   if type(cfg.cells) ~= "table" then cfg.cells = {} end
   -- Normalize cells
   local norm = {}
@@ -760,10 +821,19 @@ local function loadCfg()
         status = tostring(c.status or "free"),
         turtleId = tonumber(c.turtleId),
         doneAt = c.doneAt,
+        scanned = c.scanned == true,
+        scanSolidCount = tonumber(c.scanSolidCount),
+        scanAt = tonumber(c.scanAt),
+        scanRadius = tonumber(c.scanRadius),
+        digMode = type(c.digMode) == "string" and c.digMode or nil,
+        solidsTruncated = c.solidsTruncated == true,
+        scanningBy = tonumber(c.scanningBy),
+        scanLockAt = tonumber(c.scanLockAt),
       }
     end
   end
   cfg.cells = norm
+  rebuildScannedFromScanFiles()
   if #cfg.cells < 1 and cfg.W >= 1 and cfg.L >= 1 then
     buildCellGrid({ keepDone = false })
   end
@@ -949,6 +1019,7 @@ local function touchTurtle(id, msg)
   if msg.moves ~= nil then t.moves = tonumber(msg.moves) or t.moves end
   if msg.coal ~= nil then t.coal = tonumber(msg.coal) or t.coal end
   if msg.status then t.status = msg.status end
+  if msg.role then t.role = tostring(msg.role) end
   if msg.posX ~= nil then
     t.posX = tonumber(msg.posX) or t.posX
     t.posY = tonumber(msg.posY) or t.posY
@@ -1060,17 +1131,31 @@ local function cellPayload(c, extra)
     -- Per-cell scanner-bot map wins over depot geo hints.
     if c.scanned then
       local solids = loadCellScanSolids(c.id)
-      p.digMode = "solids"
-      p.dig = "solids"
-      p.geoCoverage = "full"
+      local truncated = c.solidsTruncated == true
+      local digMode = c.digMode or "solids"
+      if truncated then
+        digMode = "hybrid"
+      elseif digMode ~= "hybrid" and digMode ~= "layer" then
+        digMode = "solids"
+      end
+      local coverage = "full"
+      if truncated or digMode == "hybrid" then
+        coverage = "partial"
+      elseif digMode == "layer" then
+        coverage = "none"
+      end
+      p.digMode = digMode
+      p.dig = digMode == "solids" and "solids" or "layer"
+      p.geoCoverage = coverage
       p.solids = solids
       p.geo = p.geo or {}
       p.geo.ok = true
-      p.geo.digMode = "solids"
-      p.geo.coverage = "full"
+      p.geo.digMode = digMode
+      p.geo.coverage = coverage
       p.geo.solids = solids
       p.geo.fromCellScanner = true
       p.geo.solidIndexCount = #solids
+      p.geo.solidsTruncated = truncated
     end
   end
   if type(extra) == "table" then
@@ -1126,15 +1211,16 @@ local function assignScanCell(id, opts)
     existing.scanLockAt = nil
   end
 
-  local pick = nil
+  local qx, qz = turtleQuarryXZ(id, t)
+  local candidates = {}
   for _, c in ipairs(cfg.cells or {}) do
     cellScanLocked(c) -- expire stale locks
     if c.status == "free" and not c.scanned and not cellScanLocked(c)
         and c.turtleId == nil then
-      pick = c
-      break
+      candidates[#candidates + 1] = c
     end
   end
+  local pick = pickNearestCell(candidates, qx, qz)
   if not pick then
     return scanCellPayload(nil, { ok = false, err = "no unscanned free cells" })
   end
@@ -1195,9 +1281,13 @@ local function applyScanReport(id, msg)
   end
   saveCellScanSolids(c.id, clipped)
   c.scanned = true
-  c.scanSolidCount = #clipped
+  c.scanSolidCount = tonumber(msg.scanSolidCount) or #clipped
   c.scanAt = now()
   c.scanRadius = tonumber(msg.radius) or c.scanRadius
+  local dm = tostring(msg.digMode or "solids")
+  if dm ~= "hybrid" and dm ~= "layer" and dm ~= "solids" then dm = "solids" end
+  c.digMode = dm
+  c.solidsTruncated = msg.solidsTruncated == true
   c.scanningBy = nil
   c.scanLockAt = nil
   t.status = "idle"
@@ -1211,8 +1301,10 @@ local function applyScanReport(id, msg)
     autoDone = true
   end
   saveCfg()
-  print(("[scan+] cell %s solids=%d%s"):format(
-    cellLabel(c), #clipped, autoDone and " → auto-complete (empty)" or ""))
+  print(("[scan+] cell %s solids=%d idx=%d mode=%s%s%s"):format(
+    cellLabel(c), c.scanSolidCount, #clipped, c.digMode,
+    c.solidsTruncated and " truncated" or "",
+    autoDone and " → auto-complete (empty)" or ""))
   return {
     ok = true,
     cellId = c.id,
@@ -1266,15 +1358,18 @@ local function assignCell(id, opts)
     return true
   end
 
-  -- Prefer scanned free cells so miners work the solid index first.
-  local pick = nil
+  local qx, qz = turtleQuarryXZ(id, t)
+  local scannedUsable, anyUsable = {}, {}
   for _, c in ipairs(cfg.cells or {}) do
-    if usable(c) and c.scanned then pick = c; break end
-  end
-  if not pick then
-    for _, c in ipairs(cfg.cells or {}) do
-      if usable(c) then pick = c; break end
+    cellScanLocked(c)
+    if usable(c) then
+      anyUsable[#anyUsable + 1] = c
+      if c.scanned then scannedUsable[#scannedUsable + 1] = c end
     end
+  end
+  local pick = pickNearestCell(scannedUsable, qx, qz)
+  if not pick then
+    pick = pickNearestCell(anyUsable, qx, qz)
   end
   if not pick then
     local err = cfg.requireScan and "no scanned free cells (run scanner bot)" or "no free cells"
@@ -1294,7 +1389,14 @@ end
 
 local function markCellDone(id, msg)
   local t = touchTurtle(id, msg or {})
-  local c = cellForTurtle(id)
+  msg = msg or {}
+  local c = nil
+  local msgCellId = tonumber(msg.cellId)
+  if msgCellId then
+    c = findCell(msgCellId)
+  else
+    c = cellForTurtle(id)
+  end
   if c then
     c.status = "complete"
     c.turtleId = nil
@@ -1570,6 +1672,9 @@ local function handleMsg(id, msg)
       print(("[+] #%d %s  bpc=%s"):format(
         id, tostring(msg.name or "?"), tostring(msg.bpc or "?")))
     end
+    if msg.role == "scanner" or (row and row.role == "scanner") then
+      ensureRequireScanForScanner(msg)
+    end
     if first and (t == "quarry_join" or t == "quarry_hello")
         and (tonumber(cfg.W) or 0) >= 1 then
       -- Rebuild size if fleet grew enough to need smaller cells (no active assigns).
@@ -1630,6 +1735,7 @@ local function handleMsg(id, msg)
       return
     end
     claimHandledAt[id] = now()
+    ensureRequireScanForScanner(msg)
     touchTurtle(id, msg)
     local reply = assignScanCell(id, {
       forceNew = msg.nextCell or msg.forceNew,
@@ -1639,6 +1745,7 @@ local function handleMsg(id, msg)
     broadcastStatus(true)
 
   elseif t == "quarry_scan_report" then
+    ensureRequireScanForScanner(msg)
     local result = applyScanReport(id, msg)
     flushCfg(true)
     result.type = "quarry_scan_ack"
@@ -1650,6 +1757,16 @@ local function handleMsg(id, msg)
       rednet.send(id, nextScan, PROTO)
     end
     broadcastStatus(true)
+
+  elseif t == "quarry_scan_heartbeat" then
+    ensureRequireScanForScanner(msg)
+    touchTurtle(id, msg)
+    local c = findCell(msg.cellId) or cellForScanner(id)
+    if c and tonumber(c.scanningBy) == tonumber(id) then
+      c.scanLockAt = now()
+      markCfgDirty()
+    end
+    markStatusDirty()
 
   elseif t == "quarry_leave_origin" then
     local row = touchTurtle(id, msg)
