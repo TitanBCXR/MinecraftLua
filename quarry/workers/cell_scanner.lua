@@ -1,21 +1,22 @@
 --[[
   quarry/workers/cell_scanner.lua  -  Per-cell Geo Scanner turtle
-  Titan-Version: 1.0.2
+  Titan-Version: 1.0.3
 
   Places an Advanced Peripherals Geo Scanner at the center of each free
   unscanned quarry cell, runs scan(radius), reports solids to the site board,
-  then swaps modem→pickaxe to dig the scanner up, modem back on, next cell.
+  briefly swaps to pickaxe only to dig the scanner up, then modem back on
+  before moving to the next cell.
 
   Setup (same depot as miners):
     * Stand at quarry origin 0,0,0 facing into the mine (+Z)
     * Fuel chest LEFT → slot 16 (coal/charcoal)
-    * Slot 15 = wireless modem (RIGHT upgrade while talking)
-    * Inventory: Geo Scanner + diamond/netherite pickaxe
+    * Slot 15 = wireless modem (stays on RIGHT most of the time)
+    * Inventory: Geo Scanner + pickaxe (for retrieve only)
     * Site board online; `origin` set on the board
 
   Tooling:
-    * RIGHT = modem while traveling check-ins / reporting
-    * RIGHT = pickaxe while path-digging and retrieving the Geo Scanner
+    * RIGHT = modem for travel, place, scan, report, move to next cell
+    * RIGHT = pickaxe ONLY while digging up the placed Geo Scanner
     * LEFT upgrade is never touched
 
   Commands:
@@ -35,7 +36,7 @@ local PICK_SIDE = "right"
 local FUEL_KEEP = 64
 local MIN_FUEL = 200
 local HOME_MARGIN = 24
-local VERSION = "1.0.2"
+local VERSION = "1.0.3"
 local PROTO = "titan_quarry"
 local NET = "titan_net"
 
@@ -157,7 +158,7 @@ local function ensurePick()
   return true
 end
 
--- RIGHT = wireless modem for site check-ins / scan reports.
+-- RIGHT = wireless modem (default / most of the time).
 local function ensureModem()
   local ptype = peripheral.getType(PICK_SIDE)
   if (ptype == "modem" or ptype == "wireless_modem") and openModem() then
@@ -175,8 +176,22 @@ local function ensureModem()
   if not turtle.equipRight() then
     return openModem()
   end
-  -- Pickaxe came off into selected slot — leave it in inventory for later digs.
+  -- Pickaxe came off into selected slot — leave it in inventory until retrieve.
   return openModem()
+end
+
+-- Brief pickaxe window, then always restore modem before returning.
+local function withPickaxe(fn)
+  if not ensurePick() then return false end
+  local ok, a, b, c = pcall(fn)
+  if not ensureModem() then
+    print("WARNING: could not restore modem after pickaxe use.")
+  end
+  if not ok then
+    print("Pickaxe action error: " .. tostring(a))
+    return false
+  end
+  return a, b, c
 end
 
 local function labelSelf()
@@ -347,7 +362,7 @@ local function goTo(x, y, z)
 end
 
 local function goHome()
-  ensurePick()
+  ensureModem()
   local ok = goTo(0, 0, 0)
   turnTo(0)
   suckFuelLeft()
@@ -421,14 +436,23 @@ local function placeScannerDown()
     print("No Geo Scanner item in inventory.")
     return false
   end
-  if not ensurePick() then return false end
-  digDir("down")
-  -- Re-find slot — dig may have moved selection / stacks.
+  -- Keep modem on. Only borrow pickaxe if something blocks the place spot.
+  if turtle.detectDown() and not wrapGeoDown() then
+    local cleared = withPickaxe(function()
+      digDir("down")
+      return not turtle.detectDown() or wrapGeoDown() ~= nil
+    end)
+    if not cleared then
+      print("Could not clear space under turtle for Geo Scanner.")
+      return false
+    end
+  end
   slot = findScannerSlot()
   if not slot then
     print("Geo Scanner missing after clearing space.")
     return false
   end
+  ensureModem()
   turtle.select(slot)
   if not turtle.placeDown() then
     if wrapGeoDown() then return true end
@@ -439,47 +463,42 @@ local function placeScannerDown()
   return wrapGeoDown() ~= nil
 end
 
--- Modem → pickaxe → dig scanner up → modem back on.
+-- Modem stays on until this moment → brief pickaxe dig → modem before move.
 local function pickupScannerDown()
-  print("Retrieving Geo Scanner (equip pickaxe)...")
-  if not ensurePick() then
-    print("WARNING: no pickaxe — cannot dig Geo Scanner.")
-    return false
-  end
-  selectCargo()
-  for _ = 1, 10 do
-    if findScannerSlot() then break end
-    if turtle.detectDown() then
-      turtle.digDown()
-    else
-      break
-    end
-    turtle.suckDown()
-    sleep(0.05)
-  end
-  if not findScannerSlot() then
-    -- Item may have popped as an entity beside us.
-    for _ = 1, 4 do
-      turtle.suck()
+  print("Retrieving Geo Scanner (brief pickaxe swap)...")
+  local ok = withPickaxe(function()
+    selectCargo()
+    for _ = 1, 10 do
+      if findScannerSlot() then return true end
+      if turtle.detectDown() then
+        turtle.digDown()
+      else
+        break
+      end
       turtle.suckDown()
-      turtle.suckUp()
-      if findScannerSlot() then break end
-      turnRight()
+      sleep(0.05)
     end
-  end
-  local ok = findScannerSlot() ~= nil
-  if not ok then
-    print("WARNING: Geo Scanner not in inventory after dig — check ground.")
+    if not findScannerSlot() then
+      for _ = 1, 4 do
+        turtle.suck()
+        turtle.suckDown()
+        turtle.suckUp()
+        if findScannerSlot() then return true end
+        turnRight()
+      end
+    end
+    return findScannerSlot() ~= nil
+  end)
+  if ok then
+    print("Geo Scanner recovered — modem back on.")
   else
-    print("Geo Scanner recovered.")
+    print("WARNING: Geo Scanner not in inventory after dig — check ground.")
   end
-  if not ensureModem() then
-    print("WARNING: could not re-equip modem after pickup.")
-  end
-  return ok
+  ensureModem()
+  return ok == true
 end
 
--- Place + scan only. Leaves Geo Scanner placed so we can report with modem first.
+-- Travel with modem → place → scan. Leaves scanner placed for report, then pickup.
 -- Returns solids, err, radius, scannerStillPlaced
 local function runCellScan(claim)
   local radius = math.max(1, math.min(16, math.floor(tonumber(claim.radius) or 8)))
@@ -497,8 +516,8 @@ local function runCellScan(claim)
   print(("Scan cell #%s @ %d,%d,%d r=%d"):format(
     tostring(claim.cellId), cx, cy, cz, radius))
 
-  if not ensurePick() then
-    return nil, "no-pickaxe", radius, false
+  if not ensureModem() then
+    return nil, "no-modem", radius, false
   end
   if not goTo(cx, cy, cz) then
     return nil, "path", radius, false
@@ -552,7 +571,7 @@ local function runCellScan(claim)
     end
   end
   print(("  indexed %d solid(s) in cell"):format(#solids))
-  -- Scanner stays placed until after site report (modem on RIGHT).
+  -- Scanner stays placed until after site report; modem stays on for travel/report.
   return solids, nil, radius, true
 end
 
@@ -702,12 +721,10 @@ local function scanLoop()
       print("Uploading scan to site board...")
       pending = select(1, reportScan(claim, solids, radius, false))
       if placed then
-        pickupScannerDown() -- pickaxe dig → modem back on
+        pickupScannerDown() -- only pickaxe moment; modem restored before move
       end
     end
-    if not ensureModem() then
-      print("WARNING: modem not equipped for next leg.")
-    end
+    ensureModem() -- modem on before walking to next cell
     activeScan = nil
   end
   ensureModem()
@@ -755,9 +772,9 @@ local function status()
 end
 
 local function help()
-  print("Cell scanner — place Geo Scanner, report, pickaxe dig, next cell.")
+  print("Cell scanner — modem on for travel/scan/report.")
+  print("  Pickaxe only to dig up the Geo Scanner, then modem before moving.")
   print("  join | scan | stop | home | refuel | setup | status | help | exit")
-  print("RIGHT swaps: modem (talk) <-> pickaxe (dig scanner up)")
   print("Site: requirescan on  (miners wait for maps)")
 end
 
