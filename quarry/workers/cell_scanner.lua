@@ -1,6 +1,6 @@
 --[[
   quarry/workers/cell_scanner.lua  -  Per-cell Geo Scanner turtle
-  Titan-Version: 1.0.6
+  Titan-Version: 1.0.7
 
   Places an Advanced Peripherals Geo Scanner at the center of each free
   unscanned quarry cell, runs scan(radius), reports solids to the site board,
@@ -41,7 +41,7 @@ local PICK_SIDE = "right"
 local FUEL_KEEP = 64       -- per fuel slot
 local MIN_FUEL = 200
 local HOME_MARGIN = 24
-local VERSION = "1.0.6"
+local VERSION = "1.0.7"
 local PROTO = "titan_quarry"
 local NET = "titan_net"
 local GEO_SOLID_MAX = 400   -- align with site board rednet cap
@@ -686,6 +686,19 @@ local function prepareSolidsForReport(solids)
   }
 end
 
+local function send(msg)
+  msg.from = os.getComputerID()
+  msg.name = os.getComputerLabel() or ("Scan-" .. os.getComputerID())
+  msg.role = "scanner"
+  msg.posX, msg.posY, msg.posZ = pos.x, pos.y, pos.z
+  msg.fuel = turtle.getFuelLevel()
+  if siteId then
+    rednet.send(siteId, msg, PROTO)
+  else
+    rednet.broadcast(msg, PROTO)
+  end
+end
+
 local function sendScanHeartbeat(claim, phase)
   if not claim or claim.cellId == nil then return end
   if not ensureModem() then return end
@@ -796,19 +809,6 @@ end
 --------------------------------------------------------------------------------
 -- Network
 --------------------------------------------------------------------------------
-local function send(msg)
-  msg.from = os.getComputerID()
-  msg.name = os.getComputerLabel() or ("Scan-" .. os.getComputerID())
-  msg.role = "scanner"
-  msg.posX, msg.posY, msg.posZ = pos.x, pos.y, pos.z
-  msg.fuel = turtle.getFuelLevel()
-  if siteId then
-    rednet.send(siteId, msg, PROTO)
-  else
-    rednet.broadcast(msg, PROTO)
-  end
-end
-
 local function waitReply(types, timeout)
   timeout = timeout or 5
   local want = {}

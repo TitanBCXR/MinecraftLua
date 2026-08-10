@@ -1,6 +1,6 @@
 --[[
   quarry/managers/offline_site.lua  -  Quarry site board (XZ cell fleet)
-  Titan-Version: 1.8.1
+  Titan-Version: 1.8.2
 
   Place LEFT of the storage chest (storage behind turtle origin). Modem required.
   Attach a **monitor** for the live status board — the computer terminal stays
@@ -744,6 +744,15 @@ local function pickNearestCell(candidates, qx, qz)
   return best
 end
 
+local function pickLowestCellId(candidates)
+  local best, bestId = nil, nil
+  for _, c in ipairs(candidates or {}) do
+    local id = tonumber(c.id)
+    if id and (not bestId or id < bestId) then best, bestId = c, id end
+  end
+  return best
+end
+
 local function saveCfgNow()
   local f = fs.open(CFG, "w")
   f.write(textutils.serialize(cfg))
@@ -1211,7 +1220,6 @@ local function assignScanCell(id, opts)
     existing.scanLockAt = nil
   end
 
-  local qx, qz = turtleQuarryXZ(id, t)
   local candidates = {}
   for _, c in ipairs(cfg.cells or {}) do
     cellScanLocked(c) -- expire stale locks
@@ -1220,7 +1228,7 @@ local function assignScanCell(id, opts)
       candidates[#candidates + 1] = c
     end
   end
-  local pick = pickNearestCell(candidates, qx, qz)
+  local pick = pickLowestCellId(candidates)
   if not pick then
     return scanCellPayload(nil, { ok = false, err = "no unscanned free cells" })
   end
