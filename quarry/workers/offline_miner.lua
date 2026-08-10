@@ -1,6 +1,6 @@
 --[[
   offline_miner.lua  -  Local quarry turtle (optional site board)
-  Titan-Version: 1.6.0
+  Titan-Version: 1.7.0
 
   Place the turtle at the TOP-FRONT-LEFT corner of the dig, facing into the
   mine. That cell is origin 0,0,0:
@@ -10,9 +10,9 @@
       +Z = forward (into the mine)
 
   First boot (or `setup`):
-    * Fuel chest is on the LEFT  → top up slot 16 with coal only (keeps it there)
-    * Storage chest is BEHIND    → dumps slots 1-14 (never 15 modem / 16 fuel)
-    * Slot 15 = wireless modem
+    * Fuel chest is on the LEFT  → top up slot 16 with coal/charcoal/blocks only
+    * Storage chest is BEHIND    → dumps slots 1-14 (never 15 equipment / 16 fuel)
+    * Slot 15 = wireless modem / extra equipment
     * Pickaxe on turtle upgrade slot 2 (RIGHT) — modem only swaps with that side
       (left upgrade / chunk loader is never touched)
     * Site computer (optional) LEFT of the storage chest — cell fleet claims
@@ -57,15 +57,16 @@ local CFG = "offline_miner.cfg"
 local JOB_FILE = "offline_miner_job.cfg"
 local EXCLUDE = "exclude.txt"
 local FUEL_SLOT = 16
-local MODEM_SLOT = 15   -- wireless modem; swapped only with RIGHT pickaxe
+local MODEM_SLOT = 15   -- wireless modem / extra equipment; never dump
 local PICK_SIDE = "right"  -- turtle upgrade slot 2 — never touch left (loaders)
+local FUEL_KEEP = 64         -- keep one stack of coal/charcoal in slot 16
 -- Fuel budget: go home while we still have enough for the up-over-down hop + margin.
 local HOME_MARGIN = 24       -- spare fuel on arrival at depot
 local WORK_RESERVE = 48      -- keep digging only with this much above home cost
 local MIN_FUEL = 200
 local TRAFFIC_Y = -1         -- cruise / traffic layer (+Y = down, so -1 is one above origin)
 -- Keep in sync with Titan-Version header (label uses major.minor → V1.5-Miner12).
-local MINER_VERSION = "1.6.0"
+local MINER_VERSION = "1.7.0"
 -- "outbound" = to cell (overtake) | "homebound" = to origin (yield) | "dig" = wait/retry
 local travelIntent = "dig"
 -- Other miners' last known quarry-relative poses (rednet). Used to tell turtle vs mob/player.
@@ -283,79 +284,121 @@ local function applyForwardStep()
 end
 
 --------------------------------------------------------------------------------
--- Dig / move
+-- Fuel slot 16 = coal/charcoal (and blocks) only; slot 15 = equipment
 --------------------------------------------------------------------------------
-local function digDir(dir)
-  if restricted(dir) then
-    skipped = skipped + 1
-    return false, "excluded"
-  end
-  local dig = turtle.dig
-  if dir == "up" then dig = turtle.digUp
-  elseif dir == "down" then dig = turtle.digDown end
-  for _ = 1, 8 do
-    local detect = turtle.detect
-    if dir == "up" then detect = turtle.detectUp
-    elseif dir == "down" then detect = turtle.detectDown end
-    if not detect() then return true end
-    if restricted(dir) then
-      skipped = skipped + 1
-      return false, "excluded"
-    end
-    if dig() then dug = dug + 1 end
-    sleep(0.05)
-  end
-  return not (dir == "up" and turtle.detectUp()
-    or dir == "down" and turtle.detectDown()
-    or (dir ~= "up" and dir ~= "down" and turtle.detect()))
-end
-
--- True if the selected slot holds a valid fuel item (does not consume).
+-- True if the selected slot holds any CC fuel (does not consume).
 local function selectedIsFuel()
-  return turtle.refuel(0) == true
+  local ok = false
+  pcall(function() ok = turtle.refuel(0) end)
+  return ok == true
 end
 
--- Move any fuel items from slots 1-15 into slot 16 (coal stays on the turtle).
-local function consolidateFuelToSlot16()
-  for s = 1, 15 do
-    if turtle.getItemCount(s) > 0 then
+local function isCoalName(name)
+  name = tostring(name or ""):lower()
+  if name == "" then return false end
+  -- Keep coal/charcoal items + blocks; never ores (coal_ore contains "coal").
+  if name:find("ore", 1, true) then return false end
+  return name:find("coal", 1, true) ~= nil or name:find("charcoal", 1, true) ~= nil
+end
+
+local function slotIsCoal(slot)
+  local d = turtle.getItemDetail(slot)
+  return d ~= nil and isCoalName(d.name)
+end
+
+local function findEmptyCargoSlot()
+  for s = 1, 14 do
+    if turtle.getItemCount(s) == 0 then return s end
+  end
+  return nil
+end
+
+local function selectCargoSlot()
+  local empty = findEmptyCargoSlot()
+  if empty then turtle.select(empty); return end
+  for s = 1, 14 do
+    if turtle.getItemCount(s) > 0 then turtle.select(s); return end
+  end
+  turtle.select(1)
+end
+
+-- Evict non-coal from 16, gather coal/charcoal into 16 (cap FUEL_KEEP).
+-- Ends with a cargo slot selected so dig drops never prefer slot 16.
+local function protectFuelSlot()
+  if turtle.getItemCount(FUEL_SLOT) > 0 and not slotIsCoal(FUEL_SLOT) then
+    turtle.select(FUEL_SLOT)
+    local dest = findEmptyCargoSlot()
+    if dest then turtle.transferTo(dest) end
+  end
+  for s = 1, 14 do
+    if turtle.getItemCount(FUEL_SLOT) >= FUEL_KEEP then break end
+    if turtle.getItemCount(s) > 0 and slotIsCoal(s) then
       turtle.select(s)
-      if selectedIsFuel() then
-        turtle.transferTo(FUEL_SLOT)
+      turtle.transferTo(FUEL_SLOT)
+    end
+  end
+  selectCargoSlot()
+end
+
+-- Alias: only whitelist fuel consolidates into slot 16.
+local function consolidateFuelToSlot16()
+  protectFuelSlot()
+end
+
+-- Burn enough to stay above MIN_FUEL; prefer slot 16 coal; leave ≥1 when possible.
+-- Non-coal fuels in 1–14 may burn for SOS, but never move into 16.
+local function burnSomeFuel()
+  local level = turtle.getFuelLevel()
+  if level == "unlimited" then selectCargoSlot(); return level end
+
+  if slotIsCoal(FUEL_SLOT) then
+    turtle.select(FUEL_SLOT)
+    if selectedIsFuel() then
+      local count = turtle.getItemCount(FUEL_SLOT)
+      level = turtle.getFuelLevel()
+      if count >= 1 and (not level or level < MIN_FUEL) then
+        local leave = 1
+        if not level or level < 1 then leave = 0 end
+        local burn = math.min(math.max(0, count - leave), 8)
+        if burn < 1 and leave == 0 and count >= 1 then burn = 1 end
+        if burn >= 1 then
+          turtle.refuel(burn)
+          coalBurned = coalBurned + burn
+        end
+      end
+    end
+  elseif turtle.getItemCount(FUEL_SLOT) > 0 then
+    protectFuelSlot()
+  end
+
+  level = turtle.getFuelLevel()
+  if level ~= "unlimited" and (not level or level < MIN_FUEL) then
+    for s = 1, 14 do
+      level = turtle.getFuelLevel()
+      if level == "unlimited" or (type(level) == "number" and level >= MIN_FUEL) then break end
+      if turtle.getItemCount(s) > 0 then
+        turtle.select(s)
+        if selectedIsFuel() then
+          turtle.refuel(math.min(4, turtle.getItemCount(s)))
+        end
       end
     end
   end
-  turtle.select(FUEL_SLOT)
-end
-
--- Burn only enough to stay above MIN_FUEL; always try to leave items in slot 16.
-local function burnSomeFuel()
-  turtle.select(FUEL_SLOT)
-  if not selectedIsFuel() then return turtle.getFuelLevel() end
-  local level = turtle.getFuelLevel()
-  if level == "unlimited" then return level end
-  local count = turtle.getItemCount(FUEL_SLOT)
-  if count < 1 then return level end
-  if level and level >= MIN_FUEL then return level end
-  -- Need more tank fuel — burn a few, keep a reserve in the slot when possible.
-  local leave = (count > 1) and 1 or 0
-  local burn = math.min(count - leave, 8)
-  if burn < 1 then burn = 1 end
-  turtle.refuel(burn)
-  coalBurned = coalBurned + burn
+  selectCargoSlot()
   return turtle.getFuelLevel()
 end
 
 -- True when tank is empty and no burnable fuel items remain.
 -- Computer still runs at 0 fuel (modem / rednet / UI); only move/dig need fuel.
 local function hasFuelItems()
-  consolidateFuelToSlot16()
+  protectFuelSlot()
   for s = 1, 16 do
     if turtle.getItemCount(s) > 0 then
       turtle.select(s)
-      if selectedIsFuel() then return true end
+      if selectedIsFuel() then selectCargoSlot(); return true end
     end
   end
+  selectCargoSlot()
   return false
 end
 
@@ -380,7 +423,7 @@ local function ensureFuel()
   local level = turtle.getFuelLevel()
   if level == "unlimited" then return true end
   if level and level >= MIN_FUEL then return true end
-  consolidateFuelToSlot16()
+  protectFuelSlot()
   burnSomeFuel()
   level = turtle.getFuelLevel()
   if level and level ~= "unlimited" and level < 1 then
@@ -390,25 +433,45 @@ local function ensureFuel()
   return true
 end
 
-local function inventoryFull()
-  for s = 1, 16 do
-    if s ~= FUEL_SLOT and s ~= MODEM_SLOT and turtle.getItemCount(s) == 0 then
-      return false
-    end
+local function cargoEmptyCount()
+  local n = 0
+  for s = 1, 14 do
+    if turtle.getItemCount(s) == 0 then n = n + 1 end
   end
-  return true
+  return n
+end
+
+local function inventoryFull()
+  return cargoEmptyCount() == 0
+end
+
+-- Dump before 1–14 fill so dig overflow cannot land in empty slot 16.
+local function inventoryNearlyFull()
+  return cargoEmptyCount() <= 1
 end
 
 local function suckFuelIntoSlot16()
-  consolidateFuelToSlot16()
+  protectFuelSlot()
+  if turtle.getItemCount(FUEL_SLOT) > 0 and not slotIsCoal(FUEL_SLOT) then
+    selectCargoSlot()
+    return
+  end
   turtle.select(FUEL_SLOT)
-  local space = turtle.getItemSpace(FUEL_SLOT)
+  local space
+  if turtle.getItemCount(FUEL_SLOT) == 0 then
+    space = FUEL_KEEP
+  else
+    space = math.min(turtle.getItemSpace(FUEL_SLOT) or 0, FUEL_KEEP - turtle.getItemCount(FUEL_SLOT))
+  end
   if space and space > 0 then
     turtle.suck(space)
-  elseif turtle.getItemCount(FUEL_SLOT) == 0 then
-    turtle.suck(64)
-    consolidateFuelToSlot16()
   end
+  if turtle.getItemCount(FUEL_SLOT) > 0 and not slotIsCoal(FUEL_SLOT) then
+    turtle.select(FUEL_SLOT)
+    local dest = findEmptyCargoSlot()
+    if dest then turtle.transferTo(dest) end
+  end
+  protectFuelSlot()
 end
 
 -- Pull ONLY into slot 16 from the left chest (never empties the chest into 1-15).
@@ -416,33 +479,78 @@ local function suckFuelFromLeft()
   local saved = facing
   faceLeft()
   suckFuelIntoSlot16()
-  -- Top up the fuel tank a little but KEEP coal sitting in slot 16.
   burnSomeFuel()
   turnTo(saved)
   if atOriginXZ() then faceForward() end
   local n = turtle.getItemCount(FUEL_SLOT)
-  print(("Fuel slot 16: %d item(s), tank=%s"):format(n, tostring(turtle.getFuelLevel())))
+  print(("Fuel slot 16: %d coal, tank=%s"):format(n, tostring(turtle.getFuelLevel())))
+  selectCargoSlot()
   return turtle.getFuelLevel()
 end
 
--- Mid-path / dig-layer refuel: try every side for a fuel chest (admin stations).
+-- Mid-path / dig-layer refuel: left/forward/right + up/down — never storage (behind).
 local function suckFuelNearby()
   local saved = facing
-  consolidateFuelToSlot16()
-  for dir = 0, 3 do
+  protectFuelSlot()
+  for _, dir in ipairs({ 3, 0, 1 }) do
     turnTo(dir)
     suckFuelIntoSlot16()
   end
   turtle.select(FUEL_SLOT)
-  local space = turtle.getItemSpace(FUEL_SLOT)
-  if space and space > 0 then turtle.suckUp(space) else turtle.suckUp(64) end
-  consolidateFuelToSlot16()
-  space = turtle.getItemSpace(FUEL_SLOT)
-  if space and space > 0 then turtle.suckDown(space) else turtle.suckDown(64) end
-  consolidateFuelToSlot16()
+  if turtle.getItemCount(FUEL_SLOT) == 0 or slotIsCoal(FUEL_SLOT) then
+    local space = turtle.getItemCount(FUEL_SLOT) == 0 and FUEL_KEEP
+      or math.min(turtle.getItemSpace(FUEL_SLOT) or 0, FUEL_KEEP - turtle.getItemCount(FUEL_SLOT))
+    if space and space > 0 then turtle.suckUp(space) end
+    protectFuelSlot()
+    space = turtle.getItemCount(FUEL_SLOT) == 0 and FUEL_KEEP
+      or math.min(turtle.getItemSpace(FUEL_SLOT) or 0, FUEL_KEEP - turtle.getItemCount(FUEL_SLOT))
+    if turtle.getItemCount(FUEL_SLOT) == 0 or slotIsCoal(FUEL_SLOT) then
+      if space and space > 0 then turtle.suckDown(space) end
+    end
+  end
+  protectFuelSlot()
   burnSomeFuel()
   turnTo(saved)
+  selectCargoSlot()
   return turtle.getFuelLevel()
+end
+
+--------------------------------------------------------------------------------
+-- Dig / move
+--------------------------------------------------------------------------------
+local function digDir(dir)
+  if restricted(dir) then
+    skipped = skipped + 1
+    return false, "excluded"
+  end
+  local dig = turtle.dig
+  if dir == "up" then dig = turtle.digUp
+  elseif dir == "down" then dig = turtle.digDown end
+  for _ = 1, 8 do
+    local detect = turtle.detect
+    if dir == "up" then detect = turtle.detectUp
+    elseif dir == "down" then detect = turtle.detectDown end
+    if not detect() then
+      if turtle.getItemCount(FUEL_SLOT) > 0 and not slotIsCoal(FUEL_SLOT) then
+        protectFuelSlot()
+      end
+      return true
+    end
+    if restricted(dir) then
+      skipped = skipped + 1
+      return false, "excluded"
+    end
+    if dig() then
+      dug = dug + 1
+      if turtle.getItemCount(FUEL_SLOT) > 0 and not slotIsCoal(FUEL_SLOT) then
+        protectFuelSlot()
+      end
+    end
+    sleep(0.05)
+  end
+  return not (dir == "up" and turtle.detectUp()
+    or dir == "down" and turtle.detectDown()
+    or (dir ~= "up" and dir ~= "down" and turtle.detect()))
 end
 
 --------------------------------------------------------------------------------
@@ -663,13 +771,17 @@ end
 -- Dump mined goods to the chest behind. Never drops slot 16 (coal) or 15 (modem).
 -- Also keeps pickaxes/tools in inventory so dump does not eat an unequipped pick.
 local function dumpToStorage()
-  consolidateFuelToSlot16()
+  protectFuelSlot()
   faceBack()
+  -- Contaminants stuck in 16 when cargo was full: drop them with the ores.
+  if turtle.getItemCount(FUEL_SLOT) > 0 and not slotIsCoal(FUEL_SLOT) then
+    turtle.select(FUEL_SLOT)
+    turtle.drop()
+  end
   for s = 1, 14 do
     if turtle.getItemCount(s) > 0 then
       turtle.select(s)
-      -- If somehow still fuel, try slot 16 again instead of storing it.
-      if selectedIsFuel() and turtle.getItemSpace(FUEL_SLOT) > 0 then
+      if slotIsCoal(s) and turtle.getItemCount(FUEL_SLOT) < FUEL_KEEP then
         turtle.transferTo(FUEL_SLOT)
       end
       if turtle.getItemCount(s) > 0 then
@@ -682,7 +794,7 @@ local function dumpToStorage()
       end
     end
   end
-  turtle.select(FUEL_SLOT)
+  protectFuelSlot()
   faceForward()
 end
 
@@ -1154,7 +1266,7 @@ local function estimateFuelUnits()
       end
     end
   end
-  turtle.select(FUEL_SLOT)
+  selectCargoSlot()
   return total
 end
 
@@ -1277,7 +1389,8 @@ local checkIn
 -- Inventory full and/or fuel budget: return while we can still reach depot.
 -- If short of home cost, suck mid-path chests; else SOS admin for a refuel station.
 local function manageInventory(resume)
-  local full = inventoryFull()
+  protectFuelSlot()
+  local full = inventoryFull() or inventoryNearlyFull()
   local plan, fuel, home = fuelPlanNow()
 
   if plan == "ok" and not full then
@@ -1458,7 +1571,8 @@ end
 
 -- Absolute XZ cell rectangle, full Y band, 1 layer at a time.
 -- skipY: optional set/list of quarry-Y layers to omit (site geo empty hints).
-local function cellLayerUnits(x0, x1, z0, z1, y0, y1, skipY)
+-- skipVoxels: optional list of {x,y,z} air voxels inside scanner coverage.
+local function cellLayerUnits(x0, x1, z0, z1, y0, y1, skipY, skipVoxels)
   local units = {}
   x0 = math.floor(tonumber(x0) or 0)
   x1 = math.floor(tonumber(x1) or x0)
@@ -1477,13 +1591,31 @@ local function cellLayerUnits(x0, x1, z0, z1, y0, y1, skipY)
       end
     end
   end
+  local skipXZ = {}
+  if type(skipVoxels) == "table" then
+    for _, v in ipairs(skipVoxels) do
+      if type(v) == "table" then
+        local sx = math.floor(tonumber(v.x) or 0)
+        local sy = math.floor(tonumber(v.y) or 0)
+        local sz = math.floor(tonumber(v.z) or 0)
+        skipXZ[sx .. ":" .. sy .. ":" .. sz] = true
+      end
+    end
+  end
+  local function want(x, y, z)
+    return not skipXZ[x .. ":" .. y .. ":" .. z]
+  end
   for y = y0, y1 do
     if not skip[y] then
       for z = z0, z1 do
         if ((z - z0) + (y - y0)) % 2 == 0 then
-          for x = x0, x1 do units[#units + 1] = { x = x, y = y, z = z } end
+          for x = x0, x1 do
+            if want(x, y, z) then units[#units + 1] = { x = x, y = y, z = z } end
+          end
         else
-          for x = x1, x0, -1 do units[#units + 1] = { x = x, y = y, z = z } end
+          for x = x1, x0, -1 do
+            if want(x, y, z) then units[#units + 1] = { x = x, y = y, z = z } end
+          end
         end
       end
     end
@@ -3506,7 +3638,8 @@ function site.runCellClaim(claim, existingJob)
   }
 
   local skipY = claim.emptyY or (claim.geo and claim.geo.emptyY)
-  local units = cellLayerUnits(x0, x1, z0, z1, y0, y1, skipY)
+  local skipVoxels = claim.skipVoxels or (claim.geo and claim.geo.skipVoxels)
+  local units = cellLayerUnits(x0, x1, z0, z1, y0, y1, skipY, skipVoxels)
   do
     local nSkip = 0
     if type(skipY) == "table" then
@@ -3515,8 +3648,9 @@ function site.runCellClaim(claim, existingJob)
         elseif type(k) == "number" and v then nSkip = nSkip + 1 end
       end
     end
-    if nSkip > 0 then
-      print(("Geo hint: skipping %d empty Y layer(s) near site scanner."):format(nSkip))
+    local nAir = type(skipVoxels) == "table" and #skipVoxels or 0
+    if nSkip > 0 or nAir > 0 then
+      print(("Geo hint: skip %d empty Y + %d air voxels (scanner range)."):format(nSkip, nAir))
     end
   end
   local j = existingJob

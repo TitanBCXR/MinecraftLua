@@ -633,11 +633,16 @@ Needs no GPS or Parent Center for solo digs — turtle + two chests. Stand at th
 
 | Side / slot | Role |
 |-------------|------|
-| Chest **LEFT** | Fuel → **slot 16** (coal stays there) |
+| Chest **LEFT** | Fuel → **slot 16** (coal / charcoal / blocks only) |
 | Chest **BEHIND** | Storage → dumps slots **1–14** |
-| **Slot 15** | Wireless modem (online mode) |
+| **Slot 15** | Wireless modem / extra equipment (never dumped) |
 | Upgrade **RIGHT** | Pickaxe (modem swaps with this side only; left/loader untouched) |
 | Site PC (optional) | Left of the storage chest |
+
+Slot **16** is reserved for coal, charcoal, and coal/charcoal blocks. Dig overflow,
+mid-path suck, and dump all purge junk out of that slot. Other burnables may be
+consumed from cargo in an SOS, but they are never kept in slot 16. Inventory
+homes to dump when cargo is nearly full so mined items cannot spill into 16.
 
 ### Network mode
 
@@ -717,14 +722,15 @@ edge remainders allowed). **One bot per cell.** Each bot digs that cell’s full
 `origin` (and preferably GPS). Then:
 
 ```
-scan [radius]    # block scan (default 8) → empty quarry-Y hints for miners
+scan [radius]    # block scan (default 8) → empty-Y + per-cell solid/air hints
 ores             # chunk ore counts
 geo              # last summary
 ```
 
-Empty Y hints ride on cell claims so cell miners can skip barren layers near
-the scanner. Coverage is limited to the scanner radius — re-`scan` as the dig
-moves, or treat it as a depot-local efficiency boost.
+Empty Y layers and scanned-air voxels ride on cell claims so miners can skip
+barren spots near the scanner. Coverage is limited to the scanner radius —
+re-`scan` as the dig moves. Outside that radius miners still walk the full
+cell and use `detect`. Verify walks stay detect-based before `cell_done`.
 
 **Lifecycle:** `leave_origin` (modem on) → travel → `arrive_cell` → dig inside
 cell AABB → home → `cell_done` → next free cell. Site computes **quarry-relative

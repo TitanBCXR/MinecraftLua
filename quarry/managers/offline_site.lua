@@ -1,14 +1,14 @@
 --[[
   quarry/managers/offline_site.lua  -  Quarry site board (XZ cell fleet)
-  Titan-Version: 1.4.0
+  Titan-Version: 1.5.0
 
   Place LEFT of the storage chest (storage behind turtle origin). Modem required.
   Attach a **monitor** for the live status board — the computer terminal stays
   free for the `site>` console.
 
   Optional: Advanced Peripherals **Geo Scanner** next to this computer.
-  Use `scan` / `ores` — empty Y-layer hints are attached to cell claims so
-  miners can skip barren bands near the scanner.
+  Use `scan` / `ores` — empty Y-layer hints and scanned-air voxels (within
+  scanner radius) are attached to cell claims so miners can skip barren spots.
 
   Dig model:
     * Site W×L×H footprint
@@ -21,7 +21,7 @@
   Commands:
     setup <W>x<L> <H> [cellSize]
     origin <x> <y> <z> [n|s|e|w|0-3]
-    scan [radius]   geo scanner block scan (default 8)
+    scan [radius]   geo scanner → empty-Y + air-voxel hints (default 8)
     ores            chunk ore analyze
     geo             show last geo summary
     where <id>
@@ -94,6 +94,8 @@ end
 --------------------------------------------------------------------------------
 -- Advanced Peripherals Geo Scanner (optional)
 --------------------------------------------------------------------------------
+local GEO_SKIP_MAX = 256  -- max air voxels per cell claim (rednet-friendly)
+
 local geoCache = {
   ok = false,
   err = nil,
@@ -103,6 +105,8 @@ local geoCache = {
   ores = {},       -- { { name, count }, ... } sorted
   emptyY = {},     -- [quarryY] = true when scan saw no solids at that world Y
   coveredY = {},   -- [quarryY] = true when scan had any voxel at that Y
+  scanQX = nil, scanQY = nil, scanQZ = nil,  -- scanner pose in quarry coords
+  solids = {},     -- ["x:y:z"] = true for non-air voxels inside scan radius
 }
 
 local function findGeoScanner()
@@ -136,37 +140,116 @@ local function geoWorldOfScanner()
   return nil
 end
 
+local function worldToQuarry(wx, wy, wz)
+  local ox, oy, oz = tonumber(cfg.originX), tonumber(cfg.originY), tonumber(cfg.originZ)
+  if ox == nil or oy == nil or oz == nil then return nil end
+  wx = math.floor(tonumber(wx) or 0)
+  wy = math.floor(tonumber(wy) or 0)
+  wz = math.floor(tonumber(wz) or 0)
+  local f = math.floor(tonumber(cfg.originFacing) or 0) % 4
+  local dx, dz = wx - ox, wz - oz
+  local qy = oy - wy
+  local qx, qz
+  if f == 0 then qx, qz = dx, dz
+  elseif f == 1 then qx, qz = -dz, dx
+  elseif f == 2 then qx, qz = -dx, -dz
+  else qx, qz = dz, -dx end
+  return qx, qy, qz
+end
+
+local function geoVoxelKey(qx, qy, qz)
+  return tostring(qx) .. ":" .. tostring(qy) .. ":" .. tostring(qz)
+end
+
+local function geoIsAirName(name)
+  return name == "minecraft:air" or name == "minecraft:cave_air"
+    or name == "minecraft:void_air"
+end
+
+local function geoCoveredQuarry(qx, qy, qz)
+  local R = tonumber(geoCache.radius)
+  local sx, sy, sz = geoCache.scanQX, geoCache.scanQY, geoCache.scanQZ
+  if not R or sx == nil or sy == nil or sz == nil then return false end
+  return math.abs(qx - sx) <= R
+    and math.abs(qy - sy) <= R
+    and math.abs(qz - sz) <= R
+end
+
 local function rebuildEmptyYFromScan(blocks, radius)
   geoCache.emptyY = {}
   geoCache.coveredY = {}
+  geoCache.solids = {}
+  geoCache.scanQX, geoCache.scanQY, geoCache.scanQZ = nil, nil, nil
   local sx, sy, sz = geoWorldOfScanner()
   local H = math.max(0, (tonumber(cfg.H) or 0) - 1)
-  if not sx or (tonumber(cfg.H) or 0) < 1 then return end
-  if cfg.originX == nil or cfg.originY == nil then return end
-  local oy = cfg.originY
-  -- Quarry +Y is down: worldY = originY - quarryY
+  if not sx then return end
+  if cfg.originX == nil or cfg.originY == nil or cfg.originZ == nil then return end
+
+  local sqx, sqy, sqz = worldToQuarry(sx, sy, sz)
+  if not sqx then return end
+  geoCache.scanQX, geoCache.scanQY, geoCache.scanQZ = sqx, sqy, sqz
+  geoCache.radius = radius
+
   local solidAtQY = {}
   for _, b in ipairs(blocks or {}) do
     if type(b) == "table" and type(b.name) == "string" then
       local name = b.name
+      local wx = sx + (tonumber(b.x) or 0)
       local wy = sy + (tonumber(b.y) or 0)
-      local qy = oy - wy
-      if qy >= 0 and qy <= H then
-        geoCache.coveredY[qy] = true
-        if name ~= "minecraft:air" and name ~= "minecraft:cave_air"
-            and name ~= "minecraft:void_air" then
-          solidAtQY[qy] = true
+      local wz = sz + (tonumber(b.z) or 0)
+      local qx, qy, qz = worldToQuarry(wx, wy, wz)
+      if qx ~= nil then
+        if qy >= 0 and qy <= H then
+          geoCache.coveredY[qy] = true
+        end
+        if not geoIsAirName(name) then
+          geoCache.solids[geoVoxelKey(qx, qy, qz)] = true
+          if qy >= 0 and qy <= H then
+            solidAtQY[qy] = true
+          end
         end
       end
     end
   end
-  -- Only mark empty when the scan covered that Y and saw no solids.
+  -- Also mark covered Y bands from the scanner cube (even if scan omitted air).
+  for qy = math.max(0, sqy - radius), math.min(H, sqy + radius) do
+    geoCache.coveredY[qy] = true
+  end
   for qy = 0, H do
     if geoCache.coveredY[qy] and not solidAtQY[qy] then
       geoCache.emptyY[qy] = true
     end
   end
-  geoCache.radius = radius
+end
+
+-- Compact air-voxel skip list for one cell (covered + not solid), capped.
+local function cellSkipVoxels(c)
+  local skips = {}
+  if not c or not geoCache.ok then return skips end
+  if geoCache.scanQX == nil or not geoCache.radius then return skips end
+  local H = math.max(0, (tonumber(cfg.H) or 0) - 1)
+  local x0 = math.floor(tonumber(c.x0) or 0)
+  local x1 = math.floor(tonumber(c.x1) or x0)
+  local z0 = math.floor(tonumber(c.z0) or 0)
+  local z1 = math.floor(tonumber(c.z1) or z0)
+  if x1 < x0 then x0, x1 = x1, x0 end
+  if z1 < z0 then z0, z1 = z1, z0 end
+  local solids = geoCache.solids or {}
+  for y = 0, H do
+    if geoCache.emptyY[y] then
+      -- Whole layer already skipped via emptyY.
+    else
+      for z = z0, z1 do
+        for x = x0, x1 do
+          if geoCoveredQuarry(x, y, z) and not solids[geoVoxelKey(x, y, z)] then
+            skips[#skips + 1] = { x = x, y = y, z = z }
+            if #skips >= GEO_SKIP_MAX then return skips end
+          end
+        end
+      end
+    end
+  end
+  return skips
 end
 
 local function runGeoScan(radius)
@@ -250,7 +333,7 @@ local function runChunkAnalyze()
   return rows
 end
 
-local function geoHintPayload()
+local function geoHintPayload(cell)
   if not geoCache.ok and not geoCache.err then
     return { ok = false, err = findGeoScanner() and "not scanned yet" or "no geo scanner" }
   end
@@ -263,6 +346,7 @@ local function geoHintPayload()
   for i = 1, math.min(8, #(geoCache.ores or {})) do
     top[i] = geoCache.ores[i]
   end
+  local skipVoxels = cell and cellSkipVoxels(cell) or nil
   return {
     ok = geoCache.ok == true,
     err = geoCache.err,
@@ -271,6 +355,11 @@ local function geoHintPayload()
     solidCount = geoCache.solidCount,
     emptyY = emptyList,
     ores = top,
+    scanQX = geoCache.scanQX,
+    scanQY = geoCache.scanQY,
+    scanQZ = geoCache.scanQZ,
+    skipVoxels = skipVoxels,
+    skipVoxelCount = skipVoxels and #skipVoxels or 0,
   }
 end
 
@@ -734,7 +823,7 @@ end
 
 local function cellPayload(c, extra)
   local H = math.max(1, tonumber(cfg.H) or 1)
-  local hint = geoHintPayload()
+  local hint = geoHintPayload(c)
   local p = {
     type = "quarry_cell",
     ok = c ~= nil,
@@ -746,6 +835,7 @@ local function cellPayload(c, extra)
     y0 = 0, y1 = H - 1,
     geo = hint,
     emptyY = hint.emptyY,
+    skipVoxels = hint.skipVoxels,
   }
   if c then
     p.cellId = c.id
@@ -1360,7 +1450,7 @@ local function printHelp()
   print("  setup <W>x<L> <H> [cellSize]   lock footprint + rebuild cells")
   print("  cellsize <n>                   set target cell size (rebuild free)")
   print("  origin <x> <y> <z> [facing]    GPS of quarry 0,0,0")
-  print("  scan [radius]                  Geo Scanner block scan (default 8)")
+  print("  scan [radius]                  Geo Scanner → empty-Y + air skips (default 8)")
   print("  ores                           Geo Scanner chunk ore counts")
   print("  geo                            last scan / ore summary")
   print("  where <id>                     admin distance track")
@@ -1412,8 +1502,15 @@ local function handleCommand(line)
       print("scan failed: " .. tostring(err))
     else
       local g = geoHintPayload()
-      print(("Scan ok — %d solids, %d empty quarry-Y (near scanner)."):format(
-        tonumber(g.solidCount) or 0, #(g.emptyY or {})))
+      local solidKeys = 0
+      for _ in pairs(geoCache.solids or {}) do solidKeys = solidKeys + 1 end
+      print(("Scan ok — %d solids (%d indexed), %d empty quarry-Y (near scanner)."):format(
+        tonumber(g.solidCount) or 0, solidKeys, #(g.emptyY or {})))
+      if g.scanQX ~= nil then
+        print(("  scanner quarry pose %s,%s,%s r=%s"):format(
+          tostring(g.scanQX), tostring(g.scanQY), tostring(g.scanQZ),
+          tostring(g.radius or "-")))
+      end
       if #(g.emptyY or {}) > 0 then
         print("  emptyY: " .. table.concat(g.emptyY, ","))
       end
@@ -1436,10 +1533,16 @@ local function handleCommand(line)
     end
   elseif cmd == "geo" then
     local g = geoHintPayload()
-    print(("scanner=%s ok=%s r=%s solids=%s"):format(
+    local solidKeys = 0
+    for _ in pairs(geoCache.solids or {}) do solidKeys = solidKeys + 1 end
+    print(("scanner=%s ok=%s r=%s solids=%s indexed=%d"):format(
       tostring(findGeoScanner() ~= nil), tostring(g.ok),
-      tostring(g.radius or "-"), tostring(g.solidCount or "-")))
+      tostring(g.radius or "-"), tostring(g.solidCount or "-"), solidKeys))
     if g.err then print("  err: " .. tostring(g.err)) end
+    if g.scanQX ~= nil then
+      print(("  scanner quarry %s,%s,%s"):format(
+        tostring(g.scanQX), tostring(g.scanQY), tostring(g.scanQZ)))
+    end
     if #(g.emptyY or {}) > 0 then
       print("  emptyY: " .. table.concat(g.emptyY, ","))
     end
@@ -1592,7 +1695,7 @@ end
 if findGeoScanner() then
   print("Geo Scanner found — use `scan` / `ores` / `geo`.")
 else
-  print("No Geo Scanner — dig works; attach one for empty-Y / ore hints.")
+  print("No Geo Scanner — dig works; attach one for empty-Y / air-voxel / ore hints.")
 end
 local mon = wrapMonitor()
 if mon then
