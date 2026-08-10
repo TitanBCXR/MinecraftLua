@@ -1,29 +1,33 @@
 --[[
   quarry/managers/offline_site.lua  -  Quarry site board (XZ cell fleet)
-  Titan-Version: 1.5.0
+  Titan-Version: 1.7.0
 
   Place LEFT of the storage chest (storage behind turtle origin). Modem required.
   Attach a **monitor** for the live status board — the computer terminal stays
   free for the `site>` console.
 
-  Optional: Advanced Peripherals **Geo Scanner** next to this computer.
-  Use `scan` / `ores` — empty Y-layer hints and scanned-air voxels (within
-  scanner radius) are attached to cell claims so miners can skip barren spots.
+  Optional: Advanced Peripherals **Geo Scanner** next to this computer (depot
+  scan), and/or a **cell scanner turtle** that places a Geo Scanner in each
+  cell, reports solids to this board, then picks up and moves on. Miners prefer
+  scanned cells and dig the solid index (empty scanned cells auto-complete).
 
   Dig model:
     * Site W×L×H footprint
     * Split XZ into cells (target 20×20, min 4×4, edge remainders allowed)
     * One bot per cell; digs full H one Y-layer at a time inside the cell
     * Bot check-ins: leave_origin, arrive_cell, progress, cell_done
+    * Scanner bots: quarry_scan_req / quarry_scan_report
     * Site tracks quarry-relative + world pose (origin GPS); GPS turtle fix later
     * Fleet net: debounced status/cfg flushes; claim dedupe (avoids freeze under load)
 
   Commands:
     setup <W>x<L> <H> [cellSize]
     origin <x> <y> <z> [n|s|e|w|0-3]
-    scan [radius]   geo scanner → empty-Y + air-voxel hints (default 8)
+    scan [radius|auto]  depot geo scan sized to site (or explicit 1-16)
     ores            chunk ore analyze
     geo             show last geo summary
+    requirescan on|off   miners only claim cells scanned by a scanner bot
+    clearscans           forget per-cell scanner maps (cells stay free/complete)
     where <id>
     cells | status | turtles | jobs
     reband          recall fleet home + keep cell assigns
@@ -38,6 +42,7 @@ local PROTO = "titan_quarry"
 local NET = "titan_net"
 local CFG = "offline_site.cfg"
 local JOB_DIR = "quarry_jobs"
+local SCAN_DIR = "quarry_scans"
 local ONLINE_SECS = 45
 local POSE_SLACK = 2
 local CELL_TARGET = 20
@@ -46,6 +51,7 @@ local STATUS_MIN_MS = 1500   -- min gap between full status broadcasts
 local CFG_MIN_MS = 2000      -- debounce routine cfg writes
 local CLAIM_DEDUPE_MS = 900  -- ignore dual cell_req+claim_req from same bot
 local JOB_PERSIST_MS = 5000  -- throttle per-turtle job file writes
+local SCAN_LOCK_SECS = 180   -- scanner claim lock timeout
 
 local titan = nil
 if fs.exists("lib/titan.lua") then
@@ -60,6 +66,7 @@ local cfg = {
   label = nil,
   originX = nil, originY = nil, originZ = nil, originFacing = 0,
   cells = {},
+  requireScan = false, -- when true, miners only get cells scanned by a scanner bot
 }
 
 local turtles = {}
@@ -94,7 +101,8 @@ end
 --------------------------------------------------------------------------------
 -- Advanced Peripherals Geo Scanner (optional)
 --------------------------------------------------------------------------------
-local GEO_SKIP_MAX = 256  -- max air voxels per cell claim (rednet-friendly)
+local GEO_RADIUS_MAX = 16
+local GEO_SOLID_MAX = 400  -- max solid voxels per cell claim (rednet-friendly)
 
 local geoCache = {
   ok = false,
@@ -107,6 +115,7 @@ local geoCache = {
   coveredY = {},   -- [quarryY] = true when scan had any voxel at that Y
   scanQX = nil, scanQY = nil, scanQZ = nil,  -- scanner pose in quarry coords
   solids = {},     -- ["x:y:z"] = true for non-air voxels inside scan radius
+  needRadius = nil, -- quarry span from scanner (may exceed GEO_RADIUS_MAX)
 }
 
 local function findGeoScanner()
@@ -222,11 +231,7 @@ local function rebuildEmptyYFromScan(blocks, radius)
   end
 end
 
--- Compact air-voxel skip list for one cell (covered + not solid), capped.
-local function cellSkipVoxels(c)
-  local skips = {}
-  if not c or not geoCache.ok then return skips end
-  if geoCache.scanQX == nil or not geoCache.radius then return skips end
+local function cellBounds(c)
   local H = math.max(0, (tonumber(cfg.H) or 0) - 1)
   local x0 = math.floor(tonumber(c.x0) or 0)
   local x1 = math.floor(tonumber(c.x1) or x0)
@@ -234,22 +239,84 @@ local function cellSkipVoxels(c)
   local z1 = math.floor(tonumber(c.z1) or z0)
   if x1 < x0 then x0, x1 = x1, x0 end
   if z1 < z0 then z0, z1 = z1, z0 end
-  local solids = geoCache.solids or {}
-  for y = 0, H do
-    if geoCache.emptyY[y] then
-      -- Whole layer already skipped via emptyY.
+  return x0, x1, z0, z1, 0, H
+end
+
+-- "full" = every cell voxel inside last scan cube; "partial" / "none" otherwise.
+-- Chebyshev coverage ⇒ checking the 8 AABB corners is enough.
+local function cellGeoCoverage(c)
+  if not c or not geoCache.ok or geoCache.scanQX == nil or not geoCache.radius then
+    return "none"
+  end
+  local x0, x1, z0, z1, y0, y1 = cellBounds(c)
+  local corners = {
+    { x0, y0, z0 }, { x1, y0, z0 }, { x0, y0, z1 }, { x1, y0, z1 },
+    { x0, y1, z0 }, { x1, y1, z0 }, { x0, y1, z1 }, { x1, y1, z1 },
+  }
+  local any, all = false, true
+  for _, p in ipairs(corners) do
+    if geoCoveredQuarry(p[1], p[2], p[3]) then
+      any = true
     else
-      for z = z0, z1 do
-        for x = x0, x1 do
-          if geoCoveredQuarry(x, y, z) and not solids[geoVoxelKey(x, y, z)] then
-            skips[#skips + 1] = { x = x, y = y, z = z }
-            if #skips >= GEO_SKIP_MAX then return skips end
+      all = false
+    end
+  end
+  if all and any then return "full" end
+  if any then return "partial" end
+  return "none"
+end
+
+-- Solid voxels inside one cell (snake order). Caps at GEO_SOLID_MAX.
+-- Returns list, truncated (bool)
+local function cellSolidVoxels(c)
+  local list = {}
+  if not c or not geoCache.ok then return list, false end
+  local x0, x1, z0, z1, y0, y1 = cellBounds(c)
+  local solids = geoCache.solids or {}
+  local truncated = false
+  for y = y0, y1 do
+    for z = z0, z1 do
+      local xStart, xEnd, xStep = x0, x1, 1
+      if ((z - z0) + (y - y0)) % 2 ~= 0 then
+        xStart, xEnd, xStep = x1, x0, -1
+      end
+      for x = xStart, xEnd, xStep do
+        if solids[geoVoxelKey(x, y, z)] then
+          list[#list + 1] = { x = x, y = y, z = z }
+          if #list >= GEO_SOLID_MAX then
+            return list, true
           end
         end
       end
     end
   end
-  return skips
+  return list, truncated
+end
+
+-- Chebyshev radius from scanner to farthest quarry corner (site-sized scan).
+local function siteScanRadius()
+  local sx, sy, sz = geoWorldOfScanner()
+  if not sx then return 8, nil, "no scanner GPS/origin" end
+  if cfg.originX == nil or cfg.originY == nil or cfg.originZ == nil then
+    return 8, nil, "set origin first"
+  end
+  local sqx, sqy, sqz = worldToQuarry(sx, sy, sz)
+  if sqx == nil then return 8, nil, "bad origin" end
+  local W = math.max(1, math.floor(tonumber(cfg.W) or 1))
+  local L = math.max(1, math.floor(tonumber(cfg.L) or 1))
+  local H = math.max(1, math.floor(tonumber(cfg.H) or 1))
+  local maxR = 0
+  local corners = {
+    { 0, 0, 0 }, { W - 1, 0, 0 }, { 0, 0, L - 1 }, { W - 1, 0, L - 1 },
+    { 0, H - 1, 0 }, { W - 1, H - 1, 0 }, { 0, H - 1, L - 1 }, { W - 1, H - 1, L - 1 },
+  }
+  for _, c in ipairs(corners) do
+    local d = math.max(math.abs(c[1] - sqx), math.abs(c[2] - sqy), math.abs(c[3] - sqz))
+    if d > maxR then maxR = d end
+  end
+  local need = math.max(1, maxR)
+  local used = math.min(GEO_RADIUS_MAX, need)
+  return used, need, nil
 end
 
 local function runGeoScan(radius)
@@ -259,7 +326,21 @@ local function runGeoScan(radius)
     geoCache.err = "no geo scanner attached"
     return nil, geoCache.err
   end
-  radius = math.max(1, math.min(16, math.floor(tonumber(radius) or 8)))
+  local needRadius = nil
+  if radius == nil or radius == "auto" or radius == "site" then
+    local used, need, err = siteScanRadius()
+    if err then
+      print("scan auto: " .. err .. " — using r=8")
+    end
+    radius = used or 8
+    needRadius = need
+    geoCache.needRadius = need
+  else
+    radius = math.max(1, math.min(GEO_RADIUS_MAX, math.floor(tonumber(radius) or 8)))
+    local _, need = siteScanRadius()
+    needRadius = need
+    geoCache.needRadius = need
+  end
   geoWaitCooldown(geo)
   if type(geo.scan) ~= "function" and type(geo.scanBlocks) ~= "function" then
     geoCache.ok = false
@@ -295,7 +376,8 @@ local function runGeoScan(radius)
   geoCache.solidCount = solids
   geoCache.radius = radius
   rebuildEmptyYFromScan(data, radius)
-  return data
+  geoCache.needRadius = needRadius or geoCache.needRadius
+  return data, nil, { radius = radius, needRadius = geoCache.needRadius }
 end
 
 local function runChunkAnalyze()
@@ -346,11 +428,28 @@ local function geoHintPayload(cell)
   for i = 1, math.min(8, #(geoCache.ores or {})) do
     top[i] = geoCache.ores[i]
   end
-  local skipVoxels = cell and cellSkipVoxels(cell) or nil
+  local coverage = cell and cellGeoCoverage(cell) or nil
+  local solids, truncated = nil, false
+  local digMode = "layer"
+  if cell and coverage == "full" then
+    solids, truncated = cellSolidVoxels(cell)
+    if truncated then
+      digMode = "layer" -- too dense for a claim payload; fall back to layer dig
+      solids = nil
+    else
+      digMode = "solids"
+    end
+  elseif cell and coverage == "partial" then
+    -- Partial coverage: still send known solids; miner digs them then layers the rest.
+    solids, truncated = cellSolidVoxels(cell)
+    digMode = truncated and "layer" or "hybrid"
+    if truncated then solids = nil end
+  end
   return {
     ok = geoCache.ok == true,
     err = geoCache.err,
     radius = geoCache.radius,
+    needRadius = geoCache.needRadius,
     age = geoCache.at > 0 and ago(geoCache.at) or nil,
     solidCount = geoCache.solidCount,
     emptyY = emptyList,
@@ -358,8 +457,11 @@ local function geoHintPayload(cell)
     scanQX = geoCache.scanQX,
     scanQY = geoCache.scanQY,
     scanQZ = geoCache.scanQZ,
-    skipVoxels = skipVoxels,
-    skipVoxelCount = skipVoxels and #skipVoxels or 0,
+    coverage = coverage,
+    digMode = digMode,
+    solids = solids,
+    solidIndexCount = solids and #solids or 0,
+    solidsTruncated = truncated == true,
   }
 end
 
@@ -422,13 +524,23 @@ local function buildCellGrid(opts)
   size = math.max(1, math.floor(size))
   cfg.cellSize = size
 
-  -- Preserve completed cells by XZ signature when rebuilding.
+  -- Preserve completed + scanned metadata by XZ signature when rebuilding.
   local doneMap = {}
+  local scanMap = {}
   if opts.keepDone ~= false then
     for _, c in ipairs(cfg.cells or {}) do
+      local key = ("%d:%d:%d:%d"):format(c.x0, c.x1, c.z0, c.z1)
       if c.status == "complete" or c.status == "done" then
-        local key = ("%d:%d:%d:%d"):format(c.x0, c.x1, c.z0, c.z1)
         doneMap[key] = c
+      end
+      if c.scanned then
+        scanMap[key] = {
+          scanned = true,
+          scanSolidCount = c.scanSolidCount,
+          scanAt = c.scanAt,
+          scanRadius = c.scanRadius,
+          oldId = c.id,
+        }
       end
     end
   end
@@ -443,17 +555,28 @@ local function buildCellGrid(opts)
       local x1 = math.min(x + size - 1, W - 1)
       local key = ("%d:%d:%d:%d"):format(x, x1, z, z1)
       local prev = doneMap[key]
-      if prev then
-        cells[#cells + 1] = {
-          id = id, x0 = x, x1 = x1, z0 = z, z1 = z1,
-          status = "complete", turtleId = nil, doneAt = prev.doneAt,
-        }
-      else
-        cells[#cells + 1] = {
-          id = id, x0 = x, x1 = x1, z0 = z, z1 = z1,
-          status = "free", turtleId = nil, doneAt = nil,
-        }
+      local scan = scanMap[key]
+      local row = {
+        id = id, x0 = x, x1 = x1, z0 = z, z1 = z1,
+        status = prev and "complete" or "free",
+        turtleId = nil, doneAt = prev and prev.doneAt or nil,
+        scanningBy = nil, scanLockAt = nil,
+      }
+      if scan then
+        row.scanned = true
+        row.scanSolidCount = scan.scanSolidCount
+        row.scanAt = scan.scanAt
+        row.scanRadius = scan.scanRadius
+        -- Solids files are keyed by cell id — copy old → new if id changed.
+        if scan.oldId and tonumber(scan.oldId) ~= id and fs.exists(SCAN_DIR) then
+          local oldPath = SCAN_DIR .. "/" .. tostring(scan.oldId) .. ".scan"
+          local newPath = SCAN_DIR .. "/" .. tostring(id) .. ".scan"
+          if fs.exists(oldPath) and not fs.exists(newPath) then
+            pcall(fs.copy, oldPath, newPath)
+          end
+        end
       end
+      cells[#cells + 1] = row
       id = id + 1
       x = x1 + 1
     end
@@ -485,12 +608,99 @@ local function cellForTurtle(id)
   return nil
 end
 
+local function cellForScanner(id)
+  id = tonumber(id)
+  for _, c in ipairs(cfg.cells or {}) do
+    if tonumber(c.scanningBy) == id then return c end
+  end
+  return nil
+end
+
 local function cellLabel(c)
   if not c then return "?" end
-  return ("C%d X%d-%d Z%d-%d"):format(
+  local tag = ""
+  if c.scanned then tag = " scanned" end
+  if c.scanningBy then tag = tag .. " scanning" end
+  return ("C%d X%d-%d Z%d-%d%s"):format(
     tonumber(c.id) or 0,
     tonumber(c.x0) or 0, tonumber(c.x1) or 0,
-    tonumber(c.z0) or 0, tonumber(c.z1) or 0)
+    tonumber(c.z0) or 0, tonumber(c.z1) or 0,
+    tag)
+end
+
+local function ensureScanDir()
+  if not fs.exists(SCAN_DIR) then fs.makeDir(SCAN_DIR) end
+end
+
+local function cellScanPath(cellId)
+  return SCAN_DIR .. "/" .. tostring(math.floor(tonumber(cellId) or 0)) .. ".scan"
+end
+
+local function saveCellScanSolids(cellId, solids)
+  ensureScanDir()
+  local f = fs.open(cellScanPath(cellId), "w")
+  if not f then return false end
+  f.write(textutils.serialize({
+    cellId = tonumber(cellId),
+    solids = solids or {},
+    at = now(),
+  }))
+  f.close()
+  return true
+end
+
+local function loadCellScanSolids(cellId)
+  local path = cellScanPath(cellId)
+  if not fs.exists(path) then return {} end
+  local f = fs.open(path, "r")
+  if not f then return {} end
+  local ok, data = pcall(textutils.unserialize, f.readAll())
+  f.close()
+  if ok and type(data) == "table" and type(data.solids) == "table" then
+    return data.solids
+  end
+  return {}
+end
+
+local function clearAllCellScans()
+  for _, c in ipairs(cfg.cells or {}) do
+    c.scanned = nil
+    c.scanSolidCount = nil
+    c.scanAt = nil
+    c.scanRadius = nil
+    c.scanningBy = nil
+    c.scanLockAt = nil
+  end
+  if fs.exists(SCAN_DIR) then
+    for _, name in ipairs(fs.list(SCAN_DIR)) do
+      pcall(fs.delete, SCAN_DIR .. "/" .. name)
+    end
+  end
+  saveCfg()
+end
+
+local function cellScanLocked(c)
+  if not c or c.scanningBy == nil then return false end
+  local age = ago(c.scanLockAt or 0)
+  if age > SCAN_LOCK_SECS then
+    c.scanningBy = nil
+    c.scanLockAt = nil
+    return false
+  end
+  return true
+end
+
+local function cellCenter(c)
+  local x0 = math.floor(tonumber(c.x0) or 0)
+  local x1 = math.floor(tonumber(c.x1) or x0)
+  local z0 = math.floor(tonumber(c.z0) or 0)
+  local z1 = math.floor(tonumber(c.z1) or z0)
+  local H = math.max(1, tonumber(cfg.H) or 1)
+  local cx = math.floor((x0 + x1) / 2)
+  local cz = math.floor((z0 + z1) / 2)
+  local span = math.max(x1 - x0, z1 - z0, H - 1)
+  local radius = math.max(1, math.min(GEO_RADIUS_MAX, math.ceil(span / 2) + 1))
+  return cx, 0, cz, radius
 end
 
 local function saveCfgNow()
@@ -824,23 +1034,44 @@ end
 local function cellPayload(c, extra)
   local H = math.max(1, tonumber(cfg.H) or 1)
   local hint = geoHintPayload(c)
+  local digMode = hint.digMode or "layer"
   local p = {
     type = "quarry_cell",
     ok = c ~= nil,
     pattern = "cell",
-    dig = "layer",
+    dig = digMode == "solids" and "solids" or "layer",
+    digMode = digMode,
+    geoCoverage = hint.coverage,
     W = cfg.W, L = cfg.L, H = cfg.H,
     cellSize = cfg.cellSize,
     maxTravel = maxTravel(), minBpc = minBpc(),
     y0 = 0, y1 = H - 1,
     geo = hint,
     emptyY = hint.emptyY,
-    skipVoxels = hint.skipVoxels,
+    solids = hint.solids,
+    requireScan = cfg.requireScan == true,
   }
   if c then
     p.cellId = c.id
     p.x0, p.x1, p.z0, p.z1 = c.x0, c.x1, c.z0, c.z1
     p.status = c.status
+    p.scanned = c.scanned == true
+    p.scanSolidCount = c.scanSolidCount
+    -- Per-cell scanner-bot map wins over depot geo hints.
+    if c.scanned then
+      local solids = loadCellScanSolids(c.id)
+      p.digMode = "solids"
+      p.dig = "solids"
+      p.geoCoverage = "full"
+      p.solids = solids
+      p.geo = p.geo or {}
+      p.geo.ok = true
+      p.geo.digMode = "solids"
+      p.geo.coverage = "full"
+      p.geo.solids = solids
+      p.geo.fromCellScanner = true
+      p.geo.solidIndexCount = #solids
+    end
   end
   if type(extra) == "table" then
     for k, v in pairs(extra) do p[k] = v end
@@ -848,9 +1079,152 @@ local function cellPayload(c, extra)
   return p
 end
 
+local function scanCellPayload(c, extra)
+  local H = math.max(1, tonumber(cfg.H) or 1)
+  local cx, cy, cz, radius = cellCenter(c)
+  local p = {
+    type = "quarry_scan_cell",
+    ok = c ~= nil,
+    cellId = c and c.id,
+    x0 = c and c.x0, x1 = c and c.x1,
+    z0 = c and c.z0, z1 = c and c.z1,
+    y0 = 0, y1 = H - 1,
+    cx = cx, cy = cy, cz = cz,
+    radius = radius,
+    W = cfg.W, L = cfg.L, H = cfg.H,
+    cellSize = cfg.cellSize,
+    maxTravel = maxTravel(), minBpc = minBpc(),
+  }
+  if type(extra) == "table" then
+    for k, v in pairs(extra) do p[k] = v end
+  end
+  return p
+end
+
+local function assignScanCell(id, opts)
+  opts = opts or {}
+  local t = turtles[id] or touchTurtle(id, {})
+  t.role = "scanner"
+  if (tonumber(cfg.W) or 0) < 1 or (tonumber(cfg.H) or 0) < 1 then
+    return scanCellPayload(nil, { ok = false, err = "site size unknown — setup WxL H" })
+  end
+  if #(cfg.cells or {}) < 1 then
+    buildCellGrid()
+    saveCfg()
+  end
+
+  local existing = cellForScanner(id)
+  if existing and not opts.forceNew then
+    if cellScanLocked(existing) then
+      t.status = "scanning"
+      turtles[id] = t
+      return scanCellPayload(existing, { resume = true })
+    end
+  end
+  if existing then
+    existing.scanningBy = nil
+    existing.scanLockAt = nil
+  end
+
+  local pick = nil
+  for _, c in ipairs(cfg.cells or {}) do
+    cellScanLocked(c) -- expire stale locks
+    if c.status == "free" and not c.scanned and not cellScanLocked(c)
+        and c.turtleId == nil then
+      pick = c
+      break
+    end
+  end
+  if not pick then
+    return scanCellPayload(nil, { ok = false, err = "no unscanned free cells" })
+  end
+  pick.scanningBy = id
+  pick.scanLockAt = now()
+  t.status = "scanning"
+  t.cellId = pick.id
+  turtles[id] = t
+  saveCfg()
+  print(("[scan] #%d %s → %s"):format(id, tostring(t.name), cellLabel(pick)))
+  return scanCellPayload(pick, { resume = false })
+end
+
+local function applyScanReport(id, msg)
+  local t = touchTurtle(id, msg or {})
+  t.role = "scanner"
+  local cellId = tonumber(msg.cellId)
+  local c = findCell(cellId) or cellForScanner(id)
+  if not c then
+    return { ok = false, err = "unknown cell" }
+  end
+  if c.scanningBy and tonumber(c.scanningBy) ~= tonumber(id) then
+    return { ok = false, err = "cell locked by another scanner" }
+  end
+  if msg.failed then
+    c.scanningBy = nil
+    c.scanLockAt = nil
+    t.status = "idle"
+    t.cellId = nil
+    turtles[id] = t
+    saveCfg()
+    return { ok = false, err = "scan failed", cellId = c.id }
+  end
+  local solids = {}
+  if type(msg.solids) == "table" then
+    for _, v in ipairs(msg.solids) do
+      if type(v) == "table" then
+        solids[#solids + 1] = {
+          x = math.floor(tonumber(v.x) or 0),
+          y = math.floor(tonumber(v.y) or 0),
+          z = math.floor(tonumber(v.z) or 0),
+        }
+      end
+    end
+  end
+  -- Keep only voxels inside the cell AABB.
+  local x0, x1 = tonumber(c.x0) or 0, tonumber(c.x1) or 0
+  local z0, z1 = tonumber(c.z0) or 0, tonumber(c.z1) or 0
+  local y1 = math.max(0, (tonumber(cfg.H) or 1) - 1)
+  if x1 < x0 then x0, x1 = x1, x0 end
+  if z1 < z0 then z0, z1 = z1, z0 end
+  local clipped = {}
+  for _, s in ipairs(solids) do
+    if s.x >= x0 and s.x <= x1 and s.z >= z0 and s.z <= z1
+        and s.y >= 0 and s.y <= y1 then
+      clipped[#clipped + 1] = s
+    end
+  end
+  saveCellScanSolids(c.id, clipped)
+  c.scanned = true
+  c.scanSolidCount = #clipped
+  c.scanAt = now()
+  c.scanRadius = tonumber(msg.radius) or c.scanRadius
+  c.scanningBy = nil
+  c.scanLockAt = nil
+  t.status = "idle"
+  t.cellId = nil
+  turtles[id] = t
+
+  local autoDone = false
+  if #clipped == 0 and c.status == "free" then
+    c.status = "complete"
+    c.doneAt = now()
+    autoDone = true
+  end
+  saveCfg()
+  print(("[scan+] cell %s solids=%d%s"):format(
+    cellLabel(c), #clipped, autoDone and " → auto-complete (empty)" or ""))
+  return {
+    ok = true,
+    cellId = c.id,
+    solidCount = #clipped,
+    autoComplete = autoDone,
+  }
+end
+
 local function assignCell(id, opts)
   opts = opts or {}
   local t = turtles[id] or touchTurtle(id, {})
+  t.role = t.role or "miner"
   if (tonumber(cfg.W) or 0) < 1 or (tonumber(cfg.H) or 0) < 1 then
     return cellPayload(nil, { ok = false, err = "site size unknown — setup WxL H" })
   end
@@ -885,12 +1259,26 @@ local function assignCell(id, opts)
     saveCfg()
   end
 
+  local function usable(c)
+    if c.status ~= "free" then return false end
+    if cellScanLocked(c) then return false end
+    if cfg.requireScan and not c.scanned then return false end
+    return true
+  end
+
+  -- Prefer scanned free cells so miners work the solid index first.
   local pick = nil
   for _, c in ipairs(cfg.cells or {}) do
-    if c.status == "free" then pick = c; break end
+    if usable(c) and c.scanned then pick = c; break end
   end
   if not pick then
-    return cellPayload(nil, { ok = false, err = "no free cells" })
+    for _, c in ipairs(cfg.cells or {}) do
+      if usable(c) then pick = c; break end
+    end
+  end
+  if not pick then
+    local err = cfg.requireScan and "no scanned free cells (run scanner bot)" or "no free cells"
+    return cellPayload(nil, { ok = false, err = err })
   end
   pick.status = "assigned"
   pick.turtleId = id
@@ -1236,6 +1624,33 @@ local function handleMsg(id, msg)
     rednet.send(id, legacy, PROTO)
     broadcastStatus(true)
 
+  elseif t == "quarry_scan_req" then
+    local last = claimHandledAt[id] or 0
+    if (now() - last) < CLAIM_DEDUPE_MS then
+      return
+    end
+    claimHandledAt[id] = now()
+    touchTurtle(id, msg)
+    local reply = assignScanCell(id, {
+      forceNew = msg.nextCell or msg.forceNew,
+    })
+    flushCfg(true)
+    rednet.send(id, reply, PROTO)
+    broadcastStatus(true)
+
+  elseif t == "quarry_scan_report" then
+    local result = applyScanReport(id, msg)
+    flushCfg(true)
+    result.type = "quarry_scan_ack"
+    rednet.send(id, result, PROTO)
+    -- Immediately hand the scanner another unscanned cell when available.
+    if result.ok and msg.next ~= false then
+      local nextScan = assignScanCell(id, { forceNew = true })
+      flushCfg(true)
+      rednet.send(id, nextScan, PROTO)
+    end
+    broadcastStatus(true)
+
   elseif t == "quarry_leave_origin" then
     local row = touchTurtle(id, msg)
     row.status = "travel"
@@ -1450,7 +1865,9 @@ local function printHelp()
   print("  setup <W>x<L> <H> [cellSize]   lock footprint + rebuild cells")
   print("  cellsize <n>                   set target cell size (rebuild free)")
   print("  origin <x> <y> <z> [facing]    GPS of quarry 0,0,0")
-  print("  scan [radius]                  Geo Scanner → empty-Y + air skips (default 8)")
+  print("  scan [radius|auto]             Depot Geo Scanner sized to site (or 1-16)")
+  print("  requirescan on|off             Miners only claim scanner-mapped cells")
+  print("  clearscans                     Forget per-cell scanner maps")
   print("  ores                           Geo Scanner chunk ore counts")
   print("  geo                            last scan / ore summary")
   print("  where <id>                     admin distance track")
@@ -1495,21 +1912,35 @@ local function handleCommand(line)
       print("geo: no scanner attached")
     end
   elseif cmd == "scan" then
-    local r = tonumber(a[2]) or 8
-    print(("Scanning radius %d…"):format(r))
-    local data, err = runGeoScan(r)
+    local arg = a[2]
+    local r = nil
+    if arg == nil or arg == "auto" or arg == "site" then
+      r = "auto"
+      local used, need, err = siteScanRadius()
+      print(("Scanning site footprint → r=%d (need %s)%s…"):format(
+        used or 8, tostring(need or "?"),
+        err and (" [" .. err .. "]") or ""))
+      if need and need > GEO_RADIUS_MAX then
+        print(("  NOTE: site needs r=%d but scanner max is %d — far cells stay layer-dig."):format(
+          need, GEO_RADIUS_MAX))
+      end
+    else
+      r = tonumber(arg) or 8
+      print(("Scanning radius %d…"):format(r))
+    end
+    local data, err, meta = runGeoScan(r)
     if not data then
       print("scan failed: " .. tostring(err))
     else
       local g = geoHintPayload()
       local solidKeys = 0
       for _ in pairs(geoCache.solids or {}) do solidKeys = solidKeys + 1 end
-      print(("Scan ok — %d solids (%d indexed), %d empty quarry-Y (near scanner)."):format(
+      print(("Scan ok — r=%s solids=%d indexed=%d emptyY=%d"):format(
+        tostring((meta and meta.radius) or g.radius or "-"),
         tonumber(g.solidCount) or 0, solidKeys, #(g.emptyY or {})))
       if g.scanQX ~= nil then
-        print(("  scanner quarry pose %s,%s,%s r=%s"):format(
-          tostring(g.scanQX), tostring(g.scanQY), tostring(g.scanQZ),
-          tostring(g.radius or "-")))
+        print(("  scanner quarry pose %s,%s,%s"):format(
+          tostring(g.scanQX), tostring(g.scanQY), tostring(g.scanQZ)))
       end
       if #(g.emptyY or {}) > 0 then
         print("  emptyY: " .. table.concat(g.emptyY, ","))
@@ -1550,6 +1981,29 @@ local function handleCommand(line)
       local o = g.ores[i]
       print(("  ore %4d  %s"):format(o.count or 0, tostring(o.name)))
     end
+    local scanned, scanning = 0, 0
+    for _, c in ipairs(cfg.cells or {}) do
+      if c.scanned then scanned = scanned + 1 end
+      if cellScanLocked(c) then scanning = scanning + 1 end
+    end
+    print(("  cell maps: scanned=%d scanning=%d requireScan=%s"):format(
+      scanned, scanning, tostring(cfg.requireScan == true)))
+  elseif cmd == "requirescan" then
+    local v = tostring(a[2] or ""):lower()
+    if v == "on" or v == "true" or v == "1" then
+      cfg.requireScan = true
+    elseif v == "off" or v == "false" or v == "0" then
+      cfg.requireScan = false
+    else
+      print("Usage: requirescan on|off  (now " .. tostring(cfg.requireScan == true) .. ")")
+      return
+    end
+    saveCfg()
+    print("requireScan = " .. tostring(cfg.requireScan))
+  elseif cmd == "clearscans" then
+    clearAllCellScans()
+    print("Cleared per-cell scanner maps.")
+    markStatusDirty()
   elseif cmd == "cells" or cmd == "claims" then
     printCells()
   elseif cmd == "turtles" then
@@ -1693,9 +2147,9 @@ else
     cfg.W, cfg.L, cfg.H, cfg.cellSize, #(cfg.cells or {})))
 end
 if findGeoScanner() then
-  print("Geo Scanner found — use `scan` / `ores` / `geo`.")
+  print("Geo Scanner found — `scan` (auto site radius) / `ores` / `geo`.")
 else
-  print("No Geo Scanner — dig works; attach one for empty-Y / air-voxel / ore hints.")
+  print("No Geo Scanner — dig works; attach one for solid-index / ore hints.")
 end
 local mon = wrapMonitor()
 if mon then

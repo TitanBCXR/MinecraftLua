@@ -1,6 +1,6 @@
 --[[
   pastebin_install.lua  -  Pastebin bootstrap installer for the Titan system
-  Titan-Version: 1.2.13
+  Titan-Version: 1.2.14
 
   Pulls the Titan files straight from Pastebin (no in-game host needed). Upload
   each file to pastebin.com once, paste its CODE into the table below, then
@@ -67,6 +67,7 @@ local KEEP_ALL = {
   "router.lua", "router_main.lua", "router_modem.lua",
   "lib/router_hub_net.lua", "lib/router_hub_ui.lua", "lib/router_hub_cmd.lua",
   "quarry/workers/offline_miner.lua", "quarry/workers/strip_miner.lua",
+  "quarry/workers/cell_scanner.lua",
   "quarry/managers/offline_site.lua",
   "storage/managers/storage_manager.lua", "storage/workers/storage_builder.lua",
   "storage/managers/storage_atm.lua",
@@ -113,6 +114,8 @@ local QUARRY_WORKERS = {
     files = { "lib/titan.lua", "quarry/workers/offline_miner.lua", "offline_miner.lua", "exclude.txt" } },
   { key = "2", name = "Strip miner (branch tunnels)", run = "quarry/workers/strip_miner.lua",
     files = { "lib/titan.lua", "quarry/workers/strip_miner.lua", "exclude.txt" } },
+  { key = "3", name = "Cell scanner (place geo / map cells)", run = "quarry/workers/cell_scanner.lua",
+    files = { "lib/titan.lua", "quarry/workers/cell_scanner.lua" } },
 }
 
 local QUARRY_MANAGERS = {
@@ -351,6 +354,7 @@ local LABELS = {
   ["offline_site.lua"] = "QuarrySite",
   ["quarry/workers/offline_miner.lua"] = "OfflineMiner",
   ["quarry/workers/strip_miner.lua"] = "StripMiner",
+  ["quarry/workers/cell_scanner.lua"] = "CellScanner",
   ["quarry/managers/offline_site.lua"] = "QuarrySite",
   ["storage/managers/storage_manager.lua"] = "StorageManager",
   ["storage/managers/storage_atm.lua"] = "StorageATM",

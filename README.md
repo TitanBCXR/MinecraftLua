@@ -7,7 +7,7 @@ A wireless dispatch system for Minecraft's **CC: Tweaked** mod (active packages)
 - **`admin.lua`** — pocket admin tablet (live boards, quarry, gates/perimeter, where-track).
 - **`router.lua`** (+ hub net/ui/cmd) — mesh repeater / MAIN router.
 - **Quarry** (`quarry/`) — installer submenu **q**:
-  - **Workers:** `quarry/workers/offline_miner.lua` (cell fleet) · `quarry/workers/strip_miner.lua` (branch tunnels)
+  - **Workers:** `quarry/workers/offline_miner.lua` (cell fleet) · `quarry/workers/cell_scanner.lua` (per-cell geo maps) · `quarry/workers/strip_miner.lua` (branch tunnels)
   - **Managers:** `quarry/managers/offline_site.lua` (cell site board + optional Geo Scanner)
   - Root `offline_miner.lua` / `offline_site.lua` are compat shims.
 - **Storage** (`storage/`) — installer submenu **s**:
@@ -118,6 +118,7 @@ Each device needs (active installer roles):
 | Admin tablet      | `admin.lua`, `lib/titan.lua`               |
 | Network router    | `router.lua`, hub libs, `versions.lua`     |
 | Quarry → Workers → Cell miner | `quarry/workers/offline_miner.lua`, `lib/titan.lua`, `exclude.txt` |
+| Quarry → Workers → Cell scanner | `quarry/workers/cell_scanner.lua`, `lib/titan.lua` |
 | Quarry → Workers → Strip miner | `quarry/workers/strip_miner.lua`, `lib/titan.lua`, `exclude.txt` |
 | Quarry → Managers → Site board | `quarry/managers/offline_site.lua`, `lib/titan.lua` (+ modem; Geo Scanner optional) |
 | Storage → Managers → Vault hub | `storage/managers/storage_manager.lua`, `lib/titan.lua` (+ wired modems to vault/I/O) |
@@ -722,15 +723,44 @@ edge remainders allowed). **One bot per cell.** Each bot digs that cell’s full
 `origin` (and preferably GPS). Then:
 
 ```
-scan [radius]    # block scan (default 8) → empty-Y + per-cell solid/air hints
+scan             # auto radius sized to the quarry footprint (max 16)
+scan 12          # explicit radius 1–16
 ores             # chunk ore counts
 geo              # last summary
 ```
 
-Empty Y layers and scanned-air voxels ride on cell claims so miners can skip
-barren spots near the scanner. Coverage is limited to the scanner radius —
-re-`scan` as the dig moves. Outside that radius miners still walk the full
-cell and use `detect`. Verify walks stay detect-based before `cell_done`.
+### Cell scanner turtle (large sites)
+
+For quarries bigger than a depot scanner can cover, install
+**Quarry → Workers → Cell scanner**. That turtle carries an AP Geo Scanner item:
+
+1. Claims an unscanned free cell from the site board  
+2. Travels to the **cell center (top layer)**  
+3. Places the Geo Scanner down, runs `scan(radius)` sized to the cell  
+4. Reports the solid index to the site (`quarry_scans/`)  
+5. Picks the scanner back up and takes the next cell  
+
+Empty scanned cells are **auto-completed** on the board. Miners prefer scanned
+cells and dig the solid index. On the site board:
+
+```
+requirescan on    # miners only claim cells the scanner has mapped
+clearscans        # wipe per-cell maps
+```
+
+Scanner turtle: modem in slot 15, coal in 16, Geo Scanner in cargo; `setup` at
+origin, then `join` / `scan`. The scanner block needs enough FE/fuel for AP’s
+`cost(radius)`.
+
+### Depot Geo Scanner (optional)
+
+After depot `scan`, nearby cell claims can also carry a solid index:
+
+- **Fully covered + 0 solids** → miner auto-completes  
+- **Fully covered + solids** → dig those positions only  
+- **Partial / beyond radius 16** → hybrid or layer dig  
+
+Cell-scanner maps override depot hints when present.
 
 **Lifecycle:** `leave_origin` (modem on) → travel → `arrive_cell` → dig inside
 cell AABB → home → `cell_done` → next free cell. Site computes **quarry-relative

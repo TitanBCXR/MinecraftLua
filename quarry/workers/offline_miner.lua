@@ -1,6 +1,6 @@
 --[[
   offline_miner.lua  -  Local quarry turtle (optional site board)
-  Titan-Version: 1.7.0
+  Titan-Version: 1.8.0
 
   Place the turtle at the TOP-FRONT-LEFT corner of the dig, facing into the
   mine. That cell is origin 0,0,0:
@@ -66,7 +66,7 @@ local WORK_RESERVE = 48      -- keep digging only with this much above home cost
 local MIN_FUEL = 200
 local TRAFFIC_Y = -1         -- cruise / traffic layer (+Y = down, so -1 is one above origin)
 -- Keep in sync with Titan-Version header (label uses major.minor → V1.5-Miner12).
-local MINER_VERSION = "1.7.0"
+local MINER_VERSION = "1.8.0"
 -- "outbound" = to cell (overtake) | "homebound" = to origin (yield) | "dig" = wait/retry
 local travelIntent = "dig"
 -- Other miners' last known quarry-relative poses (rednet). Used to tell turtle vs mob/player.
@@ -1569,10 +1569,14 @@ local function boxBandUnits(W, D, y0, y1)
   return units
 end
 
+local function voxelKey(x, y, z)
+  return tostring(x) .. ":" .. tostring(y) .. ":" .. tostring(z)
+end
+
 -- Absolute XZ cell rectangle, full Y band, 1 layer at a time.
 -- skipY: optional set/list of quarry-Y layers to omit (site geo empty hints).
--- skipVoxels: optional list of {x,y,z} air voxels inside scanner coverage.
-local function cellLayerUnits(x0, x1, z0, z1, y0, y1, skipY, skipVoxels)
+-- skipKeys: optional set of "x:y:z" to omit (already handled / known air).
+local function cellLayerUnits(x0, x1, z0, z1, y0, y1, skipY, skipKeys)
   local units = {}
   x0 = math.floor(tonumber(x0) or 0)
   x1 = math.floor(tonumber(x1) or x0)
@@ -1591,19 +1595,9 @@ local function cellLayerUnits(x0, x1, z0, z1, y0, y1, skipY, skipVoxels)
       end
     end
   end
-  local skipXZ = {}
-  if type(skipVoxels) == "table" then
-    for _, v in ipairs(skipVoxels) do
-      if type(v) == "table" then
-        local sx = math.floor(tonumber(v.x) or 0)
-        local sy = math.floor(tonumber(v.y) or 0)
-        local sz = math.floor(tonumber(v.z) or 0)
-        skipXZ[sx .. ":" .. sy .. ":" .. sz] = true
-      end
-    end
-  end
+  skipKeys = type(skipKeys) == "table" and skipKeys or {}
   local function want(x, y, z)
-    return not skipXZ[x .. ":" .. y .. ":" .. z]
+    return not skipKeys[voxelKey(x, y, z)]
   end
   for y = y0, y1 do
     if not skip[y] then
@@ -1621,6 +1615,58 @@ local function cellLayerUnits(x0, x1, z0, z1, y0, y1, skipY, skipVoxels)
     end
   end
   return units
+end
+
+local function normalizeSolidList(solids)
+  local units = {}
+  if type(solids) ~= "table" then return units end
+  for _, v in ipairs(solids) do
+    if type(v) == "table" then
+      units[#units + 1] = {
+        x = math.floor(tonumber(v.x) or 0),
+        y = math.floor(tonumber(v.y) or 0),
+        z = math.floor(tonumber(v.z) or 0),
+      }
+    end
+  end
+  return units
+end
+
+-- Geo-covered air voxels are omitted; uncovered voxels still get a layer dig.
+local function hybridCellUnits(x0, x1, z0, z1, y0, y1, solids, skipY, geo)
+  local solidUnits = normalizeSolidList(solids)
+  local solidKeys = {}
+  for _, u in ipairs(solidUnits) do
+    solidKeys[voxelKey(u.x, u.y, u.z)] = true
+  end
+  local R = tonumber(geo and geo.radius)
+  local sx, sy, sz = tonumber(geo and geo.scanQX), tonumber(geo and geo.scanQY), tonumber(geo and geo.scanQZ)
+  local skipKeys = {}
+  for k, v in pairs(solidKeys) do skipKeys[k] = v end
+  if R and sx and sy and sz then
+    for y = y0, y1 do
+      for z = z0, z1 do
+        for x = x0, x1 do
+          local covered = math.abs(x - sx) <= R
+            and math.abs(y - sy) <= R
+            and math.abs(z - sz) <= R
+          if covered and not solidKeys[voxelKey(x, y, z)] then
+            skipKeys[voxelKey(x, y, z)] = true -- scanned air
+          end
+        end
+      end
+    end
+  end
+  local rest = cellLayerUnits(x0, x1, z0, z1, y0, y1, skipY, skipKeys)
+  local units = {}
+  for _, u in ipairs(solidUnits) do units[#units + 1] = u end
+  for _, u in ipairs(rest) do units[#units + 1] = u end
+  return units, solidUnits
+end
+
+-- True if anything solid remains at the turtle (floor/ceiling/face).
+local function detectAnyHere()
+  return turtle.detect() or turtle.detectUp() or turtle.detectDown()
 end
 
 function site.gpsStubFields()
@@ -3561,7 +3607,7 @@ function site.inActiveCellXZ(slack)
   return pos.x >= x0 and pos.x <= x1 and pos.z >= z0 and pos.z <= z1
 end
 
--- Final full walk of every cell voxel. Must succeed before site cell_done.
+-- Detect-based clear check. box.units overrides full AABB walk (geo solid index).
 -- Returns ok, err, nextVerifyIdx
 function site.verifyCellClear(box, startIdx)
   local x0 = box.x0
@@ -3570,9 +3616,12 @@ function site.verifyCellClear(box, startIdx)
   local z1 = box.z1
   local y0 = box.y0
   local y1 = box.y1
-  local units = cellLayerUnits(x0, x1, z0, z1, y0, y1)
+  local units = box.units
+  if type(units) ~= "table" then
+    units = cellLayerUnits(x0, x1, z0, z1, y0, y1)
+  end
   startIdx = math.max(1, math.floor(tonumber(startIdx) or 1))
-  if startIdx > #units then return true, nil, #units + 1 end
+  if #units == 0 or startIdx > #units then return true, nil, #units + 1 end
   print(("Verify pass — %d voxels from #%d (must be clear before done)"):format(
     #units, startIdx))
   local lastY = -999
@@ -3597,7 +3646,9 @@ function site.verifyCellClear(box, startIdx)
     lastY = u.y
     if not goTo(u.x, u.y, u.z) then return false, "path", i end
     if not site.inActiveCellXZ(0) then return false, "perimeter", i end
-    excavateHere()
+    if detectAnyHere() then
+      excavateHere()
+    end
     if activeJob then
       activeJob.phase = "verify"
       activeJob.verifyIdx = i + 1
@@ -3637,10 +3688,26 @@ function site.runCellClaim(claim, existingJob)
     W = W, L = L, H = y1 - y0 + 1,
   }
 
-  local skipY = claim.emptyY or (claim.geo and claim.geo.emptyY)
-  local skipVoxels = claim.skipVoxels or (claim.geo and claim.geo.skipVoxels)
-  local units = cellLayerUnits(x0, x1, z0, z1, y0, y1, skipY, skipVoxels)
-  do
+  local geo = type(claim.geo) == "table" and claim.geo or {}
+  local skipY = claim.emptyY or geo.emptyY
+  local digMode = tostring(claim.digMode or geo.digMode or claim.dig or "layer")
+  local coverage = tostring(claim.geoCoverage or geo.coverage or "none")
+  local solidList = normalizeSolidList(claim.solids or geo.solids)
+  local units
+  local verifyUnits = nil -- nil = full AABB verify
+
+  if digMode == "solids" and coverage == "full" then
+    units = solidList
+    verifyUnits = solidList
+    print(("Geo solids: %d indexed block(s), coverage=full."):format(#units))
+  elseif digMode == "hybrid" then
+    local solidUnits
+    units, solidUnits = hybridCellUnits(x0, x1, z0, z1, y0, y1, solidList, skipY, geo)
+    verifyUnits = units
+    print(("Geo hybrid: %d solids + uncovered voxels → %d work items."):format(
+      #solidUnits, #units))
+  else
+    units = cellLayerUnits(x0, x1, z0, z1, y0, y1, skipY, nil)
     local nSkip = 0
     if type(skipY) == "table" then
       for k, v in pairs(skipY) do
@@ -3648,22 +3715,39 @@ function site.runCellClaim(claim, existingJob)
         elseif type(k) == "number" and v then nSkip = nSkip + 1 end
       end
     end
-    local nAir = type(skipVoxels) == "table" and #skipVoxels or 0
-    if nSkip > 0 or nAir > 0 then
-      print(("Geo hint: skip %d empty Y + %d air voxels (scanner range)."):format(nSkip, nAir))
+    if nSkip > 0 then
+      print(("Geo hint: skipping %d empty Y layer(s)."):format(nSkip))
     end
   end
+
+  -- Fully scanned empty cell → mark complete without leaving depot.
+  if digMode == "solids" and coverage == "full" and #units == 0 then
+    print(("Geo: cell #%s fully scanned, 0 blocks — auto complete."):format(
+      tostring(claim.cellId or "?")))
+    site.ensureModemForComms(true)
+    site.sendTyped("quarry_cell_done", {
+      status = "idle", cellDone = true, finished = true,
+      cellId = claim.cellId, y0 = y0, y1 = y1,
+      x0 = x0, x1 = x1, z0 = z0, z1 = z1,
+      geoEmpty = true,
+    })
+    activeCell = nil
+    clearJobFile({ keepSite = true })
+    return "done"
+  end
+
   local j = existingJob
   if not j or j.status == "done"
       or tonumber(j.x0) ~= x0 or tonumber(j.z0) ~= z0
       or tonumber(j.x1) ~= x1 or tonumber(j.z1) ~= z1 then
     dug, skipped = 0, 0
     j = {
-      type = "area", site = true, pattern = "cell", dig = "layer",
+      type = "area", site = true, pattern = "cell", dig = digMode,
       cellId = claim.cellId,
       W = W, L = L, D = L, H = y1 + 1, stopY = y1 + 1,
       x0 = x0, x1 = x1, z0 = z0, z1 = z1, y0 = y0, y1 = y1,
       idx = 1, total = #units, status = "active", dug = 0, skipped = 0,
+      geoDigMode = digMode, geoCoverage = coverage,
     }
   else
     j.site = true
@@ -3673,6 +3757,8 @@ function site.runCellClaim(claim, existingJob)
     j.y0, j.y1 = y0, y1
     j.total = #units
     j.idx = math.max(1, math.min(tonumber(j.idx) or 1, #units + 1))
+    j.geoDigMode = digMode
+    j.geoCoverage = coverage
     if j.phase ~= "verify" and (tonumber(j.idx) or 1) > #units then
       j.phase = "verify"
       j.verifyIdx = math.max(1, math.floor(tonumber(j.verifyIdx) or 1))
@@ -3837,8 +3923,13 @@ function site.runCellClaim(claim, existingJob)
         goHome()
         return "stop"
       end
-      excavateHere()
+      if detectAnyHere() then
+        excavateHere()
+      else
+        skipped = skipped + 1 -- geo listed it, but already air
+      end
       j.idx = i + 1
+      j.dug, j.skipped = dug, skipped
       saveJobFile(j)
       if i % 16 == 0 then
         checkIn("cell", { status = "mining", cellId = claim.cellId, job = j })
@@ -3853,11 +3944,33 @@ function site.runCellClaim(claim, existingJob)
     siteSendJob(j)
   end
 
+  -- Solids mode with nothing left to check → complete (scan was empty / all air).
+  if digMode == "solids" and coverage == "full"
+      and type(verifyUnits) == "table" and #verifyUnits == 0 then
+    print("Geo solids empty after dig — marking cell complete.")
+    site.finishJob(true)
+    digging = false
+    site.ensureModemForComms(true)
+    goHome()
+    dumpToStorage()
+    suckFuelFromLeft()
+    site.sendTyped("quarry_cell_done", {
+      status = "idle", cellDone = true, finished = true,
+      cellId = claim.cellId, y0 = y0, y1 = y1,
+      x0 = x0, x1 = x1, z0 = z0, z1 = z1,
+      geoEmpty = true,
+    })
+    activeCell = nil
+    clearJobFile({ keepSite = true })
+    return "done"
+  end
+
   print(("Verify cell #%s before marking done..."):format(tostring(claim.cellId or "?")))
   site.sendTyped("quarry_progress", { status = "verify", cellId = claim.cellId })
   local vOk, vErr, vAt = site.verifyCellClear({
     cellId = claim.cellId,
     x0 = x0, x1 = x1, z0 = z0, z1 = z1, y0 = y0, y1 = y1,
+    units = verifyUnits,
   }, j.verifyIdx or 1)
   if not vOk then
     j.phase = "verify"
