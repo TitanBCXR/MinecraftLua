@@ -1,6 +1,6 @@
 --[[
   games.lua  -  Titan Games Launcher (CC: Tweaked)
-  Titan-Version: 1.2.0
+  Titan-Version: 1.2.1
 
   Run:
 
@@ -11,10 +11,10 @@
   and launches them from a tap-friendly menu.
 
   First run: choose Managed (in-game casino currency) or Unmanaged (granted
-  local chips). Pocket: modem slot 15, speaker slot 16; S swaps sound on/off.
+  local chips). Pocket: modem slot 15, speaker slot 16; M swaps music/modem.
 
   Controls:
-    Tap / Enter  play   U update   S sound   O settings   Q quit
+    Tap / Enter  play   U update   M music/modem   S settings   Q quit
 ]]
 
 local RAW_FALLBACK = "https://raw.githubusercontent.com/TitanBCXR/MinecraftLua/main/"
@@ -136,9 +136,9 @@ local function hasModem()
   return false
 end
 
-local function doSoundSwap()
+local function doMusicModemSwap()
   if not pp or not pp.swapSound then
-    STATUS = "Sound swap needs lib/pocket_peripherals.lua"
+    STATUS = "Music/modem swap needs lib/pocket_peripherals.lua"
     return
   end
   pp.loadConfig()
@@ -571,7 +571,7 @@ local function drawMenu(state)
     -- Slim pocket footer hint (no nav buttons).
     fill(1, th, tw, 1, colors.gray)
     local mode = pp and pp.soundModeLabel and pp.soundModeLabel() or (PREFER_MODEM and "modem" or "spk")
-    textAt(2, th, ("S snd(%s)  O set  U  Q"):format(mode):sub(1, tw - 2),
+    textAt(2, th, ("M %s  S set  U  Q"):format(mode):sub(1, tw - 2),
       colors.white, colors.gray)
   end
 end
@@ -716,7 +716,7 @@ local function runSettings()
       y = y + 1
     end
 
-    textAt(2, th, "S=swap speaker on menu", colors.gray, colors.black)
+    textAt(2, th, "M=modem/speaker swap on menu", colors.gray, colors.black)
 
     local ev, p1, p2, p3 = pullEv()
     local row = rows[sel]
@@ -908,9 +908,9 @@ local function main()
         if games[state.sel] then launchGame(games[state.sel]) end
       elseif p1 == K.u then
         doSync()
-      elseif p1 == K.s then
-        doSoundSwap()
-      elseif p1 == K.o then
+      elseif p1 == K.m then
+        doMusicModemSwap()
+      elseif p1 == K.s or p1 == K.o then
         runSettings()
       elseif p1 == K.q then
         return
@@ -924,8 +924,8 @@ local function main()
       local ch = tostring(p1 or ""):lower()
       if ch == "q" then return
       elseif ch == "u" then doSync()
-      elseif ch == "s" then doSoundSwap()
-      elseif ch == "o" then
+      elseif ch == "m" then doMusicModemSwap()
+      elseif ch == "s" or ch == "o" then
         runSettings()
         STATUS = PREFER_MODEM and "Modem mode on" or "Speaker mode on"
       elseif tonumber(ch) and games[tonumber(ch)] then

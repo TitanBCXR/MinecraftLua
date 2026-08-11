@@ -21,7 +21,7 @@ A wireless dispatch system for Minecraft's **CC: Tweaked** mod (active packages)
 - **`luigi_poker.lua`** — Luigi Picture Poker (beat Luigi’s visible hand; pocket-first; hold/draw).
 - **`higher_lower.lua`** — Pair of Jacks+ video poker → Higher/Lower streak (cash out or risk for jackpot at 10).
 - **`slots.lua`** — 3-reel slots (bet/spin animation, coin bank; monitor tap UI).
-- **`games.lua`** + **`games_catalog.lua`** — Games launcher: HTTP updates; **S** swaps speaker/modem (slots 15/16); **O** Settings (music speed + soundtracks).
+- **`games.lua`** + **`games_catalog.lua`** — Games launcher: HTTP updates; **M** swaps speaker/modem (inventory search; slots 15/16 home); **S** Settings (music speed + soundtracks).
 - **`games/managers/currency_manager.lua`** — casino ledger (floppy rates/balances); mesh API for games + ATMs.
 - **`games/managers/casino_atm.lua`** — casino ATM (chips + Create ticker).
 - **`storage/managers/storage_atm.lua`** — solo storage ATM (wired modem ↔ vault; no ticker/casino).
@@ -506,7 +506,7 @@ Overlapping gates use a grace timer so walking between detectors doesn’t false
 # Games launcher + Casino currency
 
 **Launcher** (`games`): first run asks **Managed** vs **Unmanaged**, then tap a
-game, **U** update, **S** sound swap (pocket modem↔speaker), **O** Settings, **Q** quit.
+game, **U** update, **M** music/modem swap (pocket), **S** Settings, **Q** quit.
 Closing a game returns here.
 
 **Economy (first install):**
@@ -514,9 +514,10 @@ Closing a game returns here.
 - **Unmanaged** — grants **10,000** local chips (shared wallet); no hard bet cap —
   only what you have. Bet buttons **±10 / ±50 / ±100**.
 
-**Settings (O or SETTINGS bar):** music speed (0.5×–2×), per-game soundtrack presets,
+**Settings (S or SETTINGS bar):** music speed (0.5×–2×), per-game soundtrack presets,
 global track override, launch mesh preference, economy re-setup. Pocket: put **modem
-in slot 15**, **speaker in slot 16**; **S** on the main menu swaps sound on/off.
+in slot 15**, **speaker in slot 16** (home slots); **M** on the main menu swaps
+music/modem (searches all inventory for the counterpart).
 
 **Soundtracks** (`lib/games_music.lua`): themed note-block presets per game —
 Tetris (Classic / Arcade / Zen), Minesweeper (Probe / Stealth / Radar), Luigi
@@ -549,9 +550,9 @@ global LB** enabled so Tetris/Minesweeper still sync scores to the host.
 on the device is cache only. On an **advanced computer**, attach a **speaker**
 block adjacent to the PC alongside the modem — music and LB sync together. On a
 **pocket**, only one back upgrade fits: keep the **modem** in **slot 15** for boot
-sync, **speaker in slot 16**, then press **S** to swap for music (network
+sync, **speaker in slot 16**, then press **M** to swap for music (network
 locks after boot sync; scores queue locally until the next boot with modem).
-Games launcher **Settings** pick speed + soundtrack; **S** swaps hardware.
+Games launcher **Settings** pick speed + soundtrack; **M** swaps hardware.
 
 **Set the LB password (no Parent Center required):** boot `admin` → choose **2)
 Games leaderboard** at the sign-in gate (or unlock fully and open the

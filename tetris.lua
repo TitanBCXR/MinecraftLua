@@ -1,6 +1,6 @@
 --[[
   tetris.lua  -  Standalone Tetris for CC: Tweaked (pocket / computer)
-  Titan-Version: 1.3.0
+  Titan-Version: 1.3.1
 
   Drop on a pocket PC or advanced computer and run:
 
@@ -26,8 +26,8 @@
   mesh), including with a speaker / Noisy pocket. `--no-modem` skips mesh.
 
   Music (speaker / Noisy pocket): note tracks from lib/games_music.lua (speed +
-  soundtrack chosen in Games launcher Settings). M mutes. Pocket: modem in slot
-  15, speaker in slot 16; equip modem for boot sync, then S to swap for music.
+  soundtrack chosen in Games launcher Settings). In-game M mutes. Pocket: modem
+  in slot 15, speaker in slot 16; equip modem for boot sync, then M to swap for music.
 
   Player name: uses Advanced Peripherals Player Detector when present; otherwise
   prompts for a name after a game (saved in tetris.cfg). That name is what
@@ -215,7 +215,7 @@ local function meshStatusLine()
     return sp and "local (no modem)" or "local cache"
   end
   if sp and md then return "notes+host LB"
-  elseif sp then return "notes (S=modem)"
+  elseif sp then return "notes (M=modem)"
   elseif md then return "host LB"
   else return "local cache"
   end
@@ -1233,8 +1233,8 @@ local function drawMenu(playBtn, ctrlBtn)
 
   local net = NET_LOCKED and "local LB" or meshStatusLine()
   local foot = FROM_LAUNCHER
-    and ("Enter play  S swap  C  M  R  Q=Close  %s"):format(net)
-    or ("Enter play  S swap  C ctrl  M mute  R local  Q=off  %s"):format(net)
+    and ("Enter play  M swap  C  R  Q=Close  %s"):format(net)
+    or ("Enter play  M swap  C ctrl  R local  Q=off  %s"):format(net)
   text(2, th, foot:sub(1, tw - 2), colors.gray, colors.black)
 end
 
@@ -1254,8 +1254,8 @@ local function controlsScreen()
       { "Soft",  "S / J / ↓" },
       { "Hard",  "Space / Enter" },
       { "Pause", "P" },
-      { "Mute",  "M (note music)" },
-      { "Swap",  "S (modem <-> speaker)" },
+      { "Mute",  "M (in-game note music)" },
+      { "Swap",  "M (menu: modem <-> speaker)" },
       { "Board", "R reload local cache" },
       { "Menu",  FROM_LAUNCHER and "Q / Close (back to launcher)" or "Q (always)" },
     }
@@ -1347,6 +1347,25 @@ local function mainMenu()
     musicTimer = os.startTimer(MUSIC_ON and SPEAKER and 0.05 or 3600)
   end
 
+  local function menuMusicModemKey()
+    if pocket and type(pocket.equipBack) == "function" then
+      local ok, err = swapPocketUpgrade()
+      if not ok then
+        clearScreen(colors.black)
+        term.setCursorPos(1, 1)
+        print("Music/modem swap failed: " .. tostring(err or "check inventory"))
+        print("Modem slot 15, speaker slot 16 — press M again.")
+        sleep(1.6)
+        drainInputEvents()
+      end
+      resumeMenuMusic()
+    else
+      MUSIC_ON = not MUSIC_ON
+      saveCfg()
+      if MUSIC_ON then resumeMenuMusic() else stopMusic() end
+    end
+  end
+
   local function playRound()
     stopMusic()
     local score = runGame()
@@ -1377,21 +1396,8 @@ local function mainMenu()
         stopMusic()
         editPlayerName()
         resumeMenuMusic()
-      elseif p1 == keys.m then
-        MUSIC_ON = not MUSIC_ON
-        saveCfg()
-        if MUSIC_ON then resumeMenuMusic() else stopMusic() end
-      elseif p1 == keys.s or p1 == keys.u then
-        local ok, err = swapPocketUpgrade()
-        if not ok then
-          clearScreen(colors.black)
-          term.setCursorPos(1, 1)
-          print("Sound swap failed: " .. tostring(err or "check slots 15/16"))
-          print("Modem slot 15, speaker slot 16 — press S again.")
-          sleep(1.6)
-          drainInputEvents()
-        end
-        resumeMenuMusic()
+      elseif p1 == keys.m or p1 == keys.u then
+        menuMusicModemKey()
       elseif p1 == keys.q then
         stopMusic()
         clearScreen(colors.black)
@@ -1433,21 +1439,8 @@ local function mainMenu()
         stopMusic()
         editPlayerName()
         resumeMenuMusic()
-      elseif ch == "m" then
-        MUSIC_ON = not MUSIC_ON
-        saveCfg()
-        if MUSIC_ON then resumeMenuMusic() else stopMusic() end
-      elseif ch == "s" or ch == "u" then
-        local ok, err = swapPocketUpgrade()
-        if not ok then
-          clearScreen(colors.black)
-          term.setCursorPos(1, 1)
-          print("Sound swap failed: " .. tostring(err or "check slots 15/16"))
-          print("Modem slot 15, speaker slot 16 — press S again.")
-          sleep(1.6)
-          drainInputEvents()
-        end
-        resumeMenuMusic()
+      elseif ch == "m" or ch == "u" then
+        menuMusicModemKey()
       end
     elseif ev == "mouse_click" then
       local x, y = p2, p3
@@ -1497,7 +1490,7 @@ local function bootCheckUpdates()
       print("No-modem mode — cached leaderboard only.")
     else
       print("No modem — cached leaderboard only.")
-      print("(Equip wireless modem in slot 15; S swaps speaker slot 16.)")
+      print("(Equip wireless modem in slot 15; M swaps speaker from inventory.)")
     end
     lockNetworkOffline()
     sleep(0.55)

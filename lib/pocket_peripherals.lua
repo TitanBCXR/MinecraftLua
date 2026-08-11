@@ -1,14 +1,14 @@
 --[[
   pocket_peripherals.lua  -  Pocket modem / speaker slot helpers (Titan games)
-  Titan-Version: 1.0.0
+  Titan-Version: 1.0.1
 
   Reserved inventory slots for pocket PCs (16-slot hotbar):
     MODEM_SLOT   = 15  (wireless modem home — equip for mesh / host LB)
     SPEAKER_SLOT = 16  (speaker home — swap onto back for music)
 
-  Press S in the Games launcher or Tetris menu to swap the back upgrade between
-  modem and speaker. Items are parked in the home slots first; if misplaced,
-  they are found by item name and moved home.
+  Press M in the Games launcher or Tetris menu to swap the back upgrade between
+  modem and speaker. Searches all inventory slots for the counterpart item;
+  home slots 15/16 are preferred when parking items.
 
   Config (optional) in games_launcher.cfg:
     modemSlot = 15, speakerSlot = 16
@@ -70,7 +70,7 @@ function pp.getSlots()
 end
 
 function pp.setupHelp()
-  return ("Modem slot %d, speaker slot %d — S swaps sound on/off"):format(
+  return ("Modem slot %d, speaker slot %d — M swaps music/modem"):format(
     MODEM_SLOT, SPEAKER_SLOT)
 end
 
@@ -203,7 +203,7 @@ function pp.ensureModemEquipped(titan)
   return ok and pp.hasModem()
 end
 
--- Toggle back upgrade: modem equipped -> speaker; otherwise -> modem.
+-- Toggle back upgrade: modem equipped -> speaker in inventory; otherwise -> modem.
 function pp.swapSound(titan)
   pp.loadConfig()
   if not pocket or type(pocket.equipBack) ~= "function" then
@@ -214,14 +214,14 @@ function pp.swapSound(titan)
 
   local targetSlot
   if pp.hasModem() then
-    targetSlot = SPEAKER_SLOT
-    if itemCount(targetSlot) == 0 or not pp.isSpeakerItem(itemDetail(targetSlot)) then
-      return false, ("no speaker in slot %d"):format(SPEAKER_SLOT)
+    targetSlot = pp.findSpeakerSlot()
+    if not targetSlot then
+      return false, "no speaker in inventory"
     end
   else
-    targetSlot = MODEM_SLOT
-    if itemCount(targetSlot) == 0 or not pp.isModemItem(itemDetail(targetSlot)) then
-      return false, ("no modem in slot %d"):format(MODEM_SLOT)
+    targetSlot = pp.findModemSlot()
+    if not targetSlot then
+      return false, "no modem in inventory"
     end
   end
 
