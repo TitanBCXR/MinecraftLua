@@ -1,6 +1,6 @@
 --[[
   tetris.lua  -  Standalone Tetris for CC: Tweaked (pocket / computer)
-  Titan-Version: 1.2.9
+  Titan-Version: 1.3.0
 
   Drop on a pocket PC or advanced computer and run:
 
@@ -25,10 +25,9 @@
   Host LB sync runs whenever a wireless modem is present (direct or router
   mesh), including with a speaker / Noisy pocket. `--no-modem` skips mesh.
 
-  Music (speaker / Noisy pocket): two in-script note tracks — calm menu bed +
-  retro Korobeiniki in-game. M mutes. Speaker + modem together: on an advanced
-  PC attach both peripherals; on a pocket equip modem for boot sync, then U
-  to swap to speaker for music (scores queue locally until next boot sync).
+  Music (speaker / Noisy pocket): note tracks from lib/games_music.lua (speed +
+  soundtrack chosen in Games launcher Settings). M mutes. Pocket: modem in slot
+  15, speaker in slot 16; equip modem for boot sync, then S to swap for music.
 
   Player name: uses Advanced Peripherals Player Detector when present; otherwise
   prompts for a name after a game (saved in tetris.cfg). That name is what
@@ -88,6 +87,18 @@ local titan = nil
 if fs.exists("lib/titan.lua") then
   local ok, lib = pcall(dofile, "lib/titan.lua")
   if ok and type(lib) == "table" then titan = lib end
+end
+
+local pp = nil
+if fs.exists("lib/pocket_peripherals.lua") then
+  local ok, lib = pcall(dofile, "lib/pocket_peripherals.lua")
+  if ok and type(lib) == "table" then pp = lib end
+end
+
+local gm = nil
+if fs.exists("lib/games_music.lua") then
+  local ok, lib = pcall(dofile, "lib/games_music.lua")
+  if ok and type(lib) == "table" then gm = lib end
 end
 
 local NATIVE = term.current()
@@ -174,59 +185,23 @@ local HI
 HI, PLAYER_NAME = loadCfg()
 
 --------------------------------------------------------------------------------
--- Speaker music (Noisy pocket) + modem detection for mesh
+-- Speaker music (launcher settings + pocket swap)
 --------------------------------------------------------------------------------
 local SPEAKER = nil
-local musicIdx = 1
-local musicBassPulse = 0
-local musicTrackName = "menu"
--- Two tiny note-block tracks (no audio files).
-local TRACKS = {
-  -- Calm menu bed (soft arpeggios — different mood from the game theme).
-  menu = {
-    beat = 0.20,
-    legato = 0.80,
-    style = "menu",
-    bass = { 4, 4, 4, 4, 2, 2, 2, 2, 0, 0, 0, 0, 4, 4, 7, 7 },
-    melody = {
-      {9, 2}, {12, 2}, {16, 3}, {12, 2}, {9, 2}, {7, 3},
-      {false, 1},
-      {7, 2}, {11, 2}, {14, 3}, {11, 2}, {7, 2}, {4, 3},
-      {false, 1},
-      {4, 2}, {7, 2}, {12, 3}, {9, 2}, {7, 2}, {9, 4},
-      {false, 2},
-      {12, 2}, {16, 2}, {19, 3}, {16, 2}, {12, 2}, {9, 4},
-      {false, 3},
-    },
-  },
-  -- In-game: retro Korobeiniki (public-domain folk melody).
-  game = {
-    beat = 0.13,
-    legato = 0.72,
-    style = "game",
-    bass = { 4, 4, 2, 2, 0, 0, 4, 4, 7, 7, 4, 4, 0, 0, 4, 4 },
-    melody = {
-      {16, 2}, {11, 1}, {12, 1}, {14, 2}, {12, 1}, {11, 1},
-      {9, 2}, {9, 1}, {12, 1}, {16, 2}, {14, 1}, {12, 1},
-      {11, 2}, {11, 1}, {12, 1}, {14, 2}, {16, 2},
-      {12, 2}, {9, 2}, {9, 4},
-      {false, 2},
-      {14, 2}, {17, 1}, {21, 2}, {19, 1}, {17, 1},
-      {16, 3}, {12, 1}, {16, 2}, {14, 1}, {12, 1},
-      {11, 2}, {11, 1}, {12, 1}, {14, 2}, {16, 2},
-      {12, 2}, {9, 2}, {9, 4},
-      {false, 4},
-    },
-  },
-}
+local musicPlayer = gm and gm.newPlayer("tetris") or nil
 local LEGACY_MUSIC_FILE = "tetris_lofi.dfpwm"
 
 local function refreshSpeaker()
-  SPEAKER = peripheral.find("speaker")
+  if musicPlayer and musicPlayer.refreshSpeaker then
+    SPEAKER = musicPlayer:refreshSpeaker() and peripheral.find("speaker") or nil
+  else
+    SPEAKER = peripheral.find("speaker")
+  end
   return SPEAKER ~= nil
 end
 
 local function hasModem()
+  if pp and pp.hasModem then return pp.hasModem() end
   for _, name in ipairs(peripheral.getNames()) do
     if peripheral.getType(name) == "modem" then return true end
   end
@@ -240,39 +215,39 @@ local function meshStatusLine()
     return sp and "local (no modem)" or "local cache"
   end
   if sp and md then return "notes+host LB"
-  elseif sp then return "notes (U=modem)"
+  elseif sp then return "notes (S=modem)"
   elseif md then return "host LB"
   else return "local cache"
   end
 end
 
--- Swap pocket back upgrade (speaker <-> wireless modem in inventory).
--- Select the upgrade slot you want before pressing U for best results.
 local function swapPocketUpgrade()
+  if pp and pp.swapSound then
+    if gm then gm.loadSettings() end
+    local ok, err = pp.swapSound(titan)
+    refreshSpeaker()
+    return ok, err
+  end
   if not pocket or type(pocket.equipBack) ~= "function" then
     return false, "not a pocket PC"
   end
   local ok, err = pocket.equipBack()
   refreshSpeaker()
-  if hasModem() and titan and titan.openModem then
-    pcall(titan.openModem)
-  end
+  if hasModem() and titan and titan.openModem then pcall(titan.openModem) end
   return ok, err
 end
 
 local function stopMusic()
-  -- Only cut audio on pause/mute/exit / track switch — never between notes.
+  if musicPlayer then musicPlayer:stop() end
   if SPEAKER then pcall(function() SPEAKER.stop() end) end
 end
 
 local function startMusic(trackName)
-  trackName = trackName or musicTrackName or "menu"
-  if trackName ~= musicTrackName then
-    stopMusic()
+  trackName = trackName or "menu"
+  if musicPlayer then
+    musicPlayer:start(trackName)
+    return MUSIC_ON and refreshSpeaker()
   end
-  musicTrackName = trackName
-  musicIdx = 1
-  musicBassPulse = 0
   return MUSIC_ON and refreshSpeaker()
 end
 
@@ -284,46 +259,11 @@ end
 
 local function musicStepSeconds()
   if not MUSIC_ON then return 0.5 end
-  if not SPEAKER and not refreshSpeaker() then return 1.0 end
-  local tr = TRACKS[musicTrackName] or TRACKS.game
-  local melody, bass = tr.melody, tr.bass
-  local note = melody[musicIdx] or { false, 1 }
-  musicIdx = musicIdx + 1
-  if musicIdx > #melody then musicIdx = 1 end
-  local pitch, beats = note[1], tonumber(note[2]) or 1
-
-  musicBassPulse = musicBassPulse + 1
-  local bassPitch = bass[((musicBassPulse - 1) % #bass) + 1]
-
-  if tr.style == "menu" then
-    -- Softer, airier menu bed.
-    playSoft("bass", 0.16, bassPitch)
-    if pitch ~= false and pitch ~= nil then
-      playSoft("flute", 0.28, pitch)
-      playSoft("chime", 0.12, pitch)
-      playSoft("guitar", 0.12, math.max(0, pitch - 5))
-    else
-      playSoft("harp", 0.08, math.min(24, bassPitch + 12))
-    end
-  else
-    -- Brighter in-game theme.
-    playSoft("bass", 0.22, bassPitch)
-    if pitch ~= false and pitch ~= nil then
-      playSoft("harp", 0.42, pitch)
-      playSoft("pling", 0.18, pitch)
-      local harmony = pitch - 5
-      if harmony < 0 then harmony = pitch + 3 end
-      playSoft("guitar", 0.16, harmony)
-      if beats >= 2 then
-        playSoft("flute", 0.14, math.min(24, pitch + 7))
-      end
-    else
-      playSoft("guitar", 0.10, bassPitch + 12 <= 24 and bassPitch + 12 or bassPitch)
-    end
+  if musicPlayer then
+    return musicPlayer:step(MUSIC_ON)
   end
-
-  local wait = beats * (tr.beat or 0.14) * (tr.legato or 0.75)
-  return math.max(0.06, wait)
+  if not SPEAKER and not refreshSpeaker() then return 1.0 end
+  return 0.5
 end
 
 local function sfxLineClear(n)
@@ -1293,8 +1233,8 @@ local function drawMenu(playBtn, ctrlBtn)
 
   local net = NET_LOCKED and "local LB" or meshStatusLine()
   local foot = FROM_LAUNCHER
-    and ("Enter play  C  M  R  Q=Close  %s"):format(net)
-    or ("Enter play  C ctrl  M mute  R local  Q=off  %s"):format(net)
+    and ("Enter play  S swap  C  M  R  Q=Close  %s"):format(net)
+    or ("Enter play  S swap  C ctrl  M mute  R local  Q=off  %s"):format(net)
   text(2, th, foot:sub(1, tw - 2), colors.gray, colors.black)
 end
 
@@ -1315,7 +1255,7 @@ local function controlsScreen()
       { "Hard",  "Space / Enter" },
       { "Pause", "P" },
       { "Mute",  "M (note music)" },
-      { "Swap",  "U (modem <-> speaker)" },
+      { "Swap",  "S (modem <-> speaker)" },
       { "Board", "R reload local cache" },
       { "Menu",  FROM_LAUNCHER and "Q / Close (back to launcher)" or "Q (always)" },
     }
@@ -1398,6 +1338,7 @@ local function mainMenu()
   -- Soft detect on menu open.
   local det = sanitizeName(detectNearbyPlayer())
   if det then PLAYER_NAME = det; saveCfg() end
+  if gm then gm.loadSettings() end
   startMusic("menu")
   local musicTimer = os.startTimer(MUSIC_ON and refreshSpeaker() and 0.05 or 3600)
 
@@ -1440,13 +1381,13 @@ local function mainMenu()
         MUSIC_ON = not MUSIC_ON
         saveCfg()
         if MUSIC_ON then resumeMenuMusic() else stopMusic() end
-      elseif p1 == keys.u then
+      elseif p1 == keys.s or p1 == keys.u then
         local ok, err = swapPocketUpgrade()
         if not ok then
           clearScreen(colors.black)
           term.setCursorPos(1, 1)
-          print("Upgrade swap failed: " .. tostring(err or "none in hotbar"))
-          print("Select a wireless modem or speaker, then U.")
+          print("Sound swap failed: " .. tostring(err or "check slots 15/16"))
+          print("Modem slot 15, speaker slot 16 — press S again.")
           sleep(1.6)
           drainInputEvents()
         end
@@ -1496,13 +1437,13 @@ local function mainMenu()
         MUSIC_ON = not MUSIC_ON
         saveCfg()
         if MUSIC_ON then resumeMenuMusic() else stopMusic() end
-      elseif ch == "u" then
+      elseif ch == "s" or ch == "u" then
         local ok, err = swapPocketUpgrade()
         if not ok then
           clearScreen(colors.black)
           term.setCursorPos(1, 1)
-          print("Upgrade swap failed: " .. tostring(err or "none in hotbar"))
-          print("Select a wireless modem or speaker, then U.")
+          print("Sound swap failed: " .. tostring(err or "check slots 15/16"))
+          print("Modem slot 15, speaker slot 16 — press S again.")
           sleep(1.6)
           drainInputEvents()
         end
@@ -1547,12 +1488,16 @@ local function bootCheckUpdates()
   if fs.exists(LEGACY_MUSIC_FILE) then pcall(fs.delete, LEGACY_MUSIC_FILE) end
   print(meshStatusLine())
 
+  if pp and pp.ensureModemEquipped then
+    pp.ensureModemEquipped(titan)
+  end
+
   if NO_MODEM or not hasModem() then
     if NO_MODEM then
       print("No-modem mode — cached leaderboard only.")
     else
       print("No modem — cached leaderboard only.")
-      print("(Equip wireless modem for host sync; U swaps pocket upgrade.)")
+      print("(Equip wireless modem in slot 15; S swaps speaker slot 16.)")
     end
     lockNetworkOffline()
     sleep(0.55)

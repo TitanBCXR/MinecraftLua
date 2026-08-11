@@ -1,6 +1,6 @@
 --[[
   slots.lua  -  3-reel slots for CC: Tweaked
-  Titan-Version: 1.0.5
+  Titan-Version: 1.0.6
 
   Run:
 
@@ -45,6 +45,12 @@ local econ = nil
 if fs.exists("lib/games_economy.lua") then
   local ok, e = pcall(dofile, "lib/games_economy.lua")
   if ok then econ = e; econ.load() end
+end
+
+local gm = nil
+if fs.exists("lib/games_music.lua") then
+  local ok, lib = pcall(dofile, "lib/games_music.lua")
+  if ok and type(lib) == "table" then gm = lib; gm.loadSettings() end
 end
 
 -- Symbol weights (higher = more common). Payouts for 3-of-a-kind / 2-of-a-kind.
@@ -211,20 +217,33 @@ local function creditWin(n)
 end
 
 --------------------------------------------------------------------------------
--- Audio
+-- Audio (SFX + optional casino bed from lib/games_music.lua)
 --------------------------------------------------------------------------------
+local musicPlayer = gm and gm.newPlayer("slots") or nil
+
 local function refreshSpeaker()
-  SPEAKER = peripheral.find("speaker")
+  if musicPlayer and musicPlayer.refreshSpeaker then
+    SPEAKER = musicPlayer:refreshSpeaker() and peripheral.find("speaker") or nil
+  else
+    SPEAKER = peripheral.find("speaker")
+  end
   return SPEAKER ~= nil
 end
 
 local function stopMusic()
+  if musicPlayer then musicPlayer:stop() end
   if SPEAKER then pcall(function() SPEAKER.stop() end) end
 end
 
 local function playSoft(inst, vol, pitch)
   if not SPEAKER or pitch == nil or pitch < 0 or pitch > 24 then return end
   pcall(function() SPEAKER.playNote(inst, vol, pitch) end)
+end
+
+local function musicTick()
+  if not MUSIC_ON then return 0.5 end
+  if musicPlayer then return musicPlayer:step(MUSIC_ON) end
+  return 0.5
 end
 
 local function sfx(kind)
@@ -464,11 +483,15 @@ local function main()
     btns = {},
   }
   local spinTimer = nil
+  if musicPlayer then musicPlayer:start("menu") end
+  local musicTimer = os.startTimer(MUSIC_ON and 0.05 or 3600)
   drawScreen(state)
 
   while true do
     local ev, p1, p2, p3 = pullEv()
-    if ev == "timer" and spinTimer and p1 == spinTimer then
+    if ev == "timer" and p1 == musicTimer then
+      musicTimer = os.startTimer(musicTick())
+    elseif ev == "timer" and spinTimer and p1 == spinTimer then
       if spinTick(state) then
         spinTimer = os.startTimer(0.09)
       else
@@ -512,7 +535,7 @@ local function main()
       if p1 == K.q then return
       elseif p1 == K.m then
         MUSIC_ON = not MUSIC_ON; saveCfg()
-        if not MUSIC_ON then stopMusic() end
+        if not MUSIC_ON then stopMusic() else musicTimer = os.startTimer(0.05) end
       elseif not state.spinning then
         if p1 == K.one then addBet(state, 10); drawScreen(state)
         elseif p1 == K.two then addBet(state, 50); drawScreen(state)
@@ -535,7 +558,7 @@ local function main()
       if ch == "q" then return
       elseif ch == "m" then
         MUSIC_ON = not MUSIC_ON; saveCfg()
-        if not MUSIC_ON then stopMusic() end
+        if not MUSIC_ON then stopMusic() else musicTimer = os.startTimer(0.05) end
       elseif not state.spinning and ch == "1" then
         addBet(state, 10); drawScreen(state)
       elseif not state.spinning and ch == "2" then

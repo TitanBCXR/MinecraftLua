@@ -1,6 +1,6 @@
 --[[
   luigi_poker.lua  -  Luigi Picture Poker (SMB3-style) for CC: Tweaked
-  Titan-Version: 1.2.6
+  Titan-Version: 1.2.7
 
   Run:
 
@@ -51,6 +51,12 @@ local econ = nil
 if fs.exists("lib/games_economy.lua") then
   local ok, e = pcall(dofile, "lib/games_economy.lua")
   if ok then econ = e; econ.load() end
+end
+
+local gm = nil
+if fs.exists("lib/games_music.lua") then
+  local ok, lib = pcall(dofile, "lib/games_music.lua")
+  if ok and type(lib) == "table" then gm = lib; gm.loadSettings() end
 end
 
 -- Rank id 1..6 (Cloud lowest, Luigi highest)
@@ -238,22 +244,21 @@ local function creditWin(n)
 end
 
 --------------------------------------------------------------------------------
--- Tiny casino bed (optional speaker)
+-- Casino bed (lib/games_music.lua)
 --------------------------------------------------------------------------------
-local musicIdx = 1
-local MENU_NOTES = {
-  { 7, 2 }, { 10, 2 }, { 12, 2 }, { 10, 2 },
-  { 7, 2 }, { 5, 2 }, { 7, 3 }, { false, 1 },
-  { 10, 2 }, { 12, 2 }, { 14, 2 }, { 12, 2 },
-  { 10, 2 }, { 7, 3 }, { false, 2 },
-}
+local musicPlayer = gm and gm.newPlayer("luigi_poker") or nil
 
 local function refreshSpeaker()
-  SPEAKER = peripheral.find("speaker")
+  if musicPlayer and musicPlayer.refreshSpeaker then
+    SPEAKER = musicPlayer:refreshSpeaker() and peripheral.find("speaker") or nil
+  else
+    SPEAKER = peripheral.find("speaker")
+  end
   return SPEAKER ~= nil
 end
 
 local function stopMusic()
+  if musicPlayer then musicPlayer:stop() end
   if SPEAKER then pcall(function() SPEAKER.stop() end) end
 end
 
@@ -264,17 +269,9 @@ end
 
 local function musicTick()
   if not MUSIC_ON then return 0.4 end
+  if musicPlayer then return musicPlayer:step(MUSIC_ON) end
   if not SPEAKER and not refreshSpeaker() then return 1.0 end
-  local note = MENU_NOTES[musicIdx] or { false, 1 }
-  musicIdx = musicIdx + 1
-  if musicIdx > #MENU_NOTES then musicIdx = 1 end
-  local pitch, beats = note[1], note[2] or 1
-  playSoft("bass", 0.12, 2)
-  if pitch then
-    playSoft("pling", 0.22, pitch)
-    playSoft("guitar", 0.10, math.max(0, pitch - 5))
-  end
-  return math.max(0.08, beats * 0.16)
+  return 0.4
 end
 
 local function sfx(kind)
@@ -693,6 +690,7 @@ local function main()
   attachMonitor()
   refreshSpeaker()
   initEconomy()
+  if musicPlayer then musicPlayer:start("menu") end
   local state = newState()
   state.bet = clampBet(state.bet or 1)
   local musicTimer = os.startTimer(MUSIC_ON and 0.05 or 3600)

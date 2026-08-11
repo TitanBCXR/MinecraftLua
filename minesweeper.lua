@@ -1,6 +1,6 @@
 --[[
   minesweeper.lua  -  Lightweight Minesweeper for CC: Tweaked
-  Titan-Version: 1.2.3
+  Titan-Version: 1.2.4
 
   Run:
 
@@ -12,7 +12,7 @@
   mute, new, quit) so you can close the computer UI and play from the screen.
   Keys still work on the PC. Color monitors / advanced pockets get colored numbers.
 
-  Music (speaker / Noisy pocket): calm menu bed + tense in-game pulse.
+  Music: lib/games_music.lua (speed + soundtrack from Games launcher Settings).
   M mutes. Tiny note-block tracks only (no audio files).
 
   Controls:
@@ -112,6 +112,12 @@ end
 
 loadCfg()
 
+local gm = nil
+if fs.exists("lib/games_music.lua") then
+  local ok, lib = pcall(dofile, "lib/games_music.lua")
+  if ok and type(lib) == "table" then gm = lib; gm.loadSettings() end
+end
+
 local function submitMinesLb(seconds)
   if SPEAKER_ONLY then return end
   local hasModem = false
@@ -143,61 +149,28 @@ local function submitMinesLb(seconds)
 end
 
 --------------------------------------------------------------------------------
--- Speaker music (menu + gameplay). No audio files — tiny note tables.
+-- Speaker music (launcher settings)
 --------------------------------------------------------------------------------
 local SPEAKER = nil
-local musicIdx = 1
-local musicBassPulse = 0
-local musicTrackName = "menu"
-local TRACKS = {
-  -- Soft curious menu bed.
-  menu = {
-    beat = 0.22,
-    legato = 0.82,
-    style = "menu",
-    bass = { 2, 2, 2, 2, 5, 5, 5, 5, 0, 0, 7, 7, 2, 2, 5, 5 },
-    melody = {
-      {7, 2}, {9, 2}, {12, 3}, {9, 2}, {7, 2}, {5, 3},
-      {false, 1},
-      {5, 2}, {7, 2}, {11, 3}, {7, 2}, {5, 2}, {2, 4},
-      {false, 2},
-      {9, 2}, {12, 2}, {14, 3}, {12, 2}, {9, 2}, {7, 4},
-      {false, 2},
-    },
-  },
-  -- Tense in-game pulse (different mood from the menu).
-  game = {
-    beat = 0.15,
-    legato = 0.74,
-    style = "game",
-    bass = { 0, 0, 3, 3, 5, 5, 3, 3, 0, 0, 7, 7, 5, 5, 3, 3 },
-    melody = {
-      {12, 1}, {false, 1}, {12, 1}, {11, 1}, {9, 2}, {7, 2},
-      {9, 1}, {11, 1}, {12, 2}, {14, 2}, {12, 2},
-      {false, 1},
-      {14, 1}, {12, 1}, {11, 2}, {9, 2}, {7, 2}, {9, 3},
-      {false, 2},
-      {7, 1}, {9, 1}, {11, 1}, {12, 2}, {11, 1}, {9, 2}, {7, 3},
-      {false, 2},
-    },
-  },
-}
+local musicPlayer = gm and gm.newPlayer("minesweeper") or nil
 
 local function refreshSpeaker()
-  SPEAKER = peripheral.find("speaker")
+  if musicPlayer and musicPlayer.refreshSpeaker then
+    SPEAKER = musicPlayer:refreshSpeaker() and peripheral.find("speaker") or nil
+  else
+    SPEAKER = peripheral.find("speaker")
+  end
   return SPEAKER ~= nil
 end
 
 local function stopMusic()
+  if musicPlayer then musicPlayer:stop() end
   if SPEAKER then pcall(function() SPEAKER.stop() end) end
 end
 
 local function startMusic(trackName)
-  trackName = trackName or musicTrackName or "menu"
-  if trackName ~= musicTrackName then stopMusic() end
-  musicTrackName = trackName
-  musicIdx = 1
-  musicBassPulse = 0
+  trackName = trackName or "menu"
+  if musicPlayer then musicPlayer:start(trackName) end
   return MUSIC_ON and refreshSpeaker()
 end
 
@@ -208,37 +181,9 @@ end
 
 local function musicStepSeconds()
   if not MUSIC_ON then return 0.5 end
+  if musicPlayer then return musicPlayer:step(MUSIC_ON) end
   if not SPEAKER and not refreshSpeaker() then return 1.0 end
-  local tr = TRACKS[musicTrackName] or TRACKS.game
-  local melody, bass = tr.melody, tr.bass
-  local note = melody[musicIdx] or { false, 1 }
-  musicIdx = musicIdx + 1
-  if musicIdx > #melody then musicIdx = 1 end
-  local pitch, beats = note[1], tonumber(note[2]) or 1
-
-  musicBassPulse = musicBassPulse + 1
-  local bassPitch = bass[((musicBassPulse - 1) % #bass) + 1]
-  playSoft("bass", tr.style == "menu" and 0.14 or 0.20, bassPitch)
-
-  if tr.style == "menu" then
-    if pitch ~= false and pitch ~= nil then
-      playSoft("chime", 0.22, pitch)
-      playSoft("guitar", 0.12, math.max(0, pitch - 5))
-    else
-      playSoft("harp", 0.08, math.min(24, bassPitch + 12))
-    end
-  else
-    -- Sparse tense lead + soft hat tick for "sweeper" feel.
-    if pitch ~= false and pitch ~= nil then
-      playSoft("pling", 0.28, pitch)
-      playSoft("guitar", 0.12, math.max(0, pitch - 7))
-    end
-    if musicBassPulse % 2 == 0 then
-      playSoft("hat", 0.10, 18)
-    end
-  end
-
-  return math.max(0.06, beats * (tr.beat or 0.16) * (tr.legato or 0.75))
+  return 0.5
 end
 
 local function sfxOpen()

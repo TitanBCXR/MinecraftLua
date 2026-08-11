@@ -1,6 +1,6 @@
 --[[
   games.lua  -  Titan Games Launcher (CC: Tweaked)
-  Titan-Version: 1.0.9
+  Titan-Version: 1.2.0
 
   Run:
 
@@ -11,10 +11,10 @@
   and launches them from a tap-friendly menu.
 
   First run: choose Managed (in-game casino currency) or Unmanaged (granted
-  local chips). Settings (S): speaker/modem + economy reminder.
+  local chips). Pocket: modem slot 15, speaker slot 16; S swaps sound on/off.
 
   Controls:
-    Tap / Enter  play   U update   S settings   Q quit
+    Tap / Enter  play   U update   S sound   O settings   Q quit
 ]]
 
 local RAW_FALLBACK = "https://raw.githubusercontent.com/TitanBCXR/MinecraftLua/main/"
@@ -29,6 +29,32 @@ if fs.exists("lib/games_economy.lua") then
   if ok then econ = e; econ.load() end
 end
 
+local pp = nil
+if fs.exists("lib/pocket_peripherals.lua") then
+  local ok, lib = pcall(dofile, "lib/pocket_peripherals.lua")
+  if ok and type(lib) == "table" then pp = lib end
+end
+
+local titan = nil
+if fs.exists("lib/titan.lua") then
+  local ok, lib = pcall(dofile, "lib/titan.lua")
+  if ok and type(lib) == "table" then titan = lib end
+end
+
+local gm = nil
+if fs.exists("lib/games_music.lua") then
+  local ok, lib = pcall(dofile, "lib/games_music.lua")
+  if ok and type(lib) == "table" then gm = lib end
+end
+
+local GAME_LABELS = {
+  tetris = "Tetris",
+  minesweeper = "Minesweeper",
+  luigi_poker = "Luigi Poker",
+  slots = "Slots",
+  higher_lower = "Higher/Lower",
+}
+
 -- Never delete these when pruning removed catalog games.
 local PROTECTED = {
   ["games.lua"] = true,
@@ -38,6 +64,8 @@ local PROTECTED = {
   ["lib/titan.lua"] = true,
   ["lib/casino.lua"] = true,
   ["lib/games_economy.lua"] = true,
+  ["lib/pocket_peripherals.lua"] = true,
+  ["lib/games_music.lua"] = true,
   ["games_economy.cfg"] = true,
   ["games_wallet.cfg"] = true,
   ["startup.lua"] = true,
@@ -101,10 +129,27 @@ local function pullEv()
 end
 
 local function hasModem()
+  if pp and pp.hasModem then return pp.hasModem() end
   for _, side in ipairs(peripheral.getNames()) do
     if peripheral.getType(side) == "modem" then return true end
   end
   return false
+end
+
+local function doSoundSwap()
+  if not pp or not pp.swapSound then
+    STATUS = "Sound swap needs lib/pocket_peripherals.lua"
+    return
+  end
+  pp.loadConfig()
+  local ok, err = pp.swapSound(titan)
+  if ok then
+    PREFER_MODEM = hasModem()
+    saveState()
+    STATUS = PREFER_MODEM and "Modem on (mesh)" or "Speaker on (music)"
+  else
+    STATUS = tostring(err or "swap failed")
+  end
 end
 
 local function fill(x, y, w, h, bg)
@@ -133,6 +178,7 @@ local function loadState()
   if type(d) ~= "table" then return end
   LAST_SYNC = tonumber(d.lastSync) or 0
   PREFER_MODEM = d.preferModem == true
+  if gm and gm.loadSettings then gm.loadSettings(d) end
   MANAGED_FILES = {}
   if type(d.managedFiles) == "table" then
     for _, p in ipairs(d.managedFiles) do
@@ -161,12 +207,23 @@ local function saveState()
   for id in pairs(MANAGED_IDS) do ids[#ids + 1] = id end
   table.sort(ids)
   local f = fs.open(STATE_FILE, "w")
-  f.write(textutils.serialize({
+  local modemSlot, speakerSlot = 15, 16
+  if pp and pp.getSlots then modemSlot, speakerSlot = pp.getSlots() end
+  local payload = {
     lastSync = LAST_SYNC,
     managedFiles = files,
     managedIds = ids,
     preferModem = PREFER_MODEM == true,
-  }))
+    modemSlot = modemSlot,
+    speakerSlot = speakerSlot,
+  }
+  if gm and gm.exportSettings then
+    local ms = gm.exportSettings()
+    payload.musicSpeed = ms.musicSpeed
+    payload.musicTrackGlobal = ms.musicTrackGlobal
+    payload.musicTracks = ms.musicTracks
+  end
+  f.write(textutils.serialize(payload))
   f.close()
 end
 
@@ -437,10 +494,11 @@ local function drawMenu(state)
   -- On-screen UP/DOWN only on monitor setups; pockets use tap / keys / scroll.
   local showNav = USING_MONITOR == true
   local headerH = 3
+  local settingsH = 1
   local footerH = showNav and 3 or 1
   local tileH = (th < 14) and 2 or 3
   local gap = 1
-  local usable = th - headerH - footerH
+  local usable = th - headerH - footerH - settingsH
   local rows = math.max(1, math.floor((usable + gap) / (tileH + gap)))
   local cols = (tw >= 30) and 2 or 1
   local page = rows * cols
@@ -461,6 +519,7 @@ local function drawMenu(state)
   state.headerH = headerH
   state.rects = {}
   state.upBtn, state.dnBtn = nil, nil
+  state.settingsBtn = nil
 
   for i = 1, #games do
     local localIdx = i - state.scroll
@@ -492,6 +551,11 @@ local function drawMenu(state)
     textAt(2, 5, "No games yet — press U to sync", colors.orange, colors.black)
   end
 
+  local setY = th - footerH
+  state.settingsBtn = { x = 1, y = setY, w = tw, h = settingsH }
+  fill(1, setY, tw, settingsH, color and colors.orange or colors.gray)
+  textAt(2, setY, " SETTINGS (music / mesh) ", colors.black, color and colors.orange or colors.gray)
+
   if showNav then
     local footY = th - footerH + 1
     local half = math.floor(tw / 2)
@@ -506,8 +570,8 @@ local function drawMenu(state)
   else
     -- Slim pocket footer hint (no nav buttons).
     fill(1, th, tw, 1, colors.gray)
-    local mode = PREFER_MODEM and "modem" or "spk"
-    textAt(2, th, ("Tap  U upd  S set(%s)  Q"):format(mode):sub(1, tw - 2),
+    local mode = pp and pp.soundModeLabel and pp.soundModeLabel() or (PREFER_MODEM and "modem" or "spk")
+    textAt(2, th, ("S snd(%s)  O set  U  Q"):format(mode):sub(1, tw - 2),
       colors.white, colors.gray)
   end
 end
@@ -577,69 +641,139 @@ local function runEconomySetup()
   end
 end
 
+local function buildSettingsRows()
+  local rows = {}
+  rows[#rows + 1] = { kind = "speed", label = "Music speed" }
+  rows[#rows + 1] = { kind = "global", label = "Global track" }
+  if gm then
+    for _, gid in ipairs(gm.listGames()) do
+      rows[#rows + 1] = { kind = "track", gameId = gid, label = GAME_LABELS[gid] or gid }
+    end
+  end
+  rows[#rows + 1] = { kind = "mesh", label = "Launch preference" }
+  rows[#rows + 1] = { kind = "econ", label = "Economy setup" }
+  return rows
+end
+
+local function settingsValueText(row)
+  if row.kind == "speed" and gm then
+    return ("%.1fx"):format(gm.getSpeed())
+  elseif row.kind == "global" and gm then
+    local g = gm.getGlobalTrack()
+    return g and gm.presetLabel("tetris", g) or "(per game)"
+  elseif row.kind == "track" and gm then
+    local id = gm.getTrack(row.gameId)
+    return gm.presetLabel(row.gameId, id)
+  elseif row.kind == "mesh" then
+    return PREFER_MODEM and "Modem / mesh" or "Speaker music"
+  elseif row.kind == "econ" then
+    if econ and econ.setupDone then
+      return econ.isManaged() and "Managed" or "Unmanaged"
+    end
+    return "Not set"
+  end
+  return "—"
+end
+
 local function runSettings()
   if econ then econ.load() end
+  if gm then gm.loadSettings() end
+  local rows = buildSettingsRows()
+  local sel = 1
+  local scroll = 0
+
   while true do
     local tw, th = term.getSize()
     local color = isColor()
     fill(1, 1, tw, th, colors.black)
     fill(1, 1, tw, 1, color and colors.orange or colors.gray)
     textAt(2, 1, " SETTINGS ", colors.white, color and colors.orange or colors.gray)
-    textAt(2, 3, "Launch / mesh:", colors.white, colors.black)
-    local modeLine = PREFER_MODEM
-      and "Modem + global LB / casino"
-      or "Speaker music (Tetris still syncs host LB when modem equipped)"
-    textAt(2, 4, modeLine:sub(1, tw - 2),
-      PREFER_MODEM and colors.lime or colors.yellow, colors.black)
-    local econLine = "(economy not set)"
-    if econ and econ.setupDone then
-      econLine = econ.isManaged() and "Economy: MANAGED (in-game)"
-        or ("Economy: UNMANAGED (%d chips)"):format(econ.getCoins() or econ.grant or 0)
+    textAt(tw - 10, 1, "Q back", colors.yellow, color and colors.orange or colors.gray)
+    if pp and pp.setupHelp then
+      textAt(2, 2, pp.setupHelp():sub(1, tw - 2), colors.lightGray, colors.black)
     end
-    textAt(2, 6, econLine:sub(1, tw - 2), colors.lightGray, colors.black)
-    textAt(2, 8, "Space  toggle modem/speaker", colors.white, colors.black)
-    textAt(2, 9, "E      re-run economy setup", colors.white, colors.black)
-    textAt(2, 10, "Q      back", colors.white, colors.black)
-    local by = th - 2
-    local third = math.floor(tw / 3)
-    local tog = { x = 1, y = by, w = third, h = 2 }
-    local eco = { x = third + 1, y = by, w = third, h = 2 }
-    local back = { x = 2 * third + 1, y = by, w = tw - 2 * third, h = 2 }
-    fill(1, by, third, 2, color and colors.lime or colors.white)
-    fill(third + 1, by, third, 2, color and colors.purple or colors.gray)
-    fill(2 * third + 1, by, tw - 2 * third, 2, color and colors.red or colors.gray)
-    textAt(2, by, " MESH ", colors.black, color and colors.lime or colors.white)
-    textAt(third + 2, by, " ECON ", colors.white, color and colors.purple or colors.gray)
-    textAt(2 * third + 2, by, " BACK ", colors.white, color and colors.red or colors.gray)
+    textAt(2, 3, "Up/Down  Enter  <-/-> change", colors.gray, colors.black)
+
+    if sel < 1 then sel = 1 end
+    if sel > #rows then sel = #rows end
+    if sel <= scroll then scroll = math.max(0, sel - 1) end
+    local visible = math.max(1, th - 6)
+    if sel > scroll + visible then scroll = sel - visible end
+
+    local y = 5
+    for i = scroll + 1, math.min(#rows, scroll + visible) do
+      local row = rows[i]
+      local fg = colors.white
+      local bg = colors.black
+      if i == sel then fg = colors.black; bg = color and colors.yellow or colors.white end
+      fill(1, y, tw, 1, bg)
+      local val = settingsValueText(row)
+      local left = ("  %s:"):format(row.label)
+      local room = tw - #left - 2
+      if #val > room then val = val:sub(1, math.max(1, room - 1)) .. "…" end
+      textAt(2, y, left, fg, bg)
+      textAt(tw - #val - 1, y, val, fg, bg)
+      y = y + 1
+    end
+
+    textAt(2, th, "S=swap speaker on menu", colors.gray, colors.black)
 
     local ev, p1, p2, p3 = pullEv()
+    local row = rows[sel]
     if ev == "key" then
-      if p1 == keys.q or p1 == keys.backspace then return
-      elseif p1 == keys.space or p1 == keys.enter then
-        PREFER_MODEM = not PREFER_MODEM
+      if p1 == keys.q or p1 == keys.backspace then
         saveState()
-      elseif p1 == keys.e then
-        runEconomySetup()
+        return
+      elseif p1 == keys.up then
+        sel = sel > 1 and sel - 1 or #rows
+      elseif p1 == keys.down then
+        sel = sel < #rows and sel + 1 or 1
+      elseif p1 == keys.left then
+        if row.kind == "speed" and gm then
+          gm.setSpeed(gm.getSpeed() - 0.1)
+        elseif row.kind == "global" and gm then
+          gm.cycleTrack("tetris", -1)
+          gm.setGlobalTrack(gm.getTrack("tetris"))
+        elseif row.kind == "track" and gm then
+          gm.cycleTrack(row.gameId, -1)
+        elseif row.kind == "mesh" then
+          PREFER_MODEM = not PREFER_MODEM
+        end
+        saveState()
+      elseif p1 == keys.right then
+        if row.kind == "speed" and gm then
+          gm.setSpeed(gm.getSpeed() + 0.1)
+        elseif row.kind == "global" and gm then
+          local id = gm.cycleTrack("tetris", 1)
+          gm.setGlobalTrack(id)
+        elseif row.kind == "track" and gm then
+          gm.cycleTrack(row.gameId, 1)
+        elseif row.kind == "mesh" then
+          PREFER_MODEM = not PREFER_MODEM
+        end
+        saveState()
+      elseif p1 == keys.enter or p1 == keys.space then
+        if row.kind == "econ" then
+          runEconomySetup()
+        elseif row.kind == "mesh" then
+          PREFER_MODEM = not PREFER_MODEM
+          saveState()
+        end
       end
     elseif ev == "char" then
       local ch = tostring(p1 or ""):lower()
-      if ch == "q" then return
-      elseif ch == " " or ch == "t" then
-        PREFER_MODEM = not PREFER_MODEM
-        saveState()
-      elseif ch == "e" then
-        runEconomySetup()
-      end
+      if ch == "q" then saveState(); return end
     elseif ev == "mouse_click" then
-      if inRect(p2, p3, tog) then
-        PREFER_MODEM = not PREFER_MODEM
-        saveState()
-      elseif inRect(p2, p3, eco) then
-        runEconomySetup()
-      elseif inRect(p2, p3, back) then
-        return
+      local my = p3
+      local hitRow = my - 4 + scroll
+      if hitRow >= 1 and hitRow <= #rows then
+        sel = hitRow
+        if row.kind == "econ" and my == sel - scroll + 4 then
+          runEconomySetup()
+        end
       end
     elseif ev == "terminate" then
+      saveState()
       return
     end
   end
@@ -667,6 +801,10 @@ local function launchGame(game)
     print("(unmanaged — local chip wallet)")
   end
   local isTetris = game.id == "tetris"
+  local needsMesh = (econ and econ.isManaged()) or game.id == "tetris"
+  if needsMesh and pp and pp.ensureModemEquipped then
+    pp.ensureModemEquipped(titan)
+  end
   local modemHere = hasModem()
   -- Tetris always prefers install-host LB when a modem is available.
   local useModem = isTetris and modemHere
@@ -703,6 +841,7 @@ local function main()
   end
 
   loadState()
+  if gm then gm.loadSettings() end
   attachMonitor()
   if econ then
     econ.load()
@@ -770,8 +909,9 @@ local function main()
       elseif p1 == K.u then
         doSync()
       elseif p1 == K.s then
+        doSoundSwap()
+      elseif p1 == K.o then
         runSettings()
-        STATUS = PREFER_MODEM and "Modem mode on" or "Speaker mode on"
       elseif p1 == K.q then
         return
       elseif p1 == K.pageUp then
@@ -784,7 +924,8 @@ local function main()
       local ch = tostring(p1 or ""):lower()
       if ch == "q" then return
       elseif ch == "u" then doSync()
-      elseif ch == "s" then
+      elseif ch == "s" then doSoundSwap()
+      elseif ch == "o" then
         runSettings()
         STATUS = PREFER_MODEM and "Modem mode on" or "Speaker mode on"
       elseif tonumber(ch) and games[tonumber(ch)] then
@@ -799,6 +940,8 @@ local function main()
         local maxScroll = math.max(0, #games - (state.page or 1))
         state.scroll = math.min(maxScroll, state.scroll + (state.page or 1))
         state.sel = math.min(#games, state.sel + (state.page or 1))
+      elseif inRect(mx, my, state.settingsBtn) then
+        runSettings()
       else
         for i, r in pairs(state.rects) do
           if inRect(mx, my, r) then

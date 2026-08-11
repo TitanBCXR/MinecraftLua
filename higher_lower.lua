@@ -1,6 +1,6 @@
 --[[
   higher_lower.lua  -  Video Poker → Higher / Lower streak (CC: Tweaked)
-  Titan-Version: 1.1.2
+  Titan-Version: 1.1.3
 
   Run:
 
@@ -55,6 +55,12 @@ local econ = nil
 if fs.exists("lib/games_economy.lua") then
   local ok, e = pcall(dofile, "lib/games_economy.lua")
   if ok then econ = e; econ.load() end
+end
+
+local gm = nil
+if fs.exists("lib/games_music.lua") then
+  local ok, lib = pcall(dofile, "lib/games_music.lua")
+  if ok and type(lib) == "table" then gm = lib; gm.loadSettings() end
 end
 
 local RANK_NAME = {
@@ -231,20 +237,33 @@ local function creditWin(n)
 end
 
 --------------------------------------------------------------------------------
--- Audio
+-- Audio (SFX + optional bed from lib/games_music.lua)
 --------------------------------------------------------------------------------
+local musicPlayer = gm and gm.newPlayer("higher_lower") or nil
+
 local function refreshSpeaker()
-  SPEAKER = peripheral.find("speaker")
+  if musicPlayer and musicPlayer.refreshSpeaker then
+    SPEAKER = musicPlayer:refreshSpeaker() and peripheral.find("speaker") or nil
+  else
+    SPEAKER = peripheral.find("speaker")
+  end
   return SPEAKER ~= nil
 end
 
 local function stopMusic()
+  if musicPlayer then musicPlayer:stop() end
   if SPEAKER then pcall(function() SPEAKER.stop() end) end
 end
 
 local function playSoft(inst, vol, pitch)
   if not SPEAKER or pitch == nil or pitch < 0 or pitch > 24 then return end
   pcall(function() SPEAKER.playNote(inst, vol, pitch) end)
+end
+
+local function musicTick()
+  if not MUSIC_ON then return 0.5 end
+  if musicPlayer then return musicPlayer:step(MUSIC_ON) end
+  return 0.5
 end
 
 local function sfx(kind)
@@ -714,10 +733,14 @@ local function main()
     cardBoxes = {},
   }
   drawScreen(state)
+  if musicPlayer then musicPlayer:start("menu") end
+  local musicTimer = os.startTimer(MUSIC_ON and 0.05 or 3600)
 
   while true do
     local ev, p1, p2, p3 = pullEv()
-    if ev == "term_resize" then
+    if ev == "timer" and p1 == musicTimer then
+      musicTimer = os.startTimer(musicTick())
+    elseif ev == "term_resize" then
       drawScreen(state)
     elseif ev == "mouse_click" then
       local mx, my = p2, p3
@@ -769,7 +792,7 @@ local function main()
       if p1 == K.q then return
       elseif p1 == K.m then
         MUSIC_ON = not MUSIC_ON; saveCfg()
-        if not MUSIC_ON then stopMusic() end
+        if not MUSIC_ON then stopMusic() else musicTimer = os.startTimer(0.05) end
       elseif state.phase == "hold" then
         if p1 == K.d then finishPoker(state); drawScreen(state)
         elseif p1 >= K.one and p1 <= K.five then
@@ -807,7 +830,7 @@ local function main()
       if ch == "q" then return
       elseif ch == "m" then
         MUSIC_ON = not MUSIC_ON; saveCfg()
-        if not MUSIC_ON then stopMusic() end
+        if not MUSIC_ON then stopMusic() else musicTimer = os.startTimer(0.05) end
       elseif state.phase == "hold" then
         if ch == "d" then finishPoker(state); drawScreen(state)
         elseif ch >= "1" and ch <= "5" then
