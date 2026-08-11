@@ -1,6 +1,6 @@
 --[[
   router_modem.lua  -  Titan MODEM cell runtime (CC: Tweaked)
-  Titan-Version: 1.4.2
+  Titan-Version: 1.4.3
 
   Short-range RF repeater cell. Loaded by router.lua when role=modem.
   Prefer: run `router` (detects role and auto-installs this file).
@@ -446,7 +446,11 @@ local function handleInstallMesh(id, msg)
   local t = msg.type
   if t ~= "install_discover" and t ~= "install_where" and t ~= "install_get"
       and t ~= "install_file" and t ~= "install_host_here" and t ~= "install_fwd"
-      and t ~= "tetris_lb_get" and t ~= "tetris_lb_submit" and t ~= "tetris_lb" then
+      and t ~= "tetris_lb_get" and t ~= "tetris_lb_submit" and t ~= "tetris_lb"
+      and t ~= "games_lb_get" and t ~= "games_lb_submit" and t ~= "games_lb"
+      and t ~= "games_lb_admin_get" and t ~= "games_lb_admin_setpass"
+      and t ~= "games_lb_admin_edit" and t ~= "games_lb_admin_delete"
+      and t ~= "games_lb_admin_clear" and t ~= "games_lb_admin" then
     return false
   end
 
@@ -478,7 +482,11 @@ local function handleInstallMesh(id, msg)
     return true
   end
 
-  if t == "install_get" or t == "tetris_lb_get" or t == "tetris_lb_submit" then
+  if t == "install_get" or t == "tetris_lb_get" or t == "tetris_lb_submit"
+      or t == "games_lb_get" or t == "games_lb_submit"
+      or t == "games_lb_admin_get" or t == "games_lb_admin_setpass"
+      or t == "games_lb_admin_edit" or t == "games_lb_admin_delete"
+      or t == "games_lb_admin_clear" then
     local dest = tonumber(msg.dest) or tonumber(msg.hostId)
     local origin = tonumber(msg.replyTo) or tonumber(msg.originId) or id
     msg.replyTo, msg.originId, msg.dest = origin, origin, dest
@@ -493,7 +501,8 @@ local function handleInstallMesh(id, msg)
     return true
   end
 
-  if t == "install_file" or t == "install_host_here" or t == "tetris_lb" then
+  if t == "install_file" or t == "install_host_here" or t == "tetris_lb"
+      or t == "games_lb" or t == "games_lb_admin" then
     local dest = tonumber(msg.replyTo) or tonumber(msg.originId) or tonumber(msg.dest)
     if not dest then return true end
     local key = t .. "|" .. tostring(dest) .. "|" .. tostring(msg.path or msg.hostId or "")

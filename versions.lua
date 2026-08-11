@@ -5,11 +5,11 @@
   The console `packages` command shows these names + versions.
   Installers / OTA updates ship this file so devices know what they have.
 
-  Titan-Version: 1.6.95
+  Titan-Version: 1.6.96
 ]]
 
 return {
-  system = "1.6.95",
+  system = "1.6.96",
   packages = {
     ["lib/titan.lua"]      = "1.2.26",
     ["lib/casino.lua"]     = "1.0.1",
@@ -17,15 +17,15 @@ return {
     ["console.lua"]        = "1.1.9",
     ["router.lua"]         = "1.4.4",
     ["router_main.lua"]    = "1.4.2",
-    ["router_modem.lua"]   = "1.4.2",
-    ["lib/router_hub_net.lua"] = "1.4.6",
+    ["router_modem.lua"]   = "1.4.3",
+    ["lib/router_hub_net.lua"] = "1.4.7",
     ["lib/router_hub_ui.lua"]  = "1.4.3",
     ["lib/router_hub_cmd.lua"] = "1.4.3",
     ["install.lua"]        = "1.2.14",
     ["github_install.lua"] = "1.2.17",
     ["pastebin_install.lua"]= "1.2.14",
     ["datacenter.lua"]     = "1.2.14",
-    ["admin.lua"]          = "1.5.9",
+    ["admin.lua"]          = "1.5.10",
     ["quarry/workers/offline_miner.lua"] = "1.8.1",
     ["quarry/workers/strip_miner.lua"]   = "1.0.4",
     ["quarry/workers/cell_scanner.lua"]  = "1.0.7",
@@ -53,8 +53,8 @@ return {
     ["games.lua"]          = "1.0.7",
     ["games_catalog.lua"]  = "1.0.6",
     ["games_install.lua"]  = "1.0.3",
-    ["host.lua"]           = "1.2.16",
+    ["host.lua"]           = "1.2.17",
     ["exclude.txt"]        = "1.0.1",
-    ["versions.lua"]       = "1.6.95",
+    ["versions.lua"]       = "1.6.96",
   },
 }

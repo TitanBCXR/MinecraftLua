@@ -515,6 +515,9 @@ game, **U** update, **S** settings, **Q** quit. Closing a game returns here.
 **Settings (S):** mesh speaker/modem toggle + **ECON** to re-run economy setup.
 
 **Host leaderboards:** floppy `games_leaderboard.cfg` (migrates old Tetris LB).
+Optional `password` field in that file gates admin view/edit; set it from the
+admin tablet (**Leaderboard** app or `lb pass`). Public `games_lb_get` /
+`games_lb_submit` stay open for gameplay scores.
 
 **Currency Manager** (installer → Games → **c**) — ledger only (floppy + mesh).
 

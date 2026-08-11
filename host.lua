@@ -1,6 +1,6 @@
 --[[
   host.lua  -  Titan install / update host + games leaderboards (CC: Tweaked)
-  Titan-Version: 1.2.16
+  Titan-Version: 1.2.17
 
   Run this on ONE computer that already has the Titan files (your "update
   server"). It serves those files over rednet so pockets and other devices can
@@ -12,6 +12,7 @@
 
   Leaderboards live on a floppy (`games_leaderboard.cfg`, multi-game). Legacy
   `tetris_leaderboard.cfg` is migrated once. Tetris still uses tetris_lb_* msgs.
+  Admin edits use games_lb_admin_* (password in cfg; set from admin tablet).
 
   Usage:
     1. Keep this machine updated (you may wget/GitHub here — clients never see it).
@@ -122,6 +123,7 @@ end
 --------------------------------------------------------------------------------
 local boards = { tetris = {} } -- [gameId] = sorted { id, name, score, at }
 local leaderboard = boards.tetris -- alias for Tetris compat
+local lbPassword = "" -- admin password (empty = unset; deny admin ops until set)
 local lbDriveName, lbMount, lbPath = nil, nil, nil
 
 local function ensureGame(gameId)
@@ -175,33 +177,39 @@ local function readEntriesList(d)
   return {}
 end
 
-local function readAllBoards(path)
-  if not path or not fs.exists(path) or fs.isDir(path) then return {} end
+local function readLbStore(path)
+  if not path or not fs.exists(path) or fs.isDir(path) then return "", {} end
   local f = fs.open(path, "r")
-  if not f then return {} end
+  if not f then return "", {} end
   local d = textutils.unserialize(f.readAll() or "")
   f.close()
-  if type(d) ~= "table" then return {} end
+  if type(d) ~= "table" then return "", {} end
+  local pw = type(d.password) == "string" and d.password or ""
   if type(d.games) == "table" then
     local out = {}
     for gid, block in pairs(d.games) do
       out[tostring(gid)] = readEntriesList(type(block) == "table" and block or {})
     end
-    return out
+    return pw, out
   end
   -- Legacy single-board tetris file
   local entries = readEntriesList(d)
   if #entries > 0 or d.entries then
-    return { tetris = entries }
+    return pw, { tetris = entries }
   end
-  return {}
+  return pw, {}
+end
+
+local function readAllBoards(path)
+  local _, games = readLbStore(path)
+  return games
 end
 
 local function writeBoardFile(path)
   if not path then return false, "no disk" end
   local f = fs.open(path, "w")
   if not f then return false, "open failed" end
-  f.write(textutils.serialize({ games = boards }))
+  f.write(textutils.serialize({ password = lbPassword, games = boards }))
   f.close()
   if lbDriveName then
     pcall(function()
@@ -239,9 +247,10 @@ end
 local function loadLeaderboard()
   boards = { tetris = {} }
   leaderboard = boards.tetris
+  lbPassword = ""
   refreshLbDisk()
   if lbPath and fs.exists(lbPath) then
-    boards = readAllBoards(lbPath)
+    lbPassword, boards = readLbStore(lbPath)
     ensureGame("tetris")
     sortAllBoards()
     return "disk"
@@ -293,7 +302,7 @@ local function diskWatchLoop()
       refreshLbDisk()
       if lbPath then
         if fs.exists(lbPath) then
-          boards = readAllBoards(lbPath)
+          lbPassword, boards = readLbStore(lbPath)
           ensureGame("tetris")
           sortAllBoards()
           print(("[games_lb] disk ready (%s) — %d entr%s"):format(
@@ -365,6 +374,137 @@ local function submitScore(id, name, score, gameId, lowerIsBetter)
   if gid == "tetris" then leaderboard = boards.tetris end
   saveLeaderboard()
   return true
+end
+
+local function lbPassSet()
+  return type(lbPassword) == "string" and lbPassword ~= ""
+end
+
+local function checkLbAdminPass(msg)
+  if not lbPassSet() then return false, "no password set" end
+  local pw = tostring(msg.password or "")
+  if pw == "" then return false, "password required" end
+  if pw ~= lbPassword then return false, "denied" end
+  return true
+end
+
+local function adminBoardSnapshot()
+  local out = {}
+  for gid in pairs(boards) do
+    out[gid] = boardSnapshot(gid)
+  end
+  return out
+end
+
+local function deleteLbEntry(gameId, which)
+  local gid, list = ensureGame(gameId or "tetris")
+  local rank = tonumber(which)
+  if rank then
+    if rank < 1 or rank > #list then return false, "bad rank" end
+    table.remove(list, rank)
+    sortBoard(gid)
+    if gid == "tetris" then leaderboard = boards.tetris end
+    saveLeaderboard()
+    return true
+  end
+  local key = tostring(which or ""):lower()
+  if key == "" then return false, "need rank or name" end
+  for i = 1, #list do
+    if tostring(list[i].name or ""):lower() == key then
+      table.remove(list, i)
+      sortBoard(gid)
+      if gid == "tetris" then leaderboard = boards.tetris end
+      saveLeaderboard()
+      return true
+    end
+  end
+  return false, "not found"
+end
+
+local function editLbEntry(gameId, which, newScore, newName)
+  local gid, list = ensureGame(gameId or "tetris")
+  local rank = tonumber(which)
+  local entry
+  if rank then
+    if rank < 1 or rank > #list then return false, "bad rank" end
+    entry = list[rank]
+  else
+    local key = tostring(which or ""):lower()
+    if key == "" then return false, "need rank or name" end
+    for i = 1, #list do
+      if tostring(list[i].name or ""):lower() == key then
+        entry = list[i]
+        break
+      end
+    end
+    if not entry then return false, "not found" end
+  end
+  if newScore ~= nil then
+    newScore = math.floor(tonumber(newScore) or -1)
+    if newScore < 0 then return false, "bad score" end
+    entry.score = newScore
+    entry.at = os.epoch("utc")
+  end
+  if newName ~= nil then
+    newName = tostring(newName or ""):gsub("[%c%z]", ""):match("^%s*(.-)%s*$") or ""
+    if newName == "" then return false, "bad name" end
+    entry.name = newName:sub(1, 16)
+  end
+  sortBoard(gid)
+  if gid == "tetris" then leaderboard = boards.tetris end
+  saveLeaderboard()
+  return true
+end
+
+local function clearLbBoard(gameId)
+  if gameId == "all" or gameId == "*" or gameId == "" then
+    boards = { tetris = {} }
+    leaderboard = boards.tetris
+  else
+    local gid = ensureGame(gameId)
+    boards[gid] = {}
+    if gid == "tetris" then leaderboard = boards.tetris end
+  end
+  sortAllBoards()
+  saveLeaderboard()
+  return true
+end
+
+local function replyLbAdmin(dest, viaId, payload)
+  dest = tonumber(dest)
+  if not dest or type(payload) ~= "table" then return end
+  payload.type = "games_lb_admin"
+  payload.replyTo = dest
+  payload.from = os.getComputerID()
+  rednet.send(dest, payload, PROTOCOL)
+  rednet.send(dest, payload, ROUTER_PROTOCOL)
+  if viaId and viaId ~= dest then
+    rednet.send(viaId, {
+      type = "install_fwd",
+      dest = dest,
+      payload = payload,
+      replyTo = dest,
+      from = os.getComputerID(),
+    }, ROUTER_PROTOCOL)
+  end
+end
+
+local function deliverGamesLb(dest, viaId, payload)
+  dest = tonumber(dest)
+  if not dest or type(payload) ~= "table" then return end
+  payload.replyTo = dest
+  payload.from = os.getComputerID()
+  rednet.send(dest, payload, PROTOCOL)
+  rednet.send(dest, payload, ROUTER_PROTOCOL)
+  if viaId and viaId ~= dest then
+    rednet.send(viaId, {
+      type = "install_fwd",
+      dest = dest,
+      payload = payload,
+      replyTo = dest,
+      from = os.getComputerID(),
+    }, ROUTER_PROTOCOL)
+  end
 end
 
 local function manifest()
@@ -554,8 +694,7 @@ local function handleServeMsg(id, msg, proto)
       replyTo = dest,
       from = os.getComputerID(),
     }
-    rednet.send(dest, payload, PROTOCOL)
-    rednet.send(dest, payload, ROUTER_PROTOCOL)
+    deliverGamesLb(dest, id, payload)
     print(("[games_lb] get %s -> #%d (%d)"):format(game, dest, #boardSnapshot(game)))
 
   elseif t == "games_lb_submit" then
@@ -574,9 +713,103 @@ local function handleServeMsg(id, msg, proto)
       replyTo = dest,
       from = os.getComputerID(),
     }
-    rednet.send(dest, payload, PROTOCOL)
-    rednet.send(dest, payload, ROUTER_PROTOCOL)
+    deliverGamesLb(dest, id, payload)
     print(("[games_lb] %s #%d %s = %d"):format(game, id, tostring(name):sub(1, 12), score))
+
+  elseif t == "games_lb_admin_get" then
+    local dest = tonumber(msg.replyTo) or tonumber(msg.originId) or id
+    if lbPassSet() then
+      local ok, err = checkLbAdminPass(msg)
+      if not ok then
+        replyLbAdmin(dest, id, { ok = false, err = err })
+        print(("[games_lb_admin] get denied -> #%d (%s)"):format(dest, tostring(err)))
+        return
+      end
+    else
+      replyLbAdmin(dest, id, { ok = false, err = "no password set" })
+      print(("[games_lb_admin] get denied -> #%d (no password)"):format(dest))
+      return
+    end
+    replyLbAdmin(dest, id, {
+      ok = true,
+      passwordSet = true,
+      disk = lbPath ~= nil,
+      games = adminBoardSnapshot(),
+    })
+    print(("[games_lb_admin] get -> #%d"):format(dest))
+
+  elseif t == "games_lb_admin_setpass" then
+    local dest = tonumber(msg.replyTo) or tonumber(msg.originId) or id
+    local newPw = tostring(msg.newPassword or "")
+    if lbPassSet() then
+      local old = tostring(msg.oldPassword or msg.password or "")
+      if old ~= lbPassword then
+        replyLbAdmin(dest, id, { ok = false, err = "denied" })
+        print(("[games_lb_admin] setpass denied -> #%d"):format(dest))
+        return
+      end
+    end
+    lbPassword = newPw
+    saveLeaderboard()
+    replyLbAdmin(dest, id, { ok = true, passwordSet = lbPassword ~= "" })
+    print(("[games_lb_admin] setpass -> #%d (%s)"):format(
+      dest, lbPassword ~= "" and "set" or "cleared"))
+
+  elseif t == "games_lb_admin_delete" then
+    local dest = tonumber(msg.replyTo) or tonumber(msg.originId) or id
+    local okAuth, err = checkLbAdminPass(msg)
+    if not okAuth then
+      replyLbAdmin(dest, id, { ok = false, err = err })
+      return
+    end
+    local game = tostring(msg.game or "tetris"):lower()
+    local which = msg.rank or msg.which or msg.player
+    local okDel, errDel = deleteLbEntry(game, which)
+    replyLbAdmin(dest, id, {
+      ok = okDel,
+      err = errDel,
+      game = game,
+      games = adminBoardSnapshot(),
+    })
+    print(("[games_lb_admin] delete %s %s -> #%d (%s)"):format(
+      game, tostring(which), dest, okDel and "ok" or tostring(errDel)))
+
+  elseif t == "games_lb_admin_edit" then
+    local dest = tonumber(msg.replyTo) or tonumber(msg.originId) or id
+    local okAuth, err = checkLbAdminPass(msg)
+    if not okAuth then
+      replyLbAdmin(dest, id, { ok = false, err = err })
+      return
+    end
+    local game = tostring(msg.game or "tetris"):lower()
+    local which = msg.rank or msg.which or msg.player
+    local okEdit, errEdit = editLbEntry(game, which, msg.score, msg.newName)
+    replyLbAdmin(dest, id, {
+      ok = okEdit,
+      err = errEdit,
+      game = game,
+      games = adminBoardSnapshot(),
+    })
+    print(("[games_lb_admin] edit %s %s -> #%d (%s)"):format(
+      game, tostring(which), dest, okEdit and "ok" or tostring(errEdit)))
+
+  elseif t == "games_lb_admin_clear" then
+    local dest = tonumber(msg.replyTo) or tonumber(msg.originId) or id
+    local okAuth, err = checkLbAdminPass(msg)
+    if not okAuth then
+      replyLbAdmin(dest, id, { ok = false, err = err })
+      return
+    end
+    local game = msg.game
+    if game ~= nil then game = tostring(game):lower() end
+    if game == "" then game = "all" end
+    clearLbBoard(game or "all")
+    replyLbAdmin(dest, id, {
+      ok = true,
+      game = game or "all",
+      games = adminBoardSnapshot(),
+    })
+    print(("[games_lb_admin] clear %s -> #%d"):format(tostring(game or "all"), dest))
   end
 end
 

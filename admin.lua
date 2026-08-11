@@ -1,6 +1,6 @@
 --[[
   admin.lua  -  Titan admin console for a POCKET computer ("Live" tablet)
-  Titan-Version: 1.5.9
+  Titan-Version: 1.5.10
 
   Pocket remote for the whole fleet. Keep it on you; it joins the mesh like
   every other Titan device (MAIN router + modem hops).
@@ -17,6 +17,7 @@
     connect | ssh <id|label>     - remote shell (full device commands)
     say <id|label> <message>     - print on that device's screen
     storage | stock | request    - Storage Manager browse / request to output
+    lb | leaderboard             - Games host leaderboard (password on floppy)
     link                         - network topology (routers + modems)
     link <a> <b>                 - peer two routers OR attach modem->router
     link auto                    - GPS auto: peer routers, modems->nearest hub
@@ -49,6 +50,7 @@ local MSG   = titan.MSG
 local PROTO_ROUTER = titan.ROUTER_PROTOCOL or "titan_router"
 local PROTO_QUARRY = "titan_quarry"
 local PROTO_NET = titan.PROTOCOL or "titan_net"
+local INSTALL_PROTO = titan.INSTALL_PROTOCOL or "titan_install"
 
 titan.openModem()
 os.setComputerLabel(os.getComputerLabel() or ("Admin-" .. os.getComputerID()))
@@ -2168,6 +2170,305 @@ local function sshOneShot(target, line)
 end
 
 --------------------------------------------------------------------------------
+-- Games host leaderboard (install host + games_leaderboard.cfg floppy)
+--------------------------------------------------------------------------------
+local LB_SESSION_MS = 5 * 60 * 1000
+local lbSessionUntil = 0
+local lbSessionPw = nil
+
+local function lbSessionOk()
+  return (os.epoch("utc") or 0) < lbSessionUntil and type(lbSessionPw) == "string"
+end
+
+local function lbHostRpc(reqType, fields, timeout)
+  timeout = timeout or 8
+  local hostId = select(1, titan.findInstallHost(5))
+  if not hostId then return nil, "no install host" end
+  local me = os.getComputerID()
+  local mainId = titan.getMainRouterId and titan.getMainRouterId()
+  local req = {
+    type = reqType,
+    replyTo = me,
+    originId = me,
+    dest = hostId,
+    hostId = hostId,
+    from = me,
+  }
+  if type(fields) == "table" then
+    for k, v in pairs(fields) do req[k] = v end
+  end
+  rednet.send(hostId, req, INSTALL_PROTO)
+  rednet.send(hostId, req, PROTO_ROUTER)
+  if mainId then
+    rednet.send(mainId, req, PROTO_ROUTER)
+    rednet.send(mainId, {
+      type = "install_fwd",
+      dest = hostId,
+      payload = req,
+      replyTo = me,
+      from = me,
+    }, PROTO_ROUTER)
+  end
+  local deadline = os.clock() + timeout
+  while os.clock() < deadline do
+    local _, msg = rednet.receive(nil, deadline - os.clock())
+    if type(msg) == "table" and msg.type == "games_lb_admin" then
+      return msg
+    end
+  end
+  return nil, "timeout"
+end
+
+local function promptLbPassword(force)
+  if not force and lbSessionOk() then return lbSessionPw end
+  write("Leaderboard password: ")
+  local p = read("*")
+  if p and p ~= "" then
+    lbSessionPw = p
+    lbSessionUntil = (os.epoch("utc") or 0) + LB_SESSION_MS
+    return p
+  end
+  return nil
+end
+
+local function lbAuthFields(force)
+  local pw = promptLbPassword(force)
+  if not pw then return nil, "password required" end
+  return { password = pw }
+end
+
+local function printLbBoards(games)
+  games = games or {}
+  local ids = {}
+  for gid in pairs(games) do ids[#ids + 1] = gid end
+  table.sort(ids)
+  if #ids == 0 then
+    print("  (no boards)")
+    return
+  end
+  for _, gid in ipairs(ids) do
+    local board = games[gid] or {}
+    print(("== %s (%d) =="):format(gid, #board))
+    for _, e in ipairs(board) do
+      print(("  #%2d  %6d  %s"):format(
+        e.rank or 0, e.score or 0, tostring(e.name or "?"):sub(1, 16)))
+    end
+  end
+end
+
+local function lbSetPassword(newPw, oldPw)
+  local fields = { newPassword = tostring(newPw or "") }
+  if oldPw and oldPw ~= "" then fields.oldPassword = oldPw end
+  local msg, err = lbHostRpc("games_lb_admin_setpass", fields, 8)
+  if not msg then return false, err end
+  if not msg.ok then return false, msg.err or "denied" end
+  if newPw and newPw ~= "" then
+    lbSessionPw = newPw
+    lbSessionUntil = (os.epoch("utc") or 0) + LB_SESSION_MS
+  else
+    lbSessionPw = nil
+    lbSessionUntil = 0
+  end
+  return true
+end
+
+local function lbViewAll()
+  local fields, err = lbAuthFields(false)
+  if not fields then return false, err end
+  local msg, rpcErr = lbHostRpc("games_lb_admin_get", fields, 8)
+  if not msg then return false, rpcErr end
+  if not msg.ok then return false, msg.err or "denied" end
+  print(("Disk: %s  Password: set"):format(msg.disk and "yes" or "no"))
+  printLbBoards(msg.games)
+  return true
+end
+
+local function runLeaderboardApp()
+  if not requireAuth() then return end
+  print("== Games Leaderboard ==")
+  local hostId = select(1, titan.findInstallHost(3))
+  if hostId then
+    print(("Host: #%d"):format(hostId))
+  else
+    print("Host: (not found — check mesh + host running)")
+  end
+  while true do
+    print("")
+    print("  1) View all boards")
+    print("  2) Set / change password")
+    print("  3) Delete entry (rank)")
+    print("  4) Edit entry score")
+    print("  5) Clear game board")
+    print("  0) Back")
+    write("Pick: ")
+    local choice = tostring(read() or ""):lower()
+    if choice == "0" or choice == "b" or choice == "back" then return
+    elseif choice == "1" then
+      local ok, err = lbViewAll()
+      if not ok then print(tostring(err)) end
+    elseif choice == "2" then
+      write("New password (empty clears): ")
+      local newPw = read("*") or ""
+      local oldPw = nil
+      if lbSessionOk() then
+        oldPw = lbSessionPw
+      else
+        write("Current password (skip if unset): ")
+        oldPw = read("*") or ""
+        if oldPw == "" then oldPw = nil end
+      end
+      local ok, err = lbSetPassword(newPw, oldPw)
+      if ok then
+        print(newPw ~= "" and "Password saved on host floppy." or "Password cleared.")
+      else
+        print("Failed: " .. tostring(err))
+      end
+    elseif choice == "3" then
+      local fields, err = lbAuthFields(false)
+      if not fields then
+        print(err)
+      else
+        write("Game id [tetris]: ")
+        local game = read()
+        if not game or game:match("^%s*$") then game = "tetris" end
+        write("Rank to delete: ")
+        local rank = tonumber(read())
+        if not rank then
+          print("Need a rank number.")
+        else
+          fields.game = game:lower()
+          fields.rank = rank
+          local msg, rpcErr = lbHostRpc("games_lb_admin_delete", fields, 8)
+          if not msg then print(rpcErr)
+          elseif msg.ok then print("Deleted."); printLbBoards(msg.games)
+          else print("Denied: " .. tostring(msg.err)) end
+        end
+      end
+    elseif choice == "4" then
+      local fields, err = lbAuthFields(false)
+      if not fields then
+        print(err)
+      else
+        write("Game id [tetris]: ")
+        local game = read()
+        if not game or game:match("^%s*$") then game = "tetris" end
+        write("Rank to edit: ")
+        local rank = tonumber(read())
+        if not rank then
+          print("Need a rank number.")
+        else
+          write("New score: ")
+          local score = tonumber(read())
+          if not score then
+            print("Need a score.")
+          else
+            fields.game = game:lower()
+            fields.rank = rank
+            fields.score = score
+            local msg, rpcErr = lbHostRpc("games_lb_admin_edit", fields, 8)
+            if not msg then print(rpcErr)
+            elseif msg.ok then print("Updated."); printLbBoards(msg.games)
+            else print("Denied: " .. tostring(msg.err)) end
+          end
+        end
+      end
+    elseif choice == "5" then
+      local fields, err = lbAuthFields(false)
+      if not fields then
+        print(err)
+      else
+        write("Game id (or 'all'): ")
+        local game = read()
+        if not game or game:match("^%s*$") then game = "all" end
+        write(("Clear %s? (y/N): "):format(game:lower()))
+        if tostring(read() or ""):lower():sub(1, 1) == "y" then
+          fields.game = game:lower()
+          local msg, rpcErr = lbHostRpc("games_lb_admin_clear", fields, 8)
+          if not msg then print(rpcErr)
+          elseif msg.ok then print("Cleared."); printLbBoards(msg.games)
+          else print("Denied: " .. tostring(msg.err)) end
+        end
+      end
+    end
+  end
+end
+
+local function handleLeaderboardCommand(a)
+  if not requireAuth() then return true end
+  local sub = tostring(a[2] or ""):lower()
+  if sub == "" or sub == "menu" then
+    runLeaderboardApp()
+    return true
+  end
+  if sub == "show" or sub == "view" or sub == "list" then
+    local ok, err = lbViewAll()
+    if not ok then print(tostring(err)) end
+    return true
+  end
+  if sub == "pass" or sub == "setpass" or sub == "password" then
+    local newPw = a[3]
+    if not newPw then
+      write("New password: ")
+      newPw = read("*") or ""
+    end
+    local oldPw = lbSessionOk() and lbSessionPw or nil
+    if not oldPw and a[4] then oldPw = a[4] end
+    local ok, err = lbSetPassword(newPw, oldPw)
+    if ok then print("Password saved on host.") else print(tostring(err)) end
+    return true
+  end
+  if sub == "delete" or sub == "del" then
+    local game = tostring(a[3] or "tetris"):lower()
+    local rank = tonumber(a[4])
+    if not rank then
+      print("Usage: lb delete <game> <rank>")
+      return true
+    end
+    local fields, err = lbAuthFields(false)
+    if not fields then print(err); return true end
+    fields.game, fields.rank = game, rank
+    local msg, rpcErr = lbHostRpc("games_lb_admin_delete", fields, 8)
+    if not msg then print(rpcErr) elseif msg.ok then printLbBoards(msg.games)
+    else print(tostring(msg.err)) end
+    return true
+  end
+  if sub == "edit" then
+    local game = tostring(a[3] or "tetris"):lower()
+    local rank = tonumber(a[4])
+    local score = tonumber(a[5])
+    if not rank or not score then
+      print("Usage: lb edit <game> <rank> <score> [newName]")
+      return true
+    end
+    local fields, err = lbAuthFields(false)
+    if not fields then print(err); return true end
+    fields.game, fields.rank, fields.score = game, rank, score
+    if a[6] then fields.newName = table.concat(a, " ", 6) end
+    local msg, rpcErr = lbHostRpc("games_lb_admin_edit", fields, 8)
+    if not msg then print(rpcErr) elseif msg.ok then printLbBoards(msg.games)
+    else print(tostring(msg.err)) end
+    return true
+  end
+  if sub == "clear" then
+    local game = tostring(a[3] or "all"):lower()
+    local fields, err = lbAuthFields(false)
+    if not fields then print(err); return true end
+    fields.game = game
+    local msg, rpcErr = lbHostRpc("games_lb_admin_clear", fields, 8)
+    if not msg then print(rpcErr) elseif msg.ok then printLbBoards(msg.games)
+    else print(tostring(msg.err)) end
+    return true
+  end
+  print("Usage: lb | leaderboard")
+  print("  lb show")
+  print("  lb pass <new> [old]")
+  print("  lb delete <game> <rank>")
+  print("  lb edit <game> <rank> <score> [name]")
+  print("  lb clear <game|all>")
+  return true
+end
+
+--------------------------------------------------------------------------------
 -- Storage Manager (vault + I/O chests)
 --------------------------------------------------------------------------------
 local function discoverStorage(timeout)
@@ -2614,6 +2915,7 @@ local HELP_ENTRIES = {
   { "connect <id>", "SSH shell (alias: ssh)" },
   { "say <id> <msg>", "Print message on device screen" },
   { "storage", "Storage Manager app" },
+  { "lb | leaderboard", "Games host leaderboard admin" },
   { "stock [filter]", "List vault stock" },
   { "request <item> [n]", "Send items to storage output" },
   { "goto <id> x y z", "Send turtle to coords" },
@@ -2932,6 +3234,9 @@ local function handleCommand(a)
 
   elseif cmd == "storage" or cmd == "stock" or cmd == "request" or cmd == "req" then
     return handleStorageCommand(a)
+
+  elseif cmd == "lb" or cmd == "leaderboard" or cmd == "gameslb" or cmd == "games_lb" then
+    return handleLeaderboardCommand(a)
 
   elseif cmd == "dc" or cmd == "center" or cmd == "datacenter" or cmd == "parent" then
     local id, row = findByKind("datacenter")
@@ -3367,6 +3672,7 @@ local PHONE_APPS = {
   { id = "continue", name = "Resume",   sub = "mining",   bg = colors.lime },
   { id = "boards",   name = "Boards",   sub = "live",     bg = colors.yellow },
   { id = "quarry",   name = "Quarry",   sub = "offline",  bg = colors.green },
+  { id = "leaderboard", name = "Leaderboard", sub = "games LB", bg = colors.lime },
   { id = "storage",  name = "Storage",  sub = "vault",    bg = colors.orange },
   { id = "advanced", name = "Terminal", sub = "commands", bg = colors.lightGray },
   { id = "lock",     name = "Lock",     sub = "screen",   bg = colors.black },
@@ -3462,6 +3768,9 @@ local function runPhoneApp(id)
     end
   elseif id == "storage" then
     runStorageApp()
+    pauseSimple()
+  elseif id == "leaderboard" or id == "lb" or id == "gameslb" then
+    runLeaderboardApp()
     pauseSimple()
   elseif id == "advanced" then
     cfg.mode = "advanced"
