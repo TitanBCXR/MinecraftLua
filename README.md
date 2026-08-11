@@ -116,6 +116,7 @@ Each device needs (active installer roles):
 | Parent Center     | `datacenter.lua`, `lib/titan.lua`          |
 | Console           | `console.lua`, `lib/titan.lua`             |
 | Admin tablet      | `admin.lua`, `lib/titan.lua`               |
+| Install host      | `host.lua`, `lib/titan.lua`, `install.lua`, floppy for LB |
 | Network router    | `router.lua`, hub libs, `versions.lua`     |
 | Quarry → Workers → Cell miner | `quarry/workers/offline_miner.lua`, `lib/titan.lua`, `exclude.txt` |
 | Quarry → Workers → Cell scanner | `quarry/workers/cell_scanner.lua`, `lib/titan.lua` |
@@ -518,6 +519,27 @@ game, **U** update, **S** settings, **Q** quit. Closing a game returns here.
 Optional `password` field in that file gates admin view/edit; set it from the
 admin tablet (**Leaderboard** app or `lb pass`). Public `games_lb_get` /
 `games_lb_submit` stay open for gameplay scores.
+
+**Leaderboard install (managed fleet or unmanaged games-only):**
+
+| Order | Computer | Installer pick | Needs |
+|------:|----------|----------------|-------|
+| 1 | **Install host** | `github_install` / `install` → **h** Install / update host | wireless modem, disk drive, blank floppy (label **Games LB** optional) |
+| 2 | **Router** (optional) | → **4** Network router | only if game PCs / admin are out of host RF range |
+| 3 | **Admin tablet** | → **3** Admin tablet | pocket + wireless modem |
+| 4 | **Game PCs** | `games_install` **or** → **g** Games launcher | pocket/computer + modem for global LB sync |
+
+**Update order:** host first (insert floppy, run `host`), then routers, then
+admin tablet, then game PCs (`games` → **U** or re-run installer).
+
+**Unmanaged economy:** pick **UNMANAGED** on first `games` run — local chips,
+no Currency Manager. If the game PC has a modem, the launcher keeps **modem +
+global LB** enabled so Tetris/Minesweeper still sync scores to the host.
+
+**Set the LB password (no Parent Center required):** boot `admin` → choose **2)
+Games leaderboard** at the sign-in gate (or unlock fully and open the
+**Leaderboard** tile / run `lb pass <password>`). First `setpass` needs no old
+password; view/edit/delete need the password you set.
 
 **Currency Manager** (installer → Games → **c**) — ledger only (floppy + mesh).
 

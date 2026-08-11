@@ -1,6 +1,6 @@
 --[[
   admin.lua  -  Titan admin console for a POCKET computer ("Live" tablet)
-  Titan-Version: 1.5.10
+  Titan-Version: 1.5.11
 
   Pocket remote for the whole fleet. Keep it on you; it joins the mesh like
   every other Titan device (MAIN router + modem hops).
@@ -2284,7 +2284,6 @@ local function lbViewAll()
 end
 
 local function runLeaderboardApp()
-  if not requireAuth() then return end
   print("== Games Leaderboard ==")
   local hostId = select(1, titan.findInstallHost(3))
   if hostId then
@@ -2394,7 +2393,6 @@ local function runLeaderboardApp()
 end
 
 local function handleLeaderboardCommand(a)
-  if not requireAuth() then return true end
   local sub = tostring(a[2] or ""):lower()
   if sub == "" or sub == "menu" then
     runLeaderboardApp()
@@ -3990,8 +3988,29 @@ titan.setSshHandler(function(line)
   return true
 end)
 
--- Password FIRST (blocking), before any parallel loops touch the terminal.
-promptUnlockAtStart()
+-- Boot gate: fleet unlock needs Parent Center, or open Games LB (host password).
+local function promptBootAccess()
+  while not unlocked do
+    term.clear(); term.setCursorPos(1, 1)
+    print("== Titan Admin ==")
+    print("")
+    print("1) Unlock fleet (master password + Parent Center)")
+    print("2) Games leaderboard (host floppy password only)")
+    print("")
+    print("Unmanaged games arcades: pick 2 to set the LB password")
+    print("without Currency Manager or Parent Center.")
+    write("Choice [1]: ")
+    local ch = tostring(read() or "1"):lower():gsub("%s+", "")
+    if ch == "2" or ch == "l" or ch == "lb" or ch == "leaderboard" then
+      runLeaderboardApp()
+    else
+      promptUnlockAtStart()
+      if unlocked then return end
+    end
+  end
+end
+
+promptBootAccess()
 
 -- Optional first-run mode pick (friendly chooser)
 if not fs.exists(CFG_FILE) then

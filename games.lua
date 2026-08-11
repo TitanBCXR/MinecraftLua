@@ -1,6 +1,6 @@
 --[[
   games.lua  -  Titan Games Launcher (CC: Tweaked)
-  Titan-Version: 1.0.7
+  Titan-Version: 1.0.8
 
   Run:
 
@@ -98,6 +98,13 @@ local function pullEv()
   if ev == "monitor_touch" then return "mouse_click", 1, p2, p3 end
   if ev == "monitor_resize" then return "term_resize" end
   return ev, p1, p2, p3
+end
+
+local function hasModem()
+  for _, side in ipairs(peripheral.getNames()) do
+    if peripheral.getType(side) == "modem" then return true end
+  end
+  return false
 end
 
 local function fill(x, y, w, h, bg)
@@ -544,7 +551,7 @@ local function runEconomySetup()
         return
       elseif p1 == keys.two or p1 == keys.u then
         econ.setMode("unmanaged")
-        PREFER_MODEM = false
+        PREFER_MODEM = hasModem()
         saveState()
         STATUS = ("Unmanaged +%d chips"):format(econ.grant or 10000)
         return
@@ -555,7 +562,7 @@ local function runEconomySetup()
         econ.setMode("managed"); PREFER_MODEM = true; saveState()
         STATUS = "Managed casino"; return
       elseif ch == "2" or ch == "u" then
-        econ.setMode("unmanaged"); PREFER_MODEM = false; saveState()
+        econ.setMode("unmanaged"); PREFER_MODEM = hasModem(); saveState()
         STATUS = ("Unmanaged +%d chips"):format(econ.grant or 10000); return
       end
     elseif ev == "mouse_click" then
@@ -563,7 +570,7 @@ local function runEconomySetup()
         econ.setMode("managed"); PREFER_MODEM = true; saveState()
         STATUS = "Managed casino"; return
       elseif inRect(p2, p3, uBtn) then
-        econ.setMode("unmanaged"); PREFER_MODEM = false; saveState()
+        econ.setMode("unmanaged"); PREFER_MODEM = hasModem(); saveState()
         STATUS = ("Unmanaged +%d chips"):format(econ.grant or 10000); return
       end
     end
