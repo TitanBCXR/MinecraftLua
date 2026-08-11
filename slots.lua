@@ -1,6 +1,6 @@
 --[[
   slots.lua  -  3-reel slots for CC: Tweaked
-  Titan-Version: 1.0.7
+  Titan-Version: 1.0.8
 
   Run:
 
@@ -61,6 +61,12 @@ end
 
 local function equipMusicBack()
   if pp and pp.ensureSpeakerEquipped then pp.ensureSpeakerEquipped(nil) end
+end
+
+local function maybeEquipMusicBack()
+  if SPEAKER_ONLY or not USE_CASINO or (pp and pp.hasSideModem and pp.hasSideModem()) then
+    equipMusicBack()
+  end
 end
 
 -- Symbol weights (higher = more common). Payouts for 3-of-a-kind / 2-of-a-kind.
@@ -182,6 +188,7 @@ local function initEconomy()
     return
   end
   if managed and not SPEAKER_ONLY and fs.exists("lib/casino.lua") then
+    if pp and pp.ensureModemEquipped then pp.ensureModemEquipped(nil) end
     local ok, c = pcall(dofile, "lib/casino.lua")
     if ok and type(c) == "table" then
       CASINO = c
@@ -481,9 +488,9 @@ end
 --------------------------------------------------------------------------------
 local function main()
   attachMonitor()
-  equipMusicBack()
-  refreshSpeaker()
   initEconomy()
+  maybeEquipMusicBack()
+  refreshSpeaker()
   local state = {
     bet = clampBet(1),
     reels = { 1, 2, 3 },

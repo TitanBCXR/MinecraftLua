@@ -1,6 +1,6 @@
 --[[
   luigi_poker.lua  -  Luigi Picture Poker (SMB3-style) for CC: Tweaked
-  Titan-Version: 1.2.8
+  Titan-Version: 1.2.9
 
   Run:
 
@@ -67,6 +67,12 @@ end
 
 local function equipMusicBack()
   if pp and pp.ensureSpeakerEquipped then pp.ensureSpeakerEquipped(nil) end
+end
+
+local function maybeEquipMusicBack()
+  if SPEAKER_ONLY or not USE_CASINO or (pp and pp.hasSideModem and pp.hasSideModem()) then
+    equipMusicBack()
+  end
 end
 
 -- Rank id 1..6 (Cloud lowest, Luigi highest)
@@ -210,6 +216,7 @@ local function initEconomy()
     return
   end
   if managed and not SPEAKER_ONLY and fs.exists("lib/casino.lua") then
+    if pp and pp.ensureModemEquipped then pp.ensureModemEquipped(nil) end
     local ok, c = pcall(dofile, "lib/casino.lua")
     if ok and type(c) == "table" then
       CASINO = c
@@ -698,9 +705,9 @@ end
 
 local function main()
   attachMonitor()
-  equipMusicBack()
-  refreshSpeaker()
   initEconomy()
+  maybeEquipMusicBack()
+  refreshSpeaker()
   if musicPlayer then musicPlayer:start("menu") end
   local state = newState()
   state.bet = clampBet(state.bet or 1)

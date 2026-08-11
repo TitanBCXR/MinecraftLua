@@ -1,6 +1,6 @@
 --[[
   games_install.lua  -  Titan Games suite installer (CC: Tweaked)
-  Titan-Version: 1.0.3
+  Titan-Version: 1.0.4
 
   Games only — not the fleet / router installer.
 
@@ -19,7 +19,9 @@ local FILES = {
   "games.lua",
   "games_catalog.lua",
   "versions.lua",
-  "lib/titan.lua", -- Tetris helper lib (speaker-only launch still works without modem)
+  "lib/titan.lua",
+  "lib/pocket_peripherals.lua",
+  "lib/games_music.lua",
   "tetris.lua",
   "minesweeper.lua",
   "luigi_poker.lua",
@@ -75,7 +77,7 @@ else
   print("== Titan Games Install ==")
 end
 print("Source: " .. RAW_BASE)
-print("Speaker games + launcher (no modem required).")
+print("Pocket mesh + speaker games (modem in inventory for managed/unmanaged).")
 print("")
 
 -- Prefer live catalog file list when available (auto-adds new games).

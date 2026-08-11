@@ -1,6 +1,6 @@
 --[[
   pocket_peripherals.lua  -  Pocket modem / speaker helpers (Titan games)
-  Titan-Version: 1.0.4
+  Titan-Version: 1.0.5
 
   Pocket PCs keep modem/speaker in the **player inventory** (Minecraft hotbar),
   including items inside Sophisticated Backpacks when CC:T / Advanced Peripherals
@@ -109,6 +109,16 @@ end
 function pp.hasModem()
   for _, name in ipairs(peripheral.getNames()) do
     if pp.isModemType(peripheral.getType(name)) then
+      return true
+    end
+  end
+  return false
+end
+
+--- Wired/side modem while speaker (or other upgrade) is on back.
+function pp.hasSideModem()
+  for _, name in ipairs(peripheral.getNames()) do
+    if name ~= "back" and pp.isModemType(peripheral.getType(name)) then
       return true
     end
   end

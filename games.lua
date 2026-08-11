@@ -1,6 +1,6 @@
 --[[
   games.lua  -  Titan Games Launcher (CC: Tweaked)
-  Titan-Version: 1.2.3
+  Titan-Version: 1.2.4
 
   Run:
 
@@ -11,8 +11,10 @@
   and launches them from a tap-friendly menu.
 
   First run: choose Managed (in-game casino currency) or Unmanaged (granted
-  local chips). Pocket: modem/speaker in player inventory; boot equips modem
-  for mesh + host LB; games auto-swap to speaker for music after load. M swaps.
+  local chips). Managed and unmanaged share the same pocket mesh boot (modem on,
+  router announce kind games, host LB when applicable). Gambling games connect
+  to Currency Manager before speaker swap; pocket keeps modem during play when
+  needed for live casino bets. M swaps.
 
   Controls:
     Tap / Enter  play   U update   M music/modem   S settings   Q quit
@@ -801,6 +803,7 @@ local function runSettings()
       elseif p1 == keys.enter or p1 == keys.space then
         if row.kind == "econ" then
           runEconomySetup()
+          bootMeshPresence()
         elseif row.kind == "mesh" then
           doMusicModemSwap()
           saveState()

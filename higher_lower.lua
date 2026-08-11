@@ -1,6 +1,6 @@
 --[[
   higher_lower.lua  -  Video Poker → Higher / Lower streak (CC: Tweaked)
-  Titan-Version: 1.1.4
+  Titan-Version: 1.1.5
 
   Run:
 
@@ -71,6 +71,12 @@ end
 
 local function equipMusicBack()
   if pp and pp.ensureSpeakerEquipped then pp.ensureSpeakerEquipped(nil) end
+end
+
+local function maybeEquipMusicBack()
+  if SPEAKER_ONLY or not USE_CASINO or (pp and pp.hasSideModem and pp.hasSideModem()) then
+    equipMusicBack()
+  end
 end
 
 local RANK_NAME = {
@@ -203,6 +209,7 @@ local function initEconomy()
     return
   end
   if managed and not SPEAKER_ONLY and fs.exists("lib/casino.lua") then
+    if pp and pp.ensureModemEquipped then pp.ensureModemEquipped(nil) end
     local ok, c = pcall(dofile, "lib/casino.lua")
     if ok and type(c) == "table" then
       CASINO = c
@@ -728,9 +735,9 @@ end
 
 local function main()
   attachMonitor()
-  equipMusicBack()
-  refreshSpeaker()
   initEconomy()
+  maybeEquipMusicBack()
+  refreshSpeaker()
   local state = {
     phase = "bet",
     bet = clampBet(10),

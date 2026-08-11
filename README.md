@@ -550,7 +550,15 @@ admin tablet, then game PCs (`games` → **U** or re-run installer).
 no Currency Manager. If the game PC has a modem, the launcher keeps **modem +
 global LB** enabled so Tetris/Minesweeper still sync scores to the host.
 
-**Noisy Tetris tablet (speaker + host LB):** put **modem + speaker** in player
+**Managed economy (pocket / mesh):** pick **MANAGED** on first run — same
+launcher mesh boot as unmanaged: modem equipped, rednet open, router announce
+(kind `games`), host LB sync for Tetris/Minesweeper. Gambling games (Slots,
+Poker, H/L) connect to **Currency Manager** over the mesh **before** any
+speaker swap. On a pocket with one back slot, managed gambling **keeps the
+modem** during play so live bets/payouts stay on the mesh (use **M** to swap
+manually, or add a wired side modem on advanced PCs for music + casino).
+
+**Pocket tablet (speaker + mesh / host LB):** put **modem + speaker** in player
 inventory or a **Sophisticated Backpack** (hotbar helps). Boot equips **modem**
 for mesh hello + host LB sync; games **auto-swap to speaker** when the menu opens.
 **M** toggles manually. CC:T `equipBack` searches player inv from the selected
