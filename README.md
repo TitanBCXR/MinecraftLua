@@ -529,11 +529,16 @@ Optional `password` field in that file gates admin view/edit; set it from the
 admin tablet (**Leaderboard** app or `lb pass`). Public `games_lb_get` /
 `games_lb_submit` stay open for gameplay scores.
 
+**Host monitor (optional):** attach a wired or advanced monitor to the install
+host computer (any side). `host` auto-detects it and draws a public arcade board
+— top scores per game (Tetris, Minesweeper, etc.), same data as LB RPCs. Refreshes
+on new submits/admin edits and every ~30s. No monitor = no change (no errors).
+
 **Leaderboard install (managed fleet or unmanaged games-only):**
 
 | Order | Computer | Installer pick | Needs |
 |------:|----------|----------------|-------|
-| 1 | **Install host** | `github_install` / `install` → **h** Install / update host | wireless modem, disk drive, blank floppy (label **Games LB** optional) |
+| 1 | **Install host** | `github_install` / `install` → **h** Install / update host | wireless modem, disk drive, blank floppy (label **Games LB** optional); monitor optional for arcade LB |
 | 2 | **Router** (optional) | → **4** Network router | only if game PCs / admin are out of host RF range |
 | 3 | **Admin tablet** | → **3** Admin tablet | pocket + wireless modem |
 | 4 | **Game PCs** | `games_install` **or** → **g** Games launcher | pocket/computer + modem for global LB sync |

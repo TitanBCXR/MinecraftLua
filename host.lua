@@ -1,6 +1,6 @@
 --[[
   host.lua  -  Titan install / update host + games leaderboards (CC: Tweaked)
-  Titan-Version: 1.2.17
+  Titan-Version: 1.2.18
 
   Run this on ONE computer that already has the Titan files (your "update
   server"). It serves those files over rednet so pockets and other devices can
@@ -13,6 +13,9 @@
   Leaderboards live on a floppy (`games_leaderboard.cfg`, multi-game). Legacy
   `tetris_leaderboard.cfg` is migrated once. Tetris still uses tetris_lb_* msgs.
   Admin edits use games_lb_admin_* (password in cfg; set from admin tablet).
+
+  Optional wired/advanced monitor: arcade-style multi-game leaderboard board
+  (same data as games_lb_get / tetris_lb RPCs). No monitor = unchanged behavior.
 
   Usage:
     1. Keep this machine updated (you may wget/GitHub here — clients never see it).
@@ -30,6 +33,18 @@ local LB_LEGACY_TETRIS = "tetris_leaderboard.cfg"
 local LB_LOCAL_LEGACY = "tetris_leaderboard.cfg" -- migrate once from computer FS
 local LB_MAX = 25 -- keep extras; tablets only display top 3
 local LB_DISK_LABEL = "Games LB"
+local LB_MON_PERIOD = 30 -- seconds between periodic redraws
+local LB_MON_TOP = 5     -- max rows per game on the monitor
+
+local GAME_TITLES = {
+  tetris = "Tetris",
+  minesweeper = "Minesweeper",
+  luigi_poker = "Luigi Poker",
+  higher_lower = "H/L Poker",
+  slots = "Slots",
+  sandstorm = "Sandstorm",
+}
+local GAME_ORDER = { "tetris", "minesweeper", "luigi_poker", "higher_lower", "slots" }
 
 local FILES = {
   "install.lua",
@@ -125,6 +140,13 @@ local boards = { tetris = {} } -- [gameId] = sorted { id, name, score, at }
 local leaderboard = boards.tetris -- alias for Tetris compat
 local lbPassword = "" -- admin password (empty = unset; deny admin ops until set)
 local lbDriveName, lbMount, lbPath = nil, nil, nil
+local lbMonDirty = true
+local NATIVE_TERM = term.current()
+
+local function markLbMonDirty()
+  lbMonDirty = true
+  pcall(os.queueEvent, "host_lb_dirty")
+end
 
 local function ensureGame(gameId)
   gameId = tostring(gameId or "tetris"):lower()
@@ -305,18 +327,22 @@ local function diskWatchLoop()
           lbPassword, boards = readLbStore(lbPath)
           ensureGame("tetris")
           sortAllBoards()
+          markLbMonDirty()
           print(("[games_lb] disk ready (%s) — %d entr%s"):format(
             tostring(lbMount), boardCount(), boardCount() == 1 and "y" or "ies"))
         elseif had > 0 then
           writeBoardFile(lbPath)
+          markLbMonDirty()
           print(("[games_lb] wrote RAM board to %s (%d)"):format(tostring(lbMount), had))
         else
           boards = { tetris = {} }
           leaderboard = boards.tetris
+          markLbMonDirty()
           print(("[games_lb] disk ready (%s) — empty board"):format(tostring(lbMount)))
         end
       else
         print("[games_lb] floppy removed — serving last scores from RAM (not saving)")
+        markLbMonDirty()
       end
     end
   end
@@ -373,6 +399,7 @@ local function submitScore(id, name, score, gameId, lowerIsBetter)
   sortBoard(gid)
   if gid == "tetris" then leaderboard = boards.tetris end
   saveLeaderboard()
+  markLbMonDirty()
   return true
 end
 
@@ -405,6 +432,7 @@ local function deleteLbEntry(gameId, which)
     sortBoard(gid)
     if gid == "tetris" then leaderboard = boards.tetris end
     saveLeaderboard()
+    markLbMonDirty()
     return true
   end
   local key = tostring(which or ""):lower()
@@ -415,6 +443,7 @@ local function deleteLbEntry(gameId, which)
       sortBoard(gid)
       if gid == "tetris" then leaderboard = boards.tetris end
       saveLeaderboard()
+      markLbMonDirty()
       return true
     end
   end
@@ -453,6 +482,7 @@ local function editLbEntry(gameId, which, newScore, newName)
   sortBoard(gid)
   if gid == "tetris" then leaderboard = boards.tetris end
   saveLeaderboard()
+  markLbMonDirty()
   return true
 end
 
@@ -467,6 +497,7 @@ local function clearLbBoard(gameId)
   end
   sortAllBoards()
   saveLeaderboard()
+  markLbMonDirty()
   return true
 end
 
@@ -504,6 +535,195 @@ local function deliverGamesLb(dest, viaId, payload)
       replyTo = dest,
       from = os.getComputerID(),
     }, ROUTER_PROTOCOL)
+  end
+end
+
+--------------------------------------------------------------------------------
+-- Optional monitor: public arcade leaderboard board
+--------------------------------------------------------------------------------
+local function findMonitor()
+  local m = peripheral.find("monitor")
+  if m then return m end
+  for _, side in ipairs(redstone.getSides()) do
+    if peripheral.getType(side) == "monitor" then
+      return peripheral.wrap(side)
+    end
+  end
+  return nil
+end
+
+local function monIsColor(out)
+  local ok, c = pcall(function() return out.isColor and out.isColor() end)
+  return ok and c == true
+end
+
+local function monApplyScale(out)
+  if not out then return 0.5, 0, 0, false end
+  local color = monIsColor(out)
+  pcall(function() out.setTextScale(0.5) end)
+  local w, h = out.getSize()
+  local scale = 0.5
+  if w >= 90 and h >= 36 then scale = 1 end
+  pcall(function() out.setTextScale(scale) end)
+  w, h = out.getSize()
+  return scale, w, h, color
+end
+
+local function monFill(out, x, y, w, h, bg, fg)
+  if not out then return end
+  bg = bg or colors.black
+  fg = fg or colors.white
+  for row = y, y + h - 1 do
+    out.setCursorPos(x, row)
+    if out.setBackgroundColor then out.setBackgroundColor(bg) end
+    if out.setTextColor then out.setTextColor(fg) end
+    out.write(string.rep(" ", w))
+  end
+end
+
+local function monText(out, x, y, txt, fg, bg)
+  if not out or y < 1 then return end
+  local mw = select(1, out.getSize())
+  if x > mw then return end
+  txt = tostring(txt or "")
+  if out.setBackgroundColor then out.setBackgroundColor(bg or colors.black) end
+  if out.setTextColor then out.setTextColor(fg or colors.white) end
+  out.setCursorPos(x, y)
+  out.write(txt:sub(1, math.max(0, mw - x + 1)))
+end
+
+local function gameTitle(gid)
+  return GAME_TITLES[gid] or gid:gsub("_", " "):gsub("(%a)([%w']*)", function(a, b)
+    return a:upper() .. b:lower()
+  end)
+end
+
+local function gamesForMonitor()
+  local out, seen = {}, {}
+  for _, gid in ipairs(GAME_ORDER) do
+    out[#out + 1] = gid
+    seen[gid] = true
+  end
+  local extras = {}
+  for gid in pairs(boards) do
+    if not seen[gid] then extras[#extras + 1] = gid end
+  end
+  table.sort(extras)
+  for _, gid in ipairs(extras) do out[#out + 1] = gid end
+  return out
+end
+
+local function drawLbMonitor(monitor)
+  if not monitor then return end
+  local prev = term.current()
+  term.redirect(monitor)
+  local ok, err = pcall(function()
+    local scale, w, h, color = monApplyScale(monitor)
+    if w < 1 or h < 1 then return end
+    monitor.setBackgroundColor(colors.black)
+    monitor.clear()
+
+    local headerH = (h >= 12) and 2 or 1
+    local footerH = 1
+    local bodyTop = headerH + 1
+    local bodyH = h - headerH - footerH
+    if bodyH < 3 then bodyH = 3 end
+
+    local title = "TITAN GAMES LEADERBOARD"
+    local subtitle = ("Host #%d"):format(os.getComputerID())
+    if color then
+      monFill(monitor, 1, 1, w, headerH, colors.cyan, colors.black)
+      monText(monitor, 2, 1, title, colors.black, colors.cyan)
+      if headerH >= 2 then
+        monText(monitor, 2, 2, subtitle, colors.gray, colors.cyan)
+      end
+    else
+      monText(monitor, 1, 1, title, colors.white, colors.black)
+      if headerH >= 2 then
+        monText(monitor, 1, 2, subtitle, colors.lightGray, colors.black)
+      end
+    end
+
+    local games = gamesForMonitor()
+    local cols = 1
+    if w >= 88 and #games >= 3 then cols = 3
+    elseif w >= 52 and #games >= 2 then cols = 2 end
+    local colW = math.floor(w / cols)
+    local rowsPerCol = math.ceil(#games / cols)
+    local slotH = math.max(4, math.floor(bodyH / math.max(1, rowsPerCol)))
+    local topN = math.min(LB_MON_TOP, math.max(1, slotH - 2))
+
+    for gi, gid in ipairs(games) do
+      local col = math.floor((gi - 1) / rowsPerCol)
+      local rowInCol = (gi - 1) % rowsPerCol
+      local x0 = col * colW + 1
+      local y0 = bodyTop + rowInCol * slotH
+      local cw = (col == cols - 1) and (w - x0 + 1) or colW
+
+      local accent = color and colors.orange or colors.white
+      monText(monitor, x0, y0, gameTitle(gid):sub(1, cw - 1), accent, colors.black)
+      if color then
+        monFill(monitor, x0, y0 + 1, cw, 1, colors.gray, colors.lightGray)
+      end
+
+      local list = boards[gid] or {}
+      if #list == 0 then
+        monText(monitor, x0 + 1, y0 + 2, "(no scores)", colors.gray, colors.black)
+      else
+        for ri = 1, math.min(topN, #list) do
+          local e = list[ri]
+          local name = tostring(e.name or "?"):sub(1, math.max(4, cw - 12))
+          local line = ("#%d %6d %s"):format(ri, e.score or 0, name)
+          local fg = colors.lightGray
+          if ri == 1 then fg = color and colors.yellow or colors.white
+          elseif ri == 2 then fg = color and colors.lightGray or colors.lightGray
+          elseif ri == 3 then fg = color and colors.orange or colors.gray end
+          local bg = colors.black
+          if color and ri % 2 == 0 then bg = colors.gray end
+          monText(monitor, x0 + 1, y0 + 1 + ri, line:sub(1, cw - 1), fg, bg)
+        end
+      end
+    end
+
+    local diskTag = lbPath and "disk" or "RAM"
+    local foot = (" %d scores  %s  %dx%d"):format(boardCount(), diskTag, w, h)
+    if color then
+      monFill(monitor, 1, h, w, 1, colors.gray, colors.white)
+      monText(monitor, 1, h, foot, colors.white, colors.gray)
+      monText(monitor, math.max(1, w - 5), h, color and " ADV" or " MONO", colors.lightGray, colors.gray)
+    else
+      monText(monitor, 1, h, foot:sub(1, w), colors.gray, colors.black)
+    end
+  end)
+  term.redirect(prev)
+  if not ok and err then
+    pcall(term.redirect, NATIVE_TERM)
+  end
+end
+
+local function monitorDisplayLoop()
+  while true do
+    local monitor = findMonitor()
+    if monitor then
+      if lbMonDirty then
+        drawLbMonitor(monitor)
+        lbMonDirty = false
+      end
+      local timer = os.startTimer(LB_MON_PERIOD)
+      while true do
+        local ev, p1 = os.pullEvent()
+        if ev == "host_lb_dirty" or ev == "monitor_resize"
+            or ev == "peripheral" or ev == "peripheral_detach" then
+          lbMonDirty = true
+          break
+        elseif ev == "timer" and p1 == timer then
+          lbMonDirty = true
+          break
+        end
+      end
+    else
+      sleep(5)
+    end
   end
 end
 
@@ -548,6 +768,14 @@ else
 end
 print("Clients update over rednet + titan_router mesh (no GitHub URL on tablets).")
 print("Mesh relay on. Ctrl+T to stop.")
+do
+  local mon = findMonitor()
+  if mon then
+    local _, w, h, col = monApplyScale(mon)
+    print(("Monitor: arcade LB board (%dx%d%s)."):format(w, h, col and ", color" or ""))
+    markLbMonDirty()
+  end
+end
 print("")
 
 local function replyHostHere(dest, viaId)
@@ -822,7 +1050,7 @@ local function serveLoop()
   end
 end
 
-local tasks = { serveLoop, relayLoop, diskWatchLoop }
+local tasks = { serveLoop, relayLoop, diskWatchLoop, monitorDisplayLoop }
 if fs.exists("lib/titan.lua") then
   local titan = dofile("lib/titan.lua")
   tasks[#tasks + 1] = function() titan.networkLoop("host") end
