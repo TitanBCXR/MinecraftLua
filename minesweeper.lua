@@ -1,6 +1,6 @@
 --[[
   minesweeper.lua  -  Lightweight Minesweeper for CC: Tweaked
-  Titan-Version: 1.2.4
+  Titan-Version: 1.2.5
 
   Run:
 
@@ -116,6 +116,16 @@ local gm = nil
 if fs.exists("lib/games_music.lua") then
   local ok, lib = pcall(dofile, "lib/games_music.lua")
   if ok and type(lib) == "table" then gm = lib; gm.loadSettings() end
+end
+
+local pp = nil
+if fs.exists("lib/pocket_peripherals.lua") then
+  local ok, lib = pcall(dofile, "lib/pocket_peripherals.lua")
+  if ok and type(lib) == "table" then pp = lib end
+end
+
+local function equipMusicBack()
+  if pp and pp.ensureSpeakerEquipped then pp.ensureSpeakerEquipped(nil) end
 end
 
 local function submitMinesLb(seconds)
@@ -833,6 +843,7 @@ end
 
 math.randomseed(os.epoch("utc") % 2147483647)
 attachMonitor()
+equipMusicBack()
 local ok, err = pcall(mainMenu)
 cleanExit()
 if not ok then

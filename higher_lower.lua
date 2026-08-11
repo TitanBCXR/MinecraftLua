@@ -1,6 +1,6 @@
 --[[
   higher_lower.lua  -  Video Poker → Higher / Lower streak (CC: Tweaked)
-  Titan-Version: 1.1.3
+  Titan-Version: 1.1.4
 
   Run:
 
@@ -61,6 +61,16 @@ local gm = nil
 if fs.exists("lib/games_music.lua") then
   local ok, lib = pcall(dofile, "lib/games_music.lua")
   if ok and type(lib) == "table" then gm = lib; gm.loadSettings() end
+end
+
+local pp = nil
+if fs.exists("lib/pocket_peripherals.lua") then
+  local ok, lib = pcall(dofile, "lib/pocket_peripherals.lua")
+  if ok and type(lib) == "table" then pp = lib end
+end
+
+local function equipMusicBack()
+  if pp and pp.ensureSpeakerEquipped then pp.ensureSpeakerEquipped(nil) end
 end
 
 local RANK_NAME = {
@@ -718,6 +728,7 @@ end
 
 local function main()
   attachMonitor()
+  equipMusicBack()
   refreshSpeaker()
   initEconomy()
   local state = {

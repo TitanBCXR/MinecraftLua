@@ -1,6 +1,6 @@
 --[[
   sandstorm.lua  -  Note-block Sandstorm knockoff + monitor pixel show
-  Titan-Version: 1.0.1
+  Titan-Version: 1.0.2
 
   Run:
 
@@ -32,6 +32,16 @@ local STEP = 1
 local BEAT = 0
 local ENERGY = 0
 local TITLE_FLASH = 0
+
+local pp = nil
+if fs.exists("lib/pocket_peripherals.lua") then
+  local ok, lib = pcall(dofile, "lib/pocket_peripherals.lua")
+  if ok and type(lib) == "table" then pp = lib end
+end
+
+local function equipMusicBack()
+  if pp and pp.ensureSpeakerEquipped then pp.ensureSpeakerEquipped(nil) end
+end
 
 --------------------------------------------------------------------------------
 -- Sandstorm-ish arrangement (chiptune knockoff — not the original recording).
@@ -379,6 +389,7 @@ end
 --------------------------------------------------------------------------------
 local function main()
   attachMonitor()
+  equipMusicBack()
   refreshSpeaker()
   local tw, th = term.getSize()
   initViz(tw, th)

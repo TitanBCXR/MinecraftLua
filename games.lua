@@ -1,6 +1,6 @@
 --[[
   games.lua  -  Titan Games Launcher (CC: Tweaked)
-  Titan-Version: 1.2.2
+  Titan-Version: 1.2.3
 
   Run:
 
@@ -11,7 +11,8 @@
   and launches them from a tap-friendly menu.
 
   First run: choose Managed (in-game casino currency) or Unmanaged (granted
-  local chips). Pocket: modem/speaker in player inventory; M swaps back upgrade.
+  local chips). Pocket: modem/speaker in player inventory; boot equips modem
+  for mesh + host LB; games auto-swap to speaker for music after load. M swaps.
 
   Controls:
     Tap / Enter  play   U update   M music/modem   S settings   Q quit
@@ -21,7 +22,8 @@ local RAW_FALLBACK = "https://raw.githubusercontent.com/TitanBCXR/MinecraftLua/m
 local CAT_FILE = "games_catalog.lua"
 local VER_FILE = "versions.lua"
 local STATE_FILE = "games_launcher.cfg"
-local PREFER_MODEM = false -- false = speaker-only launch
+local PREFER_MODEM = true -- boot keeps modem for mesh; games auto-swap speaker
+local MESH_KIND = "games"
 
 local econ = nil
 if fs.exists("lib/games_economy.lua") then
@@ -146,9 +148,52 @@ local function doMusicModemSwap()
   if ok then
     PREFER_MODEM = hasModem()
     saveState()
-    STATUS = PREFER_MODEM and "Modem on (mesh)" or "Speaker on (music)"
+    STATUS = pp.statusText and pp.statusText() or (
+      PREFER_MODEM and "Modem on (mesh)" or "Speaker on (music)")
   else
     STATUS = "Music/modem swap failed: " .. tostring(err or "check inventory")
+  end
+end
+
+local function announceMesh()
+  if not titan or not titan.announce then return end
+  pcall(titan.announce, MESH_KIND)
+end
+
+-- Boot: equip modem from player inventory, join mesh, hello router roster.
+local function bootMeshPresence()
+  if pp and pp.loadConfig then pp.loadConfig() end
+  if pp and pp.ensureModemEquipped then
+    pp.ensureModemEquipped(titan)
+  end
+  if not hasModem() then
+    STATUS = "No modem — put one in inventory"
+    return false
+  end
+  if titan and titan.openModem then pcall(titan.openModem) end
+  if not os.getComputerLabel() or os.getComputerLabel() == "" then
+    os.setComputerLabel("Games-" .. os.getComputerID())
+  end
+  if titan and titan.findMainRouter then
+    titan.findMainRouter(3)
+  end
+  announceMesh()
+  PREFER_MODEM = true
+  if pp.refreshSourceCache then pp.refreshSourceCache() end
+  saveState()
+  STATUS = pp and pp.statusText and pp.statusText() or "Modem on (mesh)"
+  return true
+end
+
+local function restoreMeshAfterGame()
+  if pp and pp.ensureModemEquipped then
+    pp.ensureModemEquipped(titan)
+  end
+  if hasModem() then
+    if titan and titan.openModem then pcall(titan.openModem) end
+    announceMesh()
+    PREFER_MODEM = true
+    saveState()
   end
 end
 
@@ -665,7 +710,8 @@ local function settingsValueText(row)
     local id = gm.getTrack(row.gameId)
     return gm.presetLabel(row.gameId, id)
   elseif row.kind == "mesh" then
-    return PREFER_MODEM and "Modem / mesh" or "Speaker music"
+    if pp and pp.statusText then return pp.statusText() end
+    return PREFER_MODEM and "Modem on (mesh)" or "Speaker on (music)"
   elseif row.kind == "econ" then
     if econ and econ.setupDone then
       return econ.isManaged() and "Managed" or "Unmanaged"
@@ -737,7 +783,7 @@ local function runSettings()
         elseif row.kind == "track" and gm then
           gm.cycleTrack(row.gameId, -1)
         elseif row.kind == "mesh" then
-          PREFER_MODEM = not PREFER_MODEM
+          doMusicModemSwap()
         end
         saveState()
       elseif p1 == keys.right then
@@ -749,14 +795,14 @@ local function runSettings()
         elseif row.kind == "track" and gm then
           gm.cycleTrack(row.gameId, 1)
         elseif row.kind == "mesh" then
-          PREFER_MODEM = not PREFER_MODEM
+          doMusicModemSwap()
         end
         saveState()
       elseif p1 == keys.enter or p1 == keys.space then
         if row.kind == "econ" then
           runEconomySetup()
         elseif row.kind == "mesh" then
-          PREFER_MODEM = not PREFER_MODEM
+          doMusicModemSwap()
           saveState()
         end
       end
@@ -800,35 +846,24 @@ local function launchGame(game)
     econFlag = "--unmanaged"
     print("(unmanaged — local chip wallet)")
   end
-  local isTetris = game.id == "tetris"
-  local needsMesh = (econ and econ.isManaged()) or game.id == "tetris"
-  if needsMesh and pp and pp.ensureModemEquipped then
+  -- Keep modem equipped through launch (Tetris boot LB / mesh); game auto-swaps speaker.
+  if pp and pp.ensureModemEquipped then
     pp.ensureModemEquipped(titan)
   end
-  local modemHere = hasModem()
-  -- Tetris always prefers install-host LB when a modem is available.
-  local useModem = isTetris and modemHere
-    or PREFER_MODEM or (econ and econ.isManaged())
-  if isTetris and modemHere then
-    print("(host leaderboard sync at boot)")
-  elseif useModem then
-    print("(modem mode — Close returns here)")
+  if hasModem() then
+    print("(modem — game swaps speaker after load)")
   else
-    print("(speaker mode — Close returns here)")
+    print("(no modem — music if speaker available)")
   end
   sleep(0.2)
   drainEvents(0.05)
   local args = { "--launcher" }
   if econFlag then args[#args + 1] = econFlag end
-  -- Other games: speaker-only launch when mesh is off. Tetris never gets
-  -- --speaker from the launcher — it auto-detects music + host LB separately.
-  if not useModem and not isTetris then
-    table.insert(args, 1, "--speaker")
-  end
   shell.run(game.run, table.unpack(args))
   drainEvents(0.12)
   attachMonitor()
-  STATUS = "Back from " .. (game.name or game.run)
+  restoreMeshAfterGame()
+  STATUS = pp and pp.statusText and pp.statusText() or ("Back from " .. (game.name or game.run))
 end
 
 --------------------------------------------------------------------------------
@@ -849,6 +884,8 @@ local function main()
       runEconomySetup()
     end
   end
+
+  bootMeshPresence()
 
   local state = {
     catalog = loadLocalCatalog(),
@@ -927,7 +964,8 @@ local function main()
       elseif ch == "m" then doMusicModemSwap()
       elseif ch == "s" or ch == "o" then
         runSettings()
-        STATUS = PREFER_MODEM and "Modem mode on" or "Speaker mode on"
+        STATUS = pp and pp.statusText and pp.statusText() or (
+          PREFER_MODEM and "Modem on (mesh)" or "Speaker on (music)")
       elseif tonumber(ch) and games[tonumber(ch)] then
         launchGame(games[tonumber(ch)])
       end

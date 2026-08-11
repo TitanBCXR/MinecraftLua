@@ -1,6 +1,6 @@
 --[[
   luigi_poker.lua  -  Luigi Picture Poker (SMB3-style) for CC: Tweaked
-  Titan-Version: 1.2.7
+  Titan-Version: 1.2.8
 
   Run:
 
@@ -57,6 +57,16 @@ local gm = nil
 if fs.exists("lib/games_music.lua") then
   local ok, lib = pcall(dofile, "lib/games_music.lua")
   if ok and type(lib) == "table" then gm = lib; gm.loadSettings() end
+end
+
+local pp = nil
+if fs.exists("lib/pocket_peripherals.lua") then
+  local ok, lib = pcall(dofile, "lib/pocket_peripherals.lua")
+  if ok and type(lib) == "table" then pp = lib end
+end
+
+local function equipMusicBack()
+  if pp and pp.ensureSpeakerEquipped then pp.ensureSpeakerEquipped(nil) end
 end
 
 -- Rank id 1..6 (Cloud lowest, Luigi highest)
@@ -688,6 +698,7 @@ end
 
 local function main()
   attachMonitor()
+  equipMusicBack()
   refreshSpeaker()
   initEconomy()
   if musicPlayer then musicPlayer:start("menu") end

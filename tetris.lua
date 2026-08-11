@@ -1,6 +1,6 @@
 --[[
   tetris.lua  -  Standalone Tetris for CC: Tweaked (pocket / computer)
-  Titan-Version: 1.3.2
+  Titan-Version: 1.3.3
 
   Drop on a pocket PC or advanced computer and run:
 
@@ -27,7 +27,7 @@
 
   Music (speaker / Noisy pocket): note tracks from lib/games_music.lua (speed +
   soundtrack chosen in Games launcher Settings). In-game M mutes. Pocket: modem
-  in player inventory; equip modem for boot sync, then M to swap for music.
+  for boot sync; speaker auto-equipped when the menu opens (M toggles manually).
 
   Player name: uses Advanced Peripherals Player Detector when present; otherwise
   prompts for a name after a game (saved in tetris.cfg). That name is what
@@ -1593,7 +1593,19 @@ local function bootCheckUpdates()
   showQuitDisclaimer()
 end
 
+local function equipSpeakerForMusic()
+  if pp and pp.ensureSpeakerEquipped then
+    local ok = pp.ensureSpeakerEquipped(titan)
+    if ok then
+      print("Speaker on (music)")
+    end
+    return ok
+  end
+  return refreshSpeaker()
+end
+
 bootCheckUpdates()
+equipSpeakerForMusic()
 attachMonitor()
 local okRun, errRun = pcall(mainMenu)
 detachMonitor()

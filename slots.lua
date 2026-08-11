@@ -1,6 +1,6 @@
 --[[
   slots.lua  -  3-reel slots for CC: Tweaked
-  Titan-Version: 1.0.6
+  Titan-Version: 1.0.7
 
   Run:
 
@@ -51,6 +51,16 @@ local gm = nil
 if fs.exists("lib/games_music.lua") then
   local ok, lib = pcall(dofile, "lib/games_music.lua")
   if ok and type(lib) == "table" then gm = lib; gm.loadSettings() end
+end
+
+local pp = nil
+if fs.exists("lib/pocket_peripherals.lua") then
+  local ok, lib = pcall(dofile, "lib/pocket_peripherals.lua")
+  if ok and type(lib) == "table" then pp = lib end
+end
+
+local function equipMusicBack()
+  if pp and pp.ensureSpeakerEquipped then pp.ensureSpeakerEquipped(nil) end
 end
 
 -- Symbol weights (higher = more common). Payouts for 3-of-a-kind / 2-of-a-kind.
@@ -471,6 +481,7 @@ end
 --------------------------------------------------------------------------------
 local function main()
   attachMonitor()
+  equipMusicBack()
   refreshSpeaker()
   initEconomy()
   local state = {

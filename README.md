@@ -21,7 +21,7 @@ A wireless dispatch system for Minecraft's **CC: Tweaked** mod (active packages)
 - **`luigi_poker.lua`** — Luigi Picture Poker (beat Luigi’s visible hand; pocket-first; hold/draw).
 - **`higher_lower.lua`** — Pair of Jacks+ video poker → Higher/Lower streak (cash out or risk for jackpot at 10).
 - **`slots.lua`** — 3-reel slots (bet/spin animation, coin bank; monitor tap UI).
-- **`games.lua`** + **`games_catalog.lua`** — Games launcher: HTTP updates; **M** swaps speaker/modem (inventory search; slots 15/16 home); **S** Settings (music speed + soundtracks).
+- **`games.lua`** + **`games_catalog.lua`** — Games launcher: boot modem + mesh hello; scans player/backpack inv for upgrades; auto speaker after game load; **M** toggle.
 - **`games/managers/currency_manager.lua`** — casino ledger (floppy rates/balances); mesh API for games + ATMs.
 - **`games/managers/casino_atm.lua`** — casino ATM (chips + Create ticker).
 - **`storage/managers/storage_atm.lua`** — solo storage ATM (wired modem ↔ vault; no ticker/casino).
@@ -545,14 +545,14 @@ admin tablet, then game PCs (`games` → **U** or re-run installer).
 no Currency Manager. If the game PC has a modem, the launcher keeps **modem +
 global LB** enabled so Tetris/Minesweeper still sync scores to the host.
 
-**Noisy Tetris tablet (speaker + host LB):** equip a **wireless modem** at boot
-(direct or via router mesh) so scores sync to the install host; `tetris_lb.cfg`
-on the device is cache only. On an **advanced computer**, attach a **speaker**
-block adjacent to the PC alongside the modem — music and LB sync together. On a
-**pocket**, only one back upgrade fits: keep the **modem** in **slot 15** for boot
-sync, **speaker in slot 16**, then press **M** to swap for music (network
-locks after boot sync; scores queue locally until the next boot with modem).
-Games launcher **Settings** pick speed + soundtrack; **M** swaps hardware.
+**Noisy Tetris tablet (speaker + host LB):** put **modem + speaker** in player
+inventory or a **Sophisticated Backpack** (hotbar helps). Boot equips **modem**
+for mesh hello + host LB sync; games **auto-swap to speaker** when the menu opens.
+**M** toggles manually. CC:T `equipBack` searches player inv from the selected
+hotbar slot; Titan also scans AP **inventory_manager** nested backpack slots and
+placed backpack blocks when wired. Items only in a **closed** backpack that CC
+cannot see need moving to hotbar manually. Network locks after Tetris boot sync.
+Games launcher **Settings** pick speed + soundtrack.
 
 **Set the LB password (no Parent Center required):** boot `admin` → choose **2)
 Games leaderboard** at the sign-in gate (or unlock fully and open the
