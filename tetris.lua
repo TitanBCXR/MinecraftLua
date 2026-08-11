@@ -1,11 +1,11 @@
 --[[
   tetris.lua  -  Standalone Tetris for CC: Tweaked (pocket / computer)
-  Titan-Version: 1.2.8
+  Titan-Version: 1.2.9
 
   Drop on a pocket PC or advanced computer and run:
 
       tetris
-      tetris --speaker --launcher   (Games launcher: speaker only, Close exits)
+      tetris --launcher          (Games launcher: Close returns to menu)
 
   Main menu: top-3 leaderboard, Play, Controls (C). Q shuts down (or Close
   back to Games launcher when started with --launcher).
@@ -17,15 +17,18 @@
   you can close the computer UI and play from the screen. Keys still work on
   the PC. Advanced color monitors / pockets get colored pieces.
 
-  Network: one boot sync (OTA + leaderboard) then the board is cached locally
-  and the session goes fully offline — no more rednet calls (avoids pocket
-  crashes with speaker music). New scores update the local top-3 and queue for
-  the next boot sync. R reloads the local cache only.
-  `--speaker` / Games launcher skips modem entirely (local LB + notes only).
+  Network: one boot sync (OTA + host leaderboard) then the board is cached
+  locally (`tetris_lb.cfg` is cache only — install host is authority) and the
+  session goes fully offline — no more rednet calls (avoids pocket crashes
+  with speaker music). New scores update the local top-3 and queue for the next
+  boot sync. R reloads the local cache only.
+  Host LB sync runs whenever a wireless modem is present (direct or router
+  mesh), including with a speaker / Noisy pocket. `--no-modem` skips mesh.
 
   Music (speaker / Noisy pocket): two in-script note tracks — calm menu bed +
-  retro Korobeiniki in-game. M mutes. Optional mesh LB sync needs a modem
-  when not in --speaker mode.
+  retro Korobeiniki in-game. M mutes. Speaker + modem together: on an advanced
+  PC attach both peripherals; on a pocket equip modem for boot sync, then U
+  to swap to speaker for music (scores queue locally until next boot sync).
 
   Player name: uses Advanced Peripherals Player Detector when present; otherwise
   prompts for a name after a game (saved in tetris.cfg). That name is what
@@ -47,19 +50,20 @@ local SIDE_W = 5 -- compact HUD column (score uses K/M/B/T)
 local LB_TOP = 3 -- only show top 3 on menu
 local PLAYER_RANGE = 8
 
--- Games launcher: --speaker (no modem) + --launcher (Close exits, no shutdown).
-local SPEAKER_ONLY = false
+-- --launcher = Close returns to Games menu. --no-modem = skip host LB/OTA.
+-- --speaker is legacy (music hint only; does not disable host LB).
 local FROM_LAUNCHER = false
+local NO_MODEM = false
 do
   local argv = { ... }
   for i = 1, #argv do
     local s = tostring(argv[i] or ""):lower()
-    if s == "--speaker" or s == "speaker" or s == "--offline" or s == "offline" then
-      SPEAKER_ONLY = true
+    if s == "--no-modem" or s == "no-modem" or s == "--offline" or s == "offline" then
+      NO_MODEM = true
     elseif s == "--launcher" or s == "launcher" then
       FROM_LAUNCHER = true
-      SPEAKER_ONLY = true
     end
+    -- --speaker accepted for launcher compat; ignored for mesh.
   end
 end
 
@@ -231,14 +235,14 @@ end
 
 local function meshStatusLine()
   local sp = refreshSpeaker()
-  if SPEAKER_ONLY then
-    return sp and "speaker only" or "no speaker"
-  end
   local md = hasModem()
-  if sp and md then return "notes+mesh"
+  if NO_MODEM then
+    return sp and "local (no modem)" or "local cache"
+  end
+  if sp and md then return "notes+host LB"
   elseif sp then return "notes (U=modem)"
-  elseif md then return "mesh (no speaker)"
-  else return "offline"
+  elseif md then return "host LB"
+  else return "local cache"
   end
 end
 
@@ -1543,11 +1547,12 @@ local function bootCheckUpdates()
   if fs.exists(LEGACY_MUSIC_FILE) then pcall(fs.delete, LEGACY_MUSIC_FILE) end
   print(meshStatusLine())
 
-  if SPEAKER_ONLY or not hasModem() then
-    if SPEAKER_ONLY then
-      print("Speaker mode — local LB, no modem.")
+  if NO_MODEM or not hasModem() then
+    if NO_MODEM then
+      print("No-modem mode — cached leaderboard only.")
     else
-      print("No modem — using local leaderboard only.")
+      print("No modem — cached leaderboard only.")
+      print("(Equip wireless modem for host sync; U swaps pocket upgrade.)")
     end
     lockNetworkOffline()
     sleep(0.55)

@@ -1,6 +1,6 @@
 --[[
   games.lua  -  Titan Games Launcher (CC: Tweaked)
-  Titan-Version: 1.0.8
+  Titan-Version: 1.0.9
 
   Run:
 
@@ -588,7 +588,7 @@ local function runSettings()
     textAt(2, 3, "Launch / mesh:", colors.white, colors.black)
     local modeLine = PREFER_MODEM
       and "Modem + global LB / casino"
-      or "Speaker only (local music)"
+      or "Speaker music (Tetris still syncs host LB when modem equipped)"
     textAt(2, 4, modeLine:sub(1, tw - 2),
       PREFER_MODEM and colors.lime or colors.yellow, colors.black)
     local econLine = "(economy not set)"
@@ -666,27 +666,28 @@ local function launchGame(game)
     econFlag = "--unmanaged"
     print("(unmanaged — local chip wallet)")
   end
-  if PREFER_MODEM or (econ and econ.isManaged()) then
+  local isTetris = game.id == "tetris"
+  local modemHere = hasModem()
+  -- Tetris always prefers install-host LB when a modem is available.
+  local useModem = isTetris and modemHere
+    or PREFER_MODEM or (econ and econ.isManaged())
+  if isTetris and modemHere then
+    print("(host leaderboard sync at boot)")
+  elseif useModem then
     print("(modem mode — Close returns here)")
   else
     print("(speaker mode — Close returns here)")
   end
   sleep(0.2)
   drainEvents(0.05)
-  local useModem = PREFER_MODEM or (econ and econ.isManaged())
-  if useModem then
-    if econFlag then
-      shell.run(game.run, "--launcher", econFlag)
-    else
-      shell.run(game.run, "--launcher")
-    end
-  else
-    if econFlag then
-      shell.run(game.run, "--speaker", "--launcher", econFlag)
-    else
-      shell.run(game.run, "--speaker", "--launcher")
-    end
+  local args = { "--launcher" }
+  if econFlag then args[#args + 1] = econFlag end
+  -- Other games: speaker-only launch when mesh is off. Tetris never gets
+  -- --speaker from the launcher — it auto-detects music + host LB separately.
+  if not useModem and not isTetris then
+    table.insert(args, 1, "--speaker")
   end
+  shell.run(game.run, table.unpack(args))
   drainEvents(0.12)
   attachMonitor()
   STATUS = "Back from " .. (game.name or game.run)

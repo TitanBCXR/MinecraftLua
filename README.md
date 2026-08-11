@@ -15,7 +15,7 @@ A wireless dispatch system for Minecraft's **CC: Tweaked** mod (active packages)
   - **Workers:** `storage/workers/storage_builder.lua` (places the vault cell)
   - Root `storage_manager.lua` / `storage_builder.lua` are compat shims.
 - **`perimeter_sensor.lua` / `perimeter_manager.lua`** — Player Detector territory (one manager + admin alerts).
-- **`tetris.lua`** — Tetris for pocket / advanced PC + monitor (local LB; note music; monitor bottom half = touch pad).
+- **`tetris.lua`** — Tetris for pocket / advanced PC + monitor (host LB via install host; note music; monitor bottom half = touch pad).
 - **`minesweeper.lua`** — Minesweeper for pocket / advanced PC + monitor (no modem; monitor bottom half = Open/Flag touch pad).
 - **`sandstorm.lua`** — Darude Sandstorm note-block knockoff + desert pixel visualizer (speaker + color monitor).
 - **`luigi_poker.lua`** — Luigi Picture Poker (beat Luigi’s visible hand; pocket-first; hold/draw).
@@ -535,6 +535,16 @@ admin tablet, then game PCs (`games` → **U** or re-run installer).
 **Unmanaged economy:** pick **UNMANAGED** on first `games` run — local chips,
 no Currency Manager. If the game PC has a modem, the launcher keeps **modem +
 global LB** enabled so Tetris/Minesweeper still sync scores to the host.
+
+**Noisy Tetris tablet (speaker + host LB):** equip a **wireless modem** at boot
+(direct or via router mesh) so scores sync to the install host; `tetris_lb.cfg`
+on the device is cache only. On an **advanced computer**, attach a **speaker**
+block adjacent to the PC alongside the modem — music and LB sync together. On a
+**pocket**, only one back upgrade fits: keep the **modem** equipped for boot
+sync, then press **U** in-game to swap to the **speaker** for music (network
+locks after boot sync; scores queue locally until the next boot with modem).
+Games launcher **S** speaker/modem toggle does not block Tetris host LB when a
+modem is equipped.
 
 **Set the LB password (no Parent Center required):** boot `admin` → choose **2)
 Games leaderboard** at the sign-in gate (or unlock fully and open the
