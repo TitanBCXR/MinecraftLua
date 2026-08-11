@@ -1,6 +1,6 @@
 --[[
   admin.lua  -  Titan admin console for a POCKET computer ("Live" tablet)
-  Titan-Version: 1.5.11
+  Titan-Version: 1.5.13
 
   Pocket remote for the whole fleet. Keep it on you; it joins the mesh like
   every other Titan device (MAIN router + modem hops).
@@ -17,6 +17,7 @@
     connect | ssh <id|label>     - remote shell (full device commands)
     say <id|label> <message>     - print on that device's screen
     storage | stock | request    - Storage Manager browse / request to output
+    casino                       - Currency Manager (withdraw / rates / bind)
     lb | leaderboard             - Games host leaderboard (password on floppy)
     link                         - network topology (routers + modems)
     link <a> <b>                 - peer two routers OR attach modem->router
@@ -112,6 +113,14 @@ local lastWhereMsg = nil
 local trackWhereView       -- assigned later
 local flushWhereTrack      -- assigned later
 local storageManagers = {} -- [id] = { name, seen, types, units }
+local casinoManagers = {}  -- [id] = { name, seen }
+local casinoSessionUntil = 0
+local casinoSessionPw = nil
+local sessionMasterPw = nil
+local casinoLedgerManagerId = nil
+local casinoLedgerSnap = nil
+local CASINO_MON_SEC = 2
+local ADMIN_NATIVE_TERM = term.current()
 
 local function now() return os.epoch("utc") end
 local function ago(ts) return math.floor((now() - (ts or 0)) / 1000) end
@@ -981,6 +990,9 @@ showLoginScreen = function(opts)
     if pw and pw ~= "" then
       if titan.checkPassword(pw) then
         unlocked = true
+        sessionMasterPw = pw
+        casinoSessionPw = pw
+        casinoSessionUntil = now() + 5 * 60 * 1000
         themeClear(out, color)
         guiFill(out, 1, 1, w, h, color and THEME.ok or bg, THEME.text)
         guiText(out, 2, math.floor(h / 2), "Unlocked",
@@ -2669,6 +2681,430 @@ local function handleStorageCommand(a)
 end
 
 --------------------------------------------------------------------------------
+-- Currency Manager (vault + station barrels)
+--------------------------------------------------------------------------------
+local function discoverCasino(timeout)
+  timeout = timeout or 2.5
+  rednet.broadcast({ type = "casino_ping", from = os.getComputerID() }, INSTALL_PROTO)
+  rednet.broadcast({ type = "casino_ping", from = os.getComputerID() }, PROTO_ROUTER)
+  local deadline = os.clock() + timeout
+  local found = {}
+  while os.clock() < deadline do
+    local id, msg = rednet.receive(nil, math.max(0.05, deadline - os.clock()))
+    if id and type(msg) == "table" and msg.type == "casino_hello" then
+      casinoManagers[id] = {
+        id = id,
+        name = msg.name or ("Casino-" .. id),
+        seen = now(),
+      }
+      found[#found + 1] = casinoManagers[id]
+    end
+  end
+  table.sort(found, function(a, b) return (a.id or 0) < (b.id or 0) end)
+  return found
+end
+
+local function pickCasinoManager()
+  local list = discoverCasino(2)
+  if #list == 0 then
+    for id, row in pairs(casinoManagers) do
+      list[#list + 1] = row
+      row.id = id
+    end
+    table.sort(list, function(a, b) return (a.id or 0) < (b.id or 0) end)
+  end
+  if #list == 0 then return nil end
+  if #list == 1 then return list[1].id, list[1] end
+  print("Currency managers:")
+  for i, row in ipairs(list) do
+    print(("  %d) #%d %s"):format(i, row.id, tostring(row.name)))
+  end
+  write("Pick # (Enter=1): ")
+  local n = tonumber(read() or "") or 1
+  local row = list[n] or list[1]
+  return row and row.id, row
+end
+
+local function casinoRequirePw()
+  if not requireAuth() then return nil end
+  if casinoSessionPw and now() < casinoSessionUntil then return casinoSessionPw end
+  write("Master password: ")
+  local pw = read("*")
+  if titan.checkPassword(pw) then
+    casinoSessionPw = pw
+    sessionMasterPw = pw
+    casinoSessionUntil = now() + 5 * 60 * 1000
+    return pw
+  end
+  print("Denied.")
+  return nil
+end
+
+local function casinoReq(managerId, payload, timeout)
+  timeout = timeout or 6
+  payload = payload or {}
+  payload.from = os.getComputerID()
+  payload.replyTo = os.getComputerID()
+  rednet.send(managerId, payload, INSTALL_PROTO)
+  rednet.send(managerId, payload, PROTO_ROUTER)
+  local deadline = os.clock() + timeout
+  while os.clock() < deadline do
+    local id, msg = rednet.receive(nil, math.max(0.05, deadline - os.clock()))
+    if id == managerId and type(msg) == "table"
+        and (msg.type == "casino_ack" or msg.type == "casino_stations"
+          or msg.type == "casino_balance" or msg.type == "casino_rates"
+          or msg.type == "casino_ledger") then
+      return msg
+    end
+  end
+  return nil, "timeout"
+end
+
+local function casinoAdminPassword()
+  if casinoSessionPw and now() < casinoSessionUntil then return casinoSessionPw end
+  if sessionMasterPw and unlocked then return sessionMasterPw end
+  return nil
+end
+
+local function findCasinoManagerId()
+  if casinoLedgerManagerId and casinoManagers[casinoLedgerManagerId] then
+    return casinoLedgerManagerId
+  end
+  local list = discoverCasino(1.5)
+  if #list > 0 then
+    casinoLedgerManagerId = list[1].id
+    return casinoLedgerManagerId
+  end
+  return nil
+end
+
+local function fetchCasinoLedger(managerId, password)
+  return casinoReq(managerId, {
+    type = "casino_ledger_req",
+    password = password,
+  }, 4)
+end
+
+local function findAdminMonitor()
+  local m = peripheral.find("monitor")
+  if m then return m end
+  for _, side in ipairs(redstone.getSides()) do
+    if peripheral.getType(side) == "monitor" then
+      return peripheral.wrap(side)
+    end
+  end
+  return nil
+end
+
+local function adminMonIsColor(out)
+  local ok, c = pcall(function() return out.isColor and out.isColor() end)
+  return ok and c == true
+end
+
+local function adminMonApplyScale(out)
+  if not out then return 0.5, 0, 0, false end
+  local color = adminMonIsColor(out)
+  pcall(function() out.setTextScale(0.5) end)
+  local w, h = out.getSize()
+  local scale = 0.5
+  if w >= 52 and h >= 26 then scale = 1 end
+  pcall(function() out.setTextScale(scale) end)
+  w, h = out.getSize()
+  return scale, w, h, color
+end
+
+local function adminMonFill(out, x, y, ww, hh, bg, fg)
+  if not out then return end
+  bg = bg or colors.black
+  fg = fg or colors.white
+  for row = y, y + hh - 1 do
+    out.setCursorPos(x, row)
+    if out.setBackgroundColor then out.setBackgroundColor(bg) end
+    if out.setTextColor then out.setTextColor(fg) end
+    out.write(string.rep(" ", ww))
+  end
+end
+
+local function adminMonText(out, x, y, txt, fg, bg)
+  if not out or y < 1 then return end
+  local mw = select(1, out.getSize())
+  if x > mw then return end
+  txt = tostring(txt or "")
+  if out.setBackgroundColor then out.setBackgroundColor(bg or colors.black) end
+  if out.setTextColor then out.setTextColor(fg or colors.white) end
+  out.setCursorPos(x, y)
+  out.write(txt:sub(1, math.max(0, mw - x + 1)))
+end
+
+local function fmtCasinoRow(name, chips, width)
+  name = tostring(name or "?"):sub(1, math.max(1, width - 10))
+  local num = tostring(math.floor(tonumber(chips) or 0))
+  local pad = width - #name - #num
+  if pad < 1 then pad = 1 end
+  return name .. string.rep(" ", pad) .. num
+end
+
+local function drawCasinoLedgerMonitor(monitor, snap, locked)
+  if not monitor then return end
+  local prev = term.current()
+  term.redirect(monitor)
+  local ok, err = pcall(function()
+    local _, w, h, color = adminMonApplyScale(monitor)
+    if w < 1 or h < 1 then return end
+    monitor.setBackgroundColor(colors.black)
+    monitor.clear()
+
+    local headerH = (h >= 10) and 3 or 2
+    local footerH = 1
+    local bodyTop = headerH + 1
+    local bodyH = math.max(1, h - headerH - footerH)
+
+    if locked or not snap then
+      local msg = locked and "CASINO LEDGER — LOCKED" or "CASINO LEDGER — NO DATA"
+      if color then
+        adminMonFill(monitor, 1, 1, w, headerH, colors.red, colors.white)
+        adminMonText(monitor, 2, 1, msg, colors.white, colors.red)
+        adminMonText(monitor, 2, 2, "Unlock admin tablet", colors.pink, colors.red)
+      else
+        adminMonText(monitor, 1, 1, msg, colors.white, colors.black)
+      end
+      adminMonText(monitor, 1, h, (" refresh %ds"):format(CASINO_MON_SEC), colors.gray, colors.black)
+      return
+    end
+
+    local title = "CASINO LEDGER"
+    local sub = ("CHIPS %d  VAULT %d"):format(
+      tonumber(snap.totalChips) or 0, tonumber(snap.vaultChips) or 0)
+    if color then
+      adminMonFill(monitor, 1, 1, w, headerH, colors.magenta, colors.black)
+      adminMonText(monitor, 2, 1, title, colors.white, colors.magenta)
+      adminMonText(monitor, 2, 2, sub:sub(1, w - 2), colors.pink, colors.magenta)
+      if headerH >= 3 then
+        adminMonText(monitor, 2, 3, ("Admin #%d"):format(os.getComputerID()), colors.lightGray, colors.magenta)
+      end
+    else
+      adminMonText(monitor, 1, 1, title, colors.white, colors.black)
+      adminMonText(monitor, 1, 2, sub:sub(1, w), colors.lightGray, colors.black)
+    end
+
+    local players = snap.players or {}
+    if #players == 0 then
+      adminMonText(monitor, 2, bodyTop, "(no player balances)", colors.gray, colors.black)
+    else
+      for i = 1, math.min(bodyH, #players) do
+        local row = players[i]
+        local line = fmtCasinoRow(row.name, row.chips, w)
+        local fg = colors.lightGray
+        if color and i == 1 then fg = colors.yellow
+        elseif color and i == 2 then fg = colors.orange end
+        local bg = colors.black
+        if color and i % 2 == 0 then bg = colors.gray end
+        adminMonText(monitor, 1, bodyTop + i - 1, line, fg, bg)
+      end
+    end
+
+    local foot = (" %d players  refresh %ds"):format(
+      tonumber(snap.playerCount) or 0, CASINO_MON_SEC)
+    if color then
+      adminMonFill(monitor, 1, h, w, 1, colors.gray, colors.white)
+      adminMonText(monitor, 1, h, foot:sub(1, w), colors.white, colors.gray)
+    else
+      adminMonText(monitor, 1, h, foot:sub(1, w), colors.gray, colors.black)
+    end
+  end)
+  term.redirect(prev)
+  if not ok and err then pcall(term.redirect, ADMIN_NATIVE_TERM) end
+end
+
+local function casinoMonitorLoop()
+  while true do
+    local monitor = findAdminMonitor()
+    if monitor then
+      if unlocked then
+        local pw = casinoAdminPassword()
+        if pw then
+          local mid = findCasinoManagerId()
+          if mid then
+            local msg = fetchCasinoLedger(mid, pw)
+            if msg and msg.ok then
+              casinoLedgerSnap = msg
+              drawCasinoLedgerMonitor(monitor, msg, false)
+            else
+              drawCasinoLedgerMonitor(monitor, casinoLedgerSnap, false)
+            end
+          else
+            drawCasinoLedgerMonitor(monitor, nil, false)
+          end
+        else
+          drawCasinoLedgerMonitor(monitor, nil, true)
+        end
+      else
+        drawCasinoLedgerMonitor(monitor, nil, true)
+      end
+      sleep(CASINO_MON_SEC)
+    else
+      sleep(5)
+    end
+  end
+end
+
+local function runCasinoApp()
+  print("== Casino ==")
+  local mid, row = pickCasinoManager()
+  if not mid then
+    print("No Currency Manager on the mesh.")
+    print("Install games/managers/currency_manager and bind vault + barrels.")
+    return
+  end
+  print(("Manager #%d %s"):format(mid, tostring(row and row.name or "?")))
+  print("Commands:")
+  print("  balance <player>")
+  print("  withdraw <amount> <player> [stationId]")
+  print("  rate <item> <chips>")
+  print("  scan")
+  print("  stations")
+  print("  bind <stationId> input <barrel> output <barrel>")
+  while true do
+    write("casino> ")
+    local line = read()
+    if not line or not line:match("%S") then break end
+    local a = {}
+    for w in line:gmatch("%S+") do a[#a + 1] = w end
+    handleCasinoCommand(a, mid)
+  end
+end
+
+local function handleCasinoCommand(a, fixedManagerId)
+  local cmd = tostring(a[1] or ""):lower()
+  if cmd == "casino" and (not a[2] or a[2] == "") then
+    runCasinoApp()
+    return true
+  end
+  if cmd == "casino" then
+    table.remove(a, 1)
+    cmd = tostring(a[1] or ""):lower()
+  end
+
+  local mid = fixedManagerId or select(1, pickCasinoManager())
+  if not mid then
+    print("No Currency Manager found.")
+    return true
+  end
+
+  if cmd == "stations" then
+    local msg = casinoReq(mid, { type = "casino_stations_req" }, 3)
+    if not msg or not msg.ok then print("stations failed"); return true end
+    print("Station bindings:")
+    for _, row in ipairs(msg.stations or {}) do
+      print(("  #%s  in=%s  out=%s"):format(
+        tostring(row.stationId), tostring(row.input), tostring(row.output)))
+    end
+    if #(msg.stations or {}) == 0 then print("  (none)") end
+    return true
+  end
+
+  local pw = casinoRequirePw()
+  if not pw then return true end
+
+  if cmd == "balance" or cmd == "bal" then
+    local player = a[2]
+    if not player then print("Usage: casino balance <player>"); return true end
+    local msg = casinoReq(mid, {
+      type = "casino_admin_balance_req", password = pw, player = player,
+    }, 4)
+    if not msg or not msg.ok then
+      print("balance failed: " .. tostring(msg and msg.err or "timeout"))
+      return true
+    end
+    print(("%s: %d chips"):format(tostring(msg.player or player), tonumber(msg.chips) or 0))
+    return true
+  end
+
+  if cmd == "withdraw" or cmd == "wd" then
+    local amount = tonumber(a[2])
+    local player = a[3]
+    local stationId = tonumber(a[4])
+    if not amount or not player then
+      print("Usage: casino withdraw <amount> <player> [stationId]")
+      return true
+    end
+    local msg = casinoReq(mid, {
+      type = "casino_admin_withdraw",
+      password = pw,
+      amount = math.floor(amount),
+      player = player,
+      stationId = stationId,
+    }, 15)
+    if not msg then print("withdraw: timeout"); return true end
+    if not msg.ok then
+      print("withdraw failed: " .. tostring(msg.err or "?"))
+      if msg.chips then print(("Balance=%d"):format(tonumber(msg.chips) or 0)) end
+      return true
+    end
+    print(("Withdrew %d for %s -> %s. Balance=%d"):format(
+      tonumber(msg.amount) or 0, tostring(msg.player or player),
+      tostring(msg.output or "?"), tonumber(msg.chips) or 0))
+    return true
+  end
+
+  if cmd == "scan" then
+    local msg = casinoReq(mid, { type = "casino_admin_scan", password = pw }, 8)
+    if not msg then print("scan: timeout"); return true end
+    if not msg.ok then print("scan failed: " .. tostring(msg.err or "?")); return true end
+    print(("Scanned vault %s — %d accepted type(s)"):format(
+      tostring(msg.vault or "?"), #(msg.accepted or {})))
+    return true
+  end
+
+  if cmd == "rate" then
+    local item, chips = a[2], tonumber(a[3])
+    if not item or not chips then
+      print("Usage: casino rate <item> <chips>")
+      return true
+    end
+    local msg = casinoReq(mid, {
+      type = "casino_admin_rate_set",
+      password = pw,
+      item = item,
+      chips = math.floor(chips),
+    }, 4)
+    if not msg or not msg.ok then
+      print("rate failed: " .. tostring(msg and msg.err or "timeout"))
+      return true
+    end
+    print(("Set %s = %d chips"):format(tostring(msg.item or item), tonumber(msg.chips) or 0))
+    return true
+  end
+
+  if cmd == "bind" then
+    local sid = tonumber(a[2])
+    if not sid or tostring(a[3] or ""):lower() ~= "input"
+        or tostring(a[5] or ""):lower() ~= "output" then
+      print("Usage: casino bind <stationId> input <barrel> output <barrel>")
+      return true
+    end
+    local msg = casinoReq(mid, {
+      type = "casino_bind_station",
+      password = pw,
+      stationId = sid,
+      input = a[4],
+      output = a[6],
+    }, 4)
+    if not msg or not msg.ok then
+      print("bind failed: " .. tostring(msg and msg.err or "timeout"))
+      return true
+    end
+    print(("Bound station #%d  in=%s  out=%s"):format(
+      tonumber(msg.stationId) or sid, tostring(msg.input), tostring(msg.output)))
+    return true
+  end
+
+  print("Casino: balance | withdraw | rate | scan | stations | bind")
+  print("  casino withdraw <amount> <player> [stationId]")
+  return true
+end
+
+--------------------------------------------------------------------------------
 -- Network link (ender routers + local RF modems)
 --------------------------------------------------------------------------------
 scanNetTopology = function(timeout, quiet)
@@ -2913,6 +3349,7 @@ local HELP_ENTRIES = {
   { "connect <id>", "SSH shell (alias: ssh)" },
   { "say <id> <msg>", "Print message on device screen" },
   { "storage", "Storage Manager app" },
+  { "casino", "Currency Manager (vault / rates / withdraw)" },
   { "lb | leaderboard", "Games host leaderboard admin" },
   { "stock [filter]", "List vault stock" },
   { "request <item> [n]", "Send items to storage output" },
@@ -3232,6 +3669,9 @@ local function handleCommand(a)
 
   elseif cmd == "storage" or cmd == "stock" or cmd == "request" or cmd == "req" then
     return handleStorageCommand(a)
+
+  elseif cmd == "casino" or cmd == "chips" then
+    return handleCasinoCommand(a)
 
   elseif cmd == "lb" or cmd == "leaderboard" or cmd == "gameslb" or cmd == "games_lb" then
     return handleLeaderboardCommand(a)
@@ -3672,6 +4112,7 @@ local PHONE_APPS = {
   { id = "quarry",   name = "Quarry",   sub = "offline",  bg = colors.green },
   { id = "leaderboard", name = "Leaderboard", sub = "games LB", bg = colors.lime },
   { id = "storage",  name = "Storage",  sub = "vault",    bg = colors.orange },
+  { id = "casino",   name = "Casino",   sub = "chips",    bg = colors.magenta },
   { id = "advanced", name = "Terminal", sub = "commands", bg = colors.lightGray },
   { id = "lock",     name = "Lock",     sub = "screen",   bg = colors.black },
 }
@@ -3767,6 +4208,9 @@ local function runPhoneApp(id)
   elseif id == "storage" then
     runStorageApp()
     pauseSimple()
+  elseif id == "casino" then
+    runCasinoApp()
+    pauseSimple()
   elseif id == "leaderboard" or id == "lb" or id == "gameslb" then
     runLeaderboardApp()
     pauseSimple()
@@ -3776,6 +4220,8 @@ local function runPhoneApp(id)
     return "switch_advanced"
   elseif id == "lock" then
     unlocked = false
+    sessionMasterPw = nil
+    casinoSessionPw = nil
     promptUnlockAtStart()
   end
   return nil
@@ -4048,5 +4494,6 @@ parallel.waitForAny(
   listenerLoop,
   quarryListenerLoop,
   function() titan.networkLoop("admin") end,
+  casinoMonitorLoop,
   consoleLoop)
 print("Admin console closed.")

@@ -22,8 +22,8 @@ A wireless dispatch system for Minecraft's **CC: Tweaked** mod (active packages)
 - **`higher_lower.lua`** — Pair of Jacks+ video poker → Higher/Lower streak (cash out or risk for jackpot at 10).
 - **`slots.lua`** — 3-reel slots (bet/spin animation, coin bank; monitor tap UI).
 - **`games.lua`** + **`games_catalog.lua`** — Games launcher: boot modem + mesh hello; scans player/backpack inv for upgrades; auto speaker after game load; **M** toggle.
-- **`games/managers/currency_manager.lua`** — casino ledger (floppy rates/balances); mesh API for games + ATMs.
-- **`games/managers/casino_atm.lua`** — casino ATM (chips + Create ticker).
+- **`games/managers/currency_manager.lua`** — casino ledger + vault; station input/output barrels by computer ID.
+- **`games/managers/casino_atm.lua`** — casino station ATM (barrel deposit/withdraw via mesh; Create legacy optional).
 - **`storage/managers/storage_atm.lua`** — solo storage ATM (wired modem ↔ vault; no ticker/casino).
 - **`games_install.lua`** — **Games-only** installer (separate from the fleet installer).
 - **`github_install.lua`** — Fleet / Titan role installer (routers, quarry, admin, …).
@@ -572,39 +572,94 @@ Games leaderboard** at the sign-in gate (or unlock fully and open the
 **Leaderboard** tile / run `lb pass <password>`). First `setpass` needs no old
 password; view/edit/delete need the password you set.
 
-**Currency Manager** (installer → Games → **c**) — ledger only (floppy + mesh).
+**Currency Manager** (installer → Games → **c**) — vault ledger + station barrels (floppy + mesh).
 
-**Casino ATM** (installer → Games → **a**) — player deposit / withdraw.
-
-```text
-[ATM intake chest] --frogport--> Create vault network
-[ATM + detector + Stock Ticker] --mesh--> [Currency Manager + floppy]
-        | requestFiltered(address) only if chips + Create stock cover it
-        v
-   package → frogport @ ATM address (withdraw output)
-```
-
-**Manager setup:** floppy → `setpass` → bind a sample chest → `scan` → `rates`.
-
-**ATM setup:** modem + Player Detector + vanilla **intake** chest + Create **Stock
-Ticker**. Frogport watches the intake (hauls to vault after credit). Set this
-ATM’s Create package address for withdraws:
+**Casino station ATM** (installer → Games → **a**) — thin client at each station PC.
 
 ```text
-bind intake left
-address ATM-1
-deposit
-withdraw
+[Vault] <--wired-- [Currency Manager PC] --wired--> [station INPUT barrel]
+                                              \-----> [station OUTPUT barrel]
+        | disk + wireless mesh
+        +-- games (bet/payout)
+        +-- station ATMs (deposit / withdraw by computer ID)
+        +-- admin tablet (remote withdraw / rates / scan / bind)
 ```
 
-- **Deposit:** put coins in intake → `deposit` → pick player → confirm **y**.
-  Chips credit **only after confirm**. Items stay for the frogport → vault.
-- **Withdraw:** checks player chips **and** Create `stock()`. Stock Ticker is
-  called **only if** both cover the amount; then chips are debited and a
-  package is sent to `address`.
+**Manager setup (wired modem + vault + barrels on manager PC):**
+
+```text
+invs
+bind storage create:item_vault_0     # or AE/RS/chest vault
+setpass
+scan                                 # accepted coins + default rates from vault
+bind station 42 input barrel_in output barrel_out   # 42 = station ATM computer ID
+stations
+```
+
+**Station ATM setup (wireless modem + Player Detector):**
+
+```text
+status                               # note this PC's ID (e.g. 42)
+deposit                              # coins in manager INPUT barrel first → name → y
+withdraw                             # chips → manager OUTPUT barrel
+bal
+```
+
+On the manager, map that station ID to its barrels (`bind station <id> input … output …`).
+
+**Admin tablet** (Parent Center master password): **Casino** app or `casino` commands:
+
+```text
+casino balance Steve
+casino withdraw 500 Steve 42         # optional stationId → that OUTPUT barrel
+casino rate minecraft:gold_ingot 100
+casino scan
+casino stations
+casino bind 42 input barrel_in output barrel_out
+```
+
+**Legacy Create mode** (optional on station ATM): `mode create` then intake chest +
+Stock Ticker + `address` — same as v1.0 frogport/ticker flow.
+
+- **Deposit:** put accepted coins in this station's **INPUT** barrel (wired to manager) → at station PC `deposit` → pick/name player → confirm. Manager moves items to vault and credits chips.
+- **Withdraw:** station PC `withdraw` → manager debits chips and pays physical coins to this station's **OUTPUT** barrel (vault must hold enough coin items).
+- **Admin withdraw:** debits player ledger and dispenses from vault; optional `stationId` picks which OUTPUT barrel.
 
 **Player identity (managed games):** Player Detector on each gambling PC; games
-load that player’s balance from the Currency Manager over the mesh.
+load that player's balance from the Currency Manager over the mesh.
+
+**Rednet message types (titan_install + titan_router):**
+
+| Message | Direction | Purpose |
+|---------|-----------|---------|
+| `casino_ping` / `casino_hello` | any → manager | discover |
+| `casino_balance_req` / `casino_balance` | client → manager | read chips |
+| `casino_rates_req` / `casino_rates` | client → manager | accepted items + rates |
+| `casino_credit` / `casino_bet` / `casino_payout` | games/legacy ATM | ledger credit/debit |
+| `casino_station_deposit` | station → manager | input barrel → vault + credit |
+| `casino_station_withdraw` | station → manager | debit + vault → output barrel |
+| `casino_stations_req` / `casino_stations` | any → manager | list barrel bindings |
+| `casino_bind_station` | admin → manager | bind station barrels (password) |
+| `casino_admin_withdraw` | admin → manager | remote payout (password) |
+| `casino_admin_scan` | admin → manager | rescan vault items (password) |
+| `casino_admin_rate_set` | admin → manager | set one rate (password) |
+| `casino_admin_rates_set` | admin → manager | bulk rates table (password) |
+| `casino_admin_balance_req` | admin → manager | read balance (password) |
+| `casino_ledger_req` / `casino_ledger` | admin → manager | full ledger snapshot (password) |
+| `casino_ack` | manager → client | success/failure for ops above |
+
+**Live ledger monitors (optional wired/advanced monitor):**
+
+| Device | Refresh | Data source |
+|--------|---------|-------------|
+| Currency Manager | **5s** | Local floppy ledger + vault scan |
+| Admin tablet | **2s** | `casino_ledger_req` after tablet unlock |
+
+Header shows **CHIPS** (sum of player balances) and **VAULT** (physical coin items in the vault at current rates). Rows: player name left, chip balance right. No monitor attached = no extra output.
+
+**Manager console (local floppy password):** `setpass`, `bind storage|station|deposit`, `scan`, `rates`, `withdraw`, `stations`.
+
+**Legacy manager chest commands:** optional `bind deposit` for emergency local deposit/withdraw without station barrels.
 
 ---
 
@@ -921,7 +976,7 @@ from the install source (GitHub / pastebin / `host.lua`). Extras on disk that
 aren’t listed show as `*` and are not updated.
 
 Bump versions in `versions.lua` (and each file’s `Titan-Version:` header) when
-you ship a change; current system version is **1.6.67** (`currency_manager` **1.0.0**,
+you ship a change; current system version is **1.7.7** (`currency_manager` **1.1.1**,
 `higher_lower` **1.0.2**, `games` **1.0.6**).
 
 **Cell fleet:** the site board owns unique XZ cells; miners obey cell assigns and

@@ -1,6 +1,6 @@
 --[[
   Compat shim — Currency Manager lives under games/managers/.
-  Titan-Version: 1.0.5
+  Titan-Version: 1.1.1
 ]]
 local path = "games/managers/currency_manager.lua"
 if not fs.exists(path) then

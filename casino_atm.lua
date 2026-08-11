@@ -1,6 +1,6 @@
 --[[
   Compat shim — Casino ATM lives under games/managers/.
-  Titan-Version: 1.0.0
+  Titan-Version: 1.1.0
 ]]
 local path = "games/managers/casino_atm.lua"
 if not fs.exists(path) then
