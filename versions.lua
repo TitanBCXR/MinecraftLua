@@ -5,17 +5,17 @@
   The console `packages` command shows these names + versions.
   Installers / OTA updates ship this file so devices know what they have.
 
-  Titan-Version: 1.7.1
+  Titan-Version: 1.7.2
 ]]
 
 return {
-  system = "1.7.1",
+  system = "1.7.2",
   packages = {
     ["lib/titan.lua"]      = "1.2.26",
     ["lib/casino.lua"]     = "1.0.1",
     ["lib/games_economy.lua"] = "1.0.0",
     ["lib/games_music.lua"] = "1.0.0",
-    ["lib/pocket_peripherals.lua"] = "1.0.1",
+    ["lib/pocket_peripherals.lua"] = "1.0.2",
     ["console.lua"]        = "1.1.9",
     ["router.lua"]         = "1.4.4",
     ["router_main.lua"]    = "1.4.2",
@@ -46,17 +46,17 @@ return {
     ["casino_atm.lua"] = "1.0.0",
     ["perimeter_sensor.lua"] = "1.2.8",
     ["perimeter_manager.lua"]= "1.3.8",
-    ["tetris.lua"]         = "1.3.1",
+    ["tetris.lua"]         = "1.3.2",
     ["minesweeper.lua"]    = "1.2.4",
     ["sandstorm.lua"]      = "1.0.1",
     ["luigi_poker.lua"]    = "1.2.7",
     ["higher_lower.lua"]   = "1.1.3",
     ["slots.lua"]          = "1.0.6",
-    ["games.lua"]          = "1.2.1",
+    ["games.lua"]          = "1.2.2",
     ["games_catalog.lua"]  = "1.0.8",
     ["games_install.lua"]  = "1.0.3",
     ["host.lua"]           = "1.2.17",
     ["exclude.txt"]        = "1.0.1",
-    ["versions.lua"]       = "1.7.1",
+    ["versions.lua"]       = "1.7.2",
   },
 }

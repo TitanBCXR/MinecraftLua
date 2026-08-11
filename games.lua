@@ -1,6 +1,6 @@
 --[[
   games.lua  -  Titan Games Launcher (CC: Tweaked)
-  Titan-Version: 1.2.1
+  Titan-Version: 1.2.2
 
   Run:
 
@@ -11,7 +11,7 @@
   and launches them from a tap-friendly menu.
 
   First run: choose Managed (in-game casino currency) or Unmanaged (granted
-  local chips). Pocket: modem slot 15, speaker slot 16; M swaps music/modem.
+  local chips). Pocket: modem/speaker in player inventory; M swaps back upgrade.
 
   Controls:
     Tap / Enter  play   U update   M music/modem   S settings   Q quit
@@ -148,7 +148,7 @@ local function doMusicModemSwap()
     saveState()
     STATUS = PREFER_MODEM and "Modem on (mesh)" or "Speaker on (music)"
   else
-    STATUS = tostring(err or "swap failed")
+    STATUS = "Music/modem swap failed: " .. tostring(err or "check inventory")
   end
 end
 

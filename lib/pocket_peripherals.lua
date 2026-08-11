@@ -1,17 +1,19 @@
 --[[
-  pocket_peripherals.lua  -  Pocket modem / speaker slot helpers (Titan games)
-  Titan-Version: 1.0.1
+  pocket_peripherals.lua  -  Pocket modem / speaker helpers (Titan games)
+  Titan-Version: 1.0.2
 
-  Reserved inventory slots for pocket PCs (16-slot hotbar):
-    MODEM_SLOT   = 15  (wireless modem home — equip for mesh / host LB)
-    SPEAKER_SLOT = 16  (speaker home — swap onto back for music)
+  Pocket PCs keep modem/speaker in the **player inventory** (Minecraft hotbar).
+  Use pocket.equipBack() / pocket.unequipBack() — not turtle slots 15/16.
 
   Press M in the Games launcher or Tetris menu to swap the back upgrade between
-  modem and speaker. Searches all inventory slots for the counterpart item;
-  home slots 15/16 are preferred when parking items.
+  modem and speaker. equipBack searches player inventory from the selected
+  hotbar slot; putting the item on the hotbar helps.
+
+  Turtle / desktop fallback (optional): reserve inventory slots 15/16 for modem
+  and speaker when turtle.getItemDetail is available (not on pocket PCs).
 
   Config (optional) in games_launcher.cfg:
-    modemSlot = 15, speakerSlot = 16
+    modemSlot = 15, speakerSlot = 16   (turtle fallback only)
 ]]
 
 local pp = {}
@@ -23,27 +25,65 @@ local DEFAULT_SPEAKER_SLOT = 16
 local MODEM_SLOT = DEFAULT_MODEM_SLOT
 local SPEAKER_SLOT = DEFAULT_SPEAKER_SLOT
 
+local POCKET_MODEM_ERR =
+  "Put a wireless/ender modem in your player inventory (hotbar helps)"
+local POCKET_SPEAKER_ERR =
+  "Put a speaker upgrade in your player inventory (hotbar helps)"
+
+local function isPocketPC()
+  return pocket and type(pocket.equipBack) == "function"
+end
+
+local function hasTurtleInventory()
+  return turtle and type(turtle.getItemDetail) == "function" and not isPocketPC()
+end
+
+local function backType()
+  if peripheral.isPresent("back") then
+    return peripheral.getType("back")
+  end
+  return nil
+end
+
 local function itemDetail(slot)
-  if not turtle or type(turtle.getItemDetail) ~= "function" then return nil end
+  if not hasTurtleInventory() then return nil end
   local ok, d = pcall(turtle.getItemDetail, slot)
   if ok then return d end
   return nil
 end
 
 local function itemCount(slot)
-  if not turtle or type(turtle.getItemCount) ~= "function" then return 0 end
+  if not hasTurtleInventory() then return 0 end
   return turtle.getItemCount(slot) or 0
 end
 
 local function selectSlot(slot)
-  if turtle and type(turtle.select) == "function" then
+  if hasTurtleInventory() and type(turtle.select) == "function" then
     turtle.select(slot)
   end
 end
 
+function pp.isModemType(ptype)
+  if not ptype then return false end
+  local t = tostring(ptype):lower()
+  return t == "modem"
+    or t == "wired_modem"
+    or t == "wireless_modem"
+    or t == "ender_modem"
+end
+
+function pp.isSpeakerType(ptype)
+  if not ptype then return false end
+  return tostring(ptype):lower():find("speaker", 1, true) ~= nil
+end
+
 function pp.isModemItem(detail)
   if type(detail) ~= "table" or not detail.name then return false end
-  return tostring(detail.name):lower():find("modem", 1, true) ~= nil
+  local n = tostring(detail.name):lower()
+  if n:find("speaker", 1, true) then return false end
+  return n:find("modem", 1, true) ~= nil
+    or n:find("ender_modem", 1, true) ~= nil
+    or n:find("wireless_modem", 1, true) ~= nil
 end
 
 function pp.isSpeakerItem(detail)
@@ -53,8 +93,7 @@ end
 
 function pp.hasModem()
   for _, name in ipairs(peripheral.getNames()) do
-    local t = peripheral.getType(name)
-    if t == "modem" or t == "wired_modem" or t == "wireless_modem" then
+    if pp.isModemType(peripheral.getType(name)) then
       return true
     end
   end
@@ -70,6 +109,9 @@ function pp.getSlots()
 end
 
 function pp.setupHelp()
+  if isPocketPC() then
+    return "Player inventory — M swaps modem/speaker on back"
+  end
   return ("Modem slot %d, speaker slot %d — M swaps music/modem"):format(
     MODEM_SLOT, SPEAKER_SLOT)
 end
@@ -120,6 +162,7 @@ local function inventorySize()
 end
 
 local function findItemSlot(pred, skipSlot)
+  if not hasTurtleInventory() then return nil end
   if pred(itemDetail(MODEM_SLOT)) and MODEM_SLOT ~= skipSlot then return MODEM_SLOT end
   if pred(itemDetail(SPEAKER_SLOT)) and SPEAKER_SLOT ~= skipSlot then return SPEAKER_SLOT end
   for s = 1, inventorySize() do
@@ -137,6 +180,7 @@ function pp.findSpeakerSlot()
 end
 
 local function findEmptySlot(exclude)
+  if not hasTurtleInventory() then return nil end
   exclude = exclude or {}
   local skip = {}
   skip[exclude] = true
@@ -149,6 +193,7 @@ local function findEmptySlot(exclude)
 end
 
 local function moveStackToSlot(fromSlot, toSlot)
+  if not hasTurtleInventory() then return false end
   if not fromSlot or not toSlot or fromSlot == toSlot then return true end
   if itemCount(fromSlot) == 0 then return false end
   selectSlot(fromSlot)
@@ -164,6 +209,7 @@ local function moveStackToSlot(fromSlot, toSlot)
 end
 
 local function parkToHome(homeSlot, findFn, isItemFn)
+  if not hasTurtleInventory() then return true end
   local src = findFn()
   if not src then return false end
   if src == homeSlot then return true end
@@ -185,30 +231,48 @@ function pp.parkSpeakerHome()
   return parkToHome(SPEAKER_SLOT, pp.findSpeakerSlot, pp.isSpeakerItem)
 end
 
-function pp.ensureModemEquipped(titan)
-  pp.loadConfig()
-  if not pocket or type(pocket.equipBack) ~= "function" then
-    if pp.hasModem() and titan and titan.openModem then pcall(titan.openModem) end
-    return pp.hasModem()
-  end
-  if pp.hasModem() then
-    if titan and titan.openModem then pcall(titan.openModem) end
-    return true
-  end
-  pp.parkModemHome()
-  if itemCount(MODEM_SLOT) == 0 then return false end
-  selectSlot(MODEM_SLOT)
-  local ok = pocket.equipBack()
-  if ok and titan and titan.openModem then pcall(titan.openModem) end
-  return ok and pp.hasModem()
+local function openModemIfPresent(titan)
+  if titan and titan.openModem then pcall(titan.openModem) end
 end
 
--- Toggle back upgrade: modem equipped -> speaker in inventory; otherwise -> modem.
-function pp.swapSound(titan)
-  pp.loadConfig()
-  if not pocket or type(pocket.equipBack) ~= "function" then
-    return false, "not a pocket PC"
+local function pocketHasSpeakerEquipped()
+  return pp.isSpeakerType(backType()) or pp.findSpeaker() ~= nil
+end
+
+local function pocketEquipCounterpart(wantModem, titan)
+  local errMsg = wantModem and POCKET_MODEM_ERR or POCKET_SPEAKER_ERR
+
+  local function verify()
+    if wantModem then return pp.hasModem() end
+    return pocketHasSpeakerEquipped()
   end
+
+  -- equipBack replaces the current back upgrade with another from player inventory.
+  if backType() then
+    local ok = pocket.equipBack()
+    if ok and verify() then
+      if wantModem then openModemIfPresent(titan) end
+      return true
+    end
+  end
+
+  -- Unequip current back item into player inventory, then equip from inventory.
+  if backType() and type(pocket.unequipBack) == "function" then
+    local uok, uerr = pocket.unequipBack()
+    if not uok then
+      return false, uerr or errMsg
+    end
+  end
+
+  local ok, err = pocket.equipBack()
+  if ok and verify() then
+    if wantModem then openModemIfPresent(titan) end
+    return true
+  end
+  return false, err or errMsg
+end
+
+local function swapSoundTurtle(titan)
   pp.parkModemHome()
   pp.parkSpeakerHome()
 
@@ -216,26 +280,73 @@ function pp.swapSound(titan)
   if pp.hasModem() then
     targetSlot = pp.findSpeakerSlot()
     if not targetSlot then
-      return false, "no speaker in inventory"
+      return false, ("no speaker in inventory (slot %d preferred)"):format(SPEAKER_SLOT)
     end
   else
     targetSlot = pp.findModemSlot()
     if not targetSlot then
-      return false, "no modem in inventory"
+      return false, ("no modem in inventory (slot %d preferred)"):format(MODEM_SLOT)
     end
   end
 
   selectSlot(targetSlot)
   local ok, err = pocket.equipBack()
   if ok then
-    if pp.hasModem() and titan and titan.openModem then
-      pcall(titan.openModem)
-    end
-    -- Re-park whatever landed in the wrong home slot after swap.
+    if pp.hasModem() then openModemIfPresent(titan) end
     pp.parkModemHome()
     pp.parkSpeakerHome()
   end
   return ok, err
+end
+
+function pp.ensureModemEquipped(titan)
+  pp.loadConfig()
+  if pp.hasModem() then
+    openModemIfPresent(titan)
+    return true
+  end
+
+  if isPocketPC() then
+    local ok = pocket.equipBack()
+    if not ok and backType() and type(pocket.unequipBack) == "function" then
+      if pocket.unequipBack() then
+        ok = pocket.equipBack()
+      end
+    end
+    if ok and pp.hasModem() then
+      openModemIfPresent(titan)
+      return true
+    end
+    return false
+  end
+
+  if hasTurtleInventory() then
+    pp.parkModemHome()
+    if itemCount(MODEM_SLOT) == 0 then return false end
+    selectSlot(MODEM_SLOT)
+    local ok = pocket and pocket.equipBack and pocket.equipBack()
+    if ok and pp.hasModem() then openModemIfPresent(titan) end
+    return ok and pp.hasModem()
+  end
+
+  openModemIfPresent(titan)
+  return pp.hasModem()
+end
+
+-- Toggle back upgrade: modem equipped -> speaker in player inventory; otherwise -> modem.
+function pp.swapSound(titan)
+  pp.loadConfig()
+  if not isPocketPC() then
+    if hasTurtleInventory() and pocket and type(pocket.equipBack) == "function" then
+      return swapSoundTurtle(titan)
+    end
+    return false, "not a pocket PC"
+  end
+
+  if pp.hasModem() then
+    return pocketEquipCounterpart(false, titan)
+  end
+  return pocketEquipCounterpart(true, titan)
 end
 
 function pp.soundModeLabel()

@@ -1,6 +1,6 @@
 --[[
   tetris.lua  -  Standalone Tetris for CC: Tweaked (pocket / computer)
-  Titan-Version: 1.3.1
+  Titan-Version: 1.3.2
 
   Drop on a pocket PC or advanced computer and run:
 
@@ -27,7 +27,7 @@
 
   Music (speaker / Noisy pocket): note tracks from lib/games_music.lua (speed +
   soundtrack chosen in Games launcher Settings). In-game M mutes. Pocket: modem
-  in slot 15, speaker in slot 16; equip modem for boot sync, then M to swap for music.
+  in player inventory; equip modem for boot sync, then M to swap for music.
 
   Player name: uses Advanced Peripherals Player Detector when present; otherwise
   prompts for a name after a game (saved in tetris.cfg). That name is what
@@ -1354,7 +1354,11 @@ local function mainMenu()
         clearScreen(colors.black)
         term.setCursorPos(1, 1)
         print("Music/modem swap failed: " .. tostring(err or "check inventory"))
-        print("Modem slot 15, speaker slot 16 — press M again.")
+        if pp and pp.setupHelp then
+          print(pp.setupHelp() .. " — press M again.")
+        else
+          print("Put modem/speaker in player inventory — press M again.")
+        end
         sleep(1.6)
         drainInputEvents()
       end
@@ -1490,7 +1494,7 @@ local function bootCheckUpdates()
       print("No-modem mode — cached leaderboard only.")
     else
       print("No modem — cached leaderboard only.")
-      print("(Equip wireless modem in slot 15; M swaps speaker from inventory.)")
+      print("(Put wireless/ender modem in player inventory; M swaps speaker on back.)")
     end
     lockNetworkOffline()
     sleep(0.55)
