@@ -1,6 +1,6 @@
 --[[
   games.lua  -  Titan Games Launcher (CC: Tweaked)
-  Titan-Version: 1.2.6
+  Titan-Version: 1.2.7
 
   Run:
 
@@ -241,9 +241,9 @@ local function bootMeshPresence()
   end
   announceMesh()
   PREFER_MODEM = true
-  if pp.refreshSourceCache then pp.refreshSourceCache() end
+  if pp and pp.refreshSourceCache then pp.refreshSourceCache() end
   saveState()
-  STATUS = pp and pp.statusText and pp.statusText() or "Modem on (mesh)"
+  STATUS = (pp and pp.statusText and pp.statusText()) or "Modem on (mesh)"
   return true
 end
 
