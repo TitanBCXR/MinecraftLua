@@ -590,19 +590,19 @@ password; view/edit/delete need the password you set.
 ```text
 invs
 bind storage create:item_vault_0     # or AE/RS/chest vault
-bind deposit1 <barrelName>           # vault intake #1
-bind deposit2 <barrelName>           # vault intake #2
 setpass
-# put sample coins into deposit1 / deposit2 (not straight into the vault)
-intake                                # pull deposit1/2 → vault
-scan                                 # accepted coins from vault + deposit barrels
-rates                                # set chips per item
-bind station 42 input barrel_in output barrel_out   # 42 = station ATM computer ID
-stations
+# Link each deposit barrel to its station ATM computer ID (+ optional output):
+bind deposit1 <barrelInA> 42 <barrelOutA>   # computer #42 uses deposit1
+bind deposit2 <barrelInB> 55 <barrelOutB>   # computer #55 uses deposit2
+deposits                                 # show deposit ↔ computer map
+# put sample coins into deposit1 / deposit2
+intake                                    # pull deposit barrels → vault
+scan                                     # accepted coins from vault + deposits
+rates
 ```
 
-`deposit` is an alias for `deposit1`. Station ATM barrels are separate from these
-vault-intake barrels.
+`deposit` is an alias for `deposit1`. Binding a deposit to a computer ID also
+registers that station’s input (and output if given) for the ATM on that PC.
 
 **Station ATM setup (wireless modem + Player Detector):**
 

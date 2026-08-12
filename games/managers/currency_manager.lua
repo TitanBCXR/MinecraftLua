@@ -1,16 +1,17 @@
 --[[
   games/managers/currency_manager.lua  -  Casino currency vault
-  Titan-Version: 1.1.2
+  Titan-Version: 1.1.3
 
   Ledger / admin for casino chips. Persists accepted items, rates, balances,
   and password on floppy (casino_currency.cfg).
 
-  Vault + deposit barrels (stock the vault) + station barrels (player I/O):
-    bind storage <vault>                    -- coin vault (AE/RS/chest/vault)
-    bind deposit1 <barrel>                  -- vault intake barrel #1
-    bind deposit2 <barrel>                  -- vault intake barrel #2
-    intake                                  -- pull deposit1/2 → vault
-    bind station <id> input <in> output <out>
+  Vault + deposit barrels (each linked to a station computer ID):
+    bind storage <vault>
+    bind deposit1 <barrel> <computerId> [outputBarrel]
+    bind deposit2 <barrel> <computerId> [outputBarrel]
+    intake                                  -- pull deposit1/2 → vault (stock)
+    deposits                                -- list deposit ↔ computer map
+    bind station <id> input <in> output <out>   -- still supported
 
   Players use casino_atm.lua at each station PC (thin client over mesh).
   Admin tablet uses Parent Center master password for remote withdraw / rates.
@@ -45,15 +46,16 @@ local DISK_FILE = "casino_currency.cfg"
 local LOCAL_CFG = "currency_manager.cfg"
 local SESSION_MS = 5 * 60 * 1000
 local PLAYER_RANGE = 8
-local VERSION = "1.1.2"
+local VERSION = "1.1.3"
 local MON_REFRESH_SEC = 5
 local NATIVE_TERM = term.current()
 
 local cfg = {
   storage = nil,
-  deposit = nil,   -- legacy alias → migrated to deposit1
-  deposit1 = nil,  -- vault intake barrel #1
-  deposit2 = nil,  -- vault intake barrel #2
+  deposit = nil,   -- legacy string alias for deposit1 inv
+  -- deposit1 / deposit2: string (legacy) or { inv, computerId, output? }
+  deposit1 = nil,
+  deposit2 = nil,
   chest = nil, drive = nil, label = nil,
   stations = {}, -- [computerId] = { input = peripheralName, output = peripheralName }
 }
@@ -100,13 +102,63 @@ local function loadLocal()
   if (not cfg.storage or cfg.storage == "") and cfg.chest and cfg.chest ~= "" then
     cfg.storage = cfg.chest
   end
+  -- Normalize deposit1/deposit2 to { inv, computerId, output }.
+  local function normalizeDeposit(slot)
+    local d = cfg[slot]
+    if type(d) == "string" and d ~= "" then
+      cfg[slot] = { inv = d, computerId = nil, output = nil }
+    elseif type(d) == "table" and type(d.inv) == "string" and d.inv ~= "" then
+      d.computerId = tonumber(d.computerId) or nil
+      if d.computerId and d.computerId <= 0 then d.computerId = nil end
+      if type(d.output) ~= "string" or d.output == "" then d.output = nil end
+      cfg[slot] = d
+    elseif d == "" then
+      cfg[slot] = nil
+    end
+  end
   -- Legacy: single `deposit` becomes deposit1.
-  if (not cfg.deposit1 or cfg.deposit1 == "") and cfg.deposit and cfg.deposit ~= "" then
+  if cfg.deposit1 == nil and type(cfg.deposit) == "string" and cfg.deposit ~= "" then
     cfg.deposit1 = cfg.deposit
   end
-  if cfg.deposit1 and cfg.deposit1 ~= "" then
-    cfg.deposit = cfg.deposit1 -- keep legacy field in sync for old helpers
+  normalizeDeposit("deposit1")
+  normalizeDeposit("deposit2")
+  if type(cfg.deposit1) == "table" then
+    cfg.deposit = cfg.deposit1.inv
   end
+end
+
+local function depositInvName(slot)
+  local d = cfg[slot]
+  if type(d) == "table" then return d.inv end
+  if type(d) == "string" and d ~= "" then return d end
+  return nil
+end
+
+local function depositComputerId(slot)
+  local d = cfg[slot]
+  if type(d) == "table" then return tonumber(d.computerId) end
+  return nil
+end
+
+local function depositOutputName(slot)
+  local d = cfg[slot]
+  if type(d) == "table" and type(d.output) == "string" and d.output ~= "" then
+    return d.output
+  end
+  return nil
+end
+
+-- Keep stations[] aligned with deposit1/2 computer bindings.
+local function syncStationFromDeposit(slot)
+  local inv = depositInvName(slot)
+  local sid = depositComputerId(slot)
+  if not inv or not sid then return end
+  local row = cfg.stations[sid] or cfg.stations[tostring(sid)] or {}
+  row.input = inv
+  local out = depositOutputName(slot)
+  if out then row.output = out end
+  cfg.stations[sid] = row
+  cfg.stations[tostring(sid)] = nil
 end
 
 local function saveLocal()
@@ -221,6 +273,9 @@ end
 
 local function wrapRole(role)
   local n = cfg[role]
+  if role == "deposit1" or role == "deposit2" then
+    n = depositInvName(role)
+  end
   if not n or not isInventory(n) then return nil end
   return peripheral.wrap(n), n
 end
@@ -230,23 +285,37 @@ local function wrapStorage()
 end
 
 local function wrapDeposit()
-  -- Prefer deposit1; fall back to legacy deposit field.
   local inv, name = wrapRole("deposit1")
   if inv then return inv, name end
-  return wrapRole("deposit")
+  if type(cfg.deposit) == "string" and isInventory(cfg.deposit) then
+    return peripheral.wrap(cfg.deposit), cfg.deposit
+  end
+  return nil
 end
 
 local function listDepositRoles()
   local out = {}
-  if cfg.deposit1 and cfg.deposit1 ~= "" then
-    out[#out + 1] = { role = "deposit1", name = cfg.deposit1 }
-  elseif cfg.deposit and cfg.deposit ~= "" then
-    out[#out + 1] = { role = "deposit1", name = cfg.deposit }
-  end
-  if cfg.deposit2 and cfg.deposit2 ~= "" then
-    out[#out + 1] = { role = "deposit2", name = cfg.deposit2 }
+  for _, role in ipairs({ "deposit1", "deposit2" }) do
+    local name = depositInvName(role)
+    if name then
+      out[#out + 1] = {
+        role = role,
+        name = name,
+        computerId = depositComputerId(role),
+        output = depositOutputName(role),
+      }
+    end
   end
   return out
+end
+
+local function findDepositSlotForComputer(computerId)
+  computerId = tonumber(computerId)
+  if not computerId then return nil end
+  for _, role in ipairs({ "deposit1", "deposit2" }) do
+    if depositComputerId(role) == computerId then return role end
+  end
+  return nil
 end
 
 local function normalizeStationId(id)
@@ -506,7 +575,8 @@ local function cmdBind(a)
   if role == "deposit" then role = "deposit1" end -- alias
   if (role ~= "storage" and role ~= "deposit1" and role ~= "deposit2" and role ~= "drive")
       or not name then
-    print("Usage: bind storage|deposit1|deposit2|drive <peripheralName|side>")
+    print("Usage: bind storage|drive <peripheralName|side>")
+    print("       bind deposit1|deposit2 <barrel> <computerId> [outputBarrel]")
     print("  (deposit = deposit1 alias)")
     return
   end
@@ -515,32 +585,77 @@ local function cmdBind(a)
       print("Not a disk drive: " .. tostring(name)); return
     end
     cfg.drive = name
-  else
-    if not isInventory(name) then
-      print("Not an inventory: " .. tostring(name)); return
-    end
-    local storName = cfg.storage or cfg.chest
-    if role == "storage" then
-      if name == cfg.deposit1 or name == cfg.deposit2 or name == cfg.deposit then
+    saveLocal()
+    print("Bound drive = " .. name)
+    return
+  end
+  if not isInventory(name) then
+    print("Not an inventory: " .. tostring(name)); return
+  end
+  local storName = cfg.storage or cfg.chest
+  if role == "storage" then
+    for _, slot in ipairs({ "deposit1", "deposit2" }) do
+      if depositInvName(slot) == name then
         print("That peripheral is already a deposit barrel."); return
       end
-    else
-      if storName and name == storName then
-        print("That peripheral is already the storage vault."); return
-      end
-      if role == "deposit1" and name == cfg.deposit2 then
-        print("deposit1 and deposit2 must differ."); return
-      end
-      if role == "deposit2" and name == cfg.deposit1 then
-        print("deposit1 and deposit2 must differ."); return
-      end
     end
-    cfg[role] = name
-    if role == "storage" then cfg.chest = name end
-    if role == "deposit1" then cfg.deposit = name end -- legacy sync
+    cfg.storage = name
+    cfg.chest = name
+    saveLocal()
+    print("Bound storage = " .. name)
+    return
   end
+
+  -- deposit1 / deposit2: require computer ID mapping
+  local computerId = normalizeStationId(a[4])
+  local outName = a[5]
+  if not computerId then
+    print("Usage: bind " .. role .. " <barrel> <computerId> [outputBarrel]")
+    print("  Links this deposit barrel to a station ATM computer on rednet.")
+    return
+  end
+  if storName and name == storName then
+    print("That peripheral is already the storage vault."); return
+  end
+  local other = (role == "deposit1") and "deposit2" or "deposit1"
+  if depositInvName(other) == name then
+    print("deposit1 and deposit2 must use different barrels."); return
+  end
+  local otherPc = depositComputerId(other)
+  if otherPc and otherPc == computerId then
+    print(("Computer #%d is already linked to %s."):format(computerId, other)); return
+  end
+  if outName then
+    if not isInventory(outName) then
+      print("Not an inventory (output): " .. tostring(outName)); return
+    end
+    if outName == name then
+      print("Input and output barrels must differ."); return
+    end
+    if storName and outName == storName then
+      print("Output barrel must differ from the vault."); return
+    end
+  end
+
+  cfg[role] = {
+    inv = name,
+    computerId = computerId,
+    output = outName,
+  }
+  if role == "deposit1" then cfg.deposit = name end
+  syncStationFromDeposit(role)
   saveLocal()
-  print("Bound " .. role .. " = " .. name)
+  if outName then
+    print(("Bound %s = %s  computer=#%d  output=%s"):format(
+      role, name, computerId, outName))
+  else
+    print(("Bound %s = %s  computer=#%d"):format(role, name, computerId))
+    print("Tip: add output barrel: bind " .. role .. " " .. name .. " " .. computerId .. " <outputBarrel>")
+  end
+  local st = cfg.stations[computerId]
+  if st and not st.output then
+    print("Station ATM withdraw needs an output barrel on this binding.")
+  end
 end
 
 local function collectInventories()
@@ -584,10 +699,18 @@ local function cmdInvs()
   for _, row in ipairs(list) do
     local marks = ""
     if row.name == cfg.storage then marks = marks .. " [storage]" end
-    if row.name == cfg.deposit1 or (row.name == cfg.deposit and not cfg.deposit1) then
-      marks = marks .. " [deposit1]"
+    for _, dep in ipairs(listDepositRoles()) do
+      if row.name == dep.name then
+        marks = marks .. (" [%s"):format(dep.role)
+        if dep.computerId then
+          marks = marks .. ("#pc%s"):format(tostring(dep.computerId))
+        end
+        marks = marks .. "]"
+      end
+      if dep.output and row.name == dep.output then
+        marks = marks .. (" [%s-out#pc%s]"):format(dep.role, tostring(dep.computerId or "?"))
+      end
     end
-    if row.name == cfg.deposit2 then marks = marks .. " [deposit2]" end
     for sid, bind in pairs(cfg.stations or {}) do
       if type(bind) == "table" then
         if bind.input == row.name then marks = marks .. (" [in #%s]"):format(tostring(sid)) end
@@ -597,10 +720,34 @@ local function cmdInvs()
     local note = row.note and ("  (" .. row.note .. ")") or ""
     print("  " .. row.name .. marks .. note)
   end
-  if not cfg.storage or (not cfg.deposit1 and not cfg.deposit) then
+  if not cfg.storage or not depositInvName("deposit1") then
     print("Bind:  bind storage <vault>")
-    print("       bind deposit1 <barrel>   bind deposit2 <barrel>")
+    print("       bind deposit1 <barrel> <computerId> [outputBarrel]")
+    print("       bind deposit2 <barrel> <computerId> [outputBarrel]")
     print("       intake")
+  end
+end
+
+local function cmdDeposits()
+  print("Deposit barrels ↔ station computers:")
+  local rows = listDepositRoles()
+  if #rows == 0 then
+    print("  (none)")
+    print("Bind: bind deposit1 <barrel> <computerId> [outputBarrel]")
+    return
+  end
+  for _, row in ipairs(rows) do
+    local pc = row.computerId and ("#" .. tostring(row.computerId)) or "(no computer)"
+    local out = row.output and ("  out=" .. row.output) or "  out=(unset)"
+    print(("  %s  in=%s  computer=%s%s"):format(row.role, row.name, pc, out))
+    local slot = findDepositSlotForComputer(row.computerId)
+    if row.computerId and slot then
+      local st = cfg.stations[row.computerId]
+      if st then
+        print(("         station map: in=%s out=%s"):format(
+          tostring(st.input or "?"), tostring(st.output or "?")))
+      end
+    end
   end
 end
 
@@ -1087,8 +1234,19 @@ local function cmdStatus()
   loadDisk()
   print("== Currency Manager v" .. VERSION .. " ==")
   print("Vault:    " .. tostring(cfg.storage or cfg.chest or "(unbound)"))
-  print("Deposit1: " .. tostring(cfg.deposit1 or cfg.deposit or "(unbound)"))
-  print("Deposit2: " .. tostring(cfg.deposit2 or "(unbound)"))
+  for _, role in ipairs({ "deposit1", "deposit2" }) do
+    local inv = depositInvName(role)
+    local pc = depositComputerId(role)
+    if inv then
+      print(("%s: %s  pc=%s  out=%s"):format(
+        role,
+        inv,
+        pc and ("#" .. tostring(pc)) or "?",
+        tostring(depositOutputName(role) or "(unset)")))
+    else
+      print(role .. ": (unbound)")
+    end
+  end
   print("Detect:   " .. (findDetector() and ("OK (range " .. PLAYER_RANGE .. ")") or "NONE"))
   print("Drive:    " .. tostring(cfg.drive or "(auto)"))
   print("Floppy:   " .. tostring(diskPath() or "NONE"))
@@ -1108,8 +1266,9 @@ local function cmdHelp()
 Currency Manager = vault ledger + deposit barrels + station I/O.
 
 setpass | login | logout
-bind storage|deposit1|deposit2|drive <name|side>   (password)
-bind deposit <name>   (= deposit1 alias)
+bind storage|drive <name|side>                     (password)
+bind deposit1|deposit2 <barrel> <computerId> [out] (password)
+deposits              list deposit ↔ computer map
 intake                 pull deposit1/2 → vault       (password)
 bind station <computerId> input <in> output <out>  (password)
 unbind station <computerId>                        (password)
@@ -1120,7 +1279,8 @@ withdraw <player> <chips>                          (password)
 balance [player]                                   (password)
 help | exit
 
-First stock: put coins in deposit1/2 → intake → scan → rates
+Link each deposit barrel to its ATM computer ID.
+First stock: coins in deposit1/2 → intake → scan → rates
 ]])
 end
 
@@ -1709,6 +1869,7 @@ local function consoleLoop()
     elseif cmd == "bind" then cmdBind(a)
     elseif cmd == "unbind" then cmdUnbindStation(a)
     elseif cmd == "stations" then cmdStations()
+    elseif cmd == "deposits" then cmdDeposits()
     elseif cmd == "invs" then cmdInvs()
     elseif cmd == "drives" then cmdDrives()
     elseif cmd == "scan" or cmd == "accept" then cmdScan()
