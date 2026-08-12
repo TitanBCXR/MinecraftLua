@@ -236,11 +236,6 @@ local function wrapDeposit()
   return wrapRole("deposit")
 end
 
-local function wrapDepositSlot(slot)
-  if slot == 2 then return wrapRole("deposit2") end
-  return wrapDeposit()
-end
-
 local function listDepositRoles()
   local out = {}
   if cfg.deposit1 and cfg.deposit1 ~= "" then
