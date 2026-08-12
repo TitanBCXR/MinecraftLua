@@ -1,6 +1,6 @@
 --[[
   quarry/workers/strip_miner.lua  -  Branch / strip mining turtle
-  Titan-Version: 1.0.4
+  Titan-Version: 1.0.5
 
   Classic strip mine: dig a main 1×2 tunnel, then left/right branches every
   few blocks. Solo worker (no site board). Same chest layout as cell miner:
@@ -16,6 +16,10 @@
   Fuel safety: estimates tank + fuel items vs Manhattan home cost, returns to
   depot while it can still arrive (+ margin), and pauses with a clear SOS if
   stranded short of home.
+
+  Travel follows the strip topology (main tunnel spine at x=0): exit branch to
+  spine, move along +Z/-Z, then enter the destination branch — never dig an
+  overland shortcut from the fuel chest sideways to a far branch.
 
   Place turtle at the tunnel mouth, facing into the mine (origin 0,0,0).
   +X right, +Y down, +Z forward.
@@ -45,7 +49,7 @@ local FUEL_KEEP = 64         -- keep one stack of coal on the turtle
 local MIN_FUEL = 200
 local HOME_MARGIN = 24       -- spare fuel on arrival at depot
 local WORK_RESERVE = 48      -- keep digging only with this much above home cost
-local VERSION = "1.0.4"
+local VERSION = "1.0.5"
 
 local STOP = false
 local dug, skipped, moves = 0, 0, 0
@@ -412,17 +416,27 @@ local function down(digBlocks)
   return false
 end
 
+-- Spine-first travel: main tunnel is x==0. Order avoids overland shortcuts
+-- from home (fuel) sideways through virgin rock to a far branch.
+-- 1) X → 0 (exit current branch onto main)
+-- 2) Y → target (level change on spine)
+-- 3) Z → target (along main tunnel)
+-- 4) X → target (enter destination branch)
 local function goTo(x, y, z)
   x, y, z = math.floor(x), math.floor(y), math.floor(z)
+  if pos.x ~= 0 then
+    faceDir(pos.x < 0 and 1 or 3)
+    while pos.x ~= 0 do if not forward(true) then return false end end
+  end
   while pos.y > y do if not up(true) then return false end end
   while pos.y < y do if not down(true) then return false end end
-  if pos.x ~= x then
-    faceDir(pos.x < x and 1 or 3)
-    while pos.x ~= x do if not forward(true) then return false end end
-  end
   if pos.z ~= z then
     faceDir(pos.z < z and 0 or 2)
     while pos.z ~= z do if not forward(true) then return false end end
+  end
+  if pos.x ~= x then
+    faceDir(pos.x < x and 1 or 3)
+    while pos.x ~= x do if not forward(true) then return false end end
   end
   return true
 end
