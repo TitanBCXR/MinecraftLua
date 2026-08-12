@@ -574,52 +574,59 @@ password; view/edit/delete need the password you set.
 
 **Currency Manager** (installer → Games → **c**) — vault ledger + station barrels (floppy + mesh).
 
-**Casino station ATM** (installer → Games → **a**) — thin client at each station PC.
+### Fresh Currency Manager setup
+
+**Hardware (one manager PC):**
 
 ```text
-[Vault] <--wired-- [Currency Manager PC] --wired--> [station INPUT barrel]
-                                              \-----> [station OUTPUT barrel]
-        | disk + wireless mesh
-        +-- games (bet/payout)
-        +-- station ATMs (deposit / withdraw by computer ID)
-        +-- admin tablet (remote withdraw / rates / scan / bind)
+                    wireless modem (mesh → games / admin / host)
+                              |
+[Vault] <--wired-- [Currency Manager + floppy] --wired--> deposit barrels
+                              |
+                    wired modem network for inventories
 ```
 
-**Manager setup (wired modem + vault + deposit barrels on manager PC):**
+Per managed games cabinet (same pattern for each station):
 
 ```text
-invs
-bind storage create:item_vault_0     # or AE/RS/chest vault
-setpass
-# Link each deposit barrel to its station ATM computer ID (+ optional output):
-bind deposit1 <barrelInA> 42 <barrelOutA>   # computer #42 uses deposit1
-bind deposit2 <barrelInB> 55 <barrelOutB>   # computer #55 uses deposit2
-deposits                                 # show deposit ↔ computer map
-# put sample coins into deposit1 / deposit2
-intake                                    # pull deposit barrels → vault
-scan                                     # accepted coins from vault + deposits
+[deposit INPUT barrel] ──wired──> manager
+[withdraw OUTPUT barrel] ──wired──> manager
+[Games PC + advanced modem + monitor] ──wireless──> mesh
+     ↑ menu top-right shows #computerId  (use this in bind)
+```
+
+Optional: Player Detector next to each gambling / games PC for auto name.
+
+**Manager console (first boot):**
+
+```text
+invs                                 # list wired inventories (copy names)
+bind storage <vaultName>             # e.g. create:item_vault_0 / chest_0
+setpass                              # floppy admin password
+# For each games cabinet (ID from launcher top-right, e.g. #42):
+bind deposit1 <barrelIn> 42 <barrelOut>
+bind deposit2 <barrelIn> 55 <barrelOut>
+deposits                             # verify deposit ↔ computer map
+# Put sample accepted coins in a deposit barrel (or vault), then:
+intake                                # pull deposit barrels → vault (stock)
+scan                                 # discover accepted items
+rate minecraft:gold_ingot 100        # set chip values as needed
 rates
 ```
 
-`deposit` is an alias for `deposit1`. Binding a deposit to a computer ID also
-registers that station’s input (and output if given).
+`deposit` is an alias for `deposit1`. Binding `depositN` to a computer ID also
+registers that station’s input/output for deposit notify + **W** withdraw.
 
-**Managed games launcher = deposit station:** the ATM is the managed `games`
-cabinet (same computer ID). When coins land in that PC’s deposit barrel, Currency
-Manager sends `casino_deposit_notify`; the launcher prompts for a **player name**
-and credits the deposit to that account. Keep `games` on the menu (not inside a
-minigame) while depositing.
-
-**Station ATM setup (wireless modem + Player Detector):**
+**Managed games cabinet (each station PC):**
 
 ```text
-status                               # note this PC's ID (e.g. 42)
-deposit                              # coins in manager INPUT barrel first → name → y
-withdraw                             # chips → manager OUTPUT barrel
-bal
+# Install games launcher, choose Managed on first run
+games                                # top-right shows #ID — use on manager bind
+# Deposit: put coins in that station's INPUT barrel while on the menu
+#          → name prompt → chips credited
+# Withdraw: press W → name → amount → coins to OUTPUT barrel
+#           (denied if vault lacks enough currency / exact coin mix)
 ```
-
-On the manager, map that station ID to its barrels (`bind station <id> input … output …`).
 
 **Admin tablet** (Parent Center master password): **Casino** app or `casino` commands:
 
@@ -632,12 +639,9 @@ casino stations
 casino bind 42 input barrel_in output barrel_out
 ```
 
-**Legacy Create mode** (optional on station ATM): `mode create` then intake chest +
-Stock Ticker + `address` — same as v1.0 frogport/ticker flow.
-
-- **Deposit:** put accepted coins in this station's **INPUT** barrel (wired to manager) → at station PC `deposit` → pick/name player → confirm. Manager moves items to vault and credits chips.
-- **Withdraw:** station PC `withdraw` → manager debits chips and pays physical coins to this station's **OUTPUT** barrel (vault must hold enough coin items).
-- **Admin withdraw:** debits player ledger and dispenses from vault; optional `stationId` picks which OUTPUT barrel.
+**Legacy station ATM** (installer → Games → **a**): optional thin client if you are
+not using the managed `games` launcher as the station. Same barrel binds by
+computer ID (`deposit` / `withdraw` / `bal` on that PC).
 
 **Player identity (managed games):** Player Detector on each gambling PC; games
 load that player's balance from the Currency Manager over the mesh.
@@ -652,6 +656,8 @@ load that player's balance from the Currency Manager over the mesh.
 | `casino_credit` / `casino_bet` / `casino_payout` | games/legacy ATM | ledger credit/debit |
 | `casino_station_deposit` | station → manager | input barrel → vault + credit |
 | `casino_station_withdraw` | station → manager | debit + vault → output barrel |
+| `casino_station_info` | station → manager | vault chip-value + player chips + barrel bind |
+| `casino_deposit_notify` | manager → games PC | deposit barrel has items |
 | `casino_stations_req` / `casino_stations` | any → manager | list barrel bindings |
 | `casino_bind_station` | admin → manager | bind station barrels (password) |
 | `casino_admin_withdraw` | admin → manager | remote payout (password) |

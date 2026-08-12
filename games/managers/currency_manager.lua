@@ -1,6 +1,6 @@
 --[[
   games/managers/currency_manager.lua  -  Casino currency vault
-  Titan-Version: 1.1.4
+  Titan-Version: 1.1.5
 
   Ledger / admin for casino chips. Persists accepted items, rates, balances,
   and password on floppy (casino_currency.cfg).
@@ -29,6 +29,7 @@
     casino_credit / casino_bet / casino_payout + casino_ack
     casino_station_deposit / casino_station_withdraw + ack
     casino_deposit_notify                (manager → games PC when deposit barrel has items)
+    casino_station_info                  (vault stock + player chips for linked games PC)
     casino_stations_req / casino_stations
     casino_bind_station + ack            (password: floppy or Parent Center)
     casino_admin_withdraw / scan / rate / rates + ack
@@ -47,7 +48,7 @@ local DISK_FILE = "casino_currency.cfg"
 local LOCAL_CFG = "currency_manager.cfg"
 local SESSION_MS = 5 * 60 * 1000
 local PLAYER_RANGE = 8
-local VERSION = "1.1.4"
+local VERSION = "1.1.5"
 local MON_REFRESH_SEC = 5
 local NATIVE_TERM = term.current()
 
@@ -1616,6 +1617,31 @@ local function handleNet(from, msg)
       chips = extra.balance or select(1, getBal(player)),
       movedCount = extra.movedCount,
     })
+  elseif t == "casino_station_info" then
+    -- Linked games PC asks: vault chip-value + optional player balance + barrel bind.
+    loadDisk()
+    local stationId = normalizeStationId(msg.stationId) or from
+    local stor, sname = wrapStorage()
+    local vaultValue = 0
+    if stor then _, vaultValue = storageStock(stor) end
+    local player = normalizePlayer(msg.player or msg.name)
+    local chips = player and select(1, getBal(player)) or nil
+    local inInv, inName = wrapStationBarrel(stationId, "input")
+    local outInv, outName = wrapStationBarrel(stationId, "output")
+    rednet.send(replyTo, {
+      type = "casino_station_info",
+      ok = true,
+      from = os.getComputerID(),
+      stationId = stationId,
+      vault = sname,
+      vaultValue = vaultValue or 0,
+      player = player,
+      chips = chips,
+      input = inName,
+      output = outName,
+      hasInput = inInv ~= nil,
+      hasOutput = outInv ~= nil,
+    }, PROTO)
   elseif t == "casino_station_withdraw" then
     loadDisk()
     local stationId = normalizeStationId(msg.stationId) or from
@@ -1643,13 +1669,35 @@ local function handleNet(from, msg)
       sendCasinoAck(replyTo, false, { op = "station_withdraw", err = "vault not bound" })
       return
     end
+    local _, vaultValue = storageStock(stor)
+    local playerChips = select(1, getBal(player))
+    -- Preflight: player chips AND physical vault stock must cover the withdraw.
+    if playerChips < amount then
+      sendCasinoAck(replyTo, false, {
+        op = "station_withdraw", err = "insufficient player chips",
+        stationId = stationId, player = player,
+        chips = playerChips, vaultValue = vaultValue or 0, need = amount,
+      })
+      return
+    end
+    if (vaultValue or 0) < amount then
+      sendCasinoAck(replyTo, false, {
+        op = "station_withdraw", err = "insufficient vault stock",
+        stationId = stationId, player = player,
+        chips = playerChips, vaultValue = vaultValue or 0, need = amount,
+      })
+      return
+    end
     local ok, paid, err, extra = withdrawToBarrel(stor, sname, outInv, outName, player, amount)
     extra = extra or {}
     if not ok then
+      local _, vv = storageStock(stor)
       sendCasinoAck(replyTo, false, {
         op = "station_withdraw", err = err or "withdraw failed",
         stationId = stationId, player = player,
         chips = select(1, getBal(player)),
+        vaultValue = vv or 0,
+        need = amount,
       })
       return
     end
@@ -1661,6 +1709,8 @@ local function handleNet(from, msg)
       chips = extra.balance or select(1, getBal(player)),
       totalItems = extra.totalItems,
       partial = err == "partial",
+      output = outName,
+      vaultValue = select(2, storageStock(stor)),
     })
   elseif t == "casino_bind_station" then
     if not verifyRemoteAdminPassword(msg.password) then

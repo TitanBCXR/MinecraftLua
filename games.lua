@@ -1,6 +1,6 @@
 --[[
   games.lua  -  Titan Games Launcher (CC: Tweaked)
-  Titan-Version: 1.2.8
+  Titan-Version: 1.2.10
 
   Run:
 
@@ -16,12 +16,14 @@
   to Currency Manager before speaker swap; pocket keeps modem during play when
   needed for live casino bets. M swaps.
 
-  Managed cabinets also act as the casino deposit station: when Currency Manager
-  sees items in this PC's deposit barrel, it notifies the launcher and the
-  player is prompted for a name to credit.
+  Managed cabinets also act as the casino deposit/withdraw station: Currency
+  Manager notifies on deposit barrel items; press W to withdraw chips to the
+  linked output barrel (vault must hold enough physical currency).
 
   Controls:
-    Tap / Enter  play   U update   M music/modem   S settings   Q quit
+    Tap / Enter  play   U update   W withdraw (managed)
+    M music/modem   S settings   Q quit
+  Header top-right shows this computer's #ID for Currency Manager binds.
 ]]
 
 local RAW_FALLBACK = "https://raw.githubusercontent.com/TitanBCXR/MinecraftLua/main/"
@@ -267,9 +269,29 @@ local function restoreMeshAfterGame()
 end
 
 --------------------------------------------------------------------------------
--- Managed deposit prompts (Currency Manager → this games PC)
+-- Display primitives (needed by managed deposit/withdraw prompts)
+--------------------------------------------------------------------------------
+local function fill(x, y, w, h, bg)
+  if term.setBackgroundColor then term.setBackgroundColor(bg or colors.black) end
+  for row = y, y + h - 1 do
+    term.setCursorPos(x, row)
+    term.write((" "):rep(math.max(0, w)))
+  end
+end
+
+local function textAt(x, y, s, fg, bg)
+  if term.setBackgroundColor then term.setBackgroundColor(bg or colors.black) end
+  if term.setTextColor then term.setTextColor(fg or colors.white) end
+  term.setCursorPos(x, y)
+  term.write(tostring(s or ""))
+end
+
+--------------------------------------------------------------------------------
+-- Managed deposit / withdraw (Currency Manager ↔ this games PC)
 --------------------------------------------------------------------------------
 local pendingDepositOffer = nil
+local pendingWithdraw = nil
+local lastCasinoManagerId = nil
 
 local function isManagedEcon()
   return econ and econ.isManaged and econ.isManaged()
@@ -280,6 +302,73 @@ local function normalizePlayerName(p)
   p = p:gsub("[%c%z]", ""):match("^%s*(.-)%s*$") or ""
   if p == "" then return nil end
   return p:sub(1, 24)
+end
+
+local function discoverCasinoManager(timeout)
+  timeout = timeout or 2.5
+  if lastCasinoManagerId then return lastCasinoManagerId end
+  if titan and titan.openModem then pcall(titan.openModem) end
+  if fs.exists("lib/casino.lua") then
+    local ok, casino = pcall(dofile, "lib/casino.lua")
+    if ok and type(casino) == "table" then
+      pcall(casino.open)
+      local id = casino.discover and casino.discover(timeout)
+      if id then
+        lastCasinoManagerId = tonumber(id)
+        return lastCasinoManagerId
+      end
+    end
+  end
+  rednet.broadcast({ type = "casino_ping", from = os.getComputerID() }, CASINO_PROTO)
+  rednet.broadcast({ type = "casino_ping", from = os.getComputerID() }, CASINO_ROUTER)
+  local deadline = os.clock() + timeout
+  while os.clock() < deadline do
+    local id, msg = rednet.receive(nil, math.max(0.05, deadline - os.clock()))
+    if id and type(msg) == "table" and msg.type == "casino_hello" then
+      lastCasinoManagerId = tonumber(id)
+      return lastCasinoManagerId
+    end
+  end
+  return nil
+end
+
+local function requestStationInfo(managerId, player, timeout)
+  timeout = timeout or 4
+  local payload = {
+    type = "casino_station_info",
+    from = os.getComputerID(),
+    replyTo = os.getComputerID(),
+    stationId = os.getComputerID(),
+    player = player,
+  }
+  rednet.send(managerId, payload, CASINO_PROTO)
+  rednet.send(managerId, payload, CASINO_ROUTER)
+  local deadline = os.clock() + timeout
+  while os.clock() < deadline do
+    local id, msg = rednet.receive(nil, math.max(0.05, deadline - os.clock()))
+    if id and type(msg) == "table" and msg.type == "casino_station_info" then
+      return msg
+    end
+  end
+  return nil
+end
+
+local function formatWithdrawErr(msg)
+  local err = tostring(msg and msg.err or "denied")
+  local chips = tonumber(msg and msg.chips)
+  local vault = tonumber(msg and msg.vaultValue)
+  local need = tonumber(msg and msg.need)
+  if err == "insufficient vault stock" then
+    return ("Vault has %d chips of currency (need %d)"):format(
+      vault or 0, need or 0)
+  elseif err == "insufficient player chips" then
+    return ("Only %d chips on account (need %d)"):format(chips or 0, need or 0)
+  elseif err == "cannot make exact payout from vault" then
+    return "Vault cannot make exact payout (coin mix)"
+  elseif err == "station output not bound" then
+    return "No output barrel — bind depositN … <out>"
+  end
+  return err
 end
 
 local function promptDepositCredit(offer)
@@ -332,6 +421,7 @@ local function promptDepositCredit(offer)
     STATUS = "Deposit failed — no manager id"
     return
   end
+  lastCasinoManagerId = managerId
   if titan and titan.openModem then pcall(titan.openModem) end
   local payload = {
     type = "casino_station_deposit",
@@ -359,19 +449,133 @@ local function promptDepositCredit(offer)
   STATUS = "Deposit timeout — try again from menu"
 end
 
-local function fill(x, y, w, h, bg)
-  if term.setBackgroundColor then term.setBackgroundColor(bg or colors.black) end
-  for row = y, y + h - 1 do
-    term.setCursorPos(x, row)
-    term.write((" "):rep(math.max(0, w)))
+--- Managed cabinets: withdraw chips → linked output barrel (vault stock checked).
+local function promptWithdrawChips()
+  if not isManagedEcon() then
+    STATUS = "Withdraw only on managed cabinets"
+    return
   end
-end
+  if pendingWithdraw then return end
+  pendingWithdraw = true
 
-local function textAt(x, y, s, fg, bg)
-  if term.setBackgroundColor then term.setBackgroundColor(bg or colors.black) end
-  if term.setTextColor then term.setTextColor(fg or colors.white) end
-  term.setCursorPos(x, y)
-  term.write(tostring(s or ""))
+  term.setBackgroundColor(colors.black)
+  term.clear()
+  textAt(2, 1, "CASINO WITHDRAW", colors.orange, colors.black)
+  textAt(2, 3, "Enter player name:", colors.lightGray, colors.black)
+
+  local hint = nil
+  if fs.exists("lib/casino.lua") then
+    local ok, casino = pcall(dofile, "lib/casino.lua")
+    if ok and type(casino) == "table" then
+      pcall(casino.open)
+      local det = casino.detectPlayer and select(1, casino.detectPlayer(8))
+      if det then hint = det end
+    end
+  end
+  if hint then
+    textAt(2, 4, ("Detected: %s  (Enter keeps)"):format(hint), colors.cyan, colors.black)
+  end
+  term.setCursorPos(2, 6)
+  term.setTextColor(colors.white)
+  write("> ")
+  local typed = read()
+  local player = normalizePlayerName(typed)
+  if (not player or player == "") and hint then player = hint end
+  player = normalizePlayerName(player)
+  if not player then
+    STATUS = "Withdraw cancelled — no player name"
+    pendingWithdraw = nil
+    return
+  end
+
+  textAt(2, 8, "Finding Currency Manager…", colors.yellow, colors.black)
+  local managerId = discoverCasinoManager(2.5)
+  if not managerId then
+    STATUS = "Withdraw failed — no Currency Manager on mesh"
+    pendingWithdraw = nil
+    return
+  end
+
+  textAt(2, 9, "Checking vault + balance…", colors.yellow, colors.black)
+  local info = requestStationInfo(managerId, player, 4)
+  local chips = info and tonumber(info.chips) or nil
+  local vaultValue = info and tonumber(info.vaultValue) or nil
+  local hasOutput = info and info.hasOutput == true
+  if not info then
+    STATUS = "Withdraw failed — station info timeout"
+    pendingWithdraw = nil
+    return
+  end
+  if not hasOutput then
+    STATUS = "No output barrel — bind depositN <in> <id> <out>"
+    pendingWithdraw = nil
+    return
+  end
+
+  textAt(2, 11, ("Player %s: %d chips"):format(player, chips or 0), colors.white, colors.black)
+  textAt(2, 12, ("Vault can pay: %d chips"):format(vaultValue or 0), colors.lime, colors.black)
+  textAt(2, 13, ("Output: %s"):format(tostring(info.output or "?")), colors.lightGray, colors.black)
+  textAt(2, 15, "Chip amount to withdraw:", colors.lightGray, colors.black)
+  term.setCursorPos(2, 16)
+  write("> ")
+  local amount = math.floor(tonumber(read()) or 0)
+  if amount <= 0 then
+    STATUS = "Withdraw cancelled — bad amount"
+    pendingWithdraw = nil
+    return
+  end
+  if chips and amount > chips then
+    STATUS = ("Need %d chips; %s has %d"):format(amount, player, chips)
+    pendingWithdraw = nil
+    return
+  end
+  if vaultValue and amount > vaultValue then
+    STATUS = ("Vault only has %d chips of currency"):format(vaultValue)
+    pendingWithdraw = nil
+    return
+  end
+
+  textAt(2, 18, ("Pay %d chips to barrel for %s? (y/N)"):format(amount, player),
+    colors.white, colors.black)
+  term.setCursorPos(2, 19)
+  write("> ")
+  local ans = tostring(read() or ""):lower()
+  if ans ~= "y" and ans ~= "yes" then
+    STATUS = "Withdraw cancelled"
+    pendingWithdraw = nil
+    return
+  end
+
+  local payload = {
+    type = "casino_station_withdraw",
+    from = os.getComputerID(),
+    replyTo = os.getComputerID(),
+    stationId = os.getComputerID(),
+    player = player,
+    amount = amount,
+  }
+  rednet.send(managerId, payload, CASINO_PROTO)
+  rednet.send(managerId, payload, CASINO_ROUTER)
+  local deadline = os.clock() + 12
+  while os.clock() < deadline do
+    local id, msg = rednet.receive(nil, math.max(0.05, deadline - os.clock()))
+    if id and type(msg) == "table" and msg.type == "casino_ack"
+        and (msg.op == "station_withdraw" or msg.op == nil) then
+      if msg.ok then
+        STATUS = ("Withdrew %d for %s → %s (bal %d)"):format(
+          tonumber(msg.amount) or amount,
+          player,
+          tostring(msg.output or info.output or "barrel"),
+          tonumber(msg.chips) or 0)
+      else
+        STATUS = "Withdraw denied: " .. formatWithdrawErr(msg)
+      end
+      pendingWithdraw = nil
+      return
+    end
+  end
+  STATUS = "Withdraw timeout — try again"
+  pendingWithdraw = nil
 end
 
 local function drainEvents(secs)
@@ -630,10 +834,13 @@ local TILE = {
 local function drawMenu(state)
   local tw, th = term.getSize()
   local color = isColor()
+  local hdrBg = color and colors.blue or colors.gray
   fill(1, 1, tw, th, colors.black)
-  fill(1, 1, tw, 1, color and colors.blue or colors.gray)
-  textAt(2, 1, " TITAN GAMES ", colors.white, color and colors.blue or colors.gray)
-  textAt(math.max(2, tw - 8), 1, "U=upd", colors.yellow, color and colors.blue or colors.gray)
+  fill(1, 1, tw, 1, hdrBg)
+  textAt(2, 1, " TITAN GAMES ", colors.white, hdrBg)
+  -- Top-right: this PC's ID (use when binding deposit barrels on Currency Manager).
+  local idTag = ("#%d"):format(os.getComputerID())
+  textAt(math.max(2, tw - #idTag), 1, idTag, colors.yellow, hdrBg)
 
   textAt(2, 2, STATUS:sub(1, tw - 2), colors.lightGray, colors.black)
 
@@ -718,8 +925,9 @@ local function drawMenu(state)
     -- Slim pocket footer hint (no nav buttons).
     fill(1, th, tw, 1, colors.gray)
     local mode = pp and pp.soundModeLabel and pp.soundModeLabel() or (PREFER_MODEM and "modem" or "spk")
-    textAt(2, th, ("M %s  S set  U  Q"):format(mode):sub(1, tw - 2),
-      colors.white, colors.gray)
+    local hint = ("M %s  S set  U  Q"):format(mode)
+    if isManagedEcon() then hint = ("M %s  W withdraw  S  U  Q"):format(mode) end
+    textAt(2, th, hint:sub(1, tw - 2), colors.white, colors.gray)
   end
 end
 
@@ -1059,7 +1267,7 @@ local function main()
   bootMeshPresence()
   STATUS = pp and pp.statusText and pp.statusText() or STATUS
   if isManagedEcon() then
-    STATUS = (STATUS or "Ready") .. "  |  deposit barrel → name prompt"
+    STATUS = (STATUS or "Ready") .. "  |  W=withdraw  deposit barrel → name"
   end
 
   while true do
@@ -1072,7 +1280,7 @@ local function main()
       if target == os.getComputerID() then
         p2.from = p2.from or p1
         -- Avoid stacking prompts if notify repeats while already handling.
-        if not pendingDepositOffer then
+        if not pendingDepositOffer and not pendingWithdraw then
           pendingDepositOffer = true
           promptDepositCredit(p2)
           pendingDepositOffer = nil
@@ -1092,6 +1300,8 @@ local function main()
         if games[state.sel] then launchGame(games[state.sel]) end
       elseif p1 == K.u then
         doSync()
+      elseif p1 == K.w then
+        if isManagedEcon() then promptWithdrawChips() end
       elseif p1 == K.m then
         doMusicModemSwap()
       elseif p1 == K.s or p1 == K.o then
@@ -1108,6 +1318,8 @@ local function main()
       local ch = tostring(p1 or ""):lower()
       if ch == "q" then return
       elseif ch == "u" then doSync()
+      elseif ch == "w" then
+        if isManagedEcon() then promptWithdrawChips() end
       elseif ch == "m" then doMusicModemSwap()
       elseif ch == "s" or ch == "o" then
         runSettings()
