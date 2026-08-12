@@ -1,6 +1,6 @@
 --[[
   games.lua  -  Titan Games Launcher (CC: Tweaked)
-  Titan-Version: 1.2.4
+  Titan-Version: 1.2.5
 
   Run:
 
@@ -140,6 +140,66 @@ local function hasModem()
   return false
 end
 
+--------------------------------------------------------------------------------
+-- Config / versions (before mesh helpers — they call saveState)
+--------------------------------------------------------------------------------
+local function loadState()
+  if not fs.exists(STATE_FILE) then return end
+  local f = fs.open(STATE_FILE, "r")
+  local d = textutils.unserialize(f.readAll() or "")
+  f.close()
+  if type(d) ~= "table" then return end
+  LAST_SYNC = tonumber(d.lastSync) or 0
+  PREFER_MODEM = d.preferModem == true
+  if gm and gm.loadSettings then gm.loadSettings(d) end
+  MANAGED_FILES = {}
+  if type(d.managedFiles) == "table" then
+    for _, p in ipairs(d.managedFiles) do
+      if type(p) == "string" then MANAGED_FILES[p] = true end
+    end
+    -- also allow map form
+    for k, v in pairs(d.managedFiles) do
+      if type(k) == "string" and v == true then MANAGED_FILES[k] = true end
+    end
+  end
+  MANAGED_IDS = {}
+  if type(d.managedIds) == "table" then
+    for _, id in ipairs(d.managedIds) do
+      if type(id) == "string" then MANAGED_IDS[id] = true end
+    end
+    for k, v in pairs(d.managedIds) do
+      if type(k) == "string" and v == true then MANAGED_IDS[k] = true end
+    end
+  end
+end
+
+local function saveState()
+  local files, ids = {}, {}
+  for p in pairs(MANAGED_FILES) do files[#files + 1] = p end
+  table.sort(files)
+  for id in pairs(MANAGED_IDS) do ids[#ids + 1] = id end
+  table.sort(ids)
+  local f = fs.open(STATE_FILE, "w")
+  local modemSlot, speakerSlot = 15, 16
+  if pp and pp.getSlots then modemSlot, speakerSlot = pp.getSlots() end
+  local payload = {
+    lastSync = LAST_SYNC,
+    managedFiles = files,
+    managedIds = ids,
+    preferModem = PREFER_MODEM == true,
+    modemSlot = modemSlot,
+    speakerSlot = speakerSlot,
+  }
+  if gm and gm.exportSettings then
+    local ms = gm.exportSettings()
+    payload.musicSpeed = ms.musicSpeed
+    payload.musicTrackGlobal = ms.musicTrackGlobal
+    payload.musicTracks = ms.musicTracks
+  end
+  f.write(textutils.serialize(payload))
+  f.close()
+end
+
 local function doMusicModemSwap()
   if not pp or not pp.swapSound then
     STATUS = "Music/modem swap needs lib/pocket_peripherals.lua"
@@ -212,66 +272,6 @@ local function textAt(x, y, s, fg, bg)
   if term.setTextColor then term.setTextColor(fg or colors.white) end
   term.setCursorPos(x, y)
   term.write(tostring(s or ""))
-end
-
---------------------------------------------------------------------------------
--- Config / versions
---------------------------------------------------------------------------------
-local function loadState()
-  if not fs.exists(STATE_FILE) then return end
-  local f = fs.open(STATE_FILE, "r")
-  local d = textutils.unserialize(f.readAll() or "")
-  f.close()
-  if type(d) ~= "table" then return end
-  LAST_SYNC = tonumber(d.lastSync) or 0
-  PREFER_MODEM = d.preferModem == true
-  if gm and gm.loadSettings then gm.loadSettings(d) end
-  MANAGED_FILES = {}
-  if type(d.managedFiles) == "table" then
-    for _, p in ipairs(d.managedFiles) do
-      if type(p) == "string" then MANAGED_FILES[p] = true end
-    end
-    -- also allow map form
-    for k, v in pairs(d.managedFiles) do
-      if type(k) == "string" and v == true then MANAGED_FILES[k] = true end
-    end
-  end
-  MANAGED_IDS = {}
-  if type(d.managedIds) == "table" then
-    for _, id in ipairs(d.managedIds) do
-      if type(id) == "string" then MANAGED_IDS[id] = true end
-    end
-    for k, v in pairs(d.managedIds) do
-      if type(k) == "string" and v == true then MANAGED_IDS[k] = true end
-    end
-  end
-end
-
-local function saveState()
-  local files, ids = {}, {}
-  for p in pairs(MANAGED_FILES) do files[#files + 1] = p end
-  table.sort(files)
-  for id in pairs(MANAGED_IDS) do ids[#ids + 1] = id end
-  table.sort(ids)
-  local f = fs.open(STATE_FILE, "w")
-  local modemSlot, speakerSlot = 15, 16
-  if pp and pp.getSlots then modemSlot, speakerSlot = pp.getSlots() end
-  local payload = {
-    lastSync = LAST_SYNC,
-    managedFiles = files,
-    managedIds = ids,
-    preferModem = PREFER_MODEM == true,
-    modemSlot = modemSlot,
-    speakerSlot = speakerSlot,
-  }
-  if gm and gm.exportSettings then
-    local ms = gm.exportSettings()
-    payload.musicSpeed = ms.musicSpeed
-    payload.musicTrackGlobal = ms.musicTrackGlobal
-    payload.musicTracks = ms.musicTracks
-  end
-  f.write(textutils.serialize(payload))
-  f.close()
 end
 
 local function drainEvents(secs)
