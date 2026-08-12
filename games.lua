@@ -1,6 +1,6 @@
 --[[
   games.lua  -  Titan Games Launcher (CC: Tweaked)
-  Titan-Version: 1.2.5
+  Titan-Version: 1.2.6
 
   Run:
 
@@ -872,11 +872,37 @@ end
 --------------------------------------------------------------------------------
 -- Main
 --------------------------------------------------------------------------------
+-- Pull a fresh games.lua before mesh boot so a broken local copy can heal.
+-- Returns true if this process should exit (replacement already restarted).
+local function selfHealLauncher()
+  if not http then return false end
+  local base = RAW_FALLBACK
+  local localCat = loadLocalCatalog()
+  if localCat then base = rawBase(localCat) end
+  local remoteVers = select(1, fetchVersions(base, false))
+  local localVers = loadLocalVersions()
+  local need = needFile("games.lua", remoteVers or {}, localVers or {})
+  if not need then return false end
+  print("Updating games.lua…")
+  if not downloadPath(base, "games.lua") then return false end
+  if remoteVers then
+    local verData = select(2, fetchVersions(base, false))
+    if verData then writeFile(VER_FILE, verData) end
+  end
+  print("Launcher updated — restarting…")
+  sleep(0.4)
+  shell.run("games.lua")
+  return true
+end
+
 local function main()
   if not http then
     printError("HTTP is disabled. Enable it in the CC: Tweaked config.")
     return
   end
+
+  -- Heal before anything that needs a fixed launcher (mesh boot / saveState).
+  if selfHealLauncher() then return end
 
   loadState()
   if gm then gm.loadSettings() end
@@ -887,8 +913,6 @@ local function main()
       runEconomySetup()
     end
   end
-
-  bootMeshPresence()
 
   local state = {
     catalog = loadLocalCatalog(),
@@ -924,13 +948,16 @@ local function main()
     end
   end
 
-  -- Auto-sync on launch (or if never synced / catalog missing).
+  -- Sync first so updates land even when mesh boot used to crash early.
   local need = (not state.catalog) or (os.epoch("utc") - LAST_SYNC > 6 * 60 * 60 * 1000)
   if need then
     doSync()
   else
     STATUS = "Ready  (U = check updates)"
   end
+
+  bootMeshPresence()
+  STATUS = pp and pp.statusText and pp.statusText() or STATUS
 
   while true do
     drawMenu(state)
