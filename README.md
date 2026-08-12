@@ -939,7 +939,9 @@ mine                # begin (or resume a fuel pause)
 Aliases: `go` / `start`. One-off dig: `strip 128 3 20 2` (also updates defaults).
 
 Travel follows the main tunnel spine (`x=0`) then into branches — after refuel it
-does not dig overland shortcuts from the fuel chest to far branches.
+does not dig overland shortcuts from the fuel chest to far branches. `continue`
+returns from origin along the last 5 dig poses to the saved dig face (does not
+reset to the tunnel mouth and re-dig).
 
 Fuel guard matches the cell miner idea: estimates tank + fuel items vs Manhattan
 home cost, returns to the depot while it can still arrive (+ margin/reserve),

@@ -1,6 +1,6 @@
 --[[
   quarry/workers/strip_miner.lua  -  Branch / strip mining turtle
-  Titan-Version: 1.0.6
+  Titan-Version: 1.0.7
 
   Classic strip mine: dig a main 1×2 tunnel, then left/right branches every
   few blocks. Solo worker (no site board). Same chest layout as cell miner:
@@ -20,6 +20,9 @@
   Travel follows the strip topology (main tunnel spine at x=0): exit branch to
   spine, move along +Z/-Z, then enter the destination branch — never dig an
   overland shortcut from the fuel chest sideways to a far branch.
+
+  Continue: from origin, follow the last 5 recorded move poses (trail) then the
+  saved dig pose — does not reset to the level mouth and re-dig.
 
   Place turtle at the tunnel mouth, facing into the mine (origin 0,0,0).
   +X right, +Y down, +Z forward.
@@ -49,12 +52,15 @@ local FUEL_KEEP = 64         -- keep one stack of coal on the turtle
 local MIN_FUEL = 200
 local HOME_MARGIN = 24       -- spare fuel on arrival at depot
 local WORK_RESERVE = 48      -- keep digging only with this much above home cost
-local VERSION = "1.0.6"
+local VERSION = "1.0.7"
+local TRAIL_MAX = 5
 
 local STOP = false
 local dug, skipped, moves = 0, 0, 0
 local pos = { x = 0, y = 0, z = 0 }
 local facing = 0 -- 0=+Z, 1=+X, 2=-Z, 3=-X
+local moveTrail = {} -- last TRAIL_MAX dig poses {x,y,z}, oldest first
+local suppressTrail = false -- true while goTo/home travel (keep dig breadcrumbs)
 local cfg = {
   setupDone = false,
   length = 64,
@@ -122,8 +128,40 @@ local function saveDefaults(length, spacing, branch, levels)
   return d
 end
 
+local function normalizeTrail(t)
+  local out = {}
+  if type(t) ~= "table" then return out end
+  for i = 1, #t do
+    local w = t[i]
+    if type(w) == "table" then
+      out[#out + 1] = {
+        x = math.floor(tonumber(w.x) or 0),
+        y = math.floor(tonumber(w.y) or 0),
+        z = math.floor(tonumber(w.z) or 0),
+      }
+    end
+  end
+  while #out > TRAIL_MAX do table.remove(out, 1) end
+  return out
+end
+
+local function recordMove()
+  if suppressTrail then return end
+  local p = { x = pos.x, y = pos.y, z = pos.z }
+  local last = moveTrail[#moveTrail]
+  if last and last.x == p.x and last.y == p.y and last.z == p.z then
+    return
+  end
+  moveTrail[#moveTrail + 1] = p
+  while #moveTrail > TRAIL_MAX do table.remove(moveTrail, 1) end
+  if activeJob then activeJob.trail = moveTrail end
+end
+
 local function saveJob(j)
   activeJob = j
+  if type(j) == "table" then
+    j.trail = normalizeTrail(moveTrail)
+  end
   local f = fs.open(JOB_FILE, "w")
   if f then f.write(textutils.serialize(j or {})); f.close() end
 end
@@ -134,12 +172,17 @@ local function loadJob()
   if not f then return nil end
   local ok, data = pcall(textutils.unserialize, f.readAll())
   f.close()
-  if ok and type(data) == "table" then activeJob = data; return data end
+  if ok and type(data) == "table" then
+    activeJob = data
+    moveTrail = normalizeTrail(data.trail)
+    return data
+  end
   return nil
 end
 
 local function clearJob()
   activeJob = nil
+  moveTrail = {}
   if fs.exists(JOB_FILE) then fs.delete(JOB_FILE) end
 end
 
@@ -422,6 +465,7 @@ local function forward(digBlocks)
     elseif facing == 2 then pos.z = pos.z - 1
     else pos.x = pos.x - 1 end
     moves = moves + 1
+    recordMove()
     return true
   end
   return false
@@ -431,7 +475,12 @@ local function up(digBlocks)
   if STOP then return false end
   if not ensureFuel() then return false end
   if digBlocks then digDir("up") end
-  if turtle.up() then pos.y = pos.y - 1; moves = moves + 1; return true end
+  if turtle.up() then
+    pos.y = pos.y - 1
+    moves = moves + 1
+    recordMove()
+    return true
+  end
   return false
 end
 
@@ -439,7 +488,12 @@ local function down(digBlocks)
   if STOP then return false end
   if not ensureFuel() then return false end
   if digBlocks then digDir("down") end
-  if turtle.down() then pos.y = pos.y + 1; moves = moves + 1; return true end
+  if turtle.down() then
+    pos.y = pos.y + 1
+    moves = moves + 1
+    recordMove()
+    return true
+  end
   return false
 end
 
@@ -451,21 +505,52 @@ end
 -- 4) X → target (enter destination branch)
 local function goTo(x, y, z)
   x, y, z = math.floor(x), math.floor(y), math.floor(z)
+  if pos.x == x and pos.y == y and pos.z == z then return true end
+  local prevSuppress = suppressTrail
+  suppressTrail = true
+  local ok = true
   if pos.x ~= 0 then
     faceDir(pos.x < 0 and 1 or 3)
-    while pos.x ~= 0 do if not forward(true) then return false end end
+    while pos.x ~= 0 do if not forward(true) then ok = false; break end end
   end
-  while pos.y > y do if not up(true) then return false end end
-  while pos.y < y do if not down(true) then return false end end
-  if pos.z ~= z then
+  if ok then
+    while pos.y > y do if not up(true) then ok = false; break end end
+  end
+  if ok then
+    while pos.y < y do if not down(true) then ok = false; break end end
+  end
+  if ok and pos.z ~= z then
     faceDir(pos.z < z and 0 or 2)
-    while pos.z ~= z do if not forward(true) then return false end end
+    while pos.z ~= z do if not forward(true) then ok = false; break end end
   end
-  if pos.x ~= x then
+  if ok and pos.x ~= x then
     faceDir(pos.x < x and 1 or 3)
-    while pos.x ~= x do if not forward(true) then return false end end
+    while pos.x ~= x do if not forward(true) then ok = false; break end end
   end
-  return true
+  suppressTrail = prevSuppress
+  return ok
+end
+
+-- From origin (or anywhere): walk saved trail poses, then the dig pose.
+local function goToViaTrail(job, rx, ry, rz)
+  rx = math.floor(tonumber(rx) or 0)
+  ry = math.floor(tonumber(ry) or 0)
+  rz = math.floor(tonumber(rz) or 0)
+  local trail = normalizeTrail((job and job.trail) or moveTrail)
+  moveTrail = trail
+  if #trail > 0 then
+    print(("Resume path: %d trail pose(s) → %d,%d,%d"):format(#trail, rx, ry, rz))
+    for i = 1, #trail do
+      local w = trail[i]
+      if not goTo(w.x, w.y, w.z) then
+        print(("Trail blocked at pose %d (%d,%d,%d)"):format(i, w.x, w.y, w.z))
+        return false
+      end
+    end
+  else
+    print(("Resume path: dig pose %d,%d,%d"):format(rx, ry, rz))
+  end
+  return goTo(rx, ry, rz)
 end
 
 local function inventoryFull()
@@ -653,7 +738,7 @@ local function maybeHome(opts)
     return false
   end
 
-  if not goTo(rx, ry, rz) then
+  if not goToViaTrail(activeJob, rx, ry, rz) then
     print("Could not return to dig pose after refuel.")
     if activeJob then
       activeJob.status = "paused"
@@ -728,48 +813,102 @@ local function runStrip(job)
   local levels = math.max(1, math.floor(tonumber(job.levels) or 1))
   local startIdx = math.max(1, math.floor(tonumber(job.idx) or 1))
   local startLevel = math.max(0, math.floor(tonumber(job.level) or 0))
+  local skipLevelMouth = false
 
   dug, skipped = tonumber(job.dug) or dug, tonumber(job.skipped) or skipped
+  moveTrail = normalizeTrail(job.trail or moveTrail)
   print(("Strip L=%d spacing=%d branch=%d levels=%d"):format(length, spacing, branch, levels))
 
-  -- Resume pose if we paused mid-dig for fuel.
-  if job.resumeX ~= nil and job.status == "paused" then
+  -- Resume: origin → last 5 dig poses → saved dig pose (do NOT reset to level mouth).
+  if job.resumeX ~= nil and (job.status == "paused" or job.status == "active") then
     local rx = math.floor(tonumber(job.resumeX) or 0)
     local ry = math.floor(tonumber(job.resumeY) or 0)
     local rz = math.floor(tonumber(job.resumeZ) or 0)
     local rf = math.floor(tonumber(job.resumeFacing) or 0) % 4
-    local plan, fuel, home = fuelPlanNow(0, 0, 0)
-    if pos.x == 0 and pos.y == 0 and pos.z == 0 then
-      suckFuel()
-      plan, fuel, home = fuelPlanNow(0, 0, 0)
+    local atHome = (pos.x == 0 and pos.y == 0 and pos.z == 0)
+    if atHome or job.status == "paused" then
+      local plan, fuel = fuelPlanNow(0, 0, 0)
+      if atHome then
+        suckFuel()
+        plan, fuel = fuelPlanNow(0, 0, 0)
+      end
+      local need = homeFuelCost(rx, ry, rz) + WORK_RESERVE
+      if fuel ~= math.huge and fuel < need then
+        print(("Not enough fuel to resume dig pose (have~%s need~%d)."):format(
+          tostring(fuel), need))
+        job.status = "paused"
+        saveJob(job)
+        return "paused"
+      end
+      print(("Continuing from origin toward %d,%d,%d ..."):format(rx, ry, rz))
+      if not goToViaTrail(job, rx, ry, rz) then
+        print("Could not reach resume pose via trail.")
+        job.status = "paused"
+        saveJob(job)
+        return "paused"
+      end
+      faceDir(rf)
     end
-    local need = homeFuelCost(rx, ry, rz) + WORK_RESERVE
-    if fuel ~= math.huge and fuel < need then
-      print(("Not enough fuel to resume dig pose (have~%s need~%d)."):format(
-        tostring(fuel), need))
-      job.status = "paused"
-      saveJob(job)
-      return "paused"
-    end
-    print(("Resuming @ %d,%d,%d ..."):format(rx, ry, rz))
-    if not goTo(rx, ry, rz) then
-      print("Could not reach resume pose.")
-      job.status = "paused"
-      saveJob(job)
-      return "paused"
-    end
-    faceDir(rf)
     job.status = "active"
     job.pauseReason = nil
+    skipLevelMouth = true
+
+    -- Finish a mid-branch pause, then advance main index past this junction.
+    local phase = tostring(job.phase or "main")
+    local doneBr = math.max(0, math.floor(tonumber(job.branchIdx) or 0))
+    if phase == "branch_right" or phase == "branch_left" then
+      local dir = (phase == "branch_right") and 1 or 3
+      local left = math.max(0, branch - doneBr)
+      local jx, jy, jz = 0, pos.y, pos.z
+      if left > 0 then
+        print(("Finishing %s (%d blocks left)..."):format(phase, left))
+        job.phase = phase
+        if not digBranch(dir, left) then
+          job.status = "paused"; saveJob(job); return "paused"
+        end
+      else
+        if not goTo(jx, jy, jz) then
+          job.status = "paused"; saveJob(job); return "paused"
+        end
+      end
+      faceDir(0)
+      if phase == "branch_right" and branch > 0 then
+        job.phase = "branch_left"
+        job.branchIdx = 0
+        if not digBranch(3, branch) then
+          job.status = "paused"; saveJob(job); return "paused"
+        end
+        if not goTo(jx, jy, jz) then
+          job.status = "paused"; saveJob(job); return "paused"
+        end
+        faceDir(0)
+      end
+      job.phase = "main"
+      job.branchIdx = nil
+      startIdx = math.max(startIdx + 1, (tonumber(job.idx) or startIdx) + 1)
+      saveJob(job)
+    elseif phase == "main" or phase == "" then
+      -- Already finished shaft step i if we sit at z >= idx along the main.
+      if pos.x == 0 and pos.z >= startIdx then
+        startIdx = startIdx + 1
+      end
+    end
+    job.resumeX, job.resumeY, job.resumeZ, job.resumeFacing = nil, nil, nil, nil
+    saveJob(job)
   end
 
   for level = startLevel, levels - 1 do
     if STOP then break end
     local y = level -- +Y down
-    if not (pos.x == 0 and pos.z == 0 and pos.y == y) then
+    if skipLevelMouth and level == startLevel then
+      -- Stay at resumed dig pose; do not walk back to the level mouth.
+      skipLevelMouth = false
+    elseif not (pos.x == 0 and pos.z == 0 and pos.y == y) then
       if not goTo(0, y, 0) then
         print("Could not reach level Y=" .. y)
         job.status = "paused"
+        job.resumeX, job.resumeY, job.resumeZ = pos.x, pos.y, pos.z
+        job.resumeFacing = facing
         saveJob(job)
         return "paused"
       end
@@ -780,6 +919,7 @@ local function runStrip(job)
     for i = i0, length do
       if STOP then break end
       job.idx = i
+      job.phase = "main"
       job.dug, job.skipped = dug, skipped
       job.status = "active"
       if i % 2 == 0 then saveJob(job) end
@@ -791,6 +931,8 @@ local function runStrip(job)
       if not digShaftStep() then
         print("Blocked on main tunnel at z=" .. tostring(pos.z))
         job.status = "paused"
+        job.resumeX, job.resumeY, job.resumeZ = pos.x, pos.y, pos.z
+        job.resumeFacing = facing
         saveJob(job)
         return "paused"
       end
@@ -801,11 +943,11 @@ local function runStrip(job)
       if branch > 0 and i % spacing == 0 then
         if not canAffordBranch(branch) then
           if not maybeHome({ stayHome = true }) then return "paused" end
-          -- After stay-home pause, continue will resume.
           return "paused"
         end
         local bx, by, bz = pos.x, pos.y, pos.z
         job.phase = "branch_right"
+        job.branchIdx = 0
         if not digBranch(1, branch) then
           job.status = "paused"; saveJob(job); return "paused"
         end
@@ -814,6 +956,7 @@ local function runStrip(job)
         end
         faceDir(0)
         job.phase = "branch_left"
+        job.branchIdx = 0
         if not digBranch(3, branch) then
           job.status = "paused"; saveJob(job); return "paused"
         end
@@ -822,6 +965,7 @@ local function runStrip(job)
         end
         faceDir(0)
         job.phase = "main"
+        job.branchIdx = nil
       end
     end
     if level < levels - 1 then
@@ -835,6 +979,9 @@ local function runStrip(job)
   job.status = "done"
   job.pauseReason = nil
   job.resumeX, job.resumeY, job.resumeZ = nil, nil, nil
+  job.resumeFacing = nil
+  job.trail = nil
+  moveTrail = {}
   job.dug, job.skipped = dug, skipped
   saveJob(job)
   print(("Strip done. dug=%d skipped=%d moves=%d"):format(dug, skipped, moves))
@@ -854,6 +1001,8 @@ local function startStripJob(length, spacing, branch, levels)
     dug = 0, skipped = 0,
   }
   dug, skipped, moves = 0, 0, 0
+  moveTrail = {}
+  job.trail = {}
   saveJob(job)
   print(("Mining L=%d spacing=%d branch=%d levels=%d"):format(
     d.length, d.spacing, d.branch, d.levels))
@@ -896,7 +1045,7 @@ local function printHelp()
   print(("  defaults               now L=%d sp=%d br=%d lv=%d"):format(
     d.length, d.spacing, d.branch, d.levels))
   print("  strip <L> [sp] [br] [lv]  one-off dig (also saves defaults)")
-  print("  continue | resume     resume saved job after fuel pause")
+  print("  continue | resume     from origin via last 5 dig poses → dig face")
   print("  home | dump | refuel | setup | stop | status | clearjob")
   print("  help | exit")
   print("Fuel: returns home before stranding; SOS if short of depot.")
@@ -923,6 +1072,13 @@ local function handle(line)
         tostring(activeJob.length), tostring(activeJob.level),
         tostring(activeJob.status),
         activeJob.pauseReason and ("(" .. activeJob.pauseReason .. ")") or ""))
+      local t = normalizeTrail(activeJob.trail or moveTrail)
+      if #t > 0 then
+        local w = t[#t]
+        print(("trail %d/5 last=%d,%d,%d resume=%s,%s,%s"):format(
+          #t, w.x, w.y, w.z,
+          tostring(activeJob.resumeX), tostring(activeJob.resumeY), tostring(activeJob.resumeZ)))
+      end
     end
   elseif cmd == "defaults" or cmd == "default" then
     local d = defaultsOf()
@@ -969,11 +1125,26 @@ local function handle(line)
     elseif job.status == "done" then
       print("Job already done. Use: mine")
     else
+      -- Always reset to origin, then trail → last dig pose.
       if pos.x ~= 0 or pos.y ~= 0 or pos.z ~= 0 then
-        print("Heading home to refuel before resume...")
+        print("Returning to origin before continue...")
         goHome()
       else
         suckFuel()
+      end
+      if job.resumeX == nil then
+        -- Use last trail pose as dig target if pause forgot resume coords.
+        local t = normalizeTrail(job.trail or moveTrail)
+        if #t > 0 then
+          local w = t[#t]
+          job.resumeX, job.resumeY, job.resumeZ = w.x, w.y, w.z
+          job.resumeFacing = job.resumeFacing or 0
+          job.status = "paused"
+          saveJob(job)
+        end
+      end
+      if job.resumeX == nil and job.status ~= "paused" then
+        print("No dig pose saved — continuing job loop from idx.")
       end
       runStrip(job)
     end
