@@ -1,6 +1,6 @@
 --[[
   quarry/workers/strip_miner.lua  -  Branch / strip mining turtle
-  Titan-Version: 1.0.5
+  Titan-Version: 1.0.6
 
   Classic strip mine: dig a main 1×2 tunnel, then left/right branches every
   few blocks. Solo worker (no site board). Same chest layout as cell miner:
@@ -49,7 +49,7 @@ local FUEL_KEEP = 64         -- keep one stack of coal on the turtle
 local MIN_FUEL = 200
 local HOME_MARGIN = 24       -- spare fuel on arrival at depot
 local WORK_RESERVE = 48      -- keep digging only with this much above home cost
-local VERSION = "1.0.5"
+local VERSION = "1.0.6"
 
 local STOP = false
 local dug, skipped, moves = 0, 0, 0
@@ -222,10 +222,37 @@ local function findEmptyCargoSlot()
   return nil
 end
 
+-- Digs fill the selected slot first. Prefer a partial stack with room so
+-- identical blocks keep stacking (avoid one empty slot per dig step).
 local function selectCargoSlot()
+  for s = 1, 14 do
+    local n = turtle.getItemCount(s)
+    if n > 0 and turtle.getItemSpace(s) > 0 then
+      turtle.select(s)
+      return
+    end
+  end
   local empty = findEmptyCargoSlot()
   if empty then turtle.select(empty); return end
   turtle.select(1)
+end
+
+-- Merge identical cargo stacks into earlier slots (1-14).
+local function consolidateCargo()
+  for s = 2, 14 do
+    if turtle.getItemCount(s) > 0 then
+      for d = 1, s - 1 do
+        if turtle.getItemCount(d) > 0 and turtle.getItemSpace(d) > 0 then
+          turtle.select(s)
+          if turtle.compareTo(d) then
+            turtle.transferTo(d)
+            if turtle.getItemCount(s) == 0 then break end
+          end
+        end
+      end
+    end
+  end
+  selectCargoSlot()
 end
 
 -- Slot 16 = coal/charcoal only. Evict junk, gather whitelist fuel, select cargo.
@@ -242,7 +269,7 @@ local function protectFuelSlot()
       turtle.transferTo(FUEL_SLOT)
     end
   end
-  selectCargoSlot()
+  consolidateCargo()
 end
 
 local function consolidateFuelToSlot16()
@@ -662,14 +689,16 @@ end
 -- Strip pattern
 --------------------------------------------------------------------------------
 local function digShaftStep()
+  selectCargoSlot()
   digDir("up")
   if not forward(true) then
     digDir("forward")
     if not forward(true) then return false end
   end
   digDir("up")
-  -- Keep mined coal stacking into slot 16 while digging.
+  -- Keep mined coal stacking into slot 16; merge cargo so slots fill to 64.
   gatherCoalToFuelSlot()
+  consolidateCargo()
   return true
 end
 
