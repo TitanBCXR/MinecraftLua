@@ -1,6 +1,6 @@
 --[[
   games.lua  -  Titan Games Launcher (CC: Tweaked)
-  Titan-Version: 1.2.10
+  Titan-Version: 1.2.11
 
   Run:
 
@@ -16,9 +16,9 @@
   to Currency Manager before speaker swap; pocket keeps modem during play when
   needed for live casino bets. M swaps.
 
-  Managed cabinets also act as the casino deposit/withdraw station: Currency
-  Manager notifies on deposit barrel items; press W to withdraw chips to the
-  linked output barrel (vault must hold enough physical currency).
+  Managed cabinets share one station barrel for deposit + withdraw. Currency
+  Manager notifies on deposit items; W withdraws to the same barrel. After a
+  withdraw, auto-deposit pauses until the barrel is emptied.
 
   Controls:
     Tap / Enter  play   U update   W withdraw (managed)
@@ -365,8 +365,10 @@ local function formatWithdrawErr(msg)
     return ("Only %d chips on account (need %d)"):format(chips or 0, need or 0)
   elseif err == "cannot make exact payout from vault" then
     return "Vault cannot make exact payout (coin mix)"
-  elseif err == "station output not bound" then
-    return "No output barrel — bind depositN … <out>"
+  elseif err == "station barrel not bound" or err == "station output not bound" then
+    return "No station barrel — bind depositN <barrel> <id>"
+  elseif err == "withdraw pickup pending" then
+    return "Empty the station barrel first (payout still inside)"
   end
   return err
 end
@@ -441,7 +443,12 @@ local function promptDepositCredit(offer)
         STATUS = ("Deposited for %s +%d chips (bal %d)"):format(
           player, tonumber(msg.amount) or 0, tonumber(msg.chips) or 0)
       else
-        STATUS = "Deposit denied: " .. tostring(msg.err or "?")
+        local err = tostring(msg.err or "?")
+        if err == "withdraw pickup pending" then
+          STATUS = "Deposit paused — empty barrel (take withdraw items first)"
+        else
+          STATUS = "Deposit denied: " .. err
+        end
       end
       return
     end
@@ -449,7 +456,7 @@ local function promptDepositCredit(offer)
   STATUS = "Deposit timeout — try again from menu"
 end
 
---- Managed cabinets: withdraw chips → linked output barrel (vault stock checked).
+--- Managed cabinets: withdraw chips → shared station barrel (vault stock checked).
 local function promptWithdrawChips()
   if not isManagedEcon() then
     STATUS = "Withdraw only on managed cabinets"
@@ -500,21 +507,27 @@ local function promptWithdrawChips()
   local info = requestStationInfo(managerId, player, 4)
   local chips = info and tonumber(info.chips) or nil
   local vaultValue = info and tonumber(info.vaultValue) or nil
-  local hasOutput = info and info.hasOutput == true
+  local hasBarrel = info and (info.hasBarrel == true or info.hasOutput == true or info.hasInput == true)
+  local barrelName = info and (info.barrel or info.output or info.input)
   if not info then
     STATUS = "Withdraw failed — station info timeout"
     pendingWithdraw = nil
     return
   end
-  if not hasOutput then
-    STATUS = "No output barrel — bind depositN <in> <id> <out>"
+  if not hasBarrel then
+    STATUS = "No station barrel — bind depositN <barrel> <id>"
+    pendingWithdraw = nil
+    return
+  end
+  if info.withdrawHold then
+    STATUS = "Empty station barrel first (last withdraw still inside)"
     pendingWithdraw = nil
     return
   end
 
   textAt(2, 11, ("Player %s: %d chips"):format(player, chips or 0), colors.white, colors.black)
   textAt(2, 12, ("Vault can pay: %d chips"):format(vaultValue or 0), colors.lime, colors.black)
-  textAt(2, 13, ("Output: %s"):format(tostring(info.output or "?")), colors.lightGray, colors.black)
+  textAt(2, 13, ("Barrel: %s"):format(tostring(barrelName or "?")), colors.lightGray, colors.black)
   textAt(2, 15, "Chip amount to withdraw:", colors.lightGray, colors.black)
   term.setCursorPos(2, 16)
   write("> ")
@@ -562,11 +575,8 @@ local function promptWithdrawChips()
     if id and type(msg) == "table" and msg.type == "casino_ack"
         and (msg.op == "station_withdraw" or msg.op == nil) then
       if msg.ok then
-        STATUS = ("Withdrew %d for %s → %s (bal %d)"):format(
-          tonumber(msg.amount) or amount,
-          player,
-          tostring(msg.output or info.output or "barrel"),
-          tonumber(msg.chips) or 0)
+        STATUS = ("Withdrew %d for %s — empty barrel to resume deposits"):format(
+          tonumber(msg.amount) or amount, player)
       else
         STATUS = "Withdraw denied: " .. formatWithdrawErr(msg)
       end

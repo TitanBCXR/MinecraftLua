@@ -1,26 +1,26 @@
 --[[
   games/managers/currency_manager.lua  -  Casino currency vault
-  Titan-Version: 1.1.5
+  Titan-Version: 1.1.6
 
   Ledger / admin for casino chips. Persists accepted items, rates, balances,
   and password on floppy (casino_currency.cfg).
 
-  Vault + deposit barrels (each linked to a station computer ID):
+  Vault + station barrels (each linked to a station computer ID). Deposit and
+  withdraw share the SAME barrel per station:
     bind storage <vault>
-    bind deposit1 <barrel> <computerId> [outputBarrel]
-    bind deposit2 <barrel> <computerId> [outputBarrel]
+    bind deposit1 <barrel> <computerId>
+    bind deposit2 <barrel> <computerId>
     intake                                  -- pull deposit1/2 → vault (stock)
     deposits                                -- list deposit ↔ computer map
-    bind station <id> input <in> output <out>   -- still supported
 
-  Players use casino_atm.lua at each station PC (thin client over mesh).
-  Admin tablet uses Parent Center master password for remote withdraw / rates.
+  After a withdraw, auto-deposit notify is paused until that barrel is emptied
+  (player takes payout items), then resumes.
 
   Layout:
-    [deposit1]--+                       +--> [station input/output barrels]
-    [deposit2]--+--> [Currency Manager] --+--> [Vault]
-                 | disk + wireless mesh
-                 +-- games / station ATMs / admin tablet
+    [station barrel #1]--+
+    [station barrel #2]--+--> [Currency Manager] --> [Vault]
+                          | disk + wireless mesh
+                          +-- games / admin tablet
 
   Rednet:
     casino_ping / casino_hello
@@ -48,19 +48,24 @@ local DISK_FILE = "casino_currency.cfg"
 local LOCAL_CFG = "currency_manager.cfg"
 local SESSION_MS = 5 * 60 * 1000
 local PLAYER_RANGE = 8
-local VERSION = "1.1.5"
+local VERSION = "1.1.6"
 local MON_REFRESH_SEC = 5
 local NATIVE_TERM = term.current()
 
 local cfg = {
   storage = nil,
   deposit = nil,   -- legacy string alias for deposit1 inv
-  -- deposit1 / deposit2: string (legacy) or { inv, computerId, output? }
+  -- deposit1 / deposit2: string (legacy) or { inv, computerId }
+  -- Station deposit + withdraw share the same barrel (inv).
   deposit1 = nil,
   deposit2 = nil,
   chest = nil, drive = nil, label = nil,
-  stations = {}, -- [computerId] = { input = peripheralName, output = peripheralName }
+  -- [computerId] = { input = peripheralName, output = same as input }
+  stations = {},
 }
+-- After withdraw into a station barrel, pause auto-deposit until emptied.
+local withdrawHold = {} -- [barrelName] = true
+local depositNotifyState = {} -- [role] = { fp = string, at = number }
 local data = {
   accepted = {}, -- list of item names
   rates = {},    -- item -> chips
@@ -104,15 +109,15 @@ local function loadLocal()
   if (not cfg.storage or cfg.storage == "") and cfg.chest and cfg.chest ~= "" then
     cfg.storage = cfg.chest
   end
-  -- Normalize deposit1/deposit2 to { inv, computerId, output }.
+  -- Normalize deposit1/deposit2 to { inv, computerId } (shared I/O barrel).
   local function normalizeDeposit(slot)
     local d = cfg[slot]
     if type(d) == "string" and d ~= "" then
-      cfg[slot] = { inv = d, computerId = nil, output = nil }
+      cfg[slot] = { inv = d, computerId = nil }
     elseif type(d) == "table" and type(d.inv) == "string" and d.inv ~= "" then
       d.computerId = tonumber(d.computerId) or nil
       if d.computerId and d.computerId <= 0 then d.computerId = nil end
-      if type(d.output) ~= "string" or d.output == "" then d.output = nil end
+      d.output = nil -- legacy separate output ignored; barrel is shared
       cfg[slot] = d
     elseif d == "" then
       cfg[slot] = nil
@@ -126,6 +131,20 @@ local function loadLocal()
   normalizeDeposit("deposit2")
   if type(cfg.deposit1) == "table" then
     cfg.deposit = cfg.deposit1.inv
+  end
+  -- Force station map: input == output (one barrel). Prefer deposit binding inv.
+  for _, slot in ipairs({ "deposit1", "deposit2" }) do
+    local inv = type(cfg[slot]) == "table" and cfg[slot].inv or nil
+    local sid = type(cfg[slot]) == "table" and tonumber(cfg[slot].computerId) or nil
+    if inv and sid then
+      cfg.stations[sid] = { input = inv, output = inv }
+      cfg.stations[tostring(sid)] = nil
+    end
+  end
+  for sid, row in pairs(cfg.stations) do
+    if type(row) == "table" and type(row.input) == "string" and row.input ~= "" then
+      row.output = row.input
+    end
   end
 end
 
@@ -142,25 +161,56 @@ local function depositComputerId(slot)
   return nil
 end
 
+-- Shared barrel: deposit and withdraw use the same inventory.
 local function depositOutputName(slot)
-  local d = cfg[slot]
-  if type(d) == "table" and type(d.output) == "string" and d.output ~= "" then
-    return d.output
-  end
-  return nil
+  return depositInvName(slot)
 end
 
--- Keep stations[] aligned with deposit1/2 computer bindings.
+-- Keep stations[] aligned with deposit1/2 (one barrel for both roles).
 local function syncStationFromDeposit(slot)
   local inv = depositInvName(slot)
   local sid = depositComputerId(slot)
   if not inv or not sid then return end
-  local row = cfg.stations[sid] or cfg.stations[tostring(sid)] or {}
-  row.input = inv
-  local out = depositOutputName(slot)
-  if out then row.output = out end
-  cfg.stations[sid] = row
+  cfg.stations[sid] = { input = inv, output = inv }
   cfg.stations[tostring(sid)] = nil
+end
+
+local function barrelFingerprint(inv)
+  if not inv or type(inv.list) ~= "function" then return "" end
+  local list = inv.list() or {}
+  local parts = {}
+  for slot, detail in pairs(list) do
+    if type(detail) == "table" and detail.name then
+      parts[#parts + 1] = tostring(slot) .. "=" .. detail.name .. "x" .. tostring(detail.count or 0)
+    end
+  end
+  table.sort(parts)
+  return table.concat(parts, ";")
+end
+
+local function markWithdrawHold(barrelName)
+  if type(barrelName) == "string" and barrelName ~= "" then
+    withdrawHold[barrelName] = true
+  end
+end
+
+--- Clear hold when barrel is empty; returns true if still holding (not empty).
+local function refreshWithdrawHold(barrelName, inv)
+  if not barrelName or not withdrawHold[barrelName] then return false end
+  if not inv then
+    local ok, w = pcall(peripheral.wrap, barrelName)
+    inv = (ok and w) or nil
+  end
+  if not inv or barrelFingerprint(inv) == "" then
+    withdrawHold[barrelName] = nil
+    return false
+  end
+  return true
+end
+
+local function isWithdrawHold(barrelName)
+  if not barrelName then return false end
+  return refreshWithdrawHold(barrelName) == true
 end
 
 local function saveLocal()
@@ -337,9 +387,12 @@ end
 local function wrapStationBarrel(stationId, role)
   local row, sid = getStationBinding(stationId)
   if not row then return nil, nil, sid, "no station binding for #" .. tostring(stationId) end
-  local name = row[role]
+  -- Deposit and withdraw share one barrel; either role resolves to input.
+  local name = row.input or row.output
+  if role == "output" then name = row.output or row.input end
+  if role == "input" then name = row.input or row.output end
   if not name or not isInventory(name) then
-    return nil, nil, sid, role .. " barrel not bound / missing"
+    return nil, nil, sid, "station barrel not bound / missing"
   end
   return peripheral.wrap(name), name, sid
 end
@@ -549,37 +602,30 @@ local function cmdBind(a)
   if role == "chest" then role = "storage" end -- legacy alias
   if role == "station" then
     local sid = normalizeStationId(a[3])
-    if not sid then
-      print("Usage: bind station <computerId> input <barrel> output <barrel>")
+    -- Prefer: bind station <id> <barrel>
+    -- Legacy: bind station <id> input <barrel> output <barrel> (forced to one barrel)
+    local barrel = a[4]
+    if tostring(a[4] or ""):lower() == "input" then barrel = a[5] end
+    if not sid or not barrel then
+      print("Usage: bind station <computerId> <barrel>")
       return
     end
-    if tostring(a[4] or ""):lower() ~= "input" or tostring(a[6] or ""):lower() ~= "output" then
-      print("Usage: bind station <computerId> input <barrel> output <barrel>")
-      return
-    end
-    local inName, outName = a[5], a[7]
-    if not inName or not outName then
-      print("Usage: bind station <computerId> input <barrel> output <barrel>")
-      return
-    end
-    if not isInventory(inName) then print("Not an inventory: " .. tostring(inName)); return end
-    if not isInventory(outName) then print("Not an inventory: " .. tostring(outName)); return end
-    if inName == outName then print("Input and output must differ."); return end
+    if not isInventory(barrel) then print("Not an inventory: " .. tostring(barrel)); return end
     local storName = cfg.storage or cfg.chest
-    if storName and (inName == storName or outName == storName) then
-      print("Station barrels must differ from the vault."); return
+    if storName and barrel == storName then
+      print("Station barrel must differ from the vault."); return
     end
-    cfg.stations[sid] = { input = inName, output = outName }
+    cfg.stations[sid] = { input = barrel, output = barrel }
     saveLocal()
-    print(("Station #%d  input=%s  output=%s"):format(sid, inName, outName))
+    print(("Station #%d  barrel=%s  (deposit+withdraw)"):format(sid, barrel))
     return
   end
   if role == "deposit" then role = "deposit1" end -- alias
   if (role ~= "storage" and role ~= "deposit1" and role ~= "deposit2" and role ~= "drive")
       or not name then
     print("Usage: bind storage|drive <peripheralName|side>")
-    print("       bind deposit1|deposit2 <barrel> <computerId> [outputBarrel]")
-    print("  (deposit = deposit1 alias)")
+    print("       bind deposit1|deposit2 <barrel> <computerId>")
+    print("  (deposit = deposit1 alias; one barrel for deposit + withdraw)")
     return
   end
   if role == "drive" then
@@ -608,12 +654,11 @@ local function cmdBind(a)
     return
   end
 
-  -- deposit1 / deposit2: require computer ID mapping
+  -- deposit1 / deposit2: one shared barrel + computer ID
   local computerId = normalizeStationId(a[4])
-  local outName = a[5]
   if not computerId then
-    print("Usage: bind " .. role .. " <barrel> <computerId> [outputBarrel]")
-    print("  Links this deposit barrel to a station ATM computer on rednet.")
+    print("Usage: bind " .. role .. " <barrel> <computerId>")
+    print("  Links this barrel to a managed games PC (deposit + withdraw).")
     return
   end
   if storName and name == storName then
@@ -627,37 +672,19 @@ local function cmdBind(a)
   if otherPc and otherPc == computerId then
     print(("Computer #%d is already linked to %s."):format(computerId, other)); return
   end
-  if outName then
-    if not isInventory(outName) then
-      print("Not an inventory (output): " .. tostring(outName)); return
-    end
-    if outName == name then
-      print("Input and output barrels must differ."); return
-    end
-    if storName and outName == storName then
-      print("Output barrel must differ from the vault."); return
-    end
+  if a[5] and a[5] ~= name then
+    print("Note: deposit+withdraw share one barrel — ignoring separate output arg.")
   end
 
   cfg[role] = {
     inv = name,
     computerId = computerId,
-    output = outName,
   }
   if role == "deposit1" then cfg.deposit = name end
   syncStationFromDeposit(role)
   saveLocal()
-  if outName then
-    print(("Bound %s = %s  computer=#%d  output=%s"):format(
-      role, name, computerId, outName))
-  else
-    print(("Bound %s = %s  computer=#%d"):format(role, name, computerId))
-    print("Tip: add output barrel: bind " .. role .. " " .. name .. " " .. computerId .. " <outputBarrel>")
-  end
-  local st = cfg.stations[computerId]
-  if st and not st.output then
-    print("Station ATM withdraw needs an output barrel on this binding.")
-  end
+  print(("Bound %s = %s  computer=#%d  (deposit+withdraw)"):format(
+    role, name, computerId))
 end
 
 local function collectInventories()
@@ -707,16 +734,13 @@ local function cmdInvs()
         if dep.computerId then
           marks = marks .. ("#pc%s"):format(tostring(dep.computerId))
         end
+        if isWithdrawHold(dep.name) then marks = marks .. " hold" end
         marks = marks .. "]"
-      end
-      if dep.output and row.name == dep.output then
-        marks = marks .. (" [%s-out#pc%s]"):format(dep.role, tostring(dep.computerId or "?"))
       end
     end
     for sid, bind in pairs(cfg.stations or {}) do
-      if type(bind) == "table" then
-        if bind.input == row.name then marks = marks .. (" [in #%s]"):format(tostring(sid)) end
-        if bind.output == row.name then marks = marks .. (" [out #%s]"):format(tostring(sid)) end
+      if type(bind) == "table" and (bind.input == row.name or bind.output == row.name) then
+        marks = marks .. (" [station #%s]"):format(tostring(sid))
       end
     end
     local note = row.note and ("  (" .. row.note .. ")") or ""
@@ -724,32 +748,24 @@ local function cmdInvs()
   end
   if not cfg.storage or not depositInvName("deposit1") then
     print("Bind:  bind storage <vault>")
-    print("       bind deposit1 <barrel> <computerId> [outputBarrel]")
-    print("       bind deposit2 <barrel> <computerId> [outputBarrel]")
+    print("       bind deposit1 <barrel> <computerId>")
+    print("       bind deposit2 <barrel> <computerId>")
     print("       intake")
   end
 end
 
 local function cmdDeposits()
-  print("Deposit barrels ↔ station computers:")
+  print("Station barrels ↔ computers (deposit+withdraw same barrel):")
   local rows = listDepositRoles()
   if #rows == 0 then
     print("  (none)")
-    print("Bind: bind deposit1 <barrel> <computerId> [outputBarrel]")
+    print("Bind: bind deposit1 <barrel> <computerId>")
     return
   end
   for _, row in ipairs(rows) do
     local pc = row.computerId and ("#" .. tostring(row.computerId)) or "(no computer)"
-    local out = row.output and ("  out=" .. row.output) or "  out=(unset)"
-    print(("  %s  in=%s  computer=%s%s"):format(row.role, row.name, pc, out))
-    local slot = findDepositSlotForComputer(row.computerId)
-    if row.computerId and slot then
-      local st = cfg.stations[row.computerId]
-      if st then
-        print(("         station map: in=%s out=%s"):format(
-          tostring(st.input or "?"), tostring(st.output or "?")))
-      end
-    end
+    local hold = isWithdrawHold(row.name) and "  [withdraw hold — empty barrel]" or ""
+    print(("  %s  barrel=%s  computer=%s%s"):format(row.role, row.name, pc, hold))
   end
 end
 
@@ -848,6 +864,8 @@ local function cmdIntake()
   for _, row in ipairs(deps) do
     if not isInventory(row.name) then
       print(row.role .. " missing: " .. tostring(row.name))
+    elseif isWithdrawHold(row.name) then
+      print(row.role .. " skipped — withdraw pickup pending (empty barrel first)")
     else
       local dep = peripheral.wrap(row.name)
       local moved, failed = intakeDepositBarrel(dep, row.name, stor, sname)
@@ -898,8 +916,13 @@ local function cmdRate(a)
   print(ok and ("Set " .. item .. " = " .. data.rates[item]) or tostring(err))
 end
 
---- Process accepted items from an input barrel → vault; credit player chips.
+--- Process accepted items from station barrel → vault; credit player chips.
 local function depositFromBarrel(dep, dname, stor, sname, player)
+  if isWithdrawHold(dname) then
+    return false, 0, "withdraw pickup pending — empty barrel first", {
+      withdrawHold = true,
+    }
+  end
   loadDisk()
   local accept = acceptedSet()
   if not next(accept) then return false, 0, "no accepted currency — scan vault first" end
@@ -1120,10 +1143,12 @@ local function withdrawToBarrel(stor, sname, outInv, outName, player, amount)
       if paidValue <= 0 then return false, 0, "output barrel full" end
       setBal(player, bal - paidValue)
       saveDisk()
+      markWithdrawHold(outName)
       return true, paidValue, "partial", {
         partial = true,
         balance = select(1, getBal(player)),
         totalItems = totalItems,
+        withdrawHold = true,
       }
     end
     paidValue = paidValue + rate * moved
@@ -1132,10 +1157,12 @@ local function withdrawToBarrel(stor, sname, outInv, outName, player, amount)
 
   setBal(player, bal - paidValue)
   saveDisk()
+  markWithdrawHold(outName)
   return true, paidValue, nil, {
     balance = select(1, getBal(player)),
     totalItems = totalItems,
     plan = plan,
+    withdrawHold = true,
   }
 end
 
@@ -1171,10 +1198,12 @@ local function cmdWithdraw(a)
   if err == "partial" then
     print(("Partial withdraw: %d chips (%d items → %s). Balance=%d"):format(
       paid, extra.totalItems or 0, dname, extra.balance or select(1, getBal(player))))
+    print("Auto-deposit paused until that barrel is emptied.")
     return
   end
   print(("Withdrew %d chips for %s (%d items → %s). Balance=%d"):format(
     paid, player, extra.totalItems or 0, dname, extra.balance or select(1, getBal(player))))
+  print("Auto-deposit paused until that barrel is emptied.")
 end
 
 local function cmdUnbindStation(a)
@@ -1204,13 +1233,15 @@ local function cmdStations()
   table.sort(ids)
   if #ids == 0 then
     print("  (none)")
-    print("Bind: bind station <computerId> input <barrel> output <barrel>")
+    print("Bind: bind station <computerId> <barrel>")
+    print("  (or: bind deposit1 <barrel> <computerId>)")
     return
   end
   for _, sid in ipairs(ids) do
     local row = cfg.stations[sid] or cfg.stations[tostring(sid)]
-    print(("  #%d  in=%s  out=%s"):format(
-      sid, tostring(row and row.input or "?"), tostring(row and row.output or "?")))
+    local barrel = row and (row.input or row.output) or "?"
+    local hold = isWithdrawHold(barrel) and "  [withdraw hold]" or ""
+    print(("  #%d  barrel=%s%s"):format(sid, tostring(barrel), hold))
   end
 end
 
@@ -1265,23 +1296,24 @@ end
 
 local function cmdHelp()
   print([[
-Currency Manager = vault ledger + deposit barrels + station I/O.
+Currency Manager = vault ledger + station barrels (shared I/O).
 
 setpass | login | logout
 bind storage|drive <name|side>                     (password)
-bind deposit1|deposit2 <barrel> <computerId> [out] (password)
-deposits              list deposit ↔ computer map
+bind deposit1|deposit2 <barrel> <computerId>       (password)
+deposits              list barrel ↔ computer map
 intake                 pull deposit1/2 → vault       (password)
-bind station <computerId> input <in> output <out>  (password)
+bind station <computerId> <barrel>                 (password)
 unbind station <computerId>                        (password)
 stations | invs | drives | status
 scan / rates / rate …                              (password)
-deposit [player|#]   credit via deposit1 (prefer station ATM)
+deposit [player|#]   credit via deposit1 (prefer games launcher)
 withdraw <player> <chips>                          (password)
 balance [player]                                   (password)
 help | exit
 
-Link each deposit barrel to its ATM computer ID.
+One barrel per games PC: deposit in, withdraw out (same barrel).
+After withdraw, auto-deposit pauses until the barrel is emptied.
 First stock: coins in deposit1/2 → intake → scan → rates
 ]])
 end
@@ -1592,12 +1624,19 @@ local function handleNet(from, msg)
     local stor, sname = wrapStorage()
     if not dep then
       sendCasinoAck(replyTo, false, {
-        op = "station_deposit", err = "station input not bound", stationId = stationId,
+        op = "station_deposit", err = "station barrel not bound", stationId = stationId,
       })
       return
     end
     if not stor then
       sendCasinoAck(replyTo, false, { op = "station_deposit", err = "vault not bound" })
+      return
+    end
+    if isWithdrawHold(dname) then
+      sendCasinoAck(replyTo, false, {
+        op = "station_deposit", err = "withdraw pickup pending",
+        stationId = stationId, barrel = dname,
+      })
       return
     end
     local ok, gained, err, extra = depositFromBarrel(dep, dname, stor, sname, player)
@@ -1626,8 +1665,7 @@ local function handleNet(from, msg)
     if stor then _, vaultValue = storageStock(stor) end
     local player = normalizePlayer(msg.player or msg.name)
     local chips = player and select(1, getBal(player)) or nil
-    local inInv, inName = wrapStationBarrel(stationId, "input")
-    local outInv, outName = wrapStationBarrel(stationId, "output")
+    local barrelInv, barrelName = wrapStationBarrel(stationId, "input")
     rednet.send(replyTo, {
       type = "casino_station_info",
       ok = true,
@@ -1637,10 +1675,13 @@ local function handleNet(from, msg)
       vaultValue = vaultValue or 0,
       player = player,
       chips = chips,
-      input = inName,
-      output = outName,
-      hasInput = inInv ~= nil,
-      hasOutput = outInv ~= nil,
+      input = barrelName,
+      output = barrelName,
+      barrel = barrelName,
+      hasInput = barrelInv ~= nil,
+      hasOutput = barrelInv ~= nil,
+      hasBarrel = barrelInv ~= nil,
+      withdrawHold = isWithdrawHold(barrelName),
     }, PROTO)
   elseif t == "casino_station_withdraw" then
     loadDisk()
@@ -1661,12 +1702,21 @@ local function handleNet(from, msg)
     local stor, sname = wrapStorage()
     if not outInv then
       sendCasinoAck(replyTo, false, {
-        op = "station_withdraw", err = "station output not bound", stationId = stationId,
+        op = "station_withdraw", err = "station barrel not bound", stationId = stationId,
       })
       return
     end
     if not stor then
       sendCasinoAck(replyTo, false, { op = "station_withdraw", err = "vault not bound" })
+      return
+    end
+    -- Don't stack a new payout on top of an uncleared withdraw.
+    if isWithdrawHold(outName) then
+      sendCasinoAck(replyTo, false, {
+        op = "station_withdraw", err = "withdraw pickup pending",
+        stationId = stationId, player = player, barrel = outName,
+        chips = select(1, getBal(player)),
+      })
       return
     end
     local _, vaultValue = storageStock(stor)
@@ -1710,6 +1760,8 @@ local function handleNet(from, msg)
       totalItems = extra.totalItems,
       partial = err == "partial",
       output = outName,
+      barrel = outName,
+      withdrawHold = true,
       vaultValue = select(2, storageStock(stor)),
     })
   elseif t == "casino_bind_station" then
@@ -1718,19 +1770,20 @@ local function handleNet(from, msg)
       return
     end
     local sid = normalizeStationId(msg.stationId)
-    local inName, outName = msg.input or msg.inputBarrel, msg.output or msg.outputBarrel
-    if not sid or not inName or not outName then
+    local barrel = msg.barrel or msg.input or msg.inputBarrel
+      or msg.output or msg.outputBarrel
+    if not sid or not barrel then
       sendCasinoAck(replyTo, false, { op = "bind_station", err = "bad args" })
       return
     end
-    if not isInventory(inName) or not isInventory(outName) then
+    if not isInventory(barrel) then
       sendCasinoAck(replyTo, false, { op = "bind_station", err = "bad peripheral" })
       return
     end
-    cfg.stations[sid] = { input = inName, output = outName }
+    cfg.stations[sid] = { input = barrel, output = barrel }
     saveLocal()
     sendCasinoAck(replyTo, true, {
-      op = "bind_station", stationId = sid, input = inName, output = outName,
+      op = "bind_station", stationId = sid, input = barrel, output = barrel, barrel = barrel,
     })
   elseif t == "casino_admin_withdraw" then
     if not verifyRemoteAdminPassword(msg.password) then
@@ -1885,21 +1938,6 @@ local function handleNet(from, msg)
   end
 end
 
-local depositNotifyState = {} -- [role] = { fp = string, at = number }
-
-local function barrelFingerprint(inv)
-  if not inv or type(inv.list) ~= "function" then return "" end
-  local list = inv.list() or {}
-  local parts = {}
-  for slot, detail in pairs(list) do
-    if type(detail) == "table" and detail.name then
-      parts[#parts + 1] = tostring(slot) .. "=" .. detail.name .. "x" .. tostring(detail.count or 0)
-    end
-  end
-  table.sort(parts)
-  return table.concat(parts, ";")
-end
-
 local function previewDepositChips(inv)
   loadDisk()
   if not inv or type(inv.list) ~= "function" then return 0, 0, {} end
@@ -1931,7 +1969,8 @@ local function sendDepositNotify(computerId, payload)
   rednet.broadcast(payload, ROUTER_PROTOCOL)
 end
 
--- Watch deposit1/2: when items appear, notify the linked games/ATM computer.
+-- Watch deposit1/2: when items appear, notify the linked games PC.
+-- After withdraw, skip notifies until the player empties the barrel.
 local function depositWatchLoop()
   local t = os.startTimer(1.5)
   while true do
@@ -1943,17 +1982,25 @@ local function depositWatchLoop()
           local inv = peripheral.wrap(row.name)
           local fp = barrelFingerprint(inv)
           local empty = (fp == "")
-          local st = depositNotifyState[row.role]
-          if empty then
+          -- Clear withdraw hold once barrel is empty; then auto-deposit resumes.
+          if withdrawHold[row.name] then
+            if empty then
+              withdrawHold[row.name] = nil
+              depositNotifyState[row.role] = nil
+            end
+            -- Still holding payout items: do not auto-deposit.
+          elseif empty then
             depositNotifyState[row.role] = nil
           else
+            local st = depositNotifyState[row.role]
             local due = (not st) or st.fp ~= fp or (now() - (st.at or 0) > 12000)
             if due then
               local chips, items, summary = previewDepositChips(inv)
               sendDepositNotify(sid, {
                 deposit = row.role,
                 input = row.name,
-                output = row.output,
+                output = row.name,
+                barrel = row.name,
                 previewChips = chips,
                 itemCount = items,
                 items = summary,
@@ -2036,7 +2083,8 @@ if not hasPass() then
 else
   print("Floppy OK. login to manage currency.")
 end
-print("Bind vault + deposit1/2 → computer IDs. Games launcher gets deposit prompts.")
+print("Bind vault + deposit1/2 → computer IDs (one barrel each: deposit+withdraw).")
+print("After withdraw, empty the barrel to resume auto-deposit.")
 print("Type help. Mesh casino API online.")
 print("")
 

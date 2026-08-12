@@ -22,7 +22,7 @@ A wireless dispatch system for Minecraft's **CC: Tweaked** mod (active packages)
 - **`higher_lower.lua`** — Pair of Jacks+ video poker → Higher/Lower streak (cash out or risk for jackpot at 10).
 - **`slots.lua`** — 3-reel slots (bet/spin animation, coin bank; monitor tap UI).
 - **`games.lua`** + **`games_catalog.lua`** — Games launcher: boot modem + mesh hello; scans player/backpack inv for upgrades; auto speaker after game load; **M** toggle.
-- **`games/managers/currency_manager.lua`** — casino ledger + vault; station input/output barrels by computer ID.
+- **`games/managers/currency_manager.lua`** — casino ledger + vault; one station barrel per computer ID (deposit + withdraw).
 - **`games/managers/casino_atm.lua`** — casino station ATM (barrel deposit/withdraw via mesh; Create legacy optional).
 - **`storage/managers/storage_atm.lua`** — solo storage ATM (wired modem ↔ vault; no ticker/casino).
 - **`games_install.lua`** — **Games-only** installer (separate from the fleet installer).
@@ -581,16 +581,15 @@ password; view/edit/delete need the password you set.
 ```text
                     wireless modem (mesh → games / admin / host)
                               |
-[Vault] <--wired-- [Currency Manager + floppy] --wired--> deposit barrels
+[Vault] <--wired-- [Currency Manager + floppy] --wired--> station barrels
                               |
                     wired modem network for inventories
 ```
 
-Per managed games cabinet (same pattern for each station):
+Per managed games cabinet (one shared barrel for deposit **and** withdraw):
 
 ```text
-[deposit INPUT barrel] ──wired──> manager
-[withdraw OUTPUT barrel] ──wired──> manager
+[station barrel] ──wired──> manager
 [Games PC + advanced modem + monitor] ──wireless──> mesh
      ↑ menu top-right shows #computerId  (use this in bind)
 ```
@@ -604,43 +603,44 @@ invs                                 # list wired inventories (copy names)
 bind storage <vaultName>             # e.g. create:item_vault_0 / chest_0
 setpass                              # floppy admin password
 # For each games cabinet (ID from launcher top-right, e.g. #42):
-bind deposit1 <barrelIn> 42 <barrelOut>
-bind deposit2 <barrelIn> 55 <barrelOut>
-deposits                             # verify deposit ↔ computer map
-# Put sample accepted coins in a deposit barrel (or vault), then:
-intake                                # pull deposit barrels → vault (stock)
+bind deposit1 <barrel> 42
+bind deposit2 <barrel> 55
+deposits                             # verify barrel ↔ computer map
+# Put sample accepted coins in a station barrel (or vault), then:
+intake                                # pull station barrels → vault (stock)
 scan                                 # discover accepted items
 rate minecraft:gold_ingot 100        # set chip values as needed
 rates
 ```
 
-`deposit` is an alias for `deposit1`. Binding `depositN` to a computer ID also
-registers that station’s input/output for deposit notify + **W** withdraw.
+`deposit` is an alias for `deposit1`. Binding `depositN` registers that games PC
+for deposit notify + **W** withdraw on the **same** barrel.
 
 **Managed games cabinet (each station PC):**
 
 ```text
 # Install games launcher, choose Managed on first run
 games                                # top-right shows #ID — use on manager bind
-# Deposit: put coins in that station's INPUT barrel while on the menu
+# Deposit: put coins in the station barrel while on the menu
 #          → name prompt → chips credited
-# Withdraw: press W → name → amount → coins to OUTPUT barrel
+# Withdraw: press W → name → amount → coins into the same barrel
 #           (denied if vault lacks enough currency / exact coin mix)
+# After withdraw: auto-deposit stays off until the barrel is emptied
 ```
 
 **Admin tablet** (Parent Center master password): **Casino** app or `casino` commands:
 
 ```text
 casino balance Steve
-casino withdraw 500 Steve 42         # optional stationId → that OUTPUT barrel
+casino withdraw 500 Steve 42         # optional stationId → that station barrel
 casino rate minecraft:gold_ingot 100
 casino scan
 casino stations
-casino bind 42 input barrel_in output barrel_out
+casino bind 42 barrel_name
 ```
 
 **Legacy station ATM** (installer → Games → **a**): optional thin client if you are
-not using the managed `games` launcher as the station. Same barrel binds by
+not using the managed `games` launcher as the station. Same barrel bind by
 computer ID (`deposit` / `withdraw` / `bal` on that PC).
 
 **Player identity (managed games):** Player Detector on each gambling PC; games
@@ -655,7 +655,7 @@ load that player's balance from the Currency Manager over the mesh.
 | `casino_rates_req` / `casino_rates` | client → manager | accepted items + rates |
 | `casino_credit` / `casino_bet` / `casino_payout` | games/legacy ATM | ledger credit/debit |
 | `casino_station_deposit` | station → manager | input barrel → vault + credit |
-| `casino_station_withdraw` | station → manager | debit + vault → output barrel |
+| `casino_station_withdraw` | station → manager | debit + vault → station barrel (auto-deposit paused until empty) |
 | `casino_station_info` | station → manager | vault chip-value + player chips + barrel bind |
 | `casino_deposit_notify` | manager → games PC | deposit barrel has items |
 | `casino_stations_req` / `casino_stations` | any → manager | list barrel bindings |
