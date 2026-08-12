@@ -585,16 +585,24 @@ password; view/edit/delete need the password you set.
         +-- admin tablet (remote withdraw / rates / scan / bind)
 ```
 
-**Manager setup (wired modem + vault + barrels on manager PC):**
+**Manager setup (wired modem + vault + deposit barrels on manager PC):**
 
 ```text
 invs
 bind storage create:item_vault_0     # or AE/RS/chest vault
+bind deposit1 <barrelName>           # vault intake #1
+bind deposit2 <barrelName>           # vault intake #2
 setpass
-scan                                 # accepted coins + default rates from vault
+# put sample coins into deposit1 / deposit2 (not straight into the vault)
+intake                                # pull deposit1/2 → vault
+scan                                 # accepted coins from vault + deposit barrels
+rates                                # set chips per item
 bind station 42 input barrel_in output barrel_out   # 42 = station ATM computer ID
 stations
 ```
+
+`deposit` is an alias for `deposit1`. Station ATM barrels are separate from these
+vault-intake barrels.
 
 **Station ATM setup (wireless modem + Player Detector):**
 
