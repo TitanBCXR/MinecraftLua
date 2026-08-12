@@ -1,6 +1,6 @@
 --[[
   games.lua  -  Titan Games Launcher (CC: Tweaked)
-  Titan-Version: 1.2.7
+  Titan-Version: 1.2.8
 
   Run:
 
@@ -16,6 +16,10 @@
   to Currency Manager before speaker swap; pocket keeps modem during play when
   needed for live casino bets. M swaps.
 
+  Managed cabinets also act as the casino deposit station: when Currency Manager
+  sees items in this PC's deposit barrel, it notifies the launcher and the
+  player is prompted for a name to credit.
+
   Controls:
     Tap / Enter  play   U update   M music/modem   S settings   Q quit
 ]]
@@ -26,6 +30,8 @@ local VER_FILE = "versions.lua"
 local STATE_FILE = "games_launcher.cfg"
 local PREFER_MODEM = true -- boot keeps modem for mesh; games auto-swap speaker
 local MESH_KIND = "games"
+local CASINO_PROTO = "titan_install"
+local CASINO_ROUTER = "titan_router"
 
 local econ = nil
 if fs.exists("lib/games_economy.lua") then
@@ -129,6 +135,7 @@ local function pullEv()
   local ev, p1, p2, p3 = os.pullEvent()
   if ev == "monitor_touch" then return "mouse_click", 1, p2, p3 end
   if ev == "monitor_resize" then return "term_resize" end
+  -- Keep rednet_message for managed deposit notifies (p1=id, p2=msg, p3=proto).
   return ev, p1, p2, p3
 end
 
@@ -257,6 +264,99 @@ local function restoreMeshAfterGame()
     PREFER_MODEM = true
     saveState()
   end
+end
+
+--------------------------------------------------------------------------------
+-- Managed deposit prompts (Currency Manager → this games PC)
+--------------------------------------------------------------------------------
+local pendingDepositOffer = nil
+
+local function isManagedEcon()
+  return econ and econ.isManaged and econ.isManaged()
+end
+
+local function normalizePlayerName(p)
+  if type(p) ~= "string" then return nil end
+  p = p:gsub("[%c%z]", ""):match("^%s*(.-)%s*$") or ""
+  if p == "" then return nil end
+  return p:sub(1, 24)
+end
+
+local function promptDepositCredit(offer)
+  if type(offer) ~= "table" then return end
+  local managerId = tonumber(offer.from) or tonumber(offer.managerId)
+  local tw, th = term.getSize()
+  term.setBackgroundColor(colors.black)
+  term.clear()
+  textAt(2, 1, "CASINO DEPOSIT", colors.lime, colors.black)
+  textAt(2, 3, ("Barrel: %s"):format(tostring(offer.deposit or offer.input or "?")),
+    colors.white, colors.black)
+  local prev = tonumber(offer.previewChips) or 0
+  local items = tonumber(offer.itemCount) or 0
+  textAt(2, 4, ("Items: %d   ~%d chips"):format(items, prev), colors.yellow, colors.black)
+  textAt(2, 6, "Enter player name to credit:", colors.lightGray, colors.black)
+
+  local hint = nil
+  if fs.exists("lib/casino.lua") then
+    local ok, casino = pcall(dofile, "lib/casino.lua")
+    if ok and type(casino) == "table" then
+      pcall(casino.open)
+      local det = casino.detectPlayer and select(1, casino.detectPlayer(8))
+      if det then hint = det end
+    end
+  end
+  if hint then
+    textAt(2, 7, ("Detected: %s  (Enter keeps)"):format(hint), colors.cyan, colors.black)
+  end
+  term.setCursorPos(2, 9)
+  term.setTextColor(colors.white)
+  write("> ")
+  local typed = read()
+  local player = normalizePlayerName(typed)
+  if (not player or player == "") and hint then player = hint end
+  player = normalizePlayerName(player)
+  if not player then
+    STATUS = "Deposit cancelled — no player name"
+    return
+  end
+  textAt(2, 11, ("Credit %s? (y/N)"):format(player), colors.white, colors.black)
+  term.setCursorPos(2, 12)
+  write("> ")
+  local ans = tostring(read() or ""):lower()
+  if ans ~= "y" and ans ~= "yes" then
+    STATUS = "Deposit cancelled"
+    return
+  end
+
+  if not managerId then
+    STATUS = "Deposit failed — no manager id"
+    return
+  end
+  if titan and titan.openModem then pcall(titan.openModem) end
+  local payload = {
+    type = "casino_station_deposit",
+    from = os.getComputerID(),
+    replyTo = os.getComputerID(),
+    stationId = os.getComputerID(),
+    player = player,
+  }
+  rednet.send(managerId, payload, CASINO_PROTO)
+  rednet.send(managerId, payload, CASINO_ROUTER)
+  local deadline = os.clock() + 10
+  while os.clock() < deadline do
+    local id, msg = rednet.receive(nil, math.max(0.05, deadline - os.clock()))
+    if id and type(msg) == "table" and msg.type == "casino_ack"
+        and (msg.op == "station_deposit" or msg.op == nil) then
+      if msg.ok then
+        STATUS = ("Deposited for %s +%d chips (bal %d)"):format(
+          player, tonumber(msg.amount) or 0, tonumber(msg.chips) or 0)
+      else
+        STATUS = "Deposit denied: " .. tostring(msg.err or "?")
+      end
+      return
+    end
+  end
+  STATUS = "Deposit timeout — try again from menu"
 end
 
 local function fill(x, y, w, h, bg)
@@ -958,12 +1058,29 @@ local function main()
 
   bootMeshPresence()
   STATUS = pp and pp.statusText and pp.statusText() or STATUS
+  if isManagedEcon() then
+    STATUS = (STATUS or "Ready") .. "  |  deposit barrel → name prompt"
+  end
 
   while true do
     drawMenu(state)
     local games = state.catalog and state.catalog.games or {}
     local ev, p1, p2, p3 = pullEv()
-    if ev == "term_resize" then
+    if ev == "rednet_message" and isManagedEcon() and type(p2) == "table"
+        and p2.type == "casino_deposit_notify" then
+      local target = tonumber(p2.stationId) or tonumber(p2.computerId)
+      if target == os.getComputerID() then
+        p2.from = p2.from or p1
+        -- Avoid stacking prompts if notify repeats while already handling.
+        if not pendingDepositOffer then
+          pendingDepositOffer = true
+          promptDepositCredit(p2)
+          pendingDepositOffer = nil
+          if pp and pp.ensureModemEquipped then pp.ensureModemEquipped(titan) end
+          if titan and titan.openModem then pcall(titan.openModem) end
+        end
+      end
+    elseif ev == "term_resize" then
       -- redraw
     elseif ev == "key" then
       local K = keys

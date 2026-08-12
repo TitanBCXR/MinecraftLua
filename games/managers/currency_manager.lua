@@ -1,6 +1,6 @@
 --[[
   games/managers/currency_manager.lua  -  Casino currency vault
-  Titan-Version: 1.1.3
+  Titan-Version: 1.1.4
 
   Ledger / admin for casino chips. Persists accepted items, rates, balances,
   and password on floppy (casino_currency.cfg).
@@ -28,6 +28,7 @@
     casino_rates_req / casino_rates
     casino_credit / casino_bet / casino_payout + casino_ack
     casino_station_deposit / casino_station_withdraw + ack
+    casino_deposit_notify                (manager → games PC when deposit barrel has items)
     casino_stations_req / casino_stations
     casino_bind_station + ack            (password: floppy or Parent Center)
     casino_admin_withdraw / scan / rate / rates + ack
@@ -46,7 +47,7 @@ local DISK_FILE = "casino_currency.cfg"
 local LOCAL_CFG = "currency_manager.cfg"
 local SESSION_MS = 5 * 60 * 1000
 local PLAYER_RANGE = 8
-local VERSION = "1.1.3"
+local VERSION = "1.1.4"
 local MON_REFRESH_SEC = 5
 local NATIVE_TERM = term.current()
 
@@ -1834,6 +1835,89 @@ local function handleNet(from, msg)
   end
 end
 
+local depositNotifyState = {} -- [role] = { fp = string, at = number }
+
+local function barrelFingerprint(inv)
+  if not inv or type(inv.list) ~= "function" then return "" end
+  local list = inv.list() or {}
+  local parts = {}
+  for slot, detail in pairs(list) do
+    if type(detail) == "table" and detail.name then
+      parts[#parts + 1] = tostring(slot) .. "=" .. detail.name .. "x" .. tostring(detail.count or 0)
+    end
+  end
+  table.sort(parts)
+  return table.concat(parts, ";")
+end
+
+local function previewDepositChips(inv)
+  loadDisk()
+  if not inv or type(inv.list) ~= "function" then return 0, 0, {} end
+  local list = inv.list() or {}
+  local chips, items = 0, 0
+  local summary = {}
+  for _, detail in pairs(list) do
+    if type(detail) == "table" and detail.name then
+      local n = math.floor(tonumber(detail.count) or 0)
+      local rate = tonumber(data.rates[detail.name]) or 0
+      items = items + n
+      if rate > 0 then
+        chips = chips + rate * n
+        summary[detail.name] = (summary[detail.name] or 0) + n
+      end
+    end
+  end
+  return chips, items, summary
+end
+
+local function sendDepositNotify(computerId, payload)
+  if not computerId then return end
+  payload.type = "casino_deposit_notify"
+  payload.from = os.getComputerID()
+  payload.stationId = computerId
+  rednet.send(computerId, payload, PROTO)
+  rednet.send(computerId, payload, ROUTER_PROTOCOL)
+  -- Mesh hop: routers often hear ROUTER broadcasts better than directed PROTO.
+  rednet.broadcast(payload, ROUTER_PROTOCOL)
+end
+
+-- Watch deposit1/2: when items appear, notify the linked games/ATM computer.
+local function depositWatchLoop()
+  local t = os.startTimer(1.5)
+  while true do
+    local ev, p1 = os.pullEvent("timer")
+    if ev == "timer" and p1 == t then
+      for _, row in ipairs(listDepositRoles()) do
+        local sid = row.computerId
+        if sid and isInventory(row.name) then
+          local inv = peripheral.wrap(row.name)
+          local fp = barrelFingerprint(inv)
+          local empty = (fp == "")
+          local st = depositNotifyState[row.role]
+          if empty then
+            depositNotifyState[row.role] = nil
+          else
+            local due = (not st) or st.fp ~= fp or (now() - (st.at or 0) > 12000)
+            if due then
+              local chips, items, summary = previewDepositChips(inv)
+              sendDepositNotify(sid, {
+                deposit = row.role,
+                input = row.name,
+                output = row.output,
+                previewChips = chips,
+                itemCount = items,
+                items = summary,
+              })
+              depositNotifyState[row.role] = { fp = fp, at = now() }
+            end
+          end
+        end
+      end
+      t = os.startTimer(1.5)
+    end
+  end
+end
+
 local function netLoop()
   local helloT = os.startTimer(15)
   announce()
@@ -1902,8 +1986,8 @@ if not hasPass() then
 else
   print("Floppy OK. login to manage currency.")
 end
-print("Bind vault + station barrels (+ optional legacy deposit chest).")
+print("Bind vault + deposit1/2 → computer IDs. Games launcher gets deposit prompts.")
 print("Type help. Mesh casino API online.")
 print("")
 
-parallel.waitForAny(consoleLoop, netLoop, monitorLoop)
+parallel.waitForAny(consoleLoop, netLoop, monitorLoop, depositWatchLoop)

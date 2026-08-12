@@ -602,7 +602,13 @@ rates
 ```
 
 `deposit` is an alias for `deposit1`. Binding a deposit to a computer ID also
-registers that station’s input (and output if given) for the ATM on that PC.
+registers that station’s input (and output if given).
+
+**Managed games launcher = deposit station:** the ATM is the managed `games`
+cabinet (same computer ID). When coins land in that PC’s deposit barrel, Currency
+Manager sends `casino_deposit_notify`; the launcher prompts for a **player name**
+and credits the deposit to that account. Keep `games` on the menu (not inside a
+minigame) while depositing.
 
 **Station ATM setup (wireless modem + Player Detector):**
 
