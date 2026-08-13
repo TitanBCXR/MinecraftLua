@@ -1,6 +1,6 @@
 --[[
   storage/managers/storage_clutch.lua  -  Storage fill → Create clutch
-  Titan-Version: 1.6.0
+  Titan-Version: 1.7.0
 
   Reads a Sophisticated Storage (or any inventory) over the wired modem
   network and drives a Create clutch via redstone.
@@ -21,9 +21,9 @@
     Between those points the last state is held (no chatter).
     Use `invert` if your wiring is the opposite (powered = run).
 
-  Display: steampunk instrument panel (arc gauge, brass tube, rate meter,
-  RS lamp cell) on an attached color monitor, or the advanced computer term
-  when no monitor is present.
+  Display: steampunk board (brass header, riveted panels, pressure gauge,
+  status chips, RS lamp cell) on an attached color monitor, or the
+  advanced computer term when no monitor is present.
 
   Setup:
     invs | integrators
@@ -38,7 +38,7 @@
 ]]
 
 local LOCAL_CFG = "storage_clutch.cfg"
-local VERSION = "1.6.0"
+local VERSION = "1.7.0"
 
 local cfg = {
   storage = nil,           -- inventory peripheral name
@@ -299,6 +299,9 @@ end
 
 --------------------------------------------------------------------------------
 -- Steampunk display (monitor or advanced computer term)
+-- Polish patterns match games launcher / router hub boards: solid header,
+-- status chips, filled section bars, framed gauge panels, gray footer.
+-- Palette stays brass / copper / iron for clutch only.
 --------------------------------------------------------------------------------
 local function findMonitor()
   local m = peripheral.find("monitor")
@@ -333,11 +336,11 @@ local function steamPalette(color)
   if color then
     return {
       bg = colors.black,
-      frame = colors.orange,       -- brass
-      rivet = colors.yellow,       -- polished brass
-      iron = colors.lightGray,
-      soot = colors.gray,
-      copper = colors.brown,
+      brass = colors.orange,       -- header / primary brass
+      rivet = colors.yellow,       -- polished brass accents
+      iron = colors.lightGray,     -- section rails / labels
+      soot = colors.gray,          -- card rows / tube empty
+      copper = colors.brown,       -- secondary section bars
       steam = colors.white,
       accent = colors.orange,
       danger = colors.red,
@@ -350,7 +353,7 @@ local function steamPalette(color)
   end
   return {
     bg = colors.black,
-    frame = colors.white,
+    brass = colors.white,
     rivet = colors.white,
     iron = colors.white,
     soot = colors.black,
@@ -376,21 +379,46 @@ local function gaugeColor(pct, pal, color)
   end
 end
 
-local function monWrite(out, x, y, text, fg, bg)
-  if not out then return end
-  local w, h = out.getSize()
-  if y < 1 or y > h or x > w then return end
-  if out.setBackgroundColor and bg then out.setBackgroundColor(bg) end
-  if out.setTextColor and fg then out.setTextColor(fg) end
-  out.setCursorPos(math.max(1, x), y)
-  out.write(tostring(text):sub(1, w - math.max(1, x) + 1))
+local function guiFill(out, x, y, ww, hh, bg, fg)
+  if not out or ww < 1 or hh < 1 then return end
+  local W, H = out.getSize()
+  bg = bg or colors.black
+  fg = fg or colors.white
+  for row = y, math.min(H, y + hh - 1) do
+    if row >= 1 then
+      local cx = math.max(1, x)
+      local cw = math.min(ww - (cx - x), W - cx + 1)
+      if cw > 0 then
+        if out.setBackgroundColor then out.setBackgroundColor(bg) end
+        if out.setTextColor then out.setTextColor(fg) end
+        out.setCursorPos(cx, row)
+        out.write(string.rep(" ", cw))
+      end
+    end
+  end
 end
 
-local function monCenter(out, y, text, fg, bg)
-  local w = select(1, out.getSize())
-  text = tostring(text or "")
-  local x = math.max(1, math.floor((w - #text) / 2) + 1)
-  monWrite(out, x, y, text, fg, bg)
+local function guiText(out, x, y, txt, fg, bg)
+  if not out or y < 1 then return end
+  local W, H = out.getSize()
+  if y > H or x > W then return end
+  txt = tostring(txt or "")
+  if out.setBackgroundColor then out.setBackgroundColor(bg or colors.black) end
+  if out.setTextColor then out.setTextColor(fg or colors.white) end
+  out.setCursorPos(math.max(1, x), y)
+  out.write(txt:sub(1, math.max(0, W - math.max(1, x) + 1)))
+end
+
+local function guiChip(out, x, y, label, fg, bg, colorOk)
+  label = " " .. tostring(label) .. " "
+  if colorOk then
+    guiText(out, x, y, label, fg or colors.white, bg or colors.gray)
+  else
+    local bare = tostring(label):match("^%s*(.-)%s*$") or ""
+    guiText(out, x, y, "[" .. bare .. "]", fg or colors.white, colors.black)
+    return x + #bare + 3
+  end
+  return x + #label + 1
 end
 
 --- One-cell RS lamp: green = redstone ON, red = redstone OFF.
@@ -406,195 +434,129 @@ local function drawRsLamp(out, x, y, rsOn, pal, color)
     lampBg = pal.soot
     lampFg = pal.dim
   end
-  monWrite(out, x, y, " ", lampFg, lampBg)
+  guiText(out, x, y, " ", lampFg, lampBg)
 end
 
-local function drawFrame(out, pal, title)
-  local w, h = out.getSize()
-  if w < 3 or h < 3 then return end
-  local top = "o" .. string.rep("=", math.max(0, w - 2)) .. "o"
-  local bot = "o" .. string.rep("=", math.max(0, w - 2)) .. "o"
-  monWrite(out, 1, 1, top, pal.rivet, pal.bg)
-  monWrite(out, 1, h, bot, pal.rivet, pal.bg)
-  for y = 2, h - 1 do
-    monWrite(out, 1, y, "|", pal.frame, pal.bg)
-    monWrite(out, w, y, "|", pal.frame, pal.bg)
-  end
-  -- Corner + side rivets
-  monWrite(out, 1, 1, "o", pal.rivet, pal.bg)
-  monWrite(out, w, 1, "o", pal.rivet, pal.bg)
-  monWrite(out, 1, h, "o", pal.rivet, pal.bg)
-  monWrite(out, w, h, "o", pal.rivet, pal.bg)
-  if h >= 8 then
-    local mid = math.floor(h / 2)
-    for _, y in ipairs({ 3, mid, h - 2 }) do
-      if y > 1 and y < h then
-        monWrite(out, 1, y, "+", pal.rivet, pal.bg)
-        monWrite(out, w, y, "+", pal.rivet, pal.bg)
+--- Riveted panel frame around a body region (color: filled iron rails + yellow rivets).
+local function drawPanelFrame(out, x, y, ww, hh, pal, color)
+  if ww < 3 or hh < 3 then return end
+  local W, H = out.getSize()
+  ww = math.min(ww, W - x + 1)
+  hh = math.min(hh, H - y + 1)
+  if color then
+    guiFill(out, x, y, ww, 1, pal.soot, pal.rivet)
+    guiFill(out, x, y + hh - 1, ww, 1, pal.soot, pal.rivet)
+    for row = y + 1, y + hh - 2 do
+      guiText(out, x, row, " ", pal.rivet, pal.soot)
+      guiText(out, x + ww - 1, row, " ", pal.rivet, pal.soot)
+    end
+    -- Rivets at corners + mid-sides
+    for _, px in ipairs({ x, x + ww - 1 }) do
+      for _, py in ipairs({ y, y + hh - 1 }) do
+        guiText(out, px, py, "+", pal.rivet, pal.copper)
       end
     end
-  end
-  if title and h >= 3 and w >= 8 then
-    local t = " " .. tostring(title) .. " "
-    if #t > w - 4 then t = t:sub(1, w - 4) end
-    local x = math.max(2, math.floor((w - #t) / 2) + 1)
-    monWrite(out, x, 1, t, pal.accent, pal.bg)
+    if hh >= 6 then
+      local mid = y + math.floor((hh - 1) / 2)
+      guiText(out, x, mid, "+", pal.rivet, pal.copper)
+      guiText(out, x + ww - 1, mid, "+", pal.rivet, pal.copper)
+    end
+  else
+    guiText(out, x, y, "+" .. string.rep("-", ww - 2) .. "+", pal.steam, pal.bg)
+    guiText(out, x, y + hh - 1, "+" .. string.rep("-", ww - 2) .. "+", pal.steam, pal.bg)
+    for row = y + 1, y + hh - 2 do
+      guiText(out, x, row, "|", pal.steam, pal.bg)
+      guiText(out, x + ww - 1, row, "|", pal.steam, pal.bg)
+    end
   end
 end
 
---- Brass pressure-tube bar with tick marks under the glass.
-local function drawBrassTube(out, x, y, ww, pct, fillFg, pal, color)
+--- Pressure gauge: solid fill bar + band tick row (run/stop markers).
+local function drawPressureGauge(out, x, y, ww, pct, fillBg, pal, color, onPct, offPct)
   local W = select(1, out.getSize())
   ww = math.min(ww, W - x + 1)
-  if ww < 4 then return end
+  if ww < 6 then return 0 end
   pct = math.max(0, math.min(100, tonumber(pct) or 0))
   local inner = ww - 2
   local filled = math.floor((pct / 100) * inner + 0.5)
-  monWrite(out, x, y, "[", pal.iron, pal.bg)
-  monWrite(out, x + 1, y, string.rep(" ", inner), pal.steam, pal.soot)
-  if filled > 0 then
-    -- Mixed brass fill chars for a tube look
-    local chars = {}
-    for i = 1, filled do
-      if i == filled then
-        chars[i] = ">"
-      elseif (i % 3) == 0 then
-        chars[i] = "#"
-      else
-        chars[i] = "="
-      end
+
+  -- Tube ends (brass)
+  if color then
+    guiText(out, x, y, "[", pal.rivet, pal.copper)
+    guiFill(out, x + 1, y, inner, 1, pal.soot, pal.steam)
+    if filled > 0 then
+      guiFill(out, x + 1, y, filled, 1, fillBg, colors.black)
     end
-    monWrite(out, x + 1, y, table.concat(chars), fillFg, pal.soot)
+    guiText(out, x + ww - 1, y, "]", pal.rivet, pal.copper)
+  else
+    local bar = string.rep("=", filled) .. string.rep("-", math.max(0, inner - filled))
+    guiText(out, x, y, "[" .. bar .. "]", pal.steam, pal.bg)
   end
-  monWrite(out, x + ww - 1, y, "]", pal.iron, pal.bg)
-  -- Tick marks on row below when space allows (caller may use y+1)
+
+  -- Band ticks on next row when caller leaves space
   return inner
 end
 
-local function drawTubeTicks(out, x, y, inner, pal)
+local function drawBandTicks(out, x, y, inner, pal, color, onPct, offPct)
   if inner < 4 then return end
-  local ticks = {}
-  for i = 1, inner do
-    local p = (i / inner) * 100
-    if math.abs(p - 0) < 0.1 or math.abs(p - 50) < (100 / inner)
-       or math.abs(p - 100) < 0.1 or i == 1 or i == inner
-       or math.abs(p - 25) < (100 / inner) or math.abs(p - 75) < (100 / inner) then
-      ticks[i] = "|"
-    else
-      ticks[i] = "-"
-    end
-  end
-  monWrite(out, x, y, "[", pal.dim, pal.bg)
-  monWrite(out, x + 1, y, table.concat(ticks), pal.copper, pal.bg)
-  monWrite(out, x + inner + 1, y, "]", pal.dim, pal.bg)
-end
-
---- Small horizontal rate meter (items/min), needle-ish marker.
-local function drawRateMeter(out, x, y, ww, rate, pal, color)
-  local W = select(1, out.getSize())
-  ww = math.min(ww, W - x + 1)
-  if ww < 5 then return end
-  local inner = ww - 2
-  monWrite(out, x, y, "{", pal.iron, pal.bg)
-  monWrite(out, x + 1, y, string.rep(".", inner), pal.dim, pal.soot)
-  monWrite(out, x + ww - 1, y, "}", pal.iron, pal.bg)
-  -- Center tick
-  local mid = x + 1 + math.floor((inner - 1) / 2)
-  monWrite(out, mid, y, "|", pal.rivet, pal.soot)
-  if not rate then return end
-  local it = rate.itemsPerMin or 0
-  -- Map roughly ±120 it/m across the meter
-  local span = 120
-  local t = math.max(-1, math.min(1, it / span))
-  local pos = math.floor(((t + 1) / 2) * (inner - 1) + 0.5)
-  local nx = x + 1 + pos
-  local nfg = rateColor(rate)
-  if not color then nfg = pal.steam end
-  monWrite(out, nx, y, "*", nfg, pal.soot)
-end
-
-local function boxCenter(out, boxX, boxW, y, text, fg, bg)
-  text = tostring(text or "")
-  local x = boxX + math.max(0, math.floor((boxW - #text) / 2))
-  monWrite(out, x, y, text, fg, bg)
-end
-
---- Arc-style circular gauge approximated with character cells.
---- Layout (width ~11–15, height 5):
----   .-'---'-.     ticks + rim
----  /    ^    \    needle toward fill %
---- |   XX%     |   big readout
----  \         /
----   '-.___.-'
-local function drawArcGauge(out, x, y, gw, gh, pct, fillFg, pal, color)
-  local W, H = out.getSize()
-  if gw < 9 or gh < 4 then return false end
-  if x + gw - 1 > W or y + gh - 1 > H then
-    gw = math.min(gw, W - x + 1)
-    gh = math.min(gh, H - y + 1)
-  end
-  if gw < 9 or gh < 4 then return false end
-  pct = math.max(0, math.min(100, tonumber(pct) or 0))
-
-  local function place(row, text, fg, bg)
-    text = tostring(text or "")
-    if #text > gw then text = text:sub(1, gw) end
-    boxCenter(out, x, gw, row, text, fg, bg)
-    return text
-  end
-
-  -- Rim / arc rows
-  local rim = string.rep("-", math.max(3, gw - 4))
-  place(y, ".-" .. rim .. "-.", pal.frame, pal.bg)
-
-  -- Tick row with needle tip
-  local tickInner = math.max(3, gw - 4)
-  local ticks = {}
-  for i = 1, tickInner do ticks[i] = "-" end
-  ticks[1] = "0"
-  if tickInner >= 5 then ticks[math.floor(tickInner / 2) + 1] = "^" end
-  ticks[tickInner] = "F"
-  local ni = math.max(1, math.min(tickInner, math.floor((pct / 100) * (tickInner - 1) + 0.5) + 1))
-  ticks[ni] = "v"
-  local tickLine = place(y + 1, "/" .. table.concat(ticks) .. "\\", pal.rivet, pal.bg)
-  local needleX = x + math.floor((gw - #tickLine) / 2) + ni
-  monWrite(out, needleX, y + 1, "v", fillFg, pal.bg)
-
-  local pctText = string.format("%d%%", pct)
-  if gh >= 5 then
-    place(y + 2, "|" .. string.rep(" ", math.max(0, gw - 2)) .. "|", pal.frame, pal.bg)
-    boxCenter(out, x, gw, y + 2, pctText, fillFg, pal.bg)
-    place(y + 3, "\\_" .. string.rep("_", math.max(1, gw - 4)) .. "_/", pal.copper, pal.bg)
-    if gh >= 6 then
-      boxCenter(out, x, gw, y + 4, "GAUGE", pal.copper, pal.bg)
-    end
-  else
-    boxCenter(out, x, gw, y + 2, pctText, fillFg, pal.bg)
-    place(y + 3, "'-" .. string.rep("=", math.max(1, gw - 4)) .. "-'", pal.copper, pal.bg)
-  end
-  return true
-end
-
---- Compact semicircle for narrow panels.
-local function drawMiniArc(out, x, y, ww, pct, fillFg, pal)
-  pct = math.max(0, math.min(100, tonumber(pct) or 0))
-  local inner = math.max(3, ww - 2)
-  local filled = math.floor((pct / 100) * inner + 0.5)
+  onPct = math.max(0, math.min(100, tonumber(onPct) or 20))
+  offPct = math.max(0, math.min(100, tonumber(offPct) or 60))
   local chars = {}
   for i = 1, inner do
-    if i <= filled then
-      chars[i] = (i == filled) and "v" or "="
+    local p = ((i - 0.5) / inner) * 100
+    local nearOn = math.abs(p - onPct) < (100 / inner)
+    local nearOff = math.abs(p - offPct) < (100 / inner)
+    if nearOff then
+      chars[i] = "S" -- stop
+    elseif nearOn then
+      chars[i] = "R" -- run
+    elseif i == 1 or i == inner or math.abs(p - 50) < (100 / inner) then
+      chars[i] = "|"
     else
       chars[i] = "-"
     end
   end
-  monWrite(out, x, y, "(" .. table.concat(chars) .. ")", pal.frame, pal.bg)
-  if filled > 0 then
-    monWrite(out, x + filled, y, (filled == inner and "=" or "v"), fillFg, pal.bg)
+  local line = table.concat(chars)
+  if color then
+    guiText(out, x, y, " ", pal.dim, pal.bg)
+    guiText(out, x + 1, y, line, pal.copper, pal.bg)
+    guiText(out, x + inner + 1, y, " ", pal.dim, pal.bg)
+  else
+    guiText(out, x, y, " " .. line .. " ", pal.steam, pal.bg)
   end
 end
 
---- Steampunk brass instrument panel. fill/rsOn optional.
+local function applyMonitorScale(out)
+  if not out then return 1, 0, 0 end
+  if not out.setTextScale then
+    local w, h = out.getSize()
+    return 1, w, h
+  end
+  -- Prefer readable boards like games/router: try 1 then 0.5.
+  local chosen = 0.5
+  for _, scale in ipairs({ 1, 0.5 }) do
+    pcall(function() out.setTextScale(scale) end)
+    local ww, hh = out.getSize()
+    if ww >= 26 and hh >= 12 then
+      chosen = scale
+      break
+    end
+    chosen = scale
+  end
+  pcall(function() out.setTextScale(chosen) end)
+  local w, h = out.getSize()
+  return chosen, w, h
+end
+
+local function layoutTier(w, h)
+  if w < 18 or h < 6 then return "tiny"
+  elseif w < 28 or h < 10 then return "small"
+  elseif w < 40 or h < 14 then return "medium"
+  else return "large"
+  end
+end
+
+--- Steampunk brass instrument board. fill/rsOn optional.
 local function drawMonitor(fill, rsOn)
   local out, kind = resolveDisplay()
   if not out then return false, "no monitor / color term" end
@@ -611,24 +573,13 @@ local function drawMonitor(fill, rsOn)
   local color = outIsColor(out)
   local pal = steamPalette(color)
 
+  local w, h
   if kind == "monitor" then
-    pcall(function()
-      if out.setTextScale then
-        local chosen = 0.5
-        for _, scale in ipairs({ 2, 1, 0.5 }) do
-          out.setTextScale(scale)
-          local ww, hh = out.getSize()
-          if ww >= 26 and hh >= 12 then
-            chosen = scale
-            break
-          end
-        end
-        out.setTextScale(chosen)
-      end
-    end)
+    _, w, h = applyMonitorScale(out)
+  else
+    w, h = out.getSize()
   end
 
-  local w, h = out.getSize()
   if out.setBackgroundColor then out.setBackgroundColor(pal.bg) end
   out.clear()
 
@@ -638,124 +589,206 @@ local function drawMonitor(fill, rsOn)
   local rateText = formatRate(rate)
   local rfg = rateColor(rate)
   if not color then rfg = pal.steam end
+  local onP, offP = cfg.onPct or 20, cfg.offPct or 60
+  local slotsText = fill and ("%d/%d"):format(fill.used, fill.size) or "--/--"
+  local feedLabel = (rsOn == true) and "STOP" or ((rsOn == false) and "RUN" or "?")
+  local tier = layoutTier(w, h)
+  local pad = (tier == "large" and color) and 1 or 0
+  local x0 = 1 + pad
+  local innerW = w - 2 * pad
+  local footerH = 1
+  local headerH = (tier == "tiny") and 1 or ((tier == "small") and 2 or 3)
 
-  local band = ("BAND stop%d/run%d"):format(cfg.offPct or 60, cfg.onPct or 20)
-  local bins = fill and ("SLOTS %d/%d"):format(fill.used, fill.size) or "SLOTS --/--"
-  local stock = "STOCK " .. rateText
-  local x0 = 2
-  local innerW = w - 2
+  --------------------------------------------------------------------------
+  -- Header (solid brass bar — games/router style)
+  --------------------------------------------------------------------------
+  local title = " STORAGE CLUTCH "
+  local ver = ("v%s"):format(VERSION)
+  if color then
+    guiFill(out, 1, 1, w, headerH, pal.brass, colors.black)
+    guiText(out, 2, 1, title:sub(1, w - 2), colors.black, pal.brass)
+    if #title + #ver + 3 < w then
+      guiText(out, math.max(2, w - #ver), 1, ver, pal.copper, pal.brass)
+    end
+    if headerH >= 2 then
+      local sub = (cfg.label and cfg.label ~= "" and tostring(cfg.label))
+        or (cfg.storage and tostring(cfg.storage):sub(1, w - 4))
+        or "unbound"
+      guiText(out, 2, 2, sub:sub(1, w - 2), pal.rivet, pal.brass)
+    end
+    if headerH >= 3 then
+      local meta = ("stop>=%d%%  run<=%d%%%s"):format(
+        offP, onP, cfg.invert and "  inv" or "")
+      guiText(out, 2, 3, meta:sub(1, w - 2), colors.black, pal.brass)
+    end
+  else
+    guiText(out, 1, 1, (title .. ver):sub(1, w), pal.steam, pal.bg)
+    if headerH >= 2 then
+      guiText(out, 1, 2, ("stop%d run%d"):format(offP, onP):sub(1, w), pal.steam, pal.bg)
+    end
+  end
 
-  -- Tiny screens
-  if w < 12 or h < 5 then
-    drawFrame(out, pal, "GAUGE")
-    monCenter(out, math.max(2, math.floor(h / 2)), pctText, gfg, pal.bg)
-    if h >= 4 and w >= 6 then
-      monWrite(out, 2, h - 1, "RS", pal.dim, pal.bg)
-      drawRsLamp(out, 4, h - 1, rsOn, pal, color)
+  local y = headerH + 1
+
+  --------------------------------------------------------------------------
+  -- Tiny: fill + RS lamp only
+  --------------------------------------------------------------------------
+  if tier == "tiny" or w < 14 or h < 5 then
+    if y <= h - footerH then
+      guiText(out, x0, y, pctText, gfg, pal.bg)
+      if w >= 8 then
+        guiText(out, math.max(x0, w - 5), y, "RS", pal.dim, pal.bg)
+        drawRsLamp(out, w - 2, y, rsOn, pal, color)
+      end
+    end
+    if color then
+      guiFill(out, 1, h, w, 1, pal.soot, pal.steam)
+      guiText(out, 1, h, (" %dx%d"):format(w, h), pal.iron, pal.soot)
     end
     return true
   end
 
-  drawFrame(out, pal, "BRASS PANEL")
-
   --------------------------------------------------------------------------
-  -- Large instrument board (wide + tall)
+  -- Status chip row (fill / rate / clutch)
   --------------------------------------------------------------------------
-  if w >= 28 and h >= 12 then
-    -- Left: arc gauge · Right: meters + clutch lamp
-    local gaugeW = math.min(15, math.floor(innerW * 0.45))
-    local gaugeH = math.min(6, h - 5)
-    drawArcGauge(out, x0, 2, gaugeW, gaugeH, pct, gfg, pal, color)
-
-    local rx = x0 + gaugeW + 1
-    local rw = w - rx
-    if rw < 8 then rx = x0; rw = innerW end
-
-    monWrite(out, rx, 2, "PRESSURE", pal.copper, pal.bg)
-    drawBrassTube(out, rx, 3, rw, pct, gfg, pal, color)
-    if h >= 14 then
-      drawTubeTicks(out, rx, 4, math.max(1, rw - 2), pal)
-    end
-
-    monWrite(out, rx, 5, "STOCK", pal.copper, pal.bg)
-    monWrite(out, rx, 6, rateText:sub(1, rw), rfg, pal.bg)
-    drawRateMeter(out, rx, 7, rw, rate, pal, color)
-
-    monWrite(out, rx, 9, "CLUTCH", pal.copper, pal.bg)
-    drawRsLamp(out, rx + 7, 9, rsOn, pal, color)
-
-    monWrite(out, x0, h - 2, bins:sub(1, innerW), pal.iron, pal.bg)
-    monWrite(out, x0, h - 1, band:sub(1, innerW), pal.dim, pal.bg)
-
-  --------------------------------------------------------------------------
-  -- Medium board
-  --------------------------------------------------------------------------
-  elseif h >= 10 then
-    monWrite(out, x0, 2, "GAUGE", pal.copper, pal.bg)
-    if w >= 20 and h >= 12 then
-      -- Side-by-side: arc left, meters right
-      local gw = math.min(13, math.floor(innerW * 0.5))
-      drawArcGauge(out, x0, 3, gw, 5, pct, gfg, pal, color)
-      local rx = x0 + gw + 1
-      local rw = w - rx - 1
-      monWrite(out, rx, 3, "TUBE", pal.copper, pal.bg)
-      drawBrassTube(out, rx, 4, rw, pct, gfg, pal, color)
-      monWrite(out, rx, 6, "STOCK", pal.copper, pal.bg)
-      monWrite(out, rx, 7, rateText:sub(1, rw), rfg, pal.bg)
-      drawRateMeter(out, rx, 8, rw, rate, pal, color)
-      monWrite(out, rx, 9, "RS", pal.dim, pal.bg)
-      drawRsLamp(out, rx + 3, 9, rsOn, pal, color)
-    elseif w >= 16 then
-      drawArcGauge(out, x0, 3, math.min(13, innerW), 4, pct, gfg, pal, color)
-      drawBrassTube(out, x0, 7, innerW, pct, gfg, pal, color)
-      monWrite(out, x0, 8, stock:sub(1, math.max(1, innerW - 6)), rfg, pal.bg)
-      monWrite(out, w - 7, 8, "RS", pal.dim, pal.bg)
-      drawRsLamp(out, w - 5, 8, rsOn, pal, color)
-      if h >= 11 then
-        drawRateMeter(out, x0, 9, math.min(innerW, 16), rate, pal, color)
+  if y <= h - footerH then
+    if color then
+      guiFill(out, 1, y, w, 1, pal.bg, pal.steam)
+      local x = x0
+      local fillFg = (gfg == pal.danger) and colors.white or colors.black
+      x = guiChip(out, x, y, "FILL " .. pctText, fillFg, gfg, true)
+      x = guiChip(out, x, y, rateText, colors.white, pal.soot, true)
+      -- RS single-pixel lamp + short label
+      guiText(out, x, y, "RS", pal.iron, pal.bg)
+      drawRsLamp(out, x + 2, y, rsOn, pal, color)
+      if x + 5 < w then
+        local feedBg = (rsOn == true) and pal.lampOff
+          or ((rsOn == false) and pal.lampOn or pal.soot)
+        local feedFg = (rsOn == true) and colors.white or colors.black
+        guiChip(out, x + 4, y, feedLabel, feedFg, feedBg, true)
       end
     else
-      monCenter(out, 3, pctText, gfg, pal.bg)
-      drawMiniArc(out, x0, 4, innerW, pct, gfg, pal)
-      drawBrassTube(out, x0, 5, innerW, pct, gfg, pal, color)
-      monWrite(out, x0, 6, stock:sub(1, math.max(1, innerW - 6)), rfg, pal.bg)
-      monWrite(out, w - 7, 6, "RS", pal.dim, pal.bg)
-      drawRsLamp(out, w - 5, 6, rsOn, pal, color)
-      drawRateMeter(out, x0, 7, math.min(innerW, 14), rate, pal, color)
+      guiText(out, x0, y,
+        ("FILL %s  %s  RS=%s"):format(pctText, rateText, feedLabel):sub(1, innerW),
+        pal.steam, pal.bg)
     end
-    monWrite(out, x0, h - 2, bins:sub(1, innerW), pal.iron, pal.bg)
-    monWrite(out, x0, h - 1, band:sub(1, innerW), pal.dim, pal.bg)
+    y = y + 1
+  end
 
   --------------------------------------------------------------------------
-  -- Compact (h 7–9)
+  -- Pressure section (riveted panel + solid gauge)
   --------------------------------------------------------------------------
-  elseif h >= 7 then
-    monWrite(out, x0, 2, "GAUGE", pal.copper, pal.bg)
-    monCenter(out, 3, pctText, gfg, pal.bg)
-    if w >= 14 then
-      drawMiniArc(out, x0, 4, innerW, pct, gfg, pal)
-      drawBrassTube(out, x0, 5, innerW, pct, gfg, pal, color)
+  local bodyBot = h - footerH
+  local gaugeH = 3
+  if tier == "large" then gaugeH = 5
+  elseif tier == "medium" then gaugeH = 4
+  elseif h - y - footerH < 6 then gaugeH = 2
+  end
+  gaugeH = math.min(gaugeH, math.max(2, bodyBot - y - 2))
+
+  if y + gaugeH - 1 <= bodyBot and innerW >= 8 then
+    local px, py, pw, ph = x0, y, innerW, gaugeH
+    drawPanelFrame(out, px, py, pw, ph, pal, color)
+    local ix, iy = px + 1, py + 1
+    local iw = pw - 2
+
+    if color then
+      guiFill(out, ix, iy, iw, 1, pal.copper, pal.rivet)
+      guiText(out, ix + 1, iy, "PRESSURE", pal.rivet, pal.copper)
+      local pctRight = pctText
+      guiText(out, ix + iw - #pctRight, iy, pctRight, colors.black, pal.copper)
     else
-      drawBrassTube(out, x0, 4, innerW, pct, gfg, pal, color)
+      guiText(out, ix, iy, ("PRESSURE %s"):format(pctText):sub(1, iw), pal.steam, pal.bg)
     end
-    local stockLine = stock
-    monWrite(out, x0, h - 2, stockLine:sub(1, math.max(1, innerW - 6)), rfg, pal.bg)
-    monWrite(out, w - 7, h - 2, "RS", pal.dim, pal.bg)
-    drawRsLamp(out, w - 5, h - 2, rsOn, pal, color)
-    monWrite(out, x0, h - 1, (bins .. " " .. band):sub(1, innerW), pal.dim, pal.bg)
+
+    if ph >= 3 then
+      drawPressureGauge(out, ix, iy + 1, iw, pct, gfg, pal, color, onP, offP)
+    end
+    if ph >= 4 then
+      drawBandTicks(out, ix, iy + 2, math.max(1, iw - 2), pal, color, onP, offP)
+    end
+    if ph >= 5 and color then
+      guiText(out, ix + 1, iy + 3,
+        ("R=run@%d  S=stop@%d"):format(onP, offP):sub(1, iw - 2),
+        pal.iron, pal.bg)
+    end
+    y = py + ph + 1
+  end
 
   --------------------------------------------------------------------------
-  -- Short (h 5–6)
+  -- Detail cards / rows (slots, rate, band, clutch)
   --------------------------------------------------------------------------
-  else
-    monCenter(out, 2, pctText, gfg, pal.bg)
-    drawBrassTube(out, x0, 3, innerW, pct, gfg, pal, color)
-    monWrite(out, x0, 4, stock:sub(1, math.max(1, innerW - 6)), rfg, pal.bg)
-    monWrite(out, w - 7, 4, "RS", pal.dim, pal.bg)
-    drawRsLamp(out, w - 5, 4, rsOn, pal, color)
-    if h >= 6 then
-      monWrite(out, x0, 5, band:sub(1, innerW), pal.dim, pal.bg)
+  local cards = {
+    { "SLOTS", slotsText, pal.steam },
+    { "RATE", rateText, rfg },
+    { "BAND", ("stop>=%d  run<=%d"):format(offP, onP), pal.iron },
+    { "FEED", feedLabel .. (cfg.invert and " inv" or ""),
+      (rsOn == true) and pal.danger or ((rsOn == false) and pal.ok or pal.dim) },
+  }
+
+  if color and tier ~= "tiny" and w >= 28 and y <= bodyBot then
+    -- Two-column key/value cards (router stats style)
+    local colW = math.floor((w - 2) / 2)
+    local i = 1
+    while i <= #cards and y <= bodyBot do
+      local a, b = cards[i], cards[i + 1]
+      guiFill(out, 1, y, w, 1, pal.soot, pal.steam)
+      local left = (" %s %s"):format(a[1], a[2])
+      guiText(out, 1, y, left:sub(1, colW), a[3], pal.soot)
+      if b then
+        local right = (" %s %s"):format(b[1], b[2])
+        guiText(out, colW + 2, y, right:sub(1, colW), b[3], pal.soot)
+        -- Put RS lamp next to FEED on the right card when present
+        if b[1] == "FEED" then
+          local lx = colW + 2 + math.min(colW - 2, #right + 1)
+          if lx < w then drawRsLamp(out, lx, y, rsOn, pal, color) end
+        end
+        i = i + 2
+      else
+        if a[1] == "FEED" then
+          local lx = 1 + math.min(colW - 2, #left + 1)
+          if lx < w then drawRsLamp(out, lx, y, rsOn, pal, color) end
+        end
+        i = i + 1
+      end
+      y = y + 1
     end
+  else
+    for _, c in ipairs(cards) do
+      if y > bodyBot then break end
+      local line = ("%s  %s"):format(c[1], c[2])
+      if color then
+        guiFill(out, 1, y, w, 1, pal.soot, pal.steam)
+        guiText(out, x0, y, line:sub(1, innerW), c[3], pal.soot)
+        if c[1] == "FEED" then
+          drawRsLamp(out, math.min(w - 1, x0 + #line + 1), y, rsOn, pal, color)
+        end
+      else
+        guiText(out, x0, y, line:sub(1, innerW), pal.steam, pal.bg)
+      end
+      y = y + 1
+    end
+  end
+
+  -- Extra tall boards: secondary iron rail with storage name / polarity
+  if tier == "large" and y <= bodyBot and color then
+    guiFill(out, 1, y, w, 1, pal.iron, colors.black)
+    local note = "Create default: RS ON = stop feed"
+    if cfg.invert then note = "Inverted: RS ON = run feed" end
+    guiText(out, 2, y, note:sub(1, w - 2), colors.black, pal.iron)
+  end
+
+  --------------------------------------------------------------------------
+  -- Footer
+  --------------------------------------------------------------------------
+  local right = (color and " BRASS" or " MONO") .. (" %dx%d"):format(w, h)
+  local left = " clutch"
+  if color then
+    guiFill(out, 1, h, w, 1, pal.soot, pal.steam)
+    guiText(out, 1, h, left, pal.steam, pal.soot)
+    guiText(out, math.max(1, w - #right + 1), h, right, pal.iron, pal.soot)
+  else
+    guiText(out, 1, h, (left .. right):sub(1, w), pal.dim, pal.bg)
   end
 
   return true
@@ -1014,9 +1047,9 @@ local function cmdStatus()
   end
   local _, kind = resolveDisplay()
   if kind == "monitor" then
-    print("  display:    steampunk panel (monitor)")
+    print("  display:    steampunk board (monitor)")
   elseif kind == "term" then
-    print("  display:    steampunk panel (advanced term via run/monitor)")
+    print("  display:    steampunk board (advanced term via run/monitor)")
   else
     print("  display:    (attach monitor or use advanced PC)")
   end
@@ -1059,7 +1092,7 @@ Storage Clutch — Sophisticated Storage → Create clutch
   invert [on|off]              flip redstone polarity
   interval <seconds>
   status
-  monitor                      redraw steampunk instrument panel
+  monitor                      redraw steampunk brass board
   test on|off                  force output (ignores invert)
   run                          watch loop (Ctrl+T to stop)
   help
@@ -1069,14 +1102,14 @@ Storage Clutch — Sophisticated Storage → Create clutch
 ]])
   print("Wired modems share peripherals only — not redstone.")
   print("Use a local face OR an Advanced Peripherals Redstone Integrator.")
-  print("Display: color monitor or advanced PC — brass gauges + RS lamp cell.")
+  print("Display: color monitor or advanced PC — brass board + RS lamp cell.")
   print("Fill % is slot occupancy (used/size), not item-count fullness.")
 end
 
 local function cmdMonitor()
   local ok, err = drawMonitor()
   if ok then
-    print("Instrument panel updated.")
+    print("Steampunk board updated.")
   else
     print("Display: " .. tostring(err or "failed"))
   end
@@ -1106,9 +1139,9 @@ local function cmdRun()
   rateSamples = {} -- fresh rate window when starting watch
   local _, kind = resolveDisplay()
   if kind == "monitor" then
-    print("Steampunk panel → monitor")
+    print("Steampunk board → monitor")
   elseif kind == "term" then
-    print("Steampunk panel → this screen (Ctrl+T to stop)")
+    print("Steampunk board → this screen (Ctrl+T to stop)")
   else
     print("No color display — console only")
   end
