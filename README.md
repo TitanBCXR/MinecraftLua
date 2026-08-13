@@ -25,7 +25,7 @@ A wireless dispatch system for Minecraft's **CC: Tweaked** mod (active packages)
 - **`games/managers/currency_manager.lua`** — casino ledger + vault; one station barrel per computer ID (deposit + withdraw).
 - **`games/managers/casino_atm.lua`** — casino station ATM (barrel deposit/withdraw via mesh; Create legacy optional).
 - **`storage/managers/storage_atm.lua`** — solo storage ATM (wired modem ↔ vault; no ticker/casino).
-- **`storage/managers/storage_clutch.lua`** — watch Sophisticated Storage fill % → redstone for a Create clutch (local face or AP Redstone Integrator); steampunk brass board (header, pressure gauge, status chips, RS lamp) on color monitor / advanced PC.
+- **`storage/managers/storage_clutch.lua`** — watch Sophisticated Storage fill % → redstone for a Create clutch (local face or AP Redstone Integrator); persists last RUN/STOP latch across reboots; steampunk brass board (header, pressure gauge, status chips, RS lamp) on color monitor / advanced PC.
 - **`games_install.lua`** — **Games-only** installer (separate from the fleet installer).
 - **`github_install.lua`** — Fleet / Titan role installer (routers, quarry, admin, …).
 - **`lib/titan.lua`** — shared library (protocol, messaging, navigation).
@@ -720,10 +720,11 @@ run
 
 Or local: `bind redstone back` instead of `bind integrator …`.
 
-- **`on 20`** / **`off 60`** — hysteresis: resume feed ≤20%, stop feed ≥60% (holds in between). Create default: stop = redstone ON (clutch engaged), resume = OFF; use **invert** if powered = run  
-- **invert** — flip redstone polarity if your clutch is wired the other way  
-- **test on|off** — force the output to verify wiring  
-- **run** — poll loop; steampunk brass board on color monitor or advanced term (Ctrl+T to stop): solid header, fill/rate/clutch chips, riveted pressure gauge with run/stop band ticks, slots, band; **RS** state is a single green (ON) / red (OFF) lamp cell  
+- **`on 20`** / **`off 60`** — hysteresis: resume feed ≤20%, stop feed ≥60% (holds in between). Create default: stop = redstone ON (clutch engaged), resume = OFF; use **invert** if powered = run
+- **Latch persistence** — last RUN/STOP (`latchedOn` in `storage_clutch.cfg`) is saved on change and restored on boot so hold-band resumes correctly (default RUN if none saved)
+- **invert** — flip redstone polarity if your clutch is wired the other way
+- **test on|off** — force the output to verify wiring
+- **run** — poll loop; steampunk brass board on color monitor or advanced term (Ctrl+T to stop): solid header, fill/rate/clutch chips, riveted pressure gauge with run/stop band ticks, slots, band; **RS** state is a single green (ON) / red (OFF) lamp cell
 - **monitor** — redraw the brass board once
 
 ## Storage ATM (wired modem ↔ vault)

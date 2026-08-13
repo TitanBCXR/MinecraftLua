@@ -1,6 +1,6 @@
 --[[
   storage/managers/storage_clutch.lua  -  Storage fill → Create clutch
-  Titan-Version: 1.7.0
+  Titan-Version: 1.7.1
 
   Reads a Sophisticated Storage (or any inventory) over the wired modem
   network and drives a Create clutch via redstone.
@@ -20,6 +20,8 @@
     on  20% → resume feed (redstone OFF / clutch idle) at/below 20%
     Between those points the last state is held (no chatter).
     Use `invert` if your wiring is the opposite (powered = run).
+    Latch (`latchedOn` in storage_clutch.cfg) persists across reboots so
+    the hold band resumes correctly (default RUN / latchedOn=false).
 
   Display: steampunk board (brass header, riveted panels, pressure gauge,
   status chips, RS lamp cell) on an attached color monitor, or the
@@ -38,7 +40,7 @@
 ]]
 
 local LOCAL_CFG = "storage_clutch.cfg"
-local VERSION = "1.7.0"
+local VERSION = "1.7.1"
 
 local cfg = {
   storage = nil,           -- inventory peripheral name
@@ -53,11 +55,10 @@ local cfg = {
   invert = false,
   interval = 1,            -- seconds between polls
   label = nil,
+  -- Last desired redstone state (before invert) for the hysteresis band.
+  -- Persisted in storage_clutch.cfg. true = STOP feed; false = RUN feed.
+  latchedOn = false,
 }
-
--- Last desired redstone state (before invert) for the hysteresis band.
--- true = engage clutch / stop feed (Create default); false = run feed.
-local latchedOn = false
 
 -- Sliding window for fill-rate (pct/min, items/min)
 local rateSamples = {}
@@ -93,11 +94,25 @@ local function loadCfg()
   end
   cfg.onPct = math.max(0, math.min(100, tonumber(cfg.onPct) or 20))
   cfg.offPct = math.max(0, math.min(100, tonumber(cfg.offPct) or 60))
+  -- Hysteresis latch: prefer RUN when missing/invalid (first boot / old cfg)
+  if type(cfg.latchedOn) ~= "boolean" then
+    cfg.latchedOn = false
+  end
 end
 
 local function saveCfg()
   local f = fs.open(LOCAL_CFG, "w")
   if f then f.write(textutils.serialize(cfg)); f.close() end
+end
+
+--- Update persisted latch when it flips (true=STOP feed, false=RUN).
+local function setLatch(on)
+  on = not not on
+  if cfg.latchedOn ~= on then
+    cfg.latchedOn = on
+    saveCfg()
+  end
+  return cfg.latchedOn
 end
 
 local function isInventory(name)
@@ -211,29 +226,27 @@ local function desiredOn(fill)
   local pct = fill.pct
   local resumeP = tonumber(cfg.onPct) or 20
   local stopP = tonumber(cfg.offPct) or 60
+  local nextLatch = cfg.latchedOn
 
   if resumeP == stopP then
     -- single trip: stop (rs ON) at/above, run (rs OFF) below
-    latchedOn = (pct >= stopP)
-    return latchedOn
-  end
-
-  if resumeP < stopP then
+    nextLatch = (pct >= stopP)
+  elseif resumeP < stopP then
     -- Normal band: stop at/above off%, resume at/below on% (hold in between)
     if pct >= stopP then
-      latchedOn = true
+      nextLatch = true
     elseif pct <= resumeP then
-      latchedOn = false
+      nextLatch = false
     end
   else
     -- Swapped thresholds (on > off): stop at/above on%, resume at/below off%
     if pct >= resumeP then
-      latchedOn = true
+      nextLatch = true
     elseif pct <= stopP then
-      latchedOn = false
+      nextLatch = false
     end
   end
-  return latchedOn
+  return setLatch(nextLatch)
 end
 
 --------------------------------------------------------------------------------
@@ -566,7 +579,7 @@ local function drawMonitor(fill, rsOn)
     if fill then recordFill(fill) end
   end
   if rsOn == nil then
-    rsOn = (latchedOn ~= not not cfg.invert)
+    rsOn = (cfg.latchedOn ~= not not cfg.invert)
   end
 
   local rate = fillRate()
@@ -1070,7 +1083,7 @@ local function cmdTest(arg)
   local ok, err = setRedstone(on)
   cfg.invert = saved
   if ok then
-    latchedOn = on  -- keep hysteresis in sync with forced state
+    setLatch(on)  -- keep hysteresis + cfg in sync with forced state
     print("Redstone forced " .. (on and "ON" or "OFF"))
   else
     print("Failed: " .. tostring(err))
@@ -1214,6 +1227,12 @@ end
 loadCfg()
 if cfg.label and cfg.label ~= "" then
   pcall(os.setComputerLabel, cfg.label)
+end
+
+-- Restore physical clutch from saved latch before the interactive loop
+-- (hold band would otherwise wait for the next threshold cross).
+if cfg.storage and (cfg.rsSide or cfg.integrator) then
+  pcall(setRedstone, cfg.latchedOn)
 end
 
 print(("Storage Clutch v%s — type help"):format(VERSION))
