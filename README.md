@@ -723,7 +723,8 @@ Or local: `bind redstone back` instead of `bind integrator …`.
 - **`on 20`** / **`off 60`** — hysteresis band (default ON ≤20%, OFF ≥60%; holds in between)  
 - **invert** — flip polarity if your clutch is wired the other way  
 - **test on|off** — force the output to verify wiring  
-- **run** — poll loop (Ctrl+T to stop)
+- **run** — poll loop; monitor shows fill % + rate (`%/m`, `it/m`) (Ctrl+T to stop)  
+- **monitor** — redraw the screen once
 
 ## Storage ATM (wired modem ↔ vault)
 

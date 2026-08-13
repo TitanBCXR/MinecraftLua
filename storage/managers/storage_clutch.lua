@@ -18,6 +18,8 @@
   Hysteresis (default): redstone ON at <= 20% fill, OFF at >= 60%.
   Between those points the last state is held (no chatter).
 
+  Optional: attach a color monitor to the PC — fill % and fill rate are drawn.
+
   Setup:
     invs | integrators
     bind storage <side|name>
@@ -27,11 +29,11 @@
     off <percent>                        -- turn OFF at/above (or at/below)
     invert on|off
     interval <seconds>
-    run | status | test on|off | help
+    run | status | monitor | test on|off | help
 ]]
 
 local LOCAL_CFG = "storage_clutch.cfg"
-local VERSION = "1.1.0"
+local VERSION = "1.3.0"
 
 local cfg = {
   storage = nil,           -- inventory peripheral name
@@ -49,6 +51,11 @@ local cfg = {
 
 -- Last desired state (before invert) for the hysteresis band
 local latchedOn = false
+
+-- Sliding window for fill-rate (pct/min, items/min)
+local rateSamples = {}
+local RATE_WINDOW_MS = 60000
+local RATE_MAX_SAMPLES = 120
 
 local SIDES = {
   left = true, right = true, front = true, back = true, top = true, bottom = true,
@@ -221,6 +228,198 @@ local function desiredOn(fill)
     end
   end
   return latchedOn
+end
+
+--------------------------------------------------------------------------------
+-- Fill rate (sliding window)
+--------------------------------------------------------------------------------
+local function nowMs()
+  if type(os.epoch) == "function" then
+    return os.epoch("utc")
+  end
+  return math.floor(os.clock() * 1000)
+end
+
+local function recordFill(fill)
+  if not fill then return end
+  local t = nowMs()
+  rateSamples[#rateSamples + 1] = {
+    t = t,
+    pct = fill.pct or 0,
+    used = fill.used or 0,
+    items = fill.items or 0,
+  }
+  local cutoff = t - RATE_WINDOW_MS
+  while #rateSamples > 1 and rateSamples[1].t < cutoff do
+    table.remove(rateSamples, 1)
+  end
+  while #rateSamples > RATE_MAX_SAMPLES do
+    table.remove(rateSamples, 1)
+  end
+end
+
+--- Returns { pctPerMin, itemsPerMin, ready } or nil if not enough samples
+local function fillRate()
+  if #rateSamples < 2 then return nil end
+  local a, b = rateSamples[1], rateSamples[#rateSamples]
+  local dt = (b.t - a.t) / 1000
+  if dt < 2 then return nil end
+  return {
+    pctPerMin = ((b.pct - a.pct) / dt) * 60,
+    itemsPerMin = ((b.items - a.items) / dt) * 60,
+    dt = dt,
+    ready = true,
+  }
+end
+
+local function formatRate(rate)
+  if not rate then return "rate …" end
+  local p = rate.pctPerMin
+  local sign = (p > 0.05 and "+") or (p < -0.05 and "") or ""
+  -- Show %/min primarily; add items/min when meaningful
+  local pctStr = string.format("%s%.1f%%/m", sign, p)
+  local it = rate.itemsPerMin
+  if math.abs(it) >= 1 then
+    local isign = (it > 0 and "+") or ""
+    return string.format("%s  %s%.0fit/m", pctStr, isign, it)
+  end
+  return pctStr
+end
+
+local function rateColor(rate)
+  if not rate then return colors.gray end
+  local p = rate.pctPerMin
+  if p > 0.5 then return colors.lime
+  elseif p < -0.5 then return colors.orange
+  else return colors.lightGray
+  end
+end
+
+--------------------------------------------------------------------------------
+-- Monitor
+--------------------------------------------------------------------------------
+local function findMonitor()
+  local m = peripheral.find("monitor")
+  if m then return m end
+  for _, side in ipairs(peripheral.getNames()) do
+    if peripheral.getType(side) == "monitor" then
+      return peripheral.wrap(side)
+    end
+  end
+  return nil
+end
+
+local function fillColor(pct)
+  pct = tonumber(pct) or 0
+  if pct >= 80 then return colors.red
+  elseif pct >= 60 then return colors.orange
+  elseif pct >= 40 then return colors.yellow
+  elseif pct >= 20 then return colors.lime
+  else return colors.green
+  end
+end
+
+local function monWrite(mon, x, y, text, fg, bg)
+  if not mon then return end
+  local w, h = mon.getSize()
+  if y < 1 or y > h then return end
+  if mon.setBackgroundColor and bg then mon.setBackgroundColor(bg) end
+  if mon.setTextColor and fg then mon.setTextColor(fg) end
+  mon.setCursorPos(math.max(1, x), y)
+  mon.write(tostring(text):sub(1, w - math.max(1, x) + 1))
+end
+
+local function monCenter(mon, y, text, fg, bg)
+  local w = mon.getSize()
+  text = tostring(text or "")
+  local x = math.max(1, math.floor((w - #text) / 2) + 1)
+  monWrite(mon, x, y, text, fg, bg)
+end
+
+local function drawBar(mon, y, pct, fg)
+  local w = select(1, mon.getSize())
+  pct = math.max(0, math.min(100, tonumber(pct) or 0))
+  local filled = math.floor((pct / 100) * w + 0.5)
+  if mon.setBackgroundColor then mon.setBackgroundColor(colors.gray) end
+  if mon.setTextColor then mon.setTextColor(fg or colors.white) end
+  mon.setCursorPos(1, y)
+  local bar = string.rep(" ", w)
+  mon.write(bar)
+  if filled > 0 then
+    if mon.setBackgroundColor then mon.setBackgroundColor(fg or colors.lime) end
+    mon.setCursorPos(1, y)
+    mon.write(string.rep(" ", filled))
+  end
+end
+
+--- Draw fill % + rate on attached monitor. fill/rsOn optional.
+local function drawMonitor(fill, rsOn)
+  local mon = findMonitor()
+  if not mon then return false, "no monitor" end
+
+  if not fill and cfg.storage then
+    fill = storageFill(cfg.storage)
+    if fill then recordFill(fill) end
+  end
+  if rsOn == nil then
+    rsOn = (latchedOn ~= not not cfg.invert)
+  end
+
+  local rate = fillRate()
+
+  pcall(function()
+    if mon.setTextScale then
+      -- Prefer largest scale that fits % + rate + footer
+      local chosen = 0.5
+      for _, scale in ipairs({ 5, 4, 3, 2, 1, 0.5 }) do
+        mon.setTextScale(scale)
+        local ww, hh = mon.getSize()
+        if ww >= 5 and hh >= 4 then
+          chosen = scale
+          break
+        end
+      end
+      mon.setTextScale(chosen)
+    end
+  end)
+
+  local w, h = mon.getSize()
+  if mon.setBackgroundColor then mon.setBackgroundColor(colors.black) end
+  mon.clear()
+
+  local pct = fill and fill.pct or 0
+  local fg = fillColor(pct)
+  local pctText = fill and string.format("%d%%", pct) or "--%"
+  local rateText = formatRate(rate)
+  local rfg = rateColor(rate)
+
+  monCenter(mon, 1, "STORAGE", colors.lightGray, colors.black)
+
+  if h >= 6 then
+    local mid = math.floor(h / 2)
+    monCenter(mon, mid - 1, pctText, fg, colors.black)
+    monCenter(mon, mid, rateText:sub(1, w), rfg, colors.black)
+    if fill then
+      monCenter(mon, mid + 1, ("%d/%d slots"):format(fill.used, fill.size),
+        colors.white, colors.black)
+    end
+    local barY = mid + 2
+    if barY < h then drawBar(mon, barY, pct, fg) end
+  elseif h >= 4 then
+    monCenter(mon, 2, pctText, fg, colors.black)
+    monCenter(mon, 3, rateText:sub(1, w), rfg, colors.black)
+    if h >= 5 then drawBar(mon, 4, pct, fg) end
+  else
+    monCenter(mon, math.max(2, math.floor(h / 2)), pctText, fg, colors.black)
+  end
+
+  if h >= 3 then
+    local rs = (rsOn == nil) and "?" or (rsOn and "ON" or "OFF")
+    local foot = ("RS %s  on%d/off%d"):format(rs, cfg.onPct or 20, cfg.offPct or 60)
+    monCenter(mon, h, foot:sub(1, w), colors.gray, colors.black)
+  end
+
+  return true
 end
 
 --------------------------------------------------------------------------------
@@ -456,6 +655,14 @@ local function cmdStatus()
       local applied = (want ~= cfg.invert)
       print(("  latched:    %s → redstone %s"):format(
         want and "ON" or "OFF", applied and "ON" or "OFF"))
+      recordFill(fill)
+      local rate = fillRate()
+      if rate then
+        print("  rate:       " .. formatRate(rate))
+      else
+        print("  rate:       (need a few seconds of samples)")
+      end
+      pcall(drawMonitor, fill, applied)
     else
       print("  fill:       " .. tostring(err))
     end
@@ -463,6 +670,11 @@ local function cmdStatus()
   local cur, src = getRedstoneState()
   if cur ~= nil then
     print(("  redstone:   %s (%s)"):format(cur and "ON" or "OFF", src))
+  end
+  if findMonitor() then
+    print("  monitor:    attached (fill % shown)")
+  else
+    print("  monitor:    (none)")
   end
 end
 
@@ -503,6 +715,7 @@ Storage Clutch — Sophisticated Storage → Create clutch
   invert [on|off]              flip ON/OFF meaning
   interval <seconds>
   status
+  monitor                      redraw fill % on attached screen
   test on|off                  force output (ignores invert)
   run                          watch loop (Ctrl+T to stop)
   help
@@ -511,6 +724,16 @@ Storage Clutch — Sophisticated Storage → Create clutch
 ]])
   print("Wired modems share peripherals only — not redstone.")
   print("Use a local face OR an Advanced Peripherals Redstone Integrator.")
+  print("Attach a monitor to the PC to show fill % and rate.")
+end
+
+local function cmdMonitor()
+  local ok, err = drawMonitor()
+  if ok then
+    print("Monitor updated.")
+  else
+    print("Monitor: " .. tostring(err or "failed"))
+  end
 end
 
 local function applyOnce()
@@ -520,9 +743,11 @@ local function applyOnce()
   end
   local fill, err = storageFill(cfg.storage)
   if not fill then return false, err end
+  recordFill(fill)
   local want = desiredOn(fill)
   local ok, outOrErr, src = setRedstone(want)
   if not ok then return false, outOrErr end
+  pcall(drawMonitor, fill, outOrErr)
   return true, fill, outOrErr, src
 end
 
@@ -532,14 +757,22 @@ local function cmdRun()
     print("bind redstone <side> or bind integrator <name> first")
     return
   end
+  rateSamples = {} -- fresh rate window when starting watch
+  if findMonitor() then
+    print("Monitor: fill % + rate")
+  else
+    print("No monitor attached — console only")
+  end
   print(("Watching %s — Ctrl+T to stop"):format(cfg.storage))
   local last = nil
   while true do
     local ok, a, b, c = applyOnce()
     if ok then
       local fill, on, src = a, b, c
-      local line = ("%s  %3d%%  %d/%d  rs=%s"):format(
-        os.date("%H:%M:%S"), fill.pct, fill.used, fill.size, on and "ON" or "OFF")
+      local rate = fillRate()
+      local rateStr = rate and formatRate(rate) or "rate …"
+      local line = ("%s  %3d%%  %s  %d/%d  rs=%s"):format(
+        os.date("%H:%M:%S"), fill.pct, rateStr, fill.used, fill.size, on and "ON" or "OFF")
       if line ~= last then
         print(line)
         last = line
@@ -547,6 +780,7 @@ local function cmdRun()
     else
       print(os.date("%H:%M:%S") .. "  ERR " .. tostring(a))
       last = nil
+      pcall(drawMonitor, nil, nil)
     end
     sleep(tonumber(cfg.interval) or 1)
   end
@@ -576,6 +810,7 @@ local function dispatch(line)
   elseif cmd == "invert" then cmdInvert(args[2])
   elseif cmd == "interval" then cmdInterval(args[2])
   elseif cmd == "status" or cmd == "stat" then cmdStatus()
+  elseif cmd == "monitor" or cmd == "mon" then cmdMonitor()
   elseif cmd == "test" then cmdTest(args[2])
   elseif cmd == "run" or cmd == "watch" or cmd == "start" then cmdRun()
   elseif cmd == "help" or cmd == "?" then cmdHelp()
