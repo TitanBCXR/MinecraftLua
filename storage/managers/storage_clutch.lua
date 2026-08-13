@@ -1,6 +1,6 @@
 --[[
   storage/managers/storage_clutch.lua  -  Storage fill → Create clutch
-  Titan-Version: 1.1.0
+  Titan-Version: 1.6.0
 
   Reads a Sophisticated Storage (or any inventory) over the wired modem
   network and drives a Create clutch via redstone.
@@ -15,25 +15,30 @@
     [Clutch + Integrator] --wired modem--+-- cable -- [PC + wired modem]
     (or PC redstone face → dust → clutch)
 
-  Hysteresis (default): redstone ON at <= 20% fill, OFF at >= 60%.
-  Between those points the last state is held (no chatter).
+  Hysteresis (default Create: powered clutch = STOP shaft):
+    off 60% → stop feed (redstone ON / clutch engaged) at/above 60%
+    on  20% → resume feed (redstone OFF / clutch idle) at/below 20%
+    Between those points the last state is held (no chatter).
+    Use `invert` if your wiring is the opposite (powered = run).
 
-  Optional: attach a color monitor to the PC — fill % and fill rate are drawn.
+  Display: steampunk instrument panel (arc gauge, brass tube, rate meter,
+  RS lamp cell) on an attached color monitor, or the advanced computer term
+  when no monitor is present.
 
   Setup:
     invs | integrators
     bind storage <side|name>
     bind redstone <side>                 -- local PC face
     bind integrator <name> [side]        -- remote Redstone Integrator
-    on <percent>                         -- turn ON at/below (or at/above)
-    off <percent>                        -- turn OFF at/above (or at/below)
+    on <percent>                         -- resume feed at/below this fill %
+    off <percent>                        -- stop feed at/above this fill %
     invert on|off
     interval <seconds>
     run | status | monitor | test on|off | help
 ]]
 
 local LOCAL_CFG = "storage_clutch.cfg"
-local VERSION = "1.3.1"
+local VERSION = "1.6.0"
 
 local cfg = {
   storage = nil,           -- inventory peripheral name
@@ -41,7 +46,8 @@ local cfg = {
   rsSide = nil,            -- local computer face
   integrator = nil,        -- redstoneIntegrator peripheral
   integratorSide = "front",
-  -- Hysteresis: ON at onPct, OFF at offPct (hold between)
+  -- Hysteresis (feed): resume at onPct, stop at offPct (hold between)
+  -- Create default: stop = redstone ON, resume = redstone OFF
   onPct = 20,
   offPct = 60,
   invert = false,
@@ -49,7 +55,8 @@ local cfg = {
   label = nil,
 }
 
--- Last desired state (before invert) for the hysteresis band
+-- Last desired redstone state (before invert) for the hysteresis band.
+-- true = engage clutch / stop feed (Create default); false = run feed.
 local latchedOn = false
 
 -- Sliding window for fill-rate (pct/min, items/min)
@@ -71,7 +78,7 @@ local function loadCfg()
   if ok and type(d) == "table" then
     for k, v in pairs(d) do cfg[k] = v end
   end
-  -- Migrate legacy single-threshold configs
+  -- Migrate legacy single-threshold configs → resume(on) / stop(off)
   if (cfg.onPct == nil or cfg.offPct == nil) and cfg.threshold ~= nil then
     local th = tonumber(cfg.threshold) or 90
     local when = tostring(cfg.when or "full"):lower()
@@ -79,9 +86,9 @@ local function loadCfg()
       cfg.onPct = cfg.onPct or math.min(th, 20)
       cfg.offPct = cfg.offPct or math.max(th, 60)
     else
-      -- old "full/above": ON when high → swap band
-      cfg.onPct = cfg.onPct or th
-      cfg.offPct = cfg.offPct or math.max(0, th - 30)
+      -- old "full/above": stop near threshold, resume ~30% below
+      cfg.offPct = cfg.offPct or th
+      cfg.onPct = cfg.onPct or math.max(0, th - 30)
     end
   end
   cfg.onPct = math.max(0, math.min(100, tonumber(cfg.onPct) or 20))
@@ -197,33 +204,32 @@ local function storageFill(name)
   return { used = used, size = size, items = items, pct = pct }
 end
 
+--- Desired redstone before invert.
+--- Feed semantics: offPct = stop feeding, onPct = resume feeding.
+--- Create clutch default (power = stop): stop → rs ON, resume → rs OFF.
 local function desiredOn(fill)
   local pct = fill.pct
-  local onP = tonumber(cfg.onPct) or 20
-  local offP = tonumber(cfg.offPct) or 60
+  local resumeP = tonumber(cfg.onPct) or 20
+  local stopP = tonumber(cfg.offPct) or 60
 
-  if onP == offP then
-    -- single trip point
-    if onP <= 50 then
-      latchedOn = (pct <= onP)
-    else
-      latchedOn = (pct >= onP)
-    end
+  if resumeP == stopP then
+    -- single trip: stop (rs ON) at/above, run (rs OFF) below
+    latchedOn = (pct >= stopP)
     return latchedOn
   end
 
-  if onP < offP then
-    -- Low → ON, high → OFF (default: on 20 / off 60)
-    if pct <= onP then
+  if resumeP < stopP then
+    -- Normal band: stop at/above off%, resume at/below on% (hold in between)
+    if pct >= stopP then
       latchedOn = true
-    elseif pct >= offP then
+    elseif pct <= resumeP then
       latchedOn = false
     end
   else
-    -- High → ON, low → OFF (e.g. on 80 / off 40)
-    if pct >= onP then
+    -- Swapped thresholds (on > off): stop at/above on%, resume at/below off%
+    if pct >= resumeP then
       latchedOn = true
-    elseif pct <= offP then
+    elseif pct <= stopP then
       latchedOn = false
     end
   end
@@ -292,7 +298,7 @@ local function rateColor(rate)
 end
 
 --------------------------------------------------------------------------------
--- Monitor
+-- Steampunk display (monitor or advanced computer term)
 --------------------------------------------------------------------------------
 local function findMonitor()
   local m = peripheral.find("monitor")
@@ -305,53 +311,293 @@ local function findMonitor()
   return nil
 end
 
-local function fillColor(pct)
-  pct = tonumber(pct) or 0
-  if pct >= 80 then return colors.red
-  elseif pct >= 60 then return colors.orange
-  elseif pct >= 40 then return colors.yellow
-  elseif pct >= 20 then return colors.lime
-  else return colors.green
+local function outIsColor(out)
+  local ok, c = pcall(function()
+    return out.isColor and out.isColor()
+  end)
+  return ok and c == true
+end
+
+--- Resolve draw target: attached monitor, else color term (advanced PC).
+local function resolveDisplay()
+  local mon = findMonitor()
+  if mon then return mon, "monitor" end
+  if term and term.isColor and term.isColor() then
+    return term, "term"
+  end
+  return nil, nil
+end
+
+-- Brass / copper / iron palette (color) with mono fallbacks
+local function steamPalette(color)
+  if color then
+    return {
+      bg = colors.black,
+      frame = colors.orange,       -- brass
+      rivet = colors.yellow,       -- polished brass
+      iron = colors.lightGray,
+      soot = colors.gray,
+      copper = colors.brown,
+      steam = colors.white,
+      accent = colors.orange,
+      danger = colors.red,
+      ok = colors.lime,
+      warn = colors.yellow,
+      dim = colors.gray,
+      lampOn = colors.lime,        -- RS ON  → green cell
+      lampOff = colors.red,        -- RS OFF → red cell
+    }
+  end
+  return {
+    bg = colors.black,
+    frame = colors.white,
+    rivet = colors.white,
+    iron = colors.white,
+    soot = colors.black,
+    copper = colors.white,
+    steam = colors.white,
+    accent = colors.white,
+    danger = colors.white,
+    ok = colors.white,
+    warn = colors.white,
+    dim = colors.white,
+    lampOn = colors.white,
+    lampOff = colors.black,
+  }
+end
+
+local function gaugeColor(pct, pal, color)
+  pct = math.max(0, math.min(100, tonumber(pct) or 0))
+  if not color then return pal.steam end
+  if pct >= 80 then return pal.danger
+  elseif pct >= 60 then return pal.warn
+  elseif pct >= 40 then return pal.accent
+  else return pal.ok
   end
 end
 
-local function monWrite(mon, x, y, text, fg, bg)
-  if not mon then return end
-  local w, h = mon.getSize()
-  if y < 1 or y > h then return end
-  if mon.setBackgroundColor and bg then mon.setBackgroundColor(bg) end
-  if mon.setTextColor and fg then mon.setTextColor(fg) end
-  mon.setCursorPos(math.max(1, x), y)
-  mon.write(tostring(text):sub(1, w - math.max(1, x) + 1))
+local function monWrite(out, x, y, text, fg, bg)
+  if not out then return end
+  local w, h = out.getSize()
+  if y < 1 or y > h or x > w then return end
+  if out.setBackgroundColor and bg then out.setBackgroundColor(bg) end
+  if out.setTextColor and fg then out.setTextColor(fg) end
+  out.setCursorPos(math.max(1, x), y)
+  out.write(tostring(text):sub(1, w - math.max(1, x) + 1))
 end
 
-local function monCenter(mon, y, text, fg, bg)
-  local w = mon.getSize()
+local function monCenter(out, y, text, fg, bg)
+  local w = select(1, out.getSize())
   text = tostring(text or "")
   local x = math.max(1, math.floor((w - #text) / 2) + 1)
-  monWrite(mon, x, y, text, fg, bg)
+  monWrite(out, x, y, text, fg, bg)
 end
 
-local function drawBar(mon, y, pct, fg)
-  local w = select(1, mon.getSize())
-  pct = math.max(0, math.min(100, tonumber(pct) or 0))
-  local filled = math.floor((pct / 100) * w + 0.5)
-  if mon.setBackgroundColor then mon.setBackgroundColor(colors.gray) end
-  if mon.setTextColor then mon.setTextColor(fg or colors.white) end
-  mon.setCursorPos(1, y)
-  local bar = string.rep(" ", w)
-  mon.write(bar)
-  if filled > 0 then
-    if mon.setBackgroundColor then mon.setBackgroundColor(fg or colors.lime) end
-    mon.setCursorPos(1, y)
-    mon.write(string.rep(" ", filled))
+--- One-cell RS lamp: green = redstone ON, red = redstone OFF.
+local function drawRsLamp(out, x, y, rsOn, pal, color)
+  local lampBg, lampFg
+  if rsOn == true then
+    lampBg = pal.lampOn
+    lampFg = color and colors.black or colors.white
+  elseif rsOn == false then
+    lampBg = pal.lampOff
+    lampFg = color and colors.white or colors.black
+  else
+    lampBg = pal.soot
+    lampFg = pal.dim
+  end
+  monWrite(out, x, y, " ", lampFg, lampBg)
+end
+
+local function drawFrame(out, pal, title)
+  local w, h = out.getSize()
+  if w < 3 or h < 3 then return end
+  local top = "o" .. string.rep("=", math.max(0, w - 2)) .. "o"
+  local bot = "o" .. string.rep("=", math.max(0, w - 2)) .. "o"
+  monWrite(out, 1, 1, top, pal.rivet, pal.bg)
+  monWrite(out, 1, h, bot, pal.rivet, pal.bg)
+  for y = 2, h - 1 do
+    monWrite(out, 1, y, "|", pal.frame, pal.bg)
+    monWrite(out, w, y, "|", pal.frame, pal.bg)
+  end
+  -- Corner + side rivets
+  monWrite(out, 1, 1, "o", pal.rivet, pal.bg)
+  monWrite(out, w, 1, "o", pal.rivet, pal.bg)
+  monWrite(out, 1, h, "o", pal.rivet, pal.bg)
+  monWrite(out, w, h, "o", pal.rivet, pal.bg)
+  if h >= 8 then
+    local mid = math.floor(h / 2)
+    for _, y in ipairs({ 3, mid, h - 2 }) do
+      if y > 1 and y < h then
+        monWrite(out, 1, y, "+", pal.rivet, pal.bg)
+        monWrite(out, w, y, "+", pal.rivet, pal.bg)
+      end
+    end
+  end
+  if title and h >= 3 and w >= 8 then
+    local t = " " .. tostring(title) .. " "
+    if #t > w - 4 then t = t:sub(1, w - 4) end
+    local x = math.max(2, math.floor((w - #t) / 2) + 1)
+    monWrite(out, x, 1, t, pal.accent, pal.bg)
   end
 end
 
---- Draw fill % + rate on attached monitor. fill/rsOn optional.
+--- Brass pressure-tube bar with tick marks under the glass.
+local function drawBrassTube(out, x, y, ww, pct, fillFg, pal, color)
+  local W = select(1, out.getSize())
+  ww = math.min(ww, W - x + 1)
+  if ww < 4 then return end
+  pct = math.max(0, math.min(100, tonumber(pct) or 0))
+  local inner = ww - 2
+  local filled = math.floor((pct / 100) * inner + 0.5)
+  monWrite(out, x, y, "[", pal.iron, pal.bg)
+  monWrite(out, x + 1, y, string.rep(" ", inner), pal.steam, pal.soot)
+  if filled > 0 then
+    -- Mixed brass fill chars for a tube look
+    local chars = {}
+    for i = 1, filled do
+      if i == filled then
+        chars[i] = ">"
+      elseif (i % 3) == 0 then
+        chars[i] = "#"
+      else
+        chars[i] = "="
+      end
+    end
+    monWrite(out, x + 1, y, table.concat(chars), fillFg, pal.soot)
+  end
+  monWrite(out, x + ww - 1, y, "]", pal.iron, pal.bg)
+  -- Tick marks on row below when space allows (caller may use y+1)
+  return inner
+end
+
+local function drawTubeTicks(out, x, y, inner, pal)
+  if inner < 4 then return end
+  local ticks = {}
+  for i = 1, inner do
+    local p = (i / inner) * 100
+    if math.abs(p - 0) < 0.1 or math.abs(p - 50) < (100 / inner)
+       or math.abs(p - 100) < 0.1 or i == 1 or i == inner
+       or math.abs(p - 25) < (100 / inner) or math.abs(p - 75) < (100 / inner) then
+      ticks[i] = "|"
+    else
+      ticks[i] = "-"
+    end
+  end
+  monWrite(out, x, y, "[", pal.dim, pal.bg)
+  monWrite(out, x + 1, y, table.concat(ticks), pal.copper, pal.bg)
+  monWrite(out, x + inner + 1, y, "]", pal.dim, pal.bg)
+end
+
+--- Small horizontal rate meter (items/min), needle-ish marker.
+local function drawRateMeter(out, x, y, ww, rate, pal, color)
+  local W = select(1, out.getSize())
+  ww = math.min(ww, W - x + 1)
+  if ww < 5 then return end
+  local inner = ww - 2
+  monWrite(out, x, y, "{", pal.iron, pal.bg)
+  monWrite(out, x + 1, y, string.rep(".", inner), pal.dim, pal.soot)
+  monWrite(out, x + ww - 1, y, "}", pal.iron, pal.bg)
+  -- Center tick
+  local mid = x + 1 + math.floor((inner - 1) / 2)
+  monWrite(out, mid, y, "|", pal.rivet, pal.soot)
+  if not rate then return end
+  local it = rate.itemsPerMin or 0
+  -- Map roughly ±120 it/m across the meter
+  local span = 120
+  local t = math.max(-1, math.min(1, it / span))
+  local pos = math.floor(((t + 1) / 2) * (inner - 1) + 0.5)
+  local nx = x + 1 + pos
+  local nfg = rateColor(rate)
+  if not color then nfg = pal.steam end
+  monWrite(out, nx, y, "*", nfg, pal.soot)
+end
+
+local function boxCenter(out, boxX, boxW, y, text, fg, bg)
+  text = tostring(text or "")
+  local x = boxX + math.max(0, math.floor((boxW - #text) / 2))
+  monWrite(out, x, y, text, fg, bg)
+end
+
+--- Arc-style circular gauge approximated with character cells.
+--- Layout (width ~11–15, height 5):
+---   .-'---'-.     ticks + rim
+---  /    ^    \    needle toward fill %
+--- |   XX%     |   big readout
+---  \         /
+---   '-.___.-'
+local function drawArcGauge(out, x, y, gw, gh, pct, fillFg, pal, color)
+  local W, H = out.getSize()
+  if gw < 9 or gh < 4 then return false end
+  if x + gw - 1 > W or y + gh - 1 > H then
+    gw = math.min(gw, W - x + 1)
+    gh = math.min(gh, H - y + 1)
+  end
+  if gw < 9 or gh < 4 then return false end
+  pct = math.max(0, math.min(100, tonumber(pct) or 0))
+
+  local function place(row, text, fg, bg)
+    text = tostring(text or "")
+    if #text > gw then text = text:sub(1, gw) end
+    boxCenter(out, x, gw, row, text, fg, bg)
+    return text
+  end
+
+  -- Rim / arc rows
+  local rim = string.rep("-", math.max(3, gw - 4))
+  place(y, ".-" .. rim .. "-.", pal.frame, pal.bg)
+
+  -- Tick row with needle tip
+  local tickInner = math.max(3, gw - 4)
+  local ticks = {}
+  for i = 1, tickInner do ticks[i] = "-" end
+  ticks[1] = "0"
+  if tickInner >= 5 then ticks[math.floor(tickInner / 2) + 1] = "^" end
+  ticks[tickInner] = "F"
+  local ni = math.max(1, math.min(tickInner, math.floor((pct / 100) * (tickInner - 1) + 0.5) + 1))
+  ticks[ni] = "v"
+  local tickLine = place(y + 1, "/" .. table.concat(ticks) .. "\\", pal.rivet, pal.bg)
+  local needleX = x + math.floor((gw - #tickLine) / 2) + ni
+  monWrite(out, needleX, y + 1, "v", fillFg, pal.bg)
+
+  local pctText = string.format("%d%%", pct)
+  if gh >= 5 then
+    place(y + 2, "|" .. string.rep(" ", math.max(0, gw - 2)) .. "|", pal.frame, pal.bg)
+    boxCenter(out, x, gw, y + 2, pctText, fillFg, pal.bg)
+    place(y + 3, "\\_" .. string.rep("_", math.max(1, gw - 4)) .. "_/", pal.copper, pal.bg)
+    if gh >= 6 then
+      boxCenter(out, x, gw, y + 4, "GAUGE", pal.copper, pal.bg)
+    end
+  else
+    boxCenter(out, x, gw, y + 2, pctText, fillFg, pal.bg)
+    place(y + 3, "'-" .. string.rep("=", math.max(1, gw - 4)) .. "-'", pal.copper, pal.bg)
+  end
+  return true
+end
+
+--- Compact semicircle for narrow panels.
+local function drawMiniArc(out, x, y, ww, pct, fillFg, pal)
+  pct = math.max(0, math.min(100, tonumber(pct) or 0))
+  local inner = math.max(3, ww - 2)
+  local filled = math.floor((pct / 100) * inner + 0.5)
+  local chars = {}
+  for i = 1, inner do
+    if i <= filled then
+      chars[i] = (i == filled) and "v" or "="
+    else
+      chars[i] = "-"
+    end
+  end
+  monWrite(out, x, y, "(" .. table.concat(chars) .. ")", pal.frame, pal.bg)
+  if filled > 0 then
+    monWrite(out, x + filled, y, (filled == inner and "=" or "v"), fillFg, pal.bg)
+  end
+end
+
+--- Steampunk brass instrument panel. fill/rsOn optional.
 local function drawMonitor(fill, rsOn)
-  local mon = findMonitor()
-  if not mon then return false, "no monitor" end
+  local out, kind = resolveDisplay()
+  if not out then return false, "no monitor / color term" end
 
   if not fill and cfg.storage then
     fill = storageFill(cfg.storage)
@@ -362,57 +608,154 @@ local function drawMonitor(fill, rsOn)
   end
 
   local rate = fillRate()
+  local color = outIsColor(out)
+  local pal = steamPalette(color)
 
-  pcall(function()
-    if mon.setTextScale then
-      -- Prefer largest scale that fits % + rate + footer
-      local chosen = 0.5
-      for _, scale in ipairs({ 5, 4, 3, 2, 1, 0.5 }) do
-        mon.setTextScale(scale)
-        local ww, hh = mon.getSize()
-        if ww >= 5 and hh >= 4 then
-          chosen = scale
-          break
+  if kind == "monitor" then
+    pcall(function()
+      if out.setTextScale then
+        local chosen = 0.5
+        for _, scale in ipairs({ 2, 1, 0.5 }) do
+          out.setTextScale(scale)
+          local ww, hh = out.getSize()
+          if ww >= 26 and hh >= 12 then
+            chosen = scale
+            break
+          end
         end
+        out.setTextScale(chosen)
       end
-      mon.setTextScale(chosen)
-    end
-  end)
+    end)
+  end
 
-  local w, h = mon.getSize()
-  if mon.setBackgroundColor then mon.setBackgroundColor(colors.black) end
-  mon.clear()
+  local w, h = out.getSize()
+  if out.setBackgroundColor then out.setBackgroundColor(pal.bg) end
+  out.clear()
 
   local pct = fill and fill.pct or 0
-  local fg = fillColor(pct)
+  local gfg = gaugeColor(pct, pal, color)
   local pctText = fill and string.format("%d%%", pct) or "--%"
   local rateText = formatRate(rate)
   local rfg = rateColor(rate)
+  if not color then rfg = pal.steam end
 
-  monCenter(mon, 1, "STORAGE", colors.lightGray, colors.black)
+  local band = ("BAND stop%d/run%d"):format(cfg.offPct or 60, cfg.onPct or 20)
+  local bins = fill and ("SLOTS %d/%d"):format(fill.used, fill.size) or "SLOTS --/--"
+  local stock = "STOCK " .. rateText
+  local x0 = 2
+  local innerW = w - 2
 
-  if h >= 6 then
-    local mid = math.floor(h / 2)
-    monCenter(mon, mid - 1, pctText, fg, colors.black)
-    monCenter(mon, mid, rateText:sub(1, w), rfg, colors.black)
-    if fill then
-      monCenter(mon, mid + 1, ("%d/%d slots"):format(fill.used, fill.size),
-        colors.white, colors.black)
+  -- Tiny screens
+  if w < 12 or h < 5 then
+    drawFrame(out, pal, "GAUGE")
+    monCenter(out, math.max(2, math.floor(h / 2)), pctText, gfg, pal.bg)
+    if h >= 4 and w >= 6 then
+      monWrite(out, 2, h - 1, "RS", pal.dim, pal.bg)
+      drawRsLamp(out, 4, h - 1, rsOn, pal, color)
     end
-    local barY = mid + 2
-    if barY < h then drawBar(mon, barY, pct, fg) end
-  elseif h >= 4 then
-    monCenter(mon, 2, pctText, fg, colors.black)
-    monCenter(mon, 3, rateText:sub(1, w), rfg, colors.black)
-    if h >= 5 then drawBar(mon, 4, pct, fg) end
-  else
-    monCenter(mon, math.max(2, math.floor(h / 2)), pctText, fg, colors.black)
+    return true
   end
 
-  if h >= 3 then
-    local rs = (rsOn == nil) and "?" or (rsOn and "ON" or "OFF")
-    local foot = ("RS %s  on%d/off%d"):format(rs, cfg.onPct or 20, cfg.offPct or 60)
-    monCenter(mon, h, foot:sub(1, w), colors.gray, colors.black)
+  drawFrame(out, pal, "BRASS PANEL")
+
+  --------------------------------------------------------------------------
+  -- Large instrument board (wide + tall)
+  --------------------------------------------------------------------------
+  if w >= 28 and h >= 12 then
+    -- Left: arc gauge · Right: meters + clutch lamp
+    local gaugeW = math.min(15, math.floor(innerW * 0.45))
+    local gaugeH = math.min(6, h - 5)
+    drawArcGauge(out, x0, 2, gaugeW, gaugeH, pct, gfg, pal, color)
+
+    local rx = x0 + gaugeW + 1
+    local rw = w - rx
+    if rw < 8 then rx = x0; rw = innerW end
+
+    monWrite(out, rx, 2, "PRESSURE", pal.copper, pal.bg)
+    drawBrassTube(out, rx, 3, rw, pct, gfg, pal, color)
+    if h >= 14 then
+      drawTubeTicks(out, rx, 4, math.max(1, rw - 2), pal)
+    end
+
+    monWrite(out, rx, 5, "STOCK", pal.copper, pal.bg)
+    monWrite(out, rx, 6, rateText:sub(1, rw), rfg, pal.bg)
+    drawRateMeter(out, rx, 7, rw, rate, pal, color)
+
+    monWrite(out, rx, 9, "CLUTCH", pal.copper, pal.bg)
+    drawRsLamp(out, rx + 7, 9, rsOn, pal, color)
+
+    monWrite(out, x0, h - 2, bins:sub(1, innerW), pal.iron, pal.bg)
+    monWrite(out, x0, h - 1, band:sub(1, innerW), pal.dim, pal.bg)
+
+  --------------------------------------------------------------------------
+  -- Medium board
+  --------------------------------------------------------------------------
+  elseif h >= 10 then
+    monWrite(out, x0, 2, "GAUGE", pal.copper, pal.bg)
+    if w >= 20 and h >= 12 then
+      -- Side-by-side: arc left, meters right
+      local gw = math.min(13, math.floor(innerW * 0.5))
+      drawArcGauge(out, x0, 3, gw, 5, pct, gfg, pal, color)
+      local rx = x0 + gw + 1
+      local rw = w - rx - 1
+      monWrite(out, rx, 3, "TUBE", pal.copper, pal.bg)
+      drawBrassTube(out, rx, 4, rw, pct, gfg, pal, color)
+      monWrite(out, rx, 6, "STOCK", pal.copper, pal.bg)
+      monWrite(out, rx, 7, rateText:sub(1, rw), rfg, pal.bg)
+      drawRateMeter(out, rx, 8, rw, rate, pal, color)
+      monWrite(out, rx, 9, "RS", pal.dim, pal.bg)
+      drawRsLamp(out, rx + 3, 9, rsOn, pal, color)
+    elseif w >= 16 then
+      drawArcGauge(out, x0, 3, math.min(13, innerW), 4, pct, gfg, pal, color)
+      drawBrassTube(out, x0, 7, innerW, pct, gfg, pal, color)
+      monWrite(out, x0, 8, stock:sub(1, math.max(1, innerW - 6)), rfg, pal.bg)
+      monWrite(out, w - 7, 8, "RS", pal.dim, pal.bg)
+      drawRsLamp(out, w - 5, 8, rsOn, pal, color)
+      if h >= 11 then
+        drawRateMeter(out, x0, 9, math.min(innerW, 16), rate, pal, color)
+      end
+    else
+      monCenter(out, 3, pctText, gfg, pal.bg)
+      drawMiniArc(out, x0, 4, innerW, pct, gfg, pal)
+      drawBrassTube(out, x0, 5, innerW, pct, gfg, pal, color)
+      monWrite(out, x0, 6, stock:sub(1, math.max(1, innerW - 6)), rfg, pal.bg)
+      monWrite(out, w - 7, 6, "RS", pal.dim, pal.bg)
+      drawRsLamp(out, w - 5, 6, rsOn, pal, color)
+      drawRateMeter(out, x0, 7, math.min(innerW, 14), rate, pal, color)
+    end
+    monWrite(out, x0, h - 2, bins:sub(1, innerW), pal.iron, pal.bg)
+    monWrite(out, x0, h - 1, band:sub(1, innerW), pal.dim, pal.bg)
+
+  --------------------------------------------------------------------------
+  -- Compact (h 7–9)
+  --------------------------------------------------------------------------
+  elseif h >= 7 then
+    monWrite(out, x0, 2, "GAUGE", pal.copper, pal.bg)
+    monCenter(out, 3, pctText, gfg, pal.bg)
+    if w >= 14 then
+      drawMiniArc(out, x0, 4, innerW, pct, gfg, pal)
+      drawBrassTube(out, x0, 5, innerW, pct, gfg, pal, color)
+    else
+      drawBrassTube(out, x0, 4, innerW, pct, gfg, pal, color)
+    end
+    local stockLine = stock
+    monWrite(out, x0, h - 2, stockLine:sub(1, math.max(1, innerW - 6)), rfg, pal.bg)
+    monWrite(out, w - 7, h - 2, "RS", pal.dim, pal.bg)
+    drawRsLamp(out, w - 5, h - 2, rsOn, pal, color)
+    monWrite(out, x0, h - 1, (bins .. " " .. band):sub(1, innerW), pal.dim, pal.bg)
+
+  --------------------------------------------------------------------------
+  -- Short (h 5–6)
+  --------------------------------------------------------------------------
+  else
+    monCenter(out, 2, pctText, gfg, pal.bg)
+    drawBrassTube(out, x0, 3, innerW, pct, gfg, pal, color)
+    monWrite(out, x0, 4, stock:sub(1, math.max(1, innerW - 6)), rfg, pal.bg)
+    monWrite(out, w - 7, 4, "RS", pal.dim, pal.bg)
+    drawRsLamp(out, w - 5, 4, rsOn, pal, color)
+    if h >= 6 then
+      monWrite(out, x0, 5, band:sub(1, innerW), pal.dim, pal.bg)
+    end
   end
 
   return true
@@ -573,25 +916,25 @@ end
 local function cmdOn(pct)
   local n = clampPct(pct)
   if not n then
-    print("Usage: on <percent>   — turn redstone ON at this fill %")
-    print(("  current on=%d%%  off=%d%%"):format(cfg.onPct or 20, cfg.offPct or 60))
+    print("Usage: on <percent>   — resume feed at/below this fill %")
+    print(("  current run(on)=%d%%  stop(off)=%d%%"):format(cfg.onPct or 20, cfg.offPct or 60))
     return
   end
   cfg.onPct = n
   saveCfg()
-  print(("on %d%%  (off %d%%)"):format(cfg.onPct, cfg.offPct or 60))
+  print(("on %d%% resume feed  (off %d%% stop)"):format(cfg.onPct, cfg.offPct or 60))
 end
 
 local function cmdOff(pct)
   local n = clampPct(pct)
   if not n then
-    print("Usage: off <percent>  — turn redstone OFF at this fill %")
-    print(("  current on=%d%%  off=%d%%"):format(cfg.onPct or 20, cfg.offPct or 60))
+    print("Usage: off <percent>  — stop feed at/above this fill %")
+    print(("  current run(on)=%d%%  stop(off)=%d%%"):format(cfg.onPct or 20, cfg.offPct or 60))
     return
   end
   cfg.offPct = n
   saveCfg()
-  print(("off %d%%  (on %d%%)"):format(cfg.offPct, cfg.onPct or 20))
+  print(("off %d%% stop feed  (on %d%% resume)"):format(cfg.offPct, cfg.onPct or 20))
 end
 
 local function cmdInvert(arg)
@@ -630,16 +973,15 @@ local function cmdStatus()
     print("  output:     (unbound)")
   end
   local onP, offP = cfg.onPct or 20, cfg.offPct or 60
+  local invNote = cfg.invert and " (inverted)" or ""
   if onP < offP then
-    print(("  band:       ON <= %d%% , OFF >= %d%%%s"):format(
-      onP, offP, cfg.invert and " (inverted)" or ""))
+    print(("  band:       stop >= %d%% , resume <= %d%%%s"):format(offP, onP, invNote))
   elseif onP > offP then
-    print(("  band:       ON >= %d%% , OFF <= %d%%%s"):format(
-      onP, offP, cfg.invert and " (inverted)" or ""))
+    print(("  band:       stop >= %d%% , resume <= %d%%%s"):format(onP, offP, invNote))
   else
-    print(("  band:       trip @ %d%%%s"):format(
-      onP, cfg.invert and " (inverted)" or ""))
+    print(("  band:       stop >= %d%%%s"):format(offP, invNote))
   end
+  print("  polarity:   Create default — rs ON=stop feed, OFF=run (use invert if wired opposite)")
   print(("  interval:   %.1fs"):format(cfg.interval or 1))
 
   if cfg.storage then
@@ -650,7 +992,7 @@ local function cmdStatus()
       local want = desiredOn(fill)
       local applied = (want ~= cfg.invert)
       print(("  latched:    %s → redstone %s"):format(
-        want and "ON" or "OFF", applied and "ON" or "OFF"))
+        want and "STOP" or "RUN", applied and "ON" or "OFF"))
       recordFill(fill)
       local rate = fillRate()
       if rate then
@@ -658,7 +1000,10 @@ local function cmdStatus()
       else
         print("  rate:       (need a few seconds of samples)")
       end
-      pcall(drawMonitor, fill, applied)
+      -- Don't paint over console status on the advanced term; monitor only here.
+      if findMonitor() then
+        pcall(drawMonitor, fill, applied)
+      end
     else
       print("  fill:       " .. tostring(err))
     end
@@ -667,10 +1012,13 @@ local function cmdStatus()
   if cur ~= nil then
     print(("  redstone:   %s (%s)"):format(cur and "ON" or "OFF", src))
   end
-  if findMonitor() then
-    print("  monitor:    attached (fill % shown)")
+  local _, kind = resolveDisplay()
+  if kind == "monitor" then
+    print("  display:    steampunk panel (monitor)")
+  elseif kind == "term" then
+    print("  display:    steampunk panel (advanced term via run/monitor)")
   else
-    print("  monitor:    (none)")
+    print("  display:    (attach monitor or use advanced PC)")
   end
 end
 
@@ -706,29 +1054,31 @@ Storage Clutch — Sophisticated Storage → Create clutch
   bind redstone <side>         local PC face → dust → clutch
   bind integrator <name> [side]
                                remote Integrator (side faces clutch)
-  on <percent>                 turn ON at this fill %  (default 20)
-  off <percent>                turn OFF at this fill % (default 60)
-  invert [on|off]              flip ON/OFF meaning
+  on <percent>                 resume feed at/below this fill % (default 20)
+  off <percent>                stop feed at/above this fill %  (default 60)
+  invert [on|off]              flip redstone polarity
   interval <seconds>
   status
-  monitor                      redraw fill % on attached screen
+  monitor                      redraw steampunk instrument panel
   test on|off                  force output (ignores invert)
   run                          watch loop (Ctrl+T to stop)
   help
 
-  Default band: ON at <=20%, OFF at >=60%, hold in between.
+  Default (Create: power=stop): stop >=60% (rs ON), resume <=20% (rs OFF),
+  hold in between. invert if powered=run instead.
 ]])
   print("Wired modems share peripherals only — not redstone.")
   print("Use a local face OR an Advanced Peripherals Redstone Integrator.")
-  print("Attach a monitor to the PC to show fill % and rate.")
+  print("Display: color monitor or advanced PC — brass gauges + RS lamp cell.")
+  print("Fill % is slot occupancy (used/size), not item-count fullness.")
 end
 
 local function cmdMonitor()
   local ok, err = drawMonitor()
   if ok then
-    print("Monitor updated.")
+    print("Instrument panel updated.")
   else
-    print("Monitor: " .. tostring(err or "failed"))
+    print("Display: " .. tostring(err or "failed"))
   end
 end
 
@@ -754,30 +1104,41 @@ local function cmdRun()
     return
   end
   rateSamples = {} -- fresh rate window when starting watch
-  if findMonitor() then
-    print("Monitor: fill % + rate")
+  local _, kind = resolveDisplay()
+  if kind == "monitor" then
+    print("Steampunk panel → monitor")
+  elseif kind == "term" then
+    print("Steampunk panel → this screen (Ctrl+T to stop)")
   else
-    print("No monitor attached — console only")
+    print("No color display — console only")
   end
   print(("Watching %s — Ctrl+T to stop"):format(cfg.storage))
   local last = nil
+  local useTermUi = (kind == "term")
   while true do
     local ok, a, b, c = applyOnce()
     if ok then
       local fill, on, src = a, b, c
-      local rate = fillRate()
-      local rateStr = rate and formatRate(rate) or "rate …"
-      local line = ("%s  %3d%%  %s  %d/%d  rs=%s"):format(
-        os.date("%H:%M:%S"), fill.pct, rateStr, fill.used, fill.size, on and "ON" or "OFF")
-      if line ~= last then
-        print(line)
-        last = line
+      if not useTermUi then
+        local rate = fillRate()
+        local rateStr = rate and formatRate(rate) or "rate …"
+        local line = ("%s  %3d%%  %s  %d/%d  rs=%s"):format(
+          os.date("%H:%M:%S"), fill.pct, rateStr, fill.used, fill.size, on and "ON" or "OFF")
+        if line ~= last then
+          print(line)
+          last = line
+        end
       end
     else
-      print(os.date("%H:%M:%S") .. "  ERR " .. tostring(a))
+      if not useTermUi then
+        print(os.date("%H:%M:%S") .. "  ERR " .. tostring(a))
+      end
       last = nil
       pcall(drawMonitor, nil, nil)
     end
+    -- Re-resolve in case a monitor is attached mid-run
+    local _, k2 = resolveDisplay()
+    useTermUi = (k2 == "term")
     sleep(tonumber(cfg.interval) or 1)
   end
 end

@@ -25,7 +25,7 @@ A wireless dispatch system for Minecraft's **CC: Tweaked** mod (active packages)
 - **`games/managers/currency_manager.lua`** — casino ledger + vault; one station barrel per computer ID (deposit + withdraw).
 - **`games/managers/casino_atm.lua`** — casino station ATM (barrel deposit/withdraw via mesh; Create legacy optional).
 - **`storage/managers/storage_atm.lua`** — solo storage ATM (wired modem ↔ vault; no ticker/casino).
-- **`storage/managers/storage_clutch.lua`** — watch Sophisticated Storage fill % → redstone for a Create clutch (local face or AP Redstone Integrator on the wired network).
+- **`storage/managers/storage_clutch.lua`** — watch Sophisticated Storage fill % → redstone for a Create clutch (local face or AP Redstone Integrator); steampunk instrument panel (arc gauge, brass tube, rate meter, RS lamp) on color monitor / advanced PC.
 - **`games_install.lua`** — **Games-only** installer (separate from the fleet installer).
 - **`github_install.lua`** — Fleet / Titan role installer (routers, quarry, admin, …).
 - **`lib/titan.lua`** — shared library (protocol, messaging, navigation).
@@ -720,11 +720,11 @@ run
 
 Or local: `bind redstone back` instead of `bind integrator …`.
 
-- **`on 20`** / **`off 60`** — hysteresis band (default ON ≤20%, OFF ≥60%; holds in between)  
-- **invert** — flip polarity if your clutch is wired the other way  
+- **`on 20`** / **`off 60`** — hysteresis: resume feed ≤20%, stop feed ≥60% (holds in between). Create default: stop = redstone ON (clutch engaged), resume = OFF; use **invert** if powered = run  
+- **invert** — flip redstone polarity if your clutch is wired the other way  
 - **test on|off** — force the output to verify wiring  
-- **run** — poll loop; monitor shows fill % + items/min rate (Ctrl+T to stop)  
-- **monitor** — redraw the screen once
+- **run** — poll loop; steampunk instrument panel on color monitor or advanced term (Ctrl+T to stop): arc fill gauge, brass pressure tube, items/min meter, slots, band; **RS** state is a single green (ON) / red (OFF) lamp cell  
+- **monitor** — redraw the instrument panel once
 
 ## Storage ATM (wired modem ↔ vault)
 
