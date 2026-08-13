@@ -1,6 +1,6 @@
 --[[
   storage/managers/storage_clutch.lua  -  Storage fill → Create clutch
-  Titan-Version: 1.7.1
+  Titan-Version: 1.7.2
 
   Reads a Sophisticated Storage (or any inventory) over the wired modem
   network and drives a Create clutch via redstone.
@@ -23,6 +23,9 @@
     Latch (`latchedOn` in storage_clutch.cfg) persists across reboots so
     the hold band resumes correctly (default RUN / latchedOn=false).
 
+  Boot: when storage + redstone output are bound, `run` starts automatically
+  (autoRun=true in cfg; `autorun off` to disable and stay at the `>` prompt).
+
   Display: steampunk board (brass header, riveted panels, pressure gauge,
   status chips, RS lamp cell) on an attached color monitor, or the
   advanced computer term when no monitor is present.
@@ -36,11 +39,12 @@
     off <percent>                        -- stop feed at/above this fill %
     invert on|off
     interval <seconds>
+    autorun on|off                       -- auto-start watch on boot (default on)
     run | status | monitor | test on|off | help
 ]]
 
 local LOCAL_CFG = "storage_clutch.cfg"
-local VERSION = "1.7.1"
+local VERSION = "1.7.2"
 
 local cfg = {
   storage = nil,           -- inventory peripheral name
@@ -58,6 +62,8 @@ local cfg = {
   -- Last desired redstone state (before invert) for the hysteresis band.
   -- Persisted in storage_clutch.cfg. true = STOP feed; false = RUN feed.
   latchedOn = false,
+  -- Start the watch loop (`run`) automatically when fully bound (boot / launch).
+  autoRun = true,
 }
 
 -- Sliding window for fill-rate (pct/min, items/min)
@@ -98,6 +104,14 @@ local function loadCfg()
   if type(cfg.latchedOn) ~= "boolean" then
     cfg.latchedOn = false
   end
+  -- Auto-start watch on boot (default on for older cfgs missing the key)
+  if type(cfg.autoRun) ~= "boolean" then
+    cfg.autoRun = true
+  end
+end
+
+local function isFullyBound()
+  return cfg.storage and (cfg.rsSide or cfg.integrator)
 end
 
 local function saveCfg()
@@ -1007,6 +1021,22 @@ local function cmdInterval(sec)
   print(("interval: %.1fs"):format(cfg.interval))
 end
 
+local function cmdAutoRun(arg)
+  arg = tostring(arg or ""):lower()
+  if arg == "on" or arg == "true" or arg == "1" then
+    cfg.autoRun = true
+  elseif arg == "off" or arg == "false" or arg == "0" then
+    cfg.autoRun = false
+  else
+    print("Usage: autorun on|off")
+    print("  current: " .. ((cfg.autoRun ~= false) and "on" or "off"))
+    print("  When on, fully bound clutch starts `run` on boot/launch.")
+    return
+  end
+  saveCfg()
+  print("autorun: " .. (cfg.autoRun and "on" or "off"))
+end
+
 local function cmdStatus()
   print(("Storage Clutch v%s"):format(VERSION))
   print(("  storage:    %s"):format(cfg.storage or "(unbound)"))
@@ -1029,6 +1059,7 @@ local function cmdStatus()
   end
   print("  polarity:   Create default — rs ON=stop feed, OFF=run (use invert if wired opposite)")
   print(("  interval:   %.1fs"):format(cfg.interval or 1))
+  print(("  autorun:    %s"):format((cfg.autoRun ~= false) and "on" or "off"))
 
   if cfg.storage then
     local fill, err = storageFill(cfg.storage)
@@ -1104,6 +1135,7 @@ Storage Clutch — Sophisticated Storage → Create clutch
   off <percent>                stop feed at/above this fill %  (default 60)
   invert [on|off]              flip redstone polarity
   interval <seconds>
+  autorun on|off               auto-start run on boot (default on)
   status
   monitor                      redraw steampunk brass board
   test on|off                  force output (ignores invert)
@@ -1112,6 +1144,7 @@ Storage Clutch — Sophisticated Storage → Create clutch
 
   Default (Create: power=stop): stop >=60% (rs ON), resume <=20% (rs OFF),
   hold in between. invert if powered=run instead.
+  When storage + output are bound, run starts on boot (autorun off to disable).
 ]])
   print("Wired modems share peripherals only — not redstone.")
   print("Use a local face OR an Advanced Peripherals Redstone Integrator.")
@@ -1212,6 +1245,7 @@ local function dispatch(line)
   elseif cmd == "off" then cmdOff(args[2])
   elseif cmd == "invert" then cmdInvert(args[2])
   elseif cmd == "interval" then cmdInterval(args[2])
+  elseif cmd == "autorun" or cmd == "auto" then cmdAutoRun(args[2])
   elseif cmd == "status" or cmd == "stat" then cmdStatus()
   elseif cmd == "monitor" or cmd == "mon" then cmdMonitor()
   elseif cmd == "test" then cmdTest(args[2])
@@ -1231,13 +1265,20 @@ end
 
 -- Restore physical clutch from saved latch before the interactive loop
 -- (hold band would otherwise wait for the next threshold cross).
-if cfg.storage and (cfg.rsSide or cfg.integrator) then
+if isFullyBound() then
   pcall(setRedstone, cfg.latchedOn)
 end
 
 print(("Storage Clutch v%s — type help"):format(VERSION))
 if cfg.storage or cfg.rsSide or cfg.integrator then
   cmdStatus()
+end
+
+-- Auto-start watch loop when fully bound (typical: launched from startup).
+-- Ctrl+T stops the program (same as manual `run`). Unbound → stay at prompt.
+if cfg.autoRun ~= false and isFullyBound() then
+  print("Auto-run — Ctrl+T to stop  (autorun off to disable)")
+  cmdRun()
 end
 
 while true do
