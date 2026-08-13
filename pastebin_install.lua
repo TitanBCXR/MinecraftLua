@@ -1,6 +1,6 @@
 --[[
   pastebin_install.lua  -  Pastebin bootstrap installer for the Titan system
-  Titan-Version: 1.2.14
+  Titan-Version: 1.2.15
 
   Pulls the Titan files straight from Pastebin (no in-game host needed). Upload
   each file to pastebin.com once, paste its CODE into the table below, then
@@ -38,9 +38,11 @@ local CODES = {
   ["storage/managers/storage_manager.lua"] = "",
   ["storage/workers/storage_builder.lua"] = "",
   ["storage/managers/storage_atm.lua"] = "",
+  ["storage/managers/storage_clutch.lua"] = "",
   ["storage_manager.lua"] = "",
   ["storage_builder.lua"] = "",
   ["storage_atm.lua"] = "",
+  ["storage_clutch.lua"] = "",
   ["perimeter_sensor.lua"] = "",
   ["perimeter_manager.lua"] = "",
   ["tetris.lua"]    = "",
@@ -70,8 +72,8 @@ local KEEP_ALL = {
   "quarry/workers/cell_scanner.lua",
   "quarry/managers/offline_site.lua",
   "storage/managers/storage_manager.lua", "storage/workers/storage_builder.lua",
-  "storage/managers/storage_atm.lua",
-  "storage_manager.lua", "storage_builder.lua", "storage_atm.lua",
+  "storage/managers/storage_atm.lua", "storage/managers/storage_clutch.lua",
+  "storage_manager.lua", "storage_builder.lua", "storage_atm.lua", "storage_clutch.lua",
   "offline_miner.lua", "offline_site.lua", "exclude.txt",
   "perimeter_sensor.lua", "perimeter_manager.lua", "tetris.lua", "minesweeper.lua",
   "sandstorm.lua", "luigi_poker.lua", "higher_lower.lua", "slots.lua",
@@ -138,6 +140,8 @@ local STORAGE_MANAGERS = {
     files = { "lib/titan.lua", "storage/managers/storage_manager.lua", "storage_manager.lua" } },
   { key = "2", name = "Storage ATM (modem ↔ vault)", run = "storage/managers/storage_atm.lua",
     files = { "storage/managers/storage_atm.lua", "storage_atm.lua" } },
+  { key = "3", name = "Storage Clutch (fill → redstone)", run = "storage/managers/storage_clutch.lua",
+    files = { "storage/managers/storage_clutch.lua", "storage_clutch.lua" } },
 }
 
 local STORAGE = {
@@ -359,6 +363,8 @@ local LABELS = {
   ["storage/managers/storage_manager.lua"] = "StorageManager",
   ["storage/managers/storage_atm.lua"] = "StorageATM",
   ["storage_atm.lua"] = "StorageATM",
+  ["storage/managers/storage_clutch.lua"] = "StorageClutch",
+  ["storage_clutch.lua"] = "StorageClutch",
   ["storage/workers/storage_builder.lua"] = "StorageBuilder",
   ["perimeter_sensor.lua"] = "PerimSensor",
   ["perimeter_manager.lua"] = "PerimMgr",

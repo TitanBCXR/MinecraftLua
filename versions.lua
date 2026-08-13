@@ -5,11 +5,11 @@
   The console `packages` command shows these names + versions.
   Installers / OTA updates ship this file so devices know what they have.
 
-  Titan-Version: 1.7.19
+  Titan-Version: 1.7.20
 ]]
 
 return {
-  system = "1.7.19",
+  system = "1.7.20",
   packages = {
     ["lib/titan.lua"]      = "1.2.26",
     ["lib/casino.lua"]     = "1.0.1",
@@ -23,9 +23,9 @@ return {
     ["lib/router_hub_net.lua"] = "1.4.7",
     ["lib/router_hub_ui.lua"]  = "1.4.3",
     ["lib/router_hub_cmd.lua"] = "1.4.3",
-    ["install.lua"]        = "1.2.14",
-    ["github_install.lua"] = "1.2.17",
-    ["pastebin_install.lua"]= "1.2.14",
+    ["install.lua"]        = "1.2.15",
+    ["github_install.lua"] = "1.2.18",
+    ["pastebin_install.lua"]= "1.2.15",
     ["datacenter.lua"]     = "1.2.14",
     ["admin.lua"]          = "1.5.13",
     ["quarry/workers/offline_miner.lua"] = "1.8.1",
@@ -37,9 +37,11 @@ return {
     ["storage/managers/storage_manager.lua"] = "1.0.0",
     ["storage/workers/storage_builder.lua"] = "1.0.0",
     ["storage/managers/storage_atm.lua"] = "1.4.0",
+    ["storage/managers/storage_clutch.lua"] = "1.0.0",
     ["storage_manager.lua"] = "1.0.0",
     ["storage_builder.lua"] = "1.0.0",
     ["storage_atm.lua"] = "1.4.0",
+    ["storage_clutch.lua"] = "1.0.0",
     ["games/managers/currency_manager.lua"] = "1.1.6",
     ["currency_manager.lua"] = "1.1.6",
     ["games/managers/casino_atm.lua"] = "1.1.0",
@@ -55,7 +57,7 @@ return {
     ["games.lua"]          = "1.2.11",
     ["games_catalog.lua"]  = "1.0.9",
     ["games_install.lua"]  = "1.0.4",
-    ["host.lua"]           = "1.2.18",
+    ["host.lua"]           = "1.2.19",
     ["exclude.txt"]        = "1.0.1",
     ["versions.lua"]       = "1.7.19",
   },

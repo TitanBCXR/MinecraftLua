@@ -11,9 +11,9 @@ A wireless dispatch system for Minecraft's **CC: Tweaked** mod (active packages)
   - **Managers:** `quarry/managers/offline_site.lua` (cell site board + optional Geo Scanner)
   - Root `offline_miner.lua` / `offline_site.lua` are compat shims.
 - **Storage** (`storage/`) — installer submenu **s**:
-  - **Managers:** `storage/managers/storage_manager.lua` (Create vault + Sophisticated I/O)
+  - **Managers:** `storage/managers/storage_manager.lua` (Create vault + Sophisticated I/O) · `storage/managers/storage_atm.lua` · `storage/managers/storage_clutch.lua` (fill → Create clutch)
   - **Workers:** `storage/workers/storage_builder.lua` (places the vault cell)
-  - Root `storage_manager.lua` / `storage_builder.lua` are compat shims.
+  - Root `storage_manager.lua` / `storage_builder.lua` / `storage_atm.lua` / `storage_clutch.lua` are compat shims.
 - **`perimeter_sensor.lua` / `perimeter_manager.lua`** — Player Detector territory (one manager + admin alerts).
 - **`tetris.lua`** — Tetris for pocket / advanced PC + monitor (host LB via install host; note music; monitor bottom half = touch pad).
 - **`minesweeper.lua`** — Minesweeper for pocket / advanced PC + monitor (no modem; monitor bottom half = Open/Flag touch pad).
@@ -25,6 +25,7 @@ A wireless dispatch system for Minecraft's **CC: Tweaked** mod (active packages)
 - **`games/managers/currency_manager.lua`** — casino ledger + vault; one station barrel per computer ID (deposit + withdraw).
 - **`games/managers/casino_atm.lua`** — casino station ATM (barrel deposit/withdraw via mesh; Create legacy optional).
 - **`storage/managers/storage_atm.lua`** — solo storage ATM (wired modem ↔ vault; no ticker/casino).
+- **`storage/managers/storage_clutch.lua`** — watch Sophisticated Storage fill % → redstone for a Create clutch (local face or AP Redstone Integrator on the wired network).
 - **`games_install.lua`** — **Games-only** installer (separate from the fleet installer).
 - **`github_install.lua`** — Fleet / Titan role installer (routers, quarry, admin, …).
 - **`lib/titan.lua`** — shared library (protocol, messaging, navigation).
@@ -686,7 +687,42 @@ Header shows **CHIPS** (sum of player balances) and **VAULT** (physical coin ite
 # Storage (`storage/managers` + `storage/workers`)
 
 Installer: **s → Storage → Managers / Workers**. Root `storage_manager.lua` /
-`storage_builder.lua` / `storage_atm.lua` are thin shims.
+`storage_builder.lua` / `storage_atm.lua` / `storage_clutch.lua` are thin shims.
+
+## Storage Clutch (fill → Create clutch)
+
+Installer: **s → Storage → Managers → 3**. Watches a Sophisticated Storage
+inventory (any `inventory` peripheral on the wired network) and drives a
+Create clutch with redstone.
+
+**Wired modem cable does not carry redstone.** Pick one output path:
+
+```text
+A) Local face
+   [Sophisticated] --wired--> [PC] --redstone dust--> [Clutch]
+
+B) Remote (Advanced Peripherals Redstone Integrator)
+   [Sophisticated] --wired modem--+
+   [Integrator]    --wired modem--+-- cable -- [PC + wired modem]
+        |
+     [Clutch]   (Integrator face touching clutch / dust)
+```
+
+```text
+invs
+integrators
+bind storage sophisticatedstorage:chest_0
+bind integrator redstoneIntegrator_0 front
+when full 90
+run
+```
+
+Or local: `bind redstone back` instead of `bind integrator …`.
+
+- **when full|empty|above|below [pct]** — when redstone should be ON  
+- **invert** — flip polarity if your clutch is wired the other way  
+- **test on|off** — force the output to verify wiring  
+- **run** — poll loop (Ctrl+T to stop)
 
 ## Storage ATM (wired modem ↔ vault)
 

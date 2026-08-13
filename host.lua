@@ -1,6 +1,6 @@
 --[[
   host.lua  -  Titan install / update host + games leaderboards (CC: Tweaked)
-  Titan-Version: 1.2.18
+  Titan-Version: 1.2.19
 
   Run this on ONE computer that already has the Titan files (your "update
   server"). It serves those files over rednet so pockets and other devices can
@@ -66,9 +66,11 @@ local FILES = {
   "storage/managers/storage_manager.lua",
   "storage/workers/storage_builder.lua",
   "storage/managers/storage_atm.lua",
+  "storage/managers/storage_clutch.lua",
   "storage_manager.lua",
   "storage_builder.lua",
   "storage_atm.lua",
+  "storage_clutch.lua",
   "offline_miner.lua",
   "offline_site.lua",
   "perimeter_sensor.lua",
