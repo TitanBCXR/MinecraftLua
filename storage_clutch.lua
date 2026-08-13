@@ -1,6 +1,6 @@
 --[[
   Compat shim — Storage Clutch lives under storage/managers/.
-  Titan-Version: 1.3.0
+  Titan-Version: 1.3.1
 ]]
 local path = "storage/managers/storage_clutch.lua"
 if not fs.exists(path) then

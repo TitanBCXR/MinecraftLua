@@ -33,7 +33,7 @@
 ]]
 
 local LOCAL_CFG = "storage_clutch.cfg"
-local VERSION = "1.3.0"
+local VERSION = "1.3.1"
 
 local cfg = {
   storage = nil,           -- inventory peripheral name
@@ -258,14 +258,13 @@ local function recordFill(fill)
   end
 end
 
---- Returns { pctPerMin, itemsPerMin, ready } or nil if not enough samples
+--- Returns { itemsPerMin, ready } or nil if not enough samples
 local function fillRate()
   if #rateSamples < 2 then return nil end
   local a, b = rateSamples[1], rateSamples[#rateSamples]
   local dt = (b.t - a.t) / 1000
   if dt < 2 then return nil end
   return {
-    pctPerMin = ((b.pct - a.pct) / dt) * 60,
     itemsPerMin = ((b.items - a.items) / dt) * 60,
     dt = dt,
     ready = true,
@@ -274,23 +273,20 @@ end
 
 local function formatRate(rate)
   if not rate then return "rate …" end
-  local p = rate.pctPerMin
-  local sign = (p > 0.05 and "+") or (p < -0.05 and "") or ""
-  -- Show %/min primarily; add items/min when meaningful
-  local pctStr = string.format("%s%.1f%%/m", sign, p)
-  local it = rate.itemsPerMin
-  if math.abs(it) >= 1 then
-    local isign = (it > 0 and "+") or ""
-    return string.format("%s  %s%.0fit/m", pctStr, isign, it)
+  local it = rate.itemsPerMin or 0
+  if math.abs(it) < 0.5 then return "0 it/m" end
+  local sign = (it > 0 and "+") or ""
+  if math.abs(it) >= 100 then
+    return string.format("%s%.0f it/m", sign, it)
   end
-  return pctStr
+  return string.format("%s%.1f it/m", sign, it)
 end
 
 local function rateColor(rate)
   if not rate then return colors.gray end
-  local p = rate.pctPerMin
-  if p > 0.5 then return colors.lime
-  elseif p < -0.5 then return colors.orange
+  local it = rate.itemsPerMin or 0
+  if it > 1 then return colors.lime
+  elseif it < -1 then return colors.orange
   else return colors.lightGray
   end
 end
