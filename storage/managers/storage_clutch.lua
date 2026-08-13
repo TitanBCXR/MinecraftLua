@@ -1,6 +1,6 @@
 --[[
   storage/managers/storage_clutch.lua  -  Storage fill → Create clutch
-  Titan-Version: 1.0.0
+  Titan-Version: 1.1.0
 
   Reads a Sophisticated Storage (or any inventory) over the wired modem
   network and drives a Create clutch via redstone.
@@ -15,21 +15,23 @@
     [Clutch + Integrator] --wired modem--+-- cable -- [PC + wired modem]
     (or PC redstone face → dust → clutch)
 
-  Default logic: redstone ON when storage is full (stops Create feed).
+  Hysteresis (default): redstone ON at <= 20% fill, OFF at >= 60%.
+  Between those points the last state is held (no chatter).
 
   Setup:
     invs | integrators
     bind storage <side|name>
     bind redstone <side>                 -- local PC face
     bind integrator <name> [side]        -- remote Redstone Integrator
-    when full|empty|above|below [pct]
+    on <percent>                         -- turn ON at/below (or at/above)
+    off <percent>                        -- turn OFF at/above (or at/below)
     invert on|off
     interval <seconds>
     run | status | test on|off | help
 ]]
 
 local LOCAL_CFG = "storage_clutch.cfg"
-local VERSION = "1.0.0"
+local VERSION = "1.1.0"
 
 local cfg = {
   storage = nil,           -- inventory peripheral name
@@ -37,13 +39,16 @@ local cfg = {
   rsSide = nil,            -- local computer face
   integrator = nil,        -- redstoneIntegrator peripheral
   integratorSide = "front",
-  -- Logic
-  when = "full",           -- full | empty | above | below
-  threshold = 90,          -- percent for above/below (and full uses >= this)
+  -- Hysteresis: ON at onPct, OFF at offPct (hold between)
+  onPct = 20,
+  offPct = 60,
   invert = false,
   interval = 1,            -- seconds between polls
   label = nil,
 }
+
+-- Last desired state (before invert) for the hysteresis band
+local latchedOn = false
 
 local SIDES = {
   left = true, right = true, front = true, back = true, top = true, bottom = true,
@@ -59,6 +64,21 @@ local function loadCfg()
   if ok and type(d) == "table" then
     for k, v in pairs(d) do cfg[k] = v end
   end
+  -- Migrate legacy single-threshold configs
+  if (cfg.onPct == nil or cfg.offPct == nil) and cfg.threshold ~= nil then
+    local th = tonumber(cfg.threshold) or 90
+    local when = tostring(cfg.when or "full"):lower()
+    if when == "empty" or when == "below" then
+      cfg.onPct = cfg.onPct or math.min(th, 20)
+      cfg.offPct = cfg.offPct or math.max(th, 60)
+    else
+      -- old "full/above": ON when high → swap band
+      cfg.onPct = cfg.onPct or th
+      cfg.offPct = cfg.offPct or math.max(0, th - 30)
+    end
+  end
+  cfg.onPct = math.max(0, math.min(100, tonumber(cfg.onPct) or 20))
+  cfg.offPct = math.max(0, math.min(100, tonumber(cfg.offPct) or 60))
 end
 
 local function saveCfg()
@@ -170,19 +190,37 @@ local function storageFill(name)
   return { used = used, size = size, items = items, pct = pct }
 end
 
-local function conditionMet(fill)
-  local when = tostring(cfg.when or "full"):lower()
-  local th = tonumber(cfg.threshold) or 90
-  if when == "full" then
-    return fill.pct >= th or fill.used >= fill.size
-  elseif when == "empty" then
-    return fill.used == 0 or fill.pct <= (100 - th)
-  elseif when == "above" then
-    return fill.pct >= th
-  elseif when == "below" then
-    return fill.pct <= th
+local function desiredOn(fill)
+  local pct = fill.pct
+  local onP = tonumber(cfg.onPct) or 20
+  local offP = tonumber(cfg.offPct) or 60
+
+  if onP == offP then
+    -- single trip point
+    if onP <= 50 then
+      latchedOn = (pct <= onP)
+    else
+      latchedOn = (pct >= onP)
+    end
+    return latchedOn
   end
-  return fill.pct >= th
+
+  if onP < offP then
+    -- Low → ON, high → OFF (default: on 20 / off 60)
+    if pct <= onP then
+      latchedOn = true
+    elseif pct >= offP then
+      latchedOn = false
+    end
+  else
+    -- High → ON, low → OFF (e.g. on 80 / off 40)
+    if pct >= onP then
+      latchedOn = true
+    elseif pct <= offP then
+      latchedOn = false
+    end
+  end
+  return latchedOn
 end
 
 --------------------------------------------------------------------------------
@@ -331,28 +369,34 @@ local function cmdBindIntegrator(ref, side)
   print(("Integrator bound: %s (output %s)"):format(n, cfg.integratorSide))
 end
 
-local function cmdWhen(mode, pct)
-  mode = tostring(mode or ""):lower()
-  if mode ~= "full" and mode ~= "empty" and mode ~= "above" and mode ~= "below" then
-    print("Usage: when full|empty|above|below [percent]")
-    print("  full   — ON when fill >= threshold (default 90)")
-    print("  empty  — ON when empty / nearly empty")
-    print("  above  — ON when fill >= percent")
-    print("  below  — ON when fill <= percent")
+local function clampPct(n)
+  n = tonumber(n)
+  if not n then return nil end
+  return math.max(0, math.min(100, n))
+end
+
+local function cmdOn(pct)
+  local n = clampPct(pct)
+  if not n then
+    print("Usage: on <percent>   — turn redstone ON at this fill %")
+    print(("  current on=%d%%  off=%d%%"):format(cfg.onPct or 20, cfg.offPct or 60))
     return
   end
-  cfg.when = mode
-  if pct then
-    local n = tonumber(pct)
-    if n then cfg.threshold = math.max(0, math.min(100, n)) end
-  elseif mode == "full" then
-    cfg.threshold = cfg.threshold or 90
-  elseif mode == "empty" then
-    cfg.threshold = cfg.threshold or 90
-  end
+  cfg.onPct = n
   saveCfg()
-  print(("when %s (threshold %d%%)%s"):format(
-    cfg.when, cfg.threshold, cfg.invert and " [inverted]" or ""))
+  print(("on %d%%  (off %d%%)"):format(cfg.onPct, cfg.offPct or 60))
+end
+
+local function cmdOff(pct)
+  local n = clampPct(pct)
+  if not n then
+    print("Usage: off <percent>  — turn redstone OFF at this fill %")
+    print(("  current on=%d%%  off=%d%%"):format(cfg.onPct or 20, cfg.offPct or 60))
+    return
+  end
+  cfg.offPct = n
+  saveCfg()
+  print(("off %d%%  (on %d%%)"):format(cfg.offPct, cfg.onPct or 20))
 end
 
 local function cmdInvert(arg)
@@ -390,8 +434,17 @@ local function cmdStatus()
   else
     print("  output:     (unbound)")
   end
-  print(("  when:       %s @ %d%%%s"):format(
-    cfg.when, cfg.threshold, cfg.invert and " inverted" or ""))
+  local onP, offP = cfg.onPct or 20, cfg.offPct or 60
+  if onP < offP then
+    print(("  band:       ON <= %d%% , OFF >= %d%%%s"):format(
+      onP, offP, cfg.invert and " (inverted)" or ""))
+  elseif onP > offP then
+    print(("  band:       ON >= %d%% , OFF <= %d%%%s"):format(
+      onP, offP, cfg.invert and " (inverted)" or ""))
+  else
+    print(("  band:       trip @ %d%%%s"):format(
+      onP, cfg.invert and " (inverted)" or ""))
+  end
   print(("  interval:   %.1fs"):format(cfg.interval or 1))
 
   if cfg.storage then
@@ -399,10 +452,10 @@ local function cmdStatus()
     if fill then
       print(("  fill:       %d/%d slots (%d%%), %d items"):format(
         fill.used, fill.size, fill.pct, fill.items))
-      local want = conditionMet(fill)
+      local want = desiredOn(fill)
       local applied = (want ~= cfg.invert)
-      print(("  condition:  %s → redstone %s"):format(
-        want and "MET" or "not met", applied and "ON" or "OFF"))
+      print(("  latched:    %s → redstone %s"):format(
+        want and "ON" or "OFF", applied and "ON" or "OFF"))
     else
       print("  fill:       " .. tostring(err))
     end
@@ -428,6 +481,7 @@ local function cmdTest(arg)
   local ok, err = setRedstone(on)
   cfg.invert = saved
   if ok then
+    latchedOn = on  -- keep hysteresis in sync with forced state
     print("Redstone forced " .. (on and "ON" or "OFF"))
   else
     print("Failed: " .. tostring(err))
@@ -444,13 +498,16 @@ Storage Clutch — Sophisticated Storage → Create clutch
   bind redstone <side>         local PC face → dust → clutch
   bind integrator <name> [side]
                                remote Integrator (side faces clutch)
-  when full|empty|above|below [pct]
+  on <percent>                 turn ON at this fill %  (default 20)
+  off <percent>                turn OFF at this fill % (default 60)
   invert [on|off]              flip ON/OFF meaning
   interval <seconds>
   status
   test on|off                  force output (ignores invert)
   run                          watch loop (Ctrl+T to stop)
   help
+
+  Default band: ON at <=20%, OFF at >=60%, hold in between.
 ]])
   print("Wired modems share peripherals only — not redstone.")
   print("Use a local face OR an Advanced Peripherals Redstone Integrator.")
@@ -463,7 +520,7 @@ local function applyOnce()
   end
   local fill, err = storageFill(cfg.storage)
   if not fill then return false, err end
-  local want = conditionMet(fill)
+  local want = desiredOn(fill)
   local ok, outOrErr, src = setRedstone(want)
   if not ok then return false, outOrErr end
   return true, fill, outOrErr, src
@@ -514,7 +571,8 @@ local function dispatch(line)
     else
       print("bind storage|redstone|integrator …")
     end
-  elseif cmd == "when" then cmdWhen(args[2], args[3])
+  elseif cmd == "on" then cmdOn(args[2])
+  elseif cmd == "off" then cmdOff(args[2])
   elseif cmd == "invert" then cmdInvert(args[2])
   elseif cmd == "interval" then cmdInterval(args[2])
   elseif cmd == "status" or cmd == "stat" then cmdStatus()
