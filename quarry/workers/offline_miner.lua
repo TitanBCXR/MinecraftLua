@@ -1,6 +1,6 @@
 --[[
   offline_miner.lua  -  Local quarry turtle (optional site board)
-  Titan-Version: 1.8.1
+  Titan-Version: 1.8.2
 
   Place the turtle at the TOP-FRONT-LEFT corner of the dig, facing into the
   mine. That cell is origin 0,0,0:
@@ -11,8 +11,11 @@
 
   First boot (or `setup`):
     * Fuel chest is on the LEFT  → top up slot 16 with coal/charcoal/blocks only
-    * Storage chest is BEHIND    → dumps slots 1-14 (never 15 equipment / 16 fuel)
+    * Storage chest is BEHIND    → dumps slots 1-14 only (never select/drop slot 15 or 16)
     * Slot 15 = wireless modem / extra equipment
+    * Slot 16 = fuel stack; depot refill leaves ≥1 coal before resume
+    * Depot return only when cargo 1–14 is full OR fuel plan needs refuel
+      (not when a single empty cargo slot remains)
     * Pickaxe on turtle upgrade slot 2 (RIGHT) — modem only swaps with that side
       (left upgrade / chunk loader is never touched)
     * Site computer (optional) LEFT of the storage chest — cell fleet claims
@@ -66,7 +69,7 @@ local WORK_RESERVE = 48      -- keep digging only with this much above home cost
 local MIN_FUEL = 200
 local TRAFFIC_Y = -1         -- cruise / traffic layer (+Y = down, so -1 is one above origin)
 -- Keep in sync with Titan-Version header (label uses major.minor → V1.5-Miner12).
-local MINER_VERSION = "1.8.1"
+local MINER_VERSION = "1.8.2"
 -- "outbound" = to cell (overtake) | "homebound" = to origin (yield) | "dig" = wait/retry
 local travelIntent = "dig"
 -- Other miners' last known quarry-relative poses (rednet). Used to tell turtle vs mob/player.
@@ -443,34 +446,28 @@ local function cargoEmptyCount()
 end
 
 local function inventoryFull()
+  -- Cargo only (1–14). Slot 15 equipment / 16 fuel are reserved and ignored.
   return cargoEmptyCount() == 0
-end
-
--- Dump before 1–14 fill so dig overflow cannot land in empty slot 16.
-local function inventoryNearlyFull()
-  return cargoEmptyCount() <= 1
 end
 
 local function suckFuelIntoSlot16()
   protectFuelSlot()
   if turtle.getItemCount(FUEL_SLOT) > 0 and not slotIsCoal(FUEL_SLOT) then
-    selectCargoSlot()
-    return
-  end
-  turtle.select(FUEL_SLOT)
-  local space
-  if turtle.getItemCount(FUEL_SLOT) == 0 then
-    space = FUEL_KEEP
-  else
-    space = math.min(turtle.getItemSpace(FUEL_SLOT) or 0, FUEL_KEEP - turtle.getItemCount(FUEL_SLOT))
-  end
-  if space and space > 0 then
-    turtle.suck(space)
-  end
-  if turtle.getItemCount(FUEL_SLOT) > 0 and not slotIsCoal(FUEL_SLOT) then
     turtle.select(FUEL_SLOT)
     local dest = findEmptyCargoSlot()
     if dest then turtle.transferTo(dest) end
+  end
+  -- Pull until slot 16 holds a coal stack (up to FUEL_KEEP), never into 1–15.
+  while (turtle.getItemCount(FUEL_SLOT) == 0 or slotIsCoal(FUEL_SLOT))
+      and turtle.getItemCount(FUEL_SLOT) < FUEL_KEEP do
+    local need = FUEL_KEEP - turtle.getItemCount(FUEL_SLOT)
+    turtle.select(FUEL_SLOT)
+    if not turtle.suck(need) then break end
+    if turtle.getItemCount(FUEL_SLOT) > 0 and not slotIsCoal(FUEL_SLOT) then
+      turtle.select(FUEL_SLOT)
+      local dest = findEmptyCargoSlot()
+      if dest then turtle.transferTo(dest) else break end
+    end
   end
   protectFuelSlot()
 end
@@ -769,16 +766,12 @@ local function equipToolFromInventory(sideArg, quiet)
   return false, lastErr
 end
 
--- Dump mined goods to the chest behind. Never drops slot 16 (coal) or 15 (modem).
+-- Dump mined goods to the chest behind. Never select/drop/clear slot 16 (fuel)
+-- or slot 15 (modem). Contaminants in 16 move to cargo first, then dump from there.
 -- Also keeps pickaxes/tools in inventory so dump does not eat an unequipped pick.
 local function dumpToStorage()
   protectFuelSlot()
   faceBack()
-  -- Contaminants stuck in 16 when cargo was full: drop them with the ores.
-  if turtle.getItemCount(FUEL_SLOT) > 0 and not slotIsCoal(FUEL_SLOT) then
-    turtle.select(FUEL_SLOT)
-    turtle.drop()
-  end
   for s = 1, 14 do
     if turtle.getItemCount(s) > 0 then
       turtle.select(s)
@@ -795,8 +788,40 @@ local function dumpToStorage()
       end
     end
   end
+  -- Free cargo may exist now: move junk out of 16, then drop from cargo only.
+  if turtle.getItemCount(FUEL_SLOT) > 0 and not slotIsCoal(FUEL_SLOT) then
+    turtle.select(FUEL_SLOT)
+    local dest = findEmptyCargoSlot()
+    if dest then
+      turtle.transferTo(dest)
+      turtle.select(dest)
+      local d = itemDetail(dest)
+      if not (isToolItem(d) or isModemItem(d)) then
+        turtle.drop()
+      end
+    end
+  end
   protectFuelSlot()
   faceForward()
+  selectCargoSlot()
+end
+
+-- After a depot dump: refill slot 16 and refuse to leave empty-handed.
+local function refuelAtDepot()
+  suckFuelFromLeft()
+  suckFuelNearby()
+  if turtle.getItemCount(FUEL_SLOT) < 1 or not slotIsCoal(FUEL_SLOT) then
+    -- Second pass in case first suck hit a non-coal item.
+    suckFuelFromLeft()
+  end
+  local n = turtle.getItemCount(FUEL_SLOT)
+  if n < 1 or not slotIsCoal(FUEL_SLOT) then
+    print("Depot: slot 16 empty — stock coal in the LEFT chest.")
+    return false
+  end
+  print(("Leaving depot with %d coal in slot 16, tank=%s"):format(
+    n, tostring(turtle.getFuelLevel())))
+  return true
 end
 
 local function setupChests()
@@ -805,11 +830,11 @@ local function setupChests()
   print("Facing into the mine at top-front-left (origin 0,0,0)...")
   equipToolFromInventory(nil, true)
   dumpToStorage()
-  local fuel = suckFuelFromLeft()
+  refuelAtDepot()
   cfg.setupDone = true
   saveCfg()
   print(("Setup done. Tank=%s  coal in slot 16=%d  modem slot 15=%d"):format(
-    tostring(fuel), turtle.getItemCount(FUEL_SLOT), turtle.getItemCount(MODEM_SLOT)))
+    tostring(turtle.getFuelLevel()), turtle.getItemCount(FUEL_SLOT), turtle.getItemCount(MODEM_SLOT)))
   print("Origin locked at current pose (0,0,0 forward).")
 end
 
@@ -1387,11 +1412,11 @@ end
 -- Forward decl — filled after publishMine / siteReportProgress exist.
 local checkIn
 
--- Inventory full and/or fuel budget: return while we can still reach depot.
+-- Return to depot only when cargo 1–14 is full OR fuel plan says we must refuel.
 -- If short of home cost, suck mid-path chests; else SOS admin for a refuel station.
 local function manageInventory(resume)
   protectFuelSlot()
-  local full = inventoryFull() or inventoryNearlyFull()
+  local full = inventoryFull()
   local plan, fuel, home = fuelPlanNow()
 
   if plan == "ok" and not full then
@@ -1455,8 +1480,11 @@ local function manageInventory(resume)
     return false, "home"
   end
   dumpToStorage()
-  suckFuelFromLeft()
-  suckFuelNearby()
+  if not refuelAtDepot() then
+    if broadcastSos then broadcastSos("depot_empty_fuel") end
+    if needsFuelSos() then return false, "fuel" end
+    return false, "fuel"
+  end
   if needsFuelSos() and broadcastSos then
     broadcastSos("depot_empty_fuel")
     if needsFuelSos() then return false, "fuel" end
@@ -2810,7 +2838,7 @@ function site.finishJob(ok, err)
   if not needsFuelSos() then
     goHome()
     dumpToStorage()
-    suckFuelFromLeft()
+    refuelAtDepot()
     -- Refresh saved pose to depot so reboot doesn't think we're still in the hole.
     if activeJob then
       saveJobFile(activeJob)
@@ -3300,7 +3328,7 @@ function site.processRebandCycle()
       end
 
       dumpToStorage()
-      suckFuelFromLeft()
+      refuelAtDepot()
       equipToolFromInventory(nil, true)
       site.ensurePickReady(true)
 
@@ -4008,7 +4036,7 @@ function site.runCellClaim(claim, existingJob)
   site.ensureModemForComms(true)
   goHome()
   dumpToStorage()
-  suckFuelFromLeft()
+  refuelAtDepot()
   site.sendTyped("quarry_cell_done", {
     status = "idle", cellDone = true, finished = true,
     cellId = claim.cellId, y0 = y0, y1 = y1,
@@ -4203,7 +4231,10 @@ function site.depotRefuelThenReady()
     return false
   end
   dumpToStorage()
-  suckFuelFromLeft()
+  if not refuelAtDepot() then
+    if broadcastSos then broadcastSos("depot_empty_fuel") end
+    return false
+  end
   if checkIn then checkIn("depot", { status = "depot" }) end
   if needsFuelSos() then
     if broadcastSos then broadcastSos("depot_empty_fuel") end
@@ -4392,11 +4423,12 @@ function site.handleCommand(line)
   elseif cmd == "dump" then
     goHome()
     dumpToStorage()
+    refuelAtDepot()
     print("Dumped.")
   elseif cmd == "refuel" then
     goHome()
-    local f = suckFuelFromLeft()
-    print("Fuel: " .. tostring(f))
+    refuelAtDepot()
+    print("Fuel: " .. tostring(turtle.getFuelLevel()))
   elseif cmd == "home" then
     goHome()
     print("Home.")
