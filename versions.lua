@@ -58,7 +58,7 @@ return {
     ["games.lua"]          = "1.2.11",
     ["games_catalog.lua"]  = "1.0.9",
     ["games_install.lua"]  = "1.0.4",
-    ["image_loader.lua"]   = "1.3.0",
+    ["image_loader.lua"]   = "1.3.1",
     ["host.lua"]           = "1.2.20",
     ["exclude.txt"]        = "1.0.1",
     ["versions.lua"]       = "1.7.32",

@@ -1,6 +1,6 @@
 --[[
   image_loader.lua  -  PNG → advanced (color) monitor (split UI)
-  Titan-Version: 1.3.0
+  Titan-Version: 1.3.1
 
   Computer terminal: paste/enter a download link + short status/help.
   Color monitor: tap navigation GUI (list, Load / Fetch / Refresh / Fit / Prev / Next).
@@ -9,10 +9,10 @@
   character/blit grid (not a true framebuffer); pixels are quantized to the
   nearest CC palette colour.
 
-  Storage: PNGs live under images/ — on a floppy when a disk drive is present
-  (recommended for large screenshots), otherwise on the computer. Use:
-      storage auto|disk|local
-      storage                 show free space / mount
+  Storage: fetch/load use a floppy as the working drive when present
+  (disk/images). Default mode is "disk". Commands:
+      storage               show path + free space
+      storage disk|auto|local
 
   Usage:
       image_loader
@@ -20,8 +20,8 @@
 
   Computer commands:
       <url>                   set download link (Fetch on monitor uses this)
-      fetch [url] [filename]  download PNG → images/, then load
-      github <ref> [filename] download from GitHub → images/, then load
+      fetch [url] [filename]  download PNG → disk/images/, then load
+      github <ref> [filename] download from GitHub → images store, then load
       load <path|url>         load without changing link buffer
       up / down / prev / next navigate list
       fit / refresh / help / quit
@@ -75,8 +75,8 @@ local scaleMul = 1.0
 local mon = nil
 local monName = nil
 local hitZones = {} -- filled each monitor draw
--- Image store: "auto" prefers floppy images/, else computer images/
-local storageMode = "auto" -- auto | disk | local
+-- Image store: default "disk" = floppy images/ is the working drive for fetch/load
+local storageMode = "disk" -- disk | auto | local
 local imagesRoot = "images"
 local diskMount = nil
 local diskDriveName = nil
@@ -262,14 +262,25 @@ local function resolveImagesRoot()
 
   if storageMode == "disk" then
     imagesRoot = "images"
-    ensureImagesRoot()
-    return imagesRoot, "No floppy — insert a disk in a drive (or: storage local)"
+    return imagesRoot, "No floppy in a disk drive — insert one, or: storage local / storage auto"
   end
 
-  -- auto without floppy
+  -- auto without floppy → computer
   imagesRoot = "images"
   ensureImagesRoot()
   return imagesRoot, nil
+end
+
+-- Require a usable images root for download/save. Disk mode needs a floppy.
+local function requireImagesStore()
+  local root, err = resolveImagesRoot()
+  if storageMode == "disk" and not diskMount then
+    return nil, err or "Insert a floppy to use as the image drive"
+  end
+  if not ensureImagesRoot() then
+    return nil, "Cannot create " .. tostring(root)
+  end
+  return root, nil
 end
 
 local function storageLabel()
@@ -495,6 +506,18 @@ local function loadPng(path, quiet)
 
   local viaHttp = isHttpUrl(path)
   if not viaHttp then
+    resolveImagesRoot()
+    -- Bare filename / images/foo → look on the working image drive first
+    if not fs.exists(path) then
+      local base = path:match("([^/]+)$") or path
+      if path:sub(1, 7) == "images/" then
+        base = path:sub(8)
+      end
+      local onStore = fs.combine(imagesRoot, base):gsub("\\", "/")
+      if fs.exists(onStore) and not fs.isDir(onStore) then
+        path = onStore
+      end
+    end
     if not fs.exists(path) then return nil, "File not found: " .. path end
     if fs.isDir(path) then return nil, "Not a file: " .. path end
   end
@@ -523,8 +546,8 @@ local function urlBasename(url)
 end
 
 local function imagesDest(saveAs, fallbackUrl)
-  resolveImagesRoot()
-  ensureImagesRoot()
+  local root, err = requireImagesStore()
+  if not root then return nil, err end
   local name = saveAs
   if name == nil or name == "" then
     name = urlBasename(fallbackUrl or "download.png")
@@ -612,9 +635,16 @@ local function fetchPng(url, saveAs, quiet)
   setStatus("Fetching…")
   if not quiet then print("Fetching " .. url .. " …") end
 
-  local dest = imagesDest(saveAs, url)
+  local dest, derr = imagesDest(saveAs, url)
+  if not dest then return nil, derr end
+  if not quiet then
+    print("Working drive: " .. storageLabel() .. " (" .. formatBytes(storageFree()) .. " free)")
+    print("Save as: " .. dest)
+  end
+  setStatus("→ " .. storageLabel())
+
   local dir = fs.getDir(dest)
-  if not dir or dir == "" then dir = "" end
+  if not dir or dir == "" then dir = imagesRoot or "" end
   local free = fs.getFreeSpace(dir)
   local mw, mh = decodeLimits()
 
@@ -1221,15 +1251,19 @@ if not term.isColor or not term.isColor() then
 end
 
 loadCfg()
-resolveImagesRoot()
-listImages()
 do
-  local free = storageFree()
-  print("Images: " .. storageLabel() .. " (" .. formatBytes(free) .. " free)")
-  if not diskMount and storageMode ~= "local" then
-    print("Tip: put a floppy in a disk drive to store screenshots off the computer.")
+  local _, warn = resolveImagesRoot()
+  if warn and storageMode == "disk" then
+    printError(warn)
+    print("Fetch/download needs a floppy, or run: storage auto")
+  elseif diskMount then
+    print("Image drive: " .. storageLabel() .. " (" .. formatBytes(storageFree()) .. " free)")
+  else
+    print("Images: " .. storageLabel() .. " (" .. formatBytes(storageFree()) .. " free)")
+    print("Tip: insert a floppy + disk drive — fetch uses it as the working image store.")
   end
 end
+listImages()
 
 do
   local ok, err = bindMonitor("find")

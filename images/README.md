@@ -20,13 +20,13 @@ Requires an **advanced (color) monitor** for the nav GUI. The loader quantizes t
 
 ## Storage (floppy recommended)
 
-By default (**`storage auto`**) Image Loader puts files under **`disk/images`** when a floppy is in an attached disk drive, otherwise **`images/`** on the computer.
+By default (**`storage disk`**) Image Loader uses a floppy as the **working drive** for fetch/load (`disk/images`). Insert a disk drive + floppy first.
 
 ```
 storage           # show path + free space
-storage disk      # require floppy
+storage disk      # require floppy (default)
+storage auto      # floppy if present, else computer images/
 storage local     # computer images/ only
-storage auto      # floppy if present (default)
 ```
 
 ComputerCraft uses separate quotas: `computer_space_limit` vs `floppy_space_limit` in `computercraft-server.toml`. Default floppies are often **smaller** than the computer (~125KB) — raise `floppy_space_limit` (e.g. `5000000`) if you want big screenshot downloads on the floppy.
