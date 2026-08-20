@@ -1,6 +1,6 @@
 --[[
   lib/png.lua  -  Compact PNG decoder for CC: Tweaked
-  Titan-Version: 1.0.3
+  Titan-Version: 1.0.4
 
   Decodes non-interlaced PNG:
     - 8-bit grey / RGB / indexed / grey+A / RGBA
@@ -87,15 +87,39 @@ local function readBinaryFile(path)
 end
 
 local function writeBinaryFile(path, data)
+  data = data or ""
+  local need = #data
+  local dir = fs.getDir(path)
+  if not dir or dir == "" then dir = "" end
+  local free = fs.getFreeSpace(dir)
+  if type(free) == "number" and free >= 0 and free < need then
+    return nil, ("Out of space: need %d bytes, only %d free. "
+      .. "Minecraft screenshots are often too large for the default ~1MB computer disk — "
+      .. "resize/compress the PNG (e.g. under ~200KB) or raise computer_space_limit "
+      .. "in computercraft-server.toml."):format(need, free)
+  end
+
   local f = fs.open(path, "wb")
   if not f then
     return nil, "cannot write " .. tostring(path)
   end
+
   -- Binary WriteHandle.write takes a byte number (not a string) on CC:Tweaked
-  for i = 1, #data do
-    f.write(data:byte(i))
-  end
+  local ok, err = pcall(function()
+    for i = 1, need do
+      f.write(data:byte(i))
+    end
+  end)
   f.close()
+  if not ok then
+    pcall(fs.delete, path)
+    local msg = tostring(err or "")
+    if msg:lower():find("out of space", 1, true) then
+      return nil, ("Out of space writing %s (%d bytes). "
+        .. "Delete files on this computer, use a smaller PNG, or raise computer_space_limit."):format(path, need)
+    end
+    return nil, msg
+  end
   return true
 end
 

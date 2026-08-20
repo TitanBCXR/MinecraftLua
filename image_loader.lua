@@ -1,6 +1,6 @@
 --[[
   image_loader.lua  -  PNG → advanced (color) monitor (split UI)
-  Titan-Version: 1.1.0
+  Titan-Version: 1.1.1
 
   Computer terminal: paste/enter a download link + short status/help.
   Color monitor: tap navigation GUI (list, Load / Fetch / Refresh / Fit / Prev / Next).
@@ -443,12 +443,51 @@ local function fetchPng(url, saveAs, quiet)
     return nil, "Download is not a PNG: " .. pngImage.describePrefix(data)
   end
 
+  -- Decode from RAM first so a full computer disk still shows the image
+  if not quiet then print("Decoding " .. tostring(#data) .. " bytes …") end
+  local okDec, result = pcall(pngImage.decode, data)
+  if not okDec then
+    return nil, "PNG decode failed: " .. tostring(result)
+  end
+  if type(result) ~= "table" or not result.width then
+    return nil, "Invalid PNG decode result"
+  end
+
   local dest = imagesDest(saveAs, url)
   local wok, werr = pngImage.writeBinary(dest, data)
-  if not wok then return nil, werr or ("cannot write " .. dest) end
-  if not quiet then print("Saved " .. dest .. " (" .. tostring(#data) .. " bytes)") end
-  listImages()
-  return loadPng(dest, quiet)
+  data = nil -- allow GC after decode + write attempt
+  if wok then
+    if not quiet then print("Saved " .. dest) end
+    listImages()
+    img = result
+    imgPath = dest
+    scaleMul = 1.0
+    for i = 1, #imageList do
+      if imageList[i] == dest then
+        selected = i
+        break
+      end
+    end
+    saveCfg()
+    setStatus(("Loaded %dx%d"):format(img.width, img.height))
+    if not quiet then
+      print(("Loaded %dx%d (%s)"):format(img.width, img.height, dest))
+    end
+    return true
+  end
+
+  -- Disk full / write failed: still display from memory (won't persist across reboot)
+  img = result
+  imgPath = dest .. " (unsaved)"
+  scaleMul = 1.0
+  saveCfg()
+  local warn = werr or ("cannot write " .. dest)
+  setStatus("Shown, not saved — disk full")
+  if not quiet then
+    print("Warning: " .. warn)
+    print(("Showing %dx%d from RAM (not on disk)"):format(img.width, img.height))
+  end
+  return true
 end
 
 local function githubPng(spec, saveAs, quiet)

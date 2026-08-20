@@ -55,6 +55,8 @@ image_loader
 - `github` resolves blob / short `owner/repo/path` forms to **raw.githubusercontent.com** (default branch `main`; optional `owner/repo@branch/path`).
 - Downloads use **binary** HTTP and write with `fs.open(..., "wb")` into `images/`, then auto-load.
 - Prefer raw PNG URLs — HTML pages (404 / blob UI) will be rejected with a clear error.
+- If the computer disk is full (`Out of space`), Fetch still **decodes and shows** the PNG from RAM, but it will **not** be saved under `images/` until you free space or use a smaller file.
+- **Minecraft screenshots** are often 1–5MB+. Default CC computer space is often ~1MB (`computer_space_limit` in `computercraft-server.toml`). Resize/compress to something like **160×90** or **under ~200KB** before uploading to GitHub.
 
 ## Supported PNG kinds
 
