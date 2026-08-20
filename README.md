@@ -138,10 +138,12 @@ Keep `lib/titan.lua` in a `lib` folder next to the program. Older roles are in
 
 1. Install via **Tools → Image Loader (PNG → monitor)** (or copy `image_loader.lua` + `lib/png.lua`).
 2. Attach an **advanced (color) monitor** to an advanced computer.
-3. Copy a `.png` into `images/` on the computer (world save `computer/<id>/images/`, floppy, etc.).
+3. Get a PNG into `images/` — either copy **as binary** into the world save `computer/<id>/images/`, or from the loader:
+   - `github TitanBCXR/MinecraftLua/images/Map.png`
+   - `fetch https://raw.githubusercontent.com/OWNER/REPO/main/file.png map.png`
 4. Run `image_loader` or `image_loader images/foo.png`. Use `monitor find`, `fit` / `scale`, `redraw`, `quit`.
 
-Monitors are a 16-colour blit grid — the loader quantizes and letterboxes to fit.
+Monitors are a 16-colour blit grid — the loader quantizes and letterboxes to fit. See [`images/README.md`](images/README.md).
 ## 4. Run
 
 - **Hub:** `hub.lua` — watch the monitor, type commands in the terminal.

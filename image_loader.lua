@@ -1,6 +1,6 @@
 --[[
   image_loader.lua  -  Load a PNG onto an advanced (color) monitor
-  Titan-Version: 1.0.0
+  Titan-Version: 1.0.2
 
   Needs an advanced computer + attached color monitor. Monitors are a 16-color
   character/blit grid (not a true framebuffer); pixels are quantized to the
@@ -8,16 +8,23 @@
 
   Usage:
       image_loader
-      image_loader <path.png>
+      image_loader <path.png|http-url>
 
-  Put PNGs under images/ on the computer (or pass any path). Commands:
-      load <path> / path <path>
+  Put PNGs under images/ on the computer (or pass any path / http URL). Commands:
+      load <path|url> / path <path|url>
+      github <url-or-path> [filename]   download from GitHub → images/, then load
+      fetch <url> [filename]            download any http(s) PNG → images/, then load
       scale <n>     (1 = fit size; e.g. 0.5 / 1.5)
       fit           (reset to fit-to-monitor, letterboxed)
       monitor <side|find>
       redraw
       help
       quit
+
+  GitHub examples:
+      github TitanBCXR/MinecraftLua/images/Map.png
+      github https://raw.githubusercontent.com/TitanBCXR/MinecraftLua/main/images/Map.png
+      fetch https://raw.githubusercontent.com/OWNER/REPO/main/path/file.png map.png
 ]]
 
 local pngImage
@@ -193,15 +200,43 @@ local function redraw()
   return true
 end
 
+local function isHttpUrl(path)
+  local p = tostring(path or ""):lower()
+  return p:sub(1, 7) == "http://" or p:sub(1, 8) == "https://"
+end
+
+local function probeLocalPng(path)
+  if not pngImage.readBinary then return end
+  local data, err = pngImage.readBinary(path)
+  if not data then
+    printError("Read failed: " .. tostring(err))
+    return
+  end
+  print(("File size: %d bytes"):format(#data))
+  print("First 8 bytes: " .. pngImage.hexBytes(data, 8))
+  if data:sub(1, 8) ~= pngImage.MAGIC then
+    printError(pngImage.describePrefix(data))
+    printError("Copy the PNG as binary into world save computer/<id>/images/")
+    printError("Do not paste through chat/edit. Or: github <owner/repo/path>")
+  end
+end
+
 local function loadPng(path)
   path = tostring(path or ""):gsub("^%s+", ""):gsub("%s+$", "")
-  if path == "" then return nil, "Usage: load <path.png>" end
-  if not fs.exists(path) then return nil, "File not found: " .. path end
-  if fs.isDir(path) then return nil, "Not a file: " .. path end
+  if path == "" then return nil, "Usage: load <path.png|http-url>" end
+
+  local viaHttp = isHttpUrl(path)
+  if not viaHttp then
+    if not fs.exists(path) then return nil, "File not found: " .. path end
+    if fs.isDir(path) then return nil, "Not a file: " .. path end
+  end
 
   print("Decoding " .. path .. " …")
   local ok, result = pcall(pngImage, path)
-  if not ok then return nil, "PNG decode failed: " .. tostring(result) end
+  if not ok then
+    if not viaHttp then probeLocalPng(path) end
+    return nil, "PNG decode failed: " .. tostring(result)
+  end
   if type(result) ~= "table" or not result.width then
     return nil, "Invalid PNG decode result"
   end
@@ -212,24 +247,161 @@ local function loadPng(path)
   return true
 end
 
+local function urlBasename(url)
+  local name = url:match("([^/]+)$") or "download.png"
+  name = name:match("^([^?#]+)") or name
+  if not name:lower():match("%.png$") then
+    name = name .. ".png"
+  end
+  -- sanitize for CC paths
+  name = name:gsub("[^%w%._%-]", "_")
+  if name == "" or name == ".png" then name = "download.png" end
+  return name
+end
+
+-- Always land under images/ (create dir). Bare filenames become images/<name>.
+local function imagesDest(saveAs, fallbackUrl)
+  if not fs.exists("images") then fs.makeDir("images") end
+  local name = saveAs
+  if name == nil or name == "" then
+    name = urlBasename(fallbackUrl or "download.png")
+  end
+  name = tostring(name):gsub("\\", "/")
+  if name:sub(1, 7) == "images/" then
+    local dir = fs.getDir(name)
+    if dir and dir ~= "" and not fs.exists(dir) then fs.makeDir(dir) end
+    return name
+  end
+  name = name:match("([^/]+)$") or name
+  name = name:gsub("[^%w%._%-]", "_")
+  if name == "" then name = "download.png" end
+  if not name:lower():match("%.png$") then name = name .. ".png" end
+  return fs.combine("images", name)
+end
+
+-- Resolve GitHub blob / short owner/repo/path forms to raw.githubusercontent.com
+-- Default branch: main
+local function resolveGithubRef(spec, defaultBranch)
+  defaultBranch = defaultBranch or "main"
+  spec = tostring(spec or ""):gsub("^%s+", ""):gsub("%s+$", "")
+  if spec == "" then return nil, "empty github ref" end
+
+  local lower = spec:lower()
+  if lower:sub(1, 7) == "http://" or lower:sub(1, 8) == "https://" then
+    -- Already raw
+    if lower:find("raw.githubusercontent.com/", 1, true) then
+      return spec:match("^([^?#]+)") or spec
+    end
+    -- github.com/owner/repo/blob/branch/path
+    local owner, repo, branch, path = spec:match(
+      "^https?://github%.com/([^/]+)/([^/]+)/blob/([^/]+)/(.+)$"
+    )
+    if owner then
+      path = path:match("^([^?#]+)") or path
+      return ("https://raw.githubusercontent.com/%s/%s/%s/%s"):format(owner, repo, branch, path)
+    end
+    -- github.com/owner/repo/raw/branch/path
+    owner, repo, branch, path = spec:match(
+      "^https?://github%.com/([^/]+)/([^/]+)/raw/([^/]+)/(.+)$"
+    )
+    if owner then
+      path = path:match("^([^?#]+)") or path
+      return ("https://raw.githubusercontent.com/%s/%s/%s/%s"):format(owner, repo, branch, path)
+    end
+    -- github.com/owner/repo/tree/branch/path (treat as file path)
+    owner, repo, branch, path = spec:match(
+      "^https?://github%.com/([^/]+)/([^/]+)/tree/([^/]+)/(.+)$"
+    )
+    if owner then
+      path = path:match("^([^?#]+)") or path
+      return ("https://raw.githubusercontent.com/%s/%s/%s/%s"):format(owner, repo, branch, path)
+    end
+    return nil, "not a GitHub file URL (use blob/raw URL or owner/repo/path)"
+  end
+
+  -- Optional: owner/repo@branch/path
+  local owner, repo, branch, rest = spec:match("^([^/@]+)/([^/@]+)@([^/]+)/(.+)$")
+  if owner and rest then
+    return ("https://raw.githubusercontent.com/%s/%s/%s/%s"):format(owner, repo, branch, rest)
+  end
+
+  -- Short: owner/repo/path/to/file.png  (branch defaults to main)
+  local parts = {}
+  for part in spec:gmatch("[^/]+") do
+    parts[#parts + 1] = part
+  end
+  if #parts < 3 then
+    return nil, "Usage: github <owner/repo/path.png>  (need owner, repo, and file path)"
+  end
+  owner, repo = parts[1], parts[2]
+  local path = table.concat(parts, "/", 3)
+  return ("https://raw.githubusercontent.com/%s/%s/%s/%s"):format(owner, repo, defaultBranch, path)
+end
+
+local function fetchPng(url, saveAs)
+  url = tostring(url or ""):gsub("^%s+", ""):gsub("%s+$", "")
+  if url == "" or not isHttpUrl(url) then
+    return nil, "Usage: fetch <http-url> [filename]"
+  end
+  if not http then
+    return nil, "http API not available (enable http in CC:Tweaked config)"
+  end
+
+  print("Fetching " .. url .. " …")
+  local data, err = pngImage.fetchHttp(url)
+  if not data then return nil, err or "fetch failed" end
+
+  print("First 8 bytes: " .. pngImage.hexBytes(data, 8))
+  if data:sub(1, 8) ~= pngImage.MAGIC then
+    return nil, "Download is not a PNG: " .. pngImage.describePrefix(data)
+  end
+
+  local dest = imagesDest(saveAs, url)
+  local wok, werr = pngImage.writeBinary(dest, data)
+  if not wok then return nil, werr or ("cannot write " .. dest) end
+  print("Saved " .. dest .. " (" .. tostring(#data) .. " bytes)")
+  return loadPng(dest)
+end
+
+local function githubPng(spec, saveAs)
+  spec = tostring(spec or ""):gsub("^%s+", ""):gsub("%s+$", "")
+  if spec == "" then
+    return nil, "Usage: github <owner/repo/path.png|github-url> [filename]"
+  end
+  local url, err = resolveGithubRef(spec, "main")
+  if not url then return nil, err end
+  print("GitHub → " .. url)
+  if saveAs == nil or saveAs == "" then
+    saveAs = urlBasename(url)
+  end
+  return fetchPng(url, saveAs)
+end
+
 --------------------------------------------------------------------------------
 -- CLI
 --------------------------------------------------------------------------------
 local function printHelp()
   print([[Image Loader — PNG → advanced monitor
 
-  load <path>     load a .png (try images/)
-  path <path>     same as load
-  scale <n>       size vs fit (1=fit, 0.5 half, 1.5 larger)
-  fit             reset scale to fit monitor (letterbox)
-  monitor find    bind first color monitor
-  monitor <side>  bind monitor on that side
-  redraw          draw again
+  load <path|url>           load a .png from disk or http(s)
+  path <path|url>           same as load
+  github <ref> [filename]   download from GitHub → images/, then load
+  fetch <url> [filename]    download PNG (binary) → images/, then load
+  scale <n>                 size vs fit (1=fit, 0.5 half, 1.5 larger)
+  fit                       reset scale to fit monitor (letterbox)
+  monitor find              bind first color monitor
+  monitor <side>            bind monitor on that side
+  redraw                    draw again
   help
   quit
 
-Copy PNGs into images/ on this computer, attach a color monitor,
-then:  image_loader images/logo.png]])
+Examples:
+  github TitanBCXR/MinecraftLua/images/Map.png
+  github https://github.com/TitanBCXR/MinecraftLua/blob/main/images/Map.png
+  fetch https://raw.githubusercontent.com/OWNER/REPO/main/a.png map.png
+
+Copy PNGs as binary into world save computer/<id>/images/
+(not via chat paste), or use github / fetch above.]])
 end
 
 local function handle(line)
@@ -244,6 +416,16 @@ local function handle(line)
     return false
   elseif cmd == "load" or cmd == "path" then
     local ok, err = loadPng(rest)
+    if not ok then printError(err) else redraw() end
+  elseif cmd == "github" or cmd == "gh" then
+    local ref, as = rest:match("^(%S+)%s*(.*)$")
+    as = (as or ""):gsub("^%s+", ""):gsub("%s+$", "")
+    local ok, err = githubPng(ref, as ~= "" and as or nil)
+    if not ok then printError(err) else redraw() end
+  elseif cmd == "fetch" or cmd == "download" then
+    local url, as = rest:match("^(%S+)%s*(.*)$")
+    as = (as or ""):gsub("^%s+", ""):gsub("%s+$", "")
+    local ok, err = fetchPng(url, as ~= "" and as or nil)
     if not ok then printError(err) else redraw() end
   elseif cmd == "fit" then
     scaleMul = 1.0
