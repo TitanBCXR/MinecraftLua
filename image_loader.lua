@@ -1,6 +1,6 @@
 --[[
   image_loader.lua  -  PNG → advanced (color) monitor (split UI)
-  Titan-Version: 1.3.3
+  Titan-Version: 1.3.4
 
   Computer terminal: paste/enter a download link + short status/help.
   Color monitor: tap navigation GUI (list, Load / Fetch / Refresh / Fit / Prev / Next).
@@ -238,11 +238,12 @@ end
 -- Try several target sizes so huge screenshots still display under low RAM
 local function decodeSizeLadder()
   local mw, mh = decodeLimits()
+  -- Smallest first so we get *something* on screen before CC yield timeout
   return {
-    { mw, mh },
-    { math.min(96, mw), math.min(54, mh) },
+    { 48, 27 },
     { 64, 36 },
-    { 40, 24 },
+    { math.min(96, mw), math.min(54, mh) },
+    { mw, mh },
   }
 end
 
@@ -791,38 +792,33 @@ local function fetchPng(url, saveAs, quiet)
 
   local lastErr
   local ladder = decodeSizeLadder()
+  -- Do NOT tee/save during stream decode — byte-writing a multi‑MB PNG hits
+  -- "Too long without yielding". Decode+show first; save is best-effort later.
   for i, sz in ipairs(ladder) do
-    ilog(("attempt %d: stream-decode ≤%dx%d tee=%s"):format(
-      i, sz[1], sz[2], tostring((i == 1) and dest or nil)))
+    ilog(("attempt %d: stream-decode ≤%dx%d (no tee)"):format(i, sz[1], sz[2]))
     if not quiet then
       print(("Stream-decode → ≤%dx%d …"):format(sz[1], sz[2]))
     end
     setStatus(("Stream ≤%dx%d…"):format(sz[1], sz[2]))
-    local tee = (i == 1) and dest or nil
     local img, err, saved, teeErr = pngImage.fetchHttpDecode(
-      url, sz[1], sz[2], tee, ilog
+      url, sz[1], sz[2], nil, ilog
     )
     if img and img.width then
-      ilog(("OK decode %dx%d (src %s) saved=%s teeErr=%s"):format(
+      ilog(("OK decode %dx%d (src %s)"):format(
         img.width, img.height,
-        tostring(img.srcWidth and (img.srcWidth .. "x" .. img.srcHeight) or "?"),
-        tostring(saved), tostring(teeErr)))
-      if saved and dest then
-        if not quiet then print(("Saved %s (%d bytes)"):format(dest, saved)) end
-        listImages()
-        ilog("===== FETCH OK (saved) =====")
-        return applyDecoded(img, dest, quiet)
-      end
-      if teeErr and not quiet then
-        print("Save skipped: " .. tostring(teeErr))
+        tostring(img.srcWidth and (img.srcWidth .. "x" .. img.srcHeight) or "?")))
+      -- Skip re-download save here — a second full HTTP pull often hits yield timeout.
+      -- Image is shown from RAM; use a smaller PNG on disk if you need persistence.
+      if dest and not quiet then
+        print("Shown from stream (not re-saved — avoids yield timeout on large files)")
       end
       local label = dest and (dest .. " (unsaved)") or "(memory)"
-      ilog("===== FETCH OK (unsaved display) =====")
+      ilog("===== FETCH OK (display, unsaved) =====")
       return applyDecoded(
         img,
         label,
         quiet,
-        ("Shown %dx%d (not saved)"):format(img.width, img.height)
+        ("Shown %dx%d"):format(img.width, img.height)
       )
     end
     lastErr = err
@@ -1401,7 +1397,7 @@ if not term.isColor or not term.isColor() then
 end
 
 loadCfg()
-ilog("image_loader start v1.3.3")
+ilog("image_loader start v1.3.4")
 do
   local _, warn = resolveImagesRoot()
   if warn and storageMode == "disk" then

@@ -1,6 +1,6 @@
 --[[
   lib/png.lua  -  Compact PNG decoder for CC: Tweaked
-  Titan-Version: 1.1.2
+  Titan-Version: 1.1.3
 
   Decodes non-interlaced PNG:
     - 8-bit grey / RGB / indexed / grey+A / RGBA
@@ -13,6 +13,7 @@
   Large images use a streaming, downsampled decode (default max ~160x100)
   so ComputerCraft RAM can hold Minecraft screenshots without OOMing.
   Prefer fetchHttpDecode (stream HTTP → IDAT → display) over download+reload.
+  Hot loops call pngYield() so CC does not hit "Too long without yielding".
 
   Usage:
     local png = require("lib.png")
@@ -26,6 +27,25 @@
 local band, bor, bxor, lshift, rshift = bit32.band, bit32.bor, bit32.bxor, bit32.lshift, bit32.rshift
 
 local PNG_MAGIC = "\137PNG\r\n\26\n"
+
+--------------------------------------------------------------------------------
+-- Cooperative yield (CC:Tweaked kills scripts after ~few seconds without yield)
+--------------------------------------------------------------------------------
+local _yieldN = 0
+local YIELD_EVERY = 6000 -- ops between yields (tune for speed vs timeout)
+
+local function pngYield(force)
+  _yieldN = _yieldN + 1
+  if not force and _yieldN < YIELD_EVERY then return end
+  _yieldN = 0
+  -- Standard CC cooperative yield
+  os.queueEvent("png_yield")
+  os.pullEvent("png_yield")
+end
+
+local function pngYieldReset()
+  _yieldN = 0
+end
 
 --------------------------------------------------------------------------------
 -- Binary I/O helpers (CC:Tweaked must use "rb" / http binary)
@@ -112,6 +132,7 @@ local function writeBinaryFile(path, data)
   local ok, err = pcall(function()
     for i = 1, need do
       f.write(data:byte(i))
+      if i % 4096 == 0 then pngYield(true) end
     end
   end)
   f.close()
@@ -339,6 +360,7 @@ local function emitByte(out, b)
   else
     out[#out + 1] = b
   end
+  pngYield()
 end
 
 local function emitCopy(out, distance, len)
@@ -349,6 +371,7 @@ local function emitCopy(out, distance, len)
   local start = #out - distance + 1
   for i = 1, len do
     out[#out + 1] = out[start + i - 1]
+    pngYield()
   end
 end
 
@@ -745,6 +768,7 @@ local function makeScaledSink(meta)
       rowY = rowY + 1
       sampleRow(rowY, cur)
       for i = 1, stride do prev[i] = cur[i] end
+      if rowY % 8 == 0 then pngYield(true) end
     end
   end
 
@@ -757,6 +781,7 @@ local function makeScaledSink(meta)
     if (total - consumed) >= (stride + 1) then
       drain()
     end
+    pngYield()
   end
   function sink:backref(distance, len)
     for _ = 1, len do
@@ -765,6 +790,7 @@ local function makeScaledSink(meta)
   end
   function sink:finish()
     drain()
+    pngYield(true)
     if rowY < height then
       error("truncated PNG image data", 0)
     end
@@ -914,6 +940,7 @@ end
 
 -- maxW/maxH: decode target size (monitor-friendly). Nil → defaults.
 local function decodeFromMeta(meta, maxW, maxH)
+  pngYieldReset()
   maxW = tonumber(maxW) or DEFAULT_MAX_W
   maxH = tonumber(maxH) or DEFAULT_MAX_H
   if maxW < 1 then maxW = 1 end
@@ -935,10 +962,12 @@ local function decodeFromMeta(meta, maxW, maxH)
   local zlibData = concatChunks(meta.idat)
   meta.idat = nil
   if collectgarbage then pcall(collectgarbage) end
+  pngYield(true)
 
   local sink = makeScaledSink(meta)
   inflateZlibInto(zlibData, sink)
   zlibData = nil
+  pngYield(true)
   if collectgarbage then pcall(collectgarbage) end
 
   return makePackedImage(outW, outH, sink:rgbBytes(), meta.width, meta.height, meta.bitDepth, meta.colorType)
@@ -1047,9 +1076,11 @@ local function parsePngMetaFromStream(readExactFn)
       trns = data
     elseif ctype == "IDAT" then
       idat[#idat + 1] = data
+      pngYield(true)
     elseif ctype == "IEND" then
       break
     end
+    pngYield()
   end
 
   if not width then error("missing IHDR", 0) end
@@ -1200,6 +1231,7 @@ local function fetchHttpDecode(url, maxW, maxH, teePath, logfn)
       local okw, werr = pcall(function()
         for i = 1, #s do
           tee.write(s:byte(i))
+          if i % 2048 == 0 then pngYield(true) end
         end
       end)
       if okw then
@@ -1298,6 +1330,7 @@ local function fetchHttpToFile(url, path)
           f.write(chunk:byte(i))
         end
         size = size + #chunk
+        pngYield(true)
       end
     end
   end)
