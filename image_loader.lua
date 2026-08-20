@@ -1,6 +1,6 @@
 --[[
   image_loader.lua  -  PNG → advanced (color) monitor (split UI)
-  Titan-Version: 1.3.2
+  Titan-Version: 1.3.3
 
   Computer terminal: paste/enter a download link + short status/help.
   Color monitor: tap navigation GUI (list, Load / Fetch / Refresh / Fit / Prev / Next).
@@ -13,6 +13,10 @@
   (disk/images). Default mode is "disk". Commands:
       storage               show path + free space
       storage disk|auto|local
+      log / log clear       fetch debug log on the COMPUTER (not floppy)
+
+  Debug log is always written to .image_loader.log on the computer filesystem
+  so it survives UI refresh and floppy swaps.
 
   Usage:
       image_loader
@@ -62,6 +66,8 @@ end
 -- Shared state
 --------------------------------------------------------------------------------
 local CFG_PATH = ".image_loader.cfg"
+-- Always on the COMPUTER (never under disk/) so logs survive floppy eject / UI redraw
+local LOG_PATH = ".image_loader.log"
 local alive = true
 local guiDirty = true
 local statusMsg = "Ready"
@@ -80,6 +86,83 @@ local storageMode = "disk" -- disk | auto | local
 local imagesRoot = "images"
 local diskMount = nil
 local diskDriveName = nil
+
+local function ilog(msg)
+  local line = tostring(msg or "")
+  local ts
+  if type(os.date) == "function" then
+    ts = os.date("%Y-%m-%d %H:%M:%S")
+  else
+    ts = tostring(os.clock and os.clock() or "?")
+  end
+  local out = "[" .. ts .. "] " .. line .. "\n"
+  -- Prefer append on computer FS only (LOG_PATH is never under disk/)
+  local wrote = pcall(function()
+    local f = fs.open(LOG_PATH, "a")
+    if f then
+      f.write(out)
+      f.close()
+      return true
+    end
+    error("no append")
+  end)
+  if not wrote then
+    pcall(function()
+      local prev = ""
+      if fs.exists(LOG_PATH) then
+        local rf = fs.open(LOG_PATH, "r")
+        if rf then
+          prev = rf.readAll() or ""
+          rf.close()
+        end
+      end
+      if #prev > 60000 then prev = prev:sub(-50000) end
+      local wf = fs.open(LOG_PATH, "w")
+      if wf then
+        wf.write(prev)
+        if prev ~= "" and prev:sub(-1) ~= "\n" then wf.write("\n") end
+        wf.write(out)
+        wf.close()
+      end
+    end)
+  end
+end
+
+local function clearLog()
+  pcall(function()
+    local f = fs.open(LOG_PATH, "w")
+    if f then
+      f.write("")
+      f.close()
+    end
+  end)
+  ilog("log cleared")
+end
+
+local function printLogTail(maxLines)
+  maxLines = tonumber(maxLines) or 40
+  if not fs.exists(LOG_PATH) then
+    print("(no " .. LOG_PATH .. " yet — run fetch first)")
+    return
+  end
+  local f = fs.open(LOG_PATH, "r")
+  if not f then
+    print("cannot read " .. LOG_PATH)
+    return
+  end
+  local raw = f.readAll() or ""
+  f.close()
+  local lines = {}
+  for line in (raw .. "\n"):gmatch("(.-)\n") do
+    lines[#lines + 1] = line
+  end
+  local start = math.max(1, #lines - maxLines + 1)
+  print(("--- %s (last %d of %d) ---"):format(LOG_PATH, math.min(maxLines, #lines), #lines))
+  for i = start, #lines do
+    print(lines[i])
+  end
+  print("--- end ---")
+end
 
 --------------------------------------------------------------------------------
 -- CC default palette (RGB 0..1) + blit chars
@@ -669,15 +752,22 @@ local function fetchPng(url, saveAs, quiet)
     return nil, "Usage: fetch <http-url> [filename]"
   end
   if not http then
+    ilog("FAIL: http API not available")
     return nil, "http API not available (enable http in CC:Tweaked config)"
   end
   if not pngImage.fetchHttpDecode then
+    ilog("FAIL: lib/png.lua missing fetchHttpDecode — reinstall Image Loader")
     return nil, "Update lib/png.lua — missing fetchHttpDecode (reinstall Image Loader)"
   end
 
   linkBuf = url
   saveCfg()
   setStatus("Fetching…")
+  ilog("===== FETCH START =====")
+  ilog("url=" .. url)
+  ilog("storageMode=" .. tostring(storageMode) .. " imagesRoot=" .. tostring(imagesRoot))
+  ilog("diskMount=" .. tostring(diskMount) .. " free=" .. formatBytes(storageFree()))
+  ilog("png lib has fetchHttpDecode=" .. tostring(pngImage.fetchHttpDecode ~= nil))
   if not quiet then print("Fetching " .. url .. " …") end
 
   -- Optional save path on floppy/computer (tee while streaming). May fail if disk full.
@@ -686,35 +776,48 @@ local function fetchPng(url, saveAs, quiet)
     local d, derr = imagesDest(saveAs, url)
     if d then
       dest = d
+      ilog("tee/save path=" .. dest)
       if not quiet then
         print("Working drive: " .. storageLabel() .. " (" .. formatBytes(storageFree()) .. " free)")
         print("Save as: " .. dest .. " (stream decode; save if space)")
       end
-    elseif not quiet and derr then
-      print("Note: " .. tostring(derr) .. " — decoding without save")
+    else
+      ilog("no save path: " .. tostring(derr) .. " — decode only")
+      if not quiet and derr then
+        print("Note: " .. tostring(derr) .. " — decoding without save")
+      end
     end
   end
 
   local lastErr
   local ladder = decodeSizeLadder()
   for i, sz in ipairs(ladder) do
+    ilog(("attempt %d: stream-decode ≤%dx%d tee=%s"):format(
+      i, sz[1], sz[2], tostring((i == 1) and dest or nil)))
     if not quiet then
       print(("Stream-decode → ≤%dx%d …"):format(sz[1], sz[2]))
     end
     setStatus(("Stream ≤%dx%d…"):format(sz[1], sz[2]))
-    -- Tee to disk only on first attempt (later retries re-fetch without save)
     local tee = (i == 1) and dest or nil
-    local img, err, saved, teeErr = pngImage.fetchHttpDecode(url, sz[1], sz[2], tee)
+    local img, err, saved, teeErr = pngImage.fetchHttpDecode(
+      url, sz[1], sz[2], tee, ilog
+    )
     if img and img.width then
+      ilog(("OK decode %dx%d (src %s) saved=%s teeErr=%s"):format(
+        img.width, img.height,
+        tostring(img.srcWidth and (img.srcWidth .. "x" .. img.srcHeight) or "?"),
+        tostring(saved), tostring(teeErr)))
       if saved and dest then
         if not quiet then print(("Saved %s (%d bytes)"):format(dest, saved)) end
         listImages()
+        ilog("===== FETCH OK (saved) =====")
         return applyDecoded(img, dest, quiet)
       end
       if teeErr and not quiet then
         print("Save skipped: " .. tostring(teeErr))
       end
       local label = dest and (dest .. " (unsaved)") or "(memory)"
+      ilog("===== FETCH OK (unsaved display) =====")
       return applyDecoded(
         img,
         label,
@@ -723,8 +826,47 @@ local function fetchPng(url, saveAs, quiet)
       )
     end
     lastErr = err
+    ilog("attempt failed: " .. tostring(err))
     if collectgarbage then pcall(collectgarbage) end
   end
+
+  -- Fallback: full HTTP body then decode (still logged)
+  ilog("fallback: fetchHttp + decode")
+  setStatus("Fallback fetch…")
+  local data, ferr = pngImage.fetchHttp(url)
+  if not data then
+    ilog("fallback fetch FAIL: " .. tostring(ferr))
+    ilog("===== FETCH FAIL =====")
+    return nil, ferr or ("PNG decode failed: " .. tostring(lastErr))
+  end
+  ilog("fallback got " .. tostring(#data) .. " bytes; magic=" .. pngImage.hexBytes(data, 8))
+  if data:sub(1, 8) ~= pngImage.MAGIC then
+    local desc = pngImage.describePrefix(data)
+    ilog("fallback not PNG: " .. desc)
+    ilog("===== FETCH FAIL =====")
+    return nil, "Download is not a PNG: " .. desc
+  end
+  for i, sz in ipairs(ladder) do
+    ilog(("fallback decode ≤%dx%d"):format(sz[1], sz[2]))
+    local okDec, result = pcall(pngImage.decode, data, sz[1], sz[2])
+    if okDec and type(result) == "table" and result.width then
+      data = nil
+      if collectgarbage then pcall(collectgarbage) end
+      ilog(("fallback OK %dx%d"):format(result.width, result.height))
+      ilog("===== FETCH OK (fallback) =====")
+      return applyDecoded(
+        result,
+        (dest or "download") .. " (unsaved)",
+        quiet,
+        ("Shown %dx%d (fallback)"):format(result.width, result.height)
+      )
+    end
+    lastErr = result
+    ilog("fallback decode fail: " .. tostring(result))
+    if collectgarbage then pcall(collectgarbage) end
+  end
+  data = nil
+  ilog("===== FETCH FAIL ===== " .. tostring(lastErr))
   return nil, "PNG decode failed: " .. tostring(lastErr)
 end
 
@@ -734,7 +876,11 @@ local function githubPng(spec, saveAs, quiet)
     return nil, "Usage: github <owner/repo/path.png|github-url> [filename]"
   end
   local url, err = resolveGithubRef(spec, "main")
-  if not url then return nil, err end
+  if not url then
+    ilog("github resolve FAIL: " .. tostring(err) .. " spec=" .. spec)
+    return nil, err
+  end
+  ilog("github resolve OK → " .. url)
   if not quiet then print("GitHub → " .. url) end
   linkBuf = url
   if saveAs == nil or saveAs == "" then
@@ -752,19 +898,22 @@ end
 
 local function fetchFromLinkBuf()
   local link = tostring(linkBuf or ""):gsub("^%s+", ""):gsub("%s+$", "")
+  ilog("Fetch button/linkBuf=" .. tostring(link))
   if link == "" then
+    ilog("FAIL: empty link buffer")
     return nil, "No link on computer — paste a URL first"
   end
   if isHttpUrl(link) then
     if link:lower():find("github.com/", 1, true) and not link:lower():find("raw.githubusercontent.com/", 1, true) then
-      return githubPng(link, nil, true)
+      return githubPng(link, nil, false)
     end
-    return fetchPng(link, nil, true)
+    return fetchPng(link, nil, false)
   end
   -- Short owner/repo/path
   if link:find("/", 1, true) and not link:find(" ", 1, true) then
-    return githubPng(link, nil, true)
+    return githubPng(link, nil, false)
   end
+  ilog("FAIL: link not http/github: " .. link)
   return nil, "Link is not an http(s) URL or GitHub ref"
 end
 
@@ -910,8 +1059,14 @@ local function handleMonitorAction(id, meta)
     local ok, err = loadSelected()
     if not ok then setStatus(err or "load failed") else setStatus("Loaded") end
   elseif id == "fetch" then
+    ilog("monitor Fetch tapped")
     local ok, err = fetchFromLinkBuf()
-    if not ok then setStatus(err or "fetch failed") else setStatus("Fetched") end
+    if not ok then
+      ilog("monitor Fetch FAIL: " .. tostring(err))
+      setStatus(err or "fetch failed")
+    else
+      setStatus("Fetched")
+    end
   elseif id == "refresh" then
     listImages()
     setStatus(("Refreshed (%d)"):format(#imageList))
@@ -972,9 +1127,10 @@ local function drawComputerUi()
   local cur = imgPath and (imgPath:match("([^/]+)$") or imgPath) or "(none)"
   print(("Images: %d  |  Showing: %s"):format(n, cur))
   print("Store: " .. storageLabel() .. "  (" .. formatBytes(storageFree()) .. " free)")
+  print("Log: " .. LOG_PATH .. "  (type: log)")
   print("")
   print("Paste a GitHub/raw URL, then Fetch on the monitor.")
-  print("Or: fetch / github / storage / help / quit")
+  print("Or: fetch / github / storage / log / help / quit")
   print("")
 end
 
@@ -987,6 +1143,7 @@ Computer (this screen):
   github <ref> [filename] GitHub → images/, load
   load <path|url>         load a PNG
   storage [auto|disk|local]  use floppy images/ when possible
+  log [clear|N]           show computer fetch log (.image_loader.log)
   up / down               move list selection
   prev / next             load previous / next image
   fit / refresh           fit scale / rescan images/
@@ -1088,6 +1245,14 @@ local function handleComputerLine(line)
       setStatus("Storage: " .. storageLabel())
     else
       printError("Usage: storage [auto|disk|local]")
+    end
+  elseif cmd == "log" or cmd == "logs" then
+    local arg = rest:lower()
+    if arg == "clear" or arg == "reset" then
+      clearLog()
+      print("Cleared " .. LOG_PATH)
+    else
+      printLogTail(tonumber(rest) or 50)
     end
   elseif cmd == "up" then
     selectDelta(-1)
@@ -1236,17 +1401,20 @@ if not term.isColor or not term.isColor() then
 end
 
 loadCfg()
+ilog("image_loader start v1.3.3")
 do
   local _, warn = resolveImagesRoot()
   if warn and storageMode == "disk" then
     printError(warn)
     print("Fetch/download needs a floppy, or run: storage auto")
+    ilog("warn: " .. tostring(warn))
   elseif diskMount then
     print("Image drive: " .. storageLabel() .. " (" .. formatBytes(storageFree()) .. " free)")
   else
     print("Images: " .. storageLabel() .. " (" .. formatBytes(storageFree()) .. " free)")
     print("Tip: insert a floppy + disk drive — fetch uses it as the working image store.")
   end
+  print("Debug log: " .. LOG_PATH .. " (computer only — type `log` after Fetch)")
 end
 listImages()
 

@@ -1,6 +1,6 @@
 --[[
   lib/png.lua  -  Compact PNG decoder for CC: Tweaked
-  Titan-Version: 1.1.1
+  Titan-Version: 1.1.2
 
   Decodes non-interlaced PNG:
     - 8-bit grey / RGB / indexed / grey+A / RGBA
@@ -1140,8 +1140,14 @@ local function decodeFile(path, custom_stream)
 end
 
 -- Stream HTTP PNG: parse chunks as they arrive (keep IDAT only). Optionally tee to disk.
--- Returns image, or nil, err. Third return: bytes teed (or nil).
-local function fetchHttpDecode(url, maxW, maxH, teePath)
+-- logfn(msg) optional — called with progress lines (Image Loader writes these to computer log).
+-- Returns image, or nil, err. Third return: bytes teed (or nil). Fourth: teeErr.
+local function fetchHttpDecode(url, maxW, maxH, teePath, logfn)
+  local function L(msg)
+    if type(logfn) == "function" then
+      pcall(logfn, msg)
+    end
+  end
   if not http or not http.get then
     return nil, "http API not available (enable http in CC:Tweaked config)"
   end
@@ -1149,8 +1155,10 @@ local function fetchHttpDecode(url, maxW, maxH, teePath)
   if not fetchUrl:find("?", 1, true) then
     fetchUrl = fetchUrl .. "?cb=" .. tostring(os.epoch and os.epoch("utc") or os.time())
   end
+  L("http.get binary " .. fetchUrl)
   local h, err = http.get(fetchUrl, nil, true)
   if not h then
+    L("http.get(url,nil,true) failed: " .. tostring(err) .. " — trying table form")
     local okCall, a, b = pcall(http.get, { url = fetchUrl, binary = true })
     if okCall then
       h, err = a, b
@@ -1159,9 +1167,11 @@ local function fetchHttpDecode(url, maxW, maxH, teePath)
     end
   end
   if not h then
+    L("http.get FAIL: " .. tostring(err or "unknown"))
     return nil, "http get failed: " .. tostring(err or "unknown")
   end
   local code = h.getResponseCode and h.getResponseCode() or 200
+  L("HTTP response code=" .. tostring(code))
   if code ~= 200 then
     h.close()
     local hint = (code == 404) and " (not found — check path/branch)" or ""
@@ -1173,12 +1183,19 @@ local function fetchHttpDecode(url, maxW, maxH, teePath)
     tee = fs.open(teePath, "wb")
     if not tee then
       teeErr = "cannot write " .. tostring(teePath)
+      L("tee open FAIL: " .. teeErr)
+    else
+      L("tee open OK: " .. teePath)
     end
+  else
+    L("tee disabled (decode-only)")
   end
 
+  local bytesRead = 0
   local function readTee(n)
     local s, rerr = readExact(h, n)
     if not s then return nil, rerr end
+    bytesRead = bytesRead + #s
     if tee then
       local okw, werr = pcall(function()
         for i = 1, #s do
@@ -1192,12 +1209,14 @@ local function fetchHttpDecode(url, maxW, maxH, teePath)
         pcall(function() tee.close() end)
         tee = nil
         teeErr = tostring(werr)
+        L("tee write FAIL (continue decode): " .. teeErr)
         pcall(fs.delete, teePath)
       end
     end
     return s
   end
 
+  L("parse PNG stream…")
   local ok, metaOrErr = pcall(function()
     return parsePngMetaFromStream(readTee)
   end)
@@ -1205,18 +1224,27 @@ local function fetchHttpDecode(url, maxW, maxH, teePath)
     tee.close()
   end
   h.close()
+  L("stream bytes read=" .. tostring(bytesRead) .. " teeBytes=" .. tostring(teeBytes))
   if not ok then
+    L("parse FAIL: " .. tostring(metaOrErr))
     if teePath then pcall(fs.delete, teePath) end
     return nil, tostring(metaOrErr)
   end
+  L(("IHDR %dx%d depth=%s ctype=%s idatChunks=%d"):format(
+    metaOrErr.width, metaOrErr.height,
+    tostring(metaOrErr.bitDepth), tostring(metaOrErr.colorType),
+    metaOrErr.idat and #metaOrErr.idat or 0))
 
+  L(("inflate+downsample → ≤%dx%d"):format(tonumber(maxW) or 0, tonumber(maxH) or 0))
   local okDec, imgOrErr = pcall(decodeFromMeta, metaOrErr, maxW, maxH)
   metaOrErr = nil
   if collectgarbage then pcall(collectgarbage) end
   if not okDec then
+    L("decode FAIL: " .. tostring(imgOrErr))
     if teePath and teeErr then pcall(fs.delete, teePath) end
     return nil, tostring(imgOrErr)
   end
+  L(("decode OK %dx%d"):format(imgOrErr.width, imgOrErr.height))
   local saved = (teePath and not teeErr and teeBytes > 0) and teeBytes or nil
   return imgOrErr, nil, saved, teeErr
 end
