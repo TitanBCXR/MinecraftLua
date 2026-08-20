@@ -1,6 +1,6 @@
 --[[
   lib/png.lua  -  Compact PNG decoder for CC: Tweaked
-  Titan-Version: 1.1.0
+  Titan-Version: 1.1.1
 
   Decodes non-interlaced PNG:
     - 8-bit grey / RGB / indexed / grey+A / RGBA
@@ -12,11 +12,12 @@
 
   Large images use a streaming, downsampled decode (default max ~160x100)
   so ComputerCraft RAM can hold Minecraft screenshots without OOMing.
+  Prefer fetchHttpDecode (stream HTTP → IDAT → display) over download+reload.
 
   Usage:
-    local png = require("lib.png")   -- or require("lib/png") / dofile("lib/png.lua")
+    local png = require("lib.png")
     local img = png.decodeFile("images/logo.png")
-    -- or: local img = png.decode(data, maxW, maxH)
+    -- or: local img = png.fetchHttpDecode(url, maxW, maxH, optionalSavePath)
     local r, g, b, a = img:get_pixel(1, 1):unpack()  -- 0..1 floats
 
   Paths starting with http:// or https:// are fetched with http binary mode.
@@ -912,7 +913,7 @@ local function makePackedImage(outW, outH, rgbBytes, srcW, srcH, bitDepth, color
 end
 
 -- maxW/maxH: decode target size (monitor-friendly). Nil → defaults.
-local function decodePng(bytes, maxW, maxH)
+local function decodeFromMeta(meta, maxW, maxH)
   maxW = tonumber(maxW) or DEFAULT_MAX_W
   maxH = tonumber(maxH) or DEFAULT_MAX_H
   if maxW < 1 then maxW = 1 end
@@ -920,7 +921,6 @@ local function decodePng(bytes, maxW, maxH)
   if maxW > 320 then maxW = 320 end
   if maxH > 200 then maxH = 200 end
 
-  local meta = parsePngMeta(bytes)
   local outW = meta.width
   local outH = meta.height
   if outW > maxW or outH > maxH then
@@ -934,7 +934,6 @@ local function decodePng(bytes, maxW, maxH)
 
   local zlibData = concatChunks(meta.idat)
   meta.idat = nil
-  bytes = nil
   if collectgarbage then pcall(collectgarbage) end
 
   local sink = makeScaledSink(meta)
@@ -945,10 +944,163 @@ local function decodePng(bytes, maxW, maxH)
   return makePackedImage(outW, outH, sink:rgbBytes(), meta.width, meta.height, meta.bitDepth, meta.colorType)
 end
 
+local function decodePng(bytes, maxW, maxH)
+  local meta = parsePngMeta(bytes)
+  bytes = nil
+  if collectgarbage then pcall(collectgarbage) end
+  return decodeFromMeta(meta, maxW, maxH)
+end
+
 local function isHttpUrl(path)
   if type(path) ~= "string" then return false end
   local p = path:lower()
   return p:sub(1, 7) == "http://" or p:sub(1, 8) == "https://"
+end
+
+-- Read exactly n bytes from a CC binary handle (http or fs).
+local function readExact(h, n)
+  if n <= 0 then return "" end
+  local parts = {}
+  local got = 0
+  while got < n do
+    local want = n - got
+    local chunk = h.read(want)
+    if chunk == nil then
+      return nil, "unexpected EOF (need " .. tostring(n) .. ", got " .. tostring(got) .. ")"
+    end
+    if type(chunk) == "number" then
+      parts[#parts + 1] = string.char(chunk)
+      got = got + 1
+    elseif chunk == "" then
+      return nil, "unexpected EOF (need " .. tostring(n) .. ", got " .. tostring(got) .. ")"
+    else
+      parts[#parts + 1] = chunk
+      got = got + #chunk
+    end
+  end
+  if #parts == 1 then return parts[1] end
+  return table.concat(parts)
+end
+
+local function u32beStr(s, o)
+  o = o or 1
+  local a, b, c, d = s:byte(o, o + 3)
+  return ((a * 256 + b) * 256 + c) * 256 + d
+end
+
+-- Parse PNG from a streaming readExact(n) → string function (file or HTTP).
+local function parsePngMetaFromStream(readExactFn)
+  local sig, serr = readExactFn(8)
+  if not sig then error(serr or "cannot read PNG signature", 0) end
+  if sig ~= PNG_MAGIC then
+    error(
+      ("Not a PNG file (got %s — %s)"):format(hexBytes(sig, 8), describePrefix(sig)),
+      0
+    )
+  end
+
+  local width, height, bitDepth, colorType
+  local palette = {}
+  local idat = {}
+  local trns = nil
+
+  while true do
+    local hdr, herr = readExactFn(8)
+    if not hdr then error(herr or "truncated PNG chunk header", 0) end
+    local len = u32beStr(hdr, 1)
+    local ctype = hdr:sub(5, 8)
+    local data, derr = readExactFn(len)
+    if not data then error(derr or ("truncated PNG chunk " .. ctype), 0) end
+    local crc, cerr = readExactFn(4)
+    if not crc then error(cerr or "truncated PNG CRC", 0) end
+
+    if ctype == "IHDR" then
+      if #data < 13 then error("bad IHDR", 0) end
+      width = u32beStr(data, 1)
+      height = u32beStr(data, 5)
+      bitDepth = data:byte(9)
+      colorType = data:byte(10)
+      local comp, filter, inter = data:byte(11), data:byte(12), data:byte(13)
+      if comp ~= 0 or filter ~= 0 then error("unsupported PNG compression/filter method", 0) end
+      if inter ~= 0 then error("interlaced PNG not supported", 0) end
+      if bitDepth ~= 1 and bitDepth ~= 2 and bitDepth ~= 4 and bitDepth ~= 8 and bitDepth ~= 16 then
+        error("unsupported PNG bit depth " .. tostring(bitDepth), 0)
+      end
+      if colorType == 3 and bitDepth == 16 then
+        error("indexed PNG cannot be 16-bit", 0)
+      end
+      if (colorType == 2 or colorType == 4 or colorType == 6) and bitDepth < 8 then
+        error("RGB/alpha PNG must be 8 or 16-bit", 0)
+      end
+    elseif ctype == "PLTE" then
+      local n = math.floor(#data / 3)
+      for i = 0, n - 1 do
+        local o = i * 3 + 1
+        palette[i] = {
+          data:byte(o) / 255,
+          data:byte(o + 1) / 255,
+          data:byte(o + 2) / 255,
+          1,
+        }
+      end
+    elseif ctype == "tRNS" then
+      trns = data
+    elseif ctype == "IDAT" then
+      idat[#idat + 1] = data
+    elseif ctype == "IEND" then
+      break
+    end
+  end
+
+  if not width then error("missing IHDR", 0) end
+  if #idat == 0 then error("missing IDAT", 0) end
+
+  local transGrey, transRGB
+  if trns then
+    if colorType == 3 then
+      for i = 0, #trns - 1 do
+        if palette[i] then
+          palette[i][4] = trns:byte(i + 1) / 255
+        end
+      end
+    elseif colorType == 0 and #trns >= 2 then
+      transGrey = trns:byte(1) * 256 + trns:byte(2)
+      if bitDepth == 16 then
+        transGrey = rshift(transGrey, 8)
+      elseif bitDepth == 8 then
+        transGrey = band(transGrey, 0xFF)
+      else
+        transGrey = band(transGrey, channelScale(bitDepth))
+      end
+    elseif colorType == 2 and #trns >= 6 then
+      local function u16(o) return trns:byte(o) * 256 + trns:byte(o + 1) end
+      transRGB = { u16(1), u16(3), u16(5) }
+      if bitDepth == 16 then
+        transRGB = { rshift(transRGB[1], 8), rshift(transRGB[2], 8), rshift(transRGB[3], 8) }
+      elseif bitDepth == 8 then
+        transRGB = { band(transRGB[1], 0xFF), band(transRGB[2], 0xFF), band(transRGB[3], 0xFF) }
+      end
+    end
+  end
+
+  local spp = samplesPerPixel(colorType)
+  local bitsPerPixel = bitDepth * spp
+  local filterBpp = math.max(1, math.floor((bitsPerPixel + 7) / 8))
+  local stride = math.floor((bitsPerPixel * width + 7) / 8)
+
+  return {
+    width = width,
+    height = height,
+    bitDepth = bitDepth,
+    colorType = colorType,
+    palette = palette,
+    transGrey = transGrey,
+    transRGB = transRGB,
+    spp = spp,
+    filterBpp = filterBpp,
+    stride = stride,
+    idat = idat,
+  }
 end
 
 local function decodeFile(path, custom_stream)
@@ -960,22 +1112,113 @@ local function decodeFile(path, custom_stream)
       data = custom_stream.input
     end
   end
-  if data == nil then
-    if isHttpUrl(path) then
-      local err
-      data, err = fetchHttpBinary(path)
-      if not data then error(err or "http fetch failed", 0) end
+  if data ~= nil then
+    return decodePng(data, maxW, maxH)
+  end
+  if isHttpUrl(path) then
+    local ferr
+    data, ferr = fetchHttpBinary(path)
+    if not data then error(ferr or "http fetch failed", 0) end
+    local img = decodePng(data, maxW, maxH)
+    data = nil
+    if collectgarbage then pcall(collectgarbage) end
+    return img
+  end
+  if not path then error("png.decodeFile: path required", 0) end
+
+  -- Decode from disk via streaming parse (do NOT readAll the whole PNG first)
+  local f = fs.open(path, "rb")
+  if not f then error("cannot open " .. tostring(path) .. " (need binary mode \"rb\")", 0) end
+  local ok, metaOrErr = pcall(function()
+    return parsePngMetaFromStream(function(n)
+      return readExact(f, n)
+    end)
+  end)
+  f.close()
+  if not ok then error(metaOrErr, 0) end
+  return decodeFromMeta(metaOrErr, maxW, maxH)
+end
+
+-- Stream HTTP PNG: parse chunks as they arrive (keep IDAT only). Optionally tee to disk.
+-- Returns image, or nil, err. Third return: bytes teed (or nil).
+local function fetchHttpDecode(url, maxW, maxH, teePath)
+  if not http or not http.get then
+    return nil, "http API not available (enable http in CC:Tweaked config)"
+  end
+  local fetchUrl = url
+  if not fetchUrl:find("?", 1, true) then
+    fetchUrl = fetchUrl .. "?cb=" .. tostring(os.epoch and os.epoch("utc") or os.time())
+  end
+  local h, err = http.get(fetchUrl, nil, true)
+  if not h then
+    local okCall, a, b = pcall(http.get, { url = fetchUrl, binary = true })
+    if okCall then
+      h, err = a, b
     else
-      if not path then error("png.decodeFile: path required", 0) end
-      local err
-      data, err = readBinaryFile(path)
-      if not data then error(err or ("cannot open " .. tostring(path)), 0) end
+      err = err or a
     end
   end
-  local img = decodePng(data, maxW, maxH)
-  data = nil
+  if not h then
+    return nil, "http get failed: " .. tostring(err or "unknown")
+  end
+  local code = h.getResponseCode and h.getResponseCode() or 200
+  if code ~= 200 then
+    h.close()
+    local hint = (code == 404) and " (not found — check path/branch)" or ""
+    return nil, "HTTP " .. tostring(code) .. hint
+  end
+
+  local tee, teeBytes, teeErr = nil, 0, nil
+  if teePath and teePath ~= "" then
+    tee = fs.open(teePath, "wb")
+    if not tee then
+      teeErr = "cannot write " .. tostring(teePath)
+    end
+  end
+
+  local function readTee(n)
+    local s, rerr = readExact(h, n)
+    if not s then return nil, rerr end
+    if tee then
+      local okw, werr = pcall(function()
+        for i = 1, #s do
+          tee.write(s:byte(i))
+        end
+      end)
+      if okw then
+        teeBytes = teeBytes + #s
+      else
+        -- Disk full mid-download: stop teeing, keep decoding from stream
+        pcall(function() tee.close() end)
+        tee = nil
+        teeErr = tostring(werr)
+        pcall(fs.delete, teePath)
+      end
+    end
+    return s
+  end
+
+  local ok, metaOrErr = pcall(function()
+    return parsePngMetaFromStream(readTee)
+  end)
+  if tee then
+    tee.close()
+  end
+  h.close()
+  if not ok then
+    if teePath then pcall(fs.delete, teePath) end
+    return nil, tostring(metaOrErr)
+  end
+
+  local okDec, imgOrErr = pcall(decodeFromMeta, metaOrErr, maxW, maxH)
+  metaOrErr = nil
   if collectgarbage then pcall(collectgarbage) end
-  return img
+  if not okDec then
+    if teePath and teeErr then pcall(fs.delete, teePath) end
+    return nil, tostring(imgOrErr)
+  end
+  local saved = (teePath and not teeErr and teeBytes > 0) and teeBytes or nil
+  return imgOrErr, nil, saved, teeErr
 end
 
 -- Stream HTTP body straight to a file (avoids holding the whole download in RAM).
@@ -1048,10 +1291,12 @@ local pngImage = {
   decode = decodePng,
   decodeScaled = decodePng,
   decodeFile = decodeFile,
+  decodeFromMeta = decodeFromMeta,
   readBinary = readBinaryFile,
   writeBinary = writeBinaryFile,
   fetchHttp = fetchHttpBinary,
   fetchHttpToFile = fetchHttpToFile,
+  fetchHttpDecode = fetchHttpDecode,
   httpGetBinary = fetchHttpBinary,
   hexBytes = hexBytes,
   describePrefix = describePrefix,

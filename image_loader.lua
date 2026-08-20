@@ -1,6 +1,6 @@
 --[[
   image_loader.lua  -  PNG → advanced (color) monitor (split UI)
-  Titan-Version: 1.3.1
+  Titan-Version: 1.3.2
 
   Computer terminal: paste/enter a download link + short status/help.
   Color monitor: tap navigation GUI (list, Load / Fetch / Refresh / Fit / Prev / Next).
@@ -150,6 +150,17 @@ local function decodeLimits()
     end
   end
   return mw, mh
+end
+
+-- Try several target sizes so huge screenshots still display under low RAM
+local function decodeSizeLadder()
+  local mw, mh = decodeLimits()
+  return {
+    { mw, mh },
+    { math.min(96, mw), math.min(54, mh) },
+    { 64, 36 },
+    { 40, 24 },
+  }
 end
 
 local function setStatus(msg)
@@ -500,38 +511,69 @@ local function applyDecoded(result, pathLabel, quiet, status)
   return true
 end
 
+local function loadPngFromDisk(path, quiet)
+  local lastErr
+  for _, sz in ipairs(decodeSizeLadder()) do
+    if not quiet then
+      print(("Decoding %s → ≤%dx%d …"):format(path, sz[1], sz[2]))
+    end
+    setStatus(("Decode ≤%dx%d…"):format(sz[1], sz[2]))
+    local ok, result = pcall(pngImage.decodeFile, path, { maxW = sz[1], maxH = sz[2] })
+    if ok and type(result) == "table" and result.width then
+      return applyDecoded(result, path, quiet)
+    end
+    lastErr = result
+    if collectgarbage then pcall(collectgarbage) end
+  end
+  return nil, "PNG decode failed: " .. tostring(lastErr)
+end
+
 local function loadPng(path, quiet)
   path = tostring(path or ""):gsub("^%s+", ""):gsub("%s+$", "")
   if path == "" then return nil, "Usage: load <path.png|http-url>" end
 
-  local viaHttp = isHttpUrl(path)
-  if not viaHttp then
-    resolveImagesRoot()
-    -- Bare filename / images/foo → look on the working image drive first
-    if not fs.exists(path) then
-      local base = path:match("([^/]+)$") or path
-      if path:sub(1, 7) == "images/" then
-        base = path:sub(8)
-      end
-      local onStore = fs.combine(imagesRoot, base):gsub("\\", "/")
-      if fs.exists(onStore) and not fs.isDir(onStore) then
-        path = onStore
-      end
+  if isHttpUrl(path) then
+    if not pngImage.fetchHttpDecode then
+      return nil, "Update lib/png.lua (need fetchHttpDecode)"
     end
-    if not fs.exists(path) then return nil, "File not found: " .. path end
-    if fs.isDir(path) then return nil, "Not a file: " .. path end
+    local lastErr
+    local ladder = decodeSizeLadder()
+    for _, sz in ipairs(ladder) do
+      if not quiet then
+        print(("Stream-decode %s → ≤%dx%d …"):format(path, sz[1], sz[2]))
+      end
+      setStatus(("Stream ≤%dx%d…"):format(sz[1], sz[2]))
+      local img, err = pngImage.fetchHttpDecode(path, sz[1], sz[2], nil)
+      if img and img.width then
+        return applyDecoded(img, path .. " (stream)", quiet,
+          ("Shown %dx%d"):format(img.width, img.height))
+      end
+      lastErr = err
+      if collectgarbage then pcall(collectgarbage) end
+    end
+    return nil, "PNG decode failed: " .. tostring(lastErr)
   end
 
-  local mw, mh = decodeLimits()
-  if not quiet then
-    print(("Decoding %s → ≤%dx%d …"):format(path, mw, mh))
+  resolveImagesRoot()
+  if not fs.exists(path) then
+    local base = path:match("([^/]+)$") or path
+    if path:sub(1, 7) == "images/" then
+      base = path:sub(8)
+    end
+    local onStore = fs.combine(imagesRoot, base):gsub("\\", "/")
+    if fs.exists(onStore) and not fs.isDir(onStore) then
+      path = onStore
+    end
   end
-  local ok, result = pcall(pngImage.decodeFile, path, { maxW = mw, maxH = mh })
+  if not fs.exists(path) then return nil, "File not found: " .. path end
+  if fs.isDir(path) then return nil, "Not a file: " .. path end
+
+  local ok, err = loadPngFromDisk(path, quiet)
   if not ok then
-    if not viaHttp then probeLocalPng(path) end
-    return nil, "PNG decode failed: " .. tostring(result)
+    probeLocalPng(path)
+    return nil, err
   end
-  return applyDecoded(result, path, quiet)
+  return true
 end
 
 local function urlBasename(url)
@@ -629,118 +671,61 @@ local function fetchPng(url, saveAs, quiet)
   if not http then
     return nil, "http API not available (enable http in CC:Tweaked config)"
   end
+  if not pngImage.fetchHttpDecode then
+    return nil, "Update lib/png.lua — missing fetchHttpDecode (reinstall Image Loader)"
+  end
 
   linkBuf = url
   saveCfg()
   setStatus("Fetching…")
   if not quiet then print("Fetching " .. url .. " …") end
 
-  local dest, derr = imagesDest(saveAs, url)
-  if not dest then return nil, derr end
-  if not quiet then
-    print("Working drive: " .. storageLabel() .. " (" .. formatBytes(storageFree()) .. " free)")
-    print("Save as: " .. dest)
-  end
-  setStatus("→ " .. storageLabel())
-
-  local dir = fs.getDir(dest)
-  if not dir or dir == "" then dir = imagesRoot or "" end
-  local free = fs.getFreeSpace(dir)
-  local mw, mh = decodeLimits()
-
-  -- Prefer streaming HTTP → disk (never hold the whole file in Lua RAM).
-  -- Need a little free space; screenshots are often >1MB so this may still fail.
-  local minFree = 1024
-  local tryStream = pngImage.fetchHttpToFile
-    and (type(free) ~= "number" or free < 0 or free >= minFree)
-
-  if tryStream then
-    setStatus("Downloading to disk…")
-    local size, serr = pngImage.fetchHttpToFile(url, dest)
-    if size then
-      if not quiet then print(("Saved %s (%d bytes)"):format(dest, size)) end
-      -- Only peek at the PNG signature (do not reload the whole file into RAM)
-      local hf = fs.open(dest, "rb")
-      local magic = ""
-      if hf then
-        for _ = 1, 8 do
-          local b = hf.read()
-          if b == nil then break end
-          if type(b) == "number" then
-            magic = magic .. string.char(b)
-          else
-            magic = magic .. tostring(b):sub(1, 1)
-          end
-        end
-        hf.close()
+  -- Optional save path on floppy/computer (tee while streaming). May fail if disk full.
+  local dest = nil
+  do
+    local d, derr = imagesDest(saveAs, url)
+    if d then
+      dest = d
+      if not quiet then
+        print("Working drive: " .. storageLabel() .. " (" .. formatBytes(storageFree()) .. " free)")
+        print("Save as: " .. dest .. " (stream decode; save if space)")
       end
-      if #magic >= 8 and magic ~= pngImage.MAGIC then
-        pcall(fs.delete, dest)
-        return nil, "Download is not a PNG: " .. pngImage.describePrefix(magic)
+    elseif not quiet and derr then
+      print("Note: " .. tostring(derr) .. " — decoding without save")
+    end
+  end
+
+  local lastErr
+  local ladder = decodeSizeLadder()
+  for i, sz in ipairs(ladder) do
+    if not quiet then
+      print(("Stream-decode → ≤%dx%d …"):format(sz[1], sz[2]))
+    end
+    setStatus(("Stream ≤%dx%d…"):format(sz[1], sz[2]))
+    -- Tee to disk only on first attempt (later retries re-fetch without save)
+    local tee = (i == 1) and dest or nil
+    local img, err, saved, teeErr = pngImage.fetchHttpDecode(url, sz[1], sz[2], tee)
+    if img and img.width then
+      if saved and dest then
+        if not quiet then print(("Saved %s (%d bytes)"):format(dest, saved)) end
+        listImages()
+        return applyDecoded(img, dest, quiet)
       end
-      if collectgarbage then pcall(collectgarbage) end
-      listImages()
-      return loadPng(dest, quiet)
+      if teeErr and not quiet then
+        print("Save skipped: " .. tostring(teeErr))
+      end
+      local label = dest and (dest .. " (unsaved)") or "(memory)"
+      return applyDecoded(
+        img,
+        label,
+        quiet,
+        ("Shown %dx%d (not saved)"):format(img.width, img.height)
+      )
     end
-    pcall(fs.delete, dest)
-    local sm = tostring(serr or "")
-    if sm:lower():find("out of space", 1, true) then
-      return nil, "Out of space while downloading to " .. storageLabel()
-        .. ". Free space, use a floppy (storage disk), or raise floppy_space_limit / computer_space_limit."
-    end
-    if not quiet then
-      print("Stream save failed: " .. sm .. " — trying RAM fetch")
-    end
+    lastErr = err
+    if collectgarbage then pcall(collectgarbage) end
   end
-
-  -- Fallback: full download in RAM, then downsampled streaming decode
-  local data, err = pngImage.fetchHttp(url)
-  if not data then return nil, err or "fetch failed" end
-
-  if not quiet then print("First 8 bytes: " .. pngImage.hexBytes(data, 8)) end
-  if data:sub(1, 8) ~= pngImage.MAGIC then
-    return nil, "Download is not a PNG: " .. pngImage.describePrefix(data)
-  end
-
-  local need = #data
-  local canSave = not (type(free) == "number" and free >= 0 and free < need)
-  if canSave then
-    local wok, werr = pngImage.writeBinary(dest, data)
-    if wok then
-      data = nil
-      if collectgarbage then pcall(collectgarbage) end
-      if not quiet then print("Saved " .. dest .. " (" .. tostring(need) .. " bytes)") end
-      listImages()
-      return loadPng(dest, quiet)
-    end
-    if not quiet then print("Warning: " .. tostring(werr) .. " — decode in RAM") end
-  else
-    if not quiet then
-      print(("Not enough disk (%s free, need %d) — RAM decode ≤%dx%d"):format(
-        tostring(free), need, mw, mh))
-    end
-  end
-
-  setStatus(("Decoding ≤%dx%d…"):format(mw, mh))
-  if not quiet then print(("Decoding %d bytes → ≤%dx%d …"):format(need, mw, mh)) end
-  local okDec, result = pcall(pngImage.decode, data, mw, mh)
-  data = nil
-  if collectgarbage then pcall(collectgarbage) end
-  if not okDec then
-    return nil, "PNG decode failed: " .. tostring(result)
-  end
-
-  local label = canSave and (dest .. " (unsaved)") or (dest .. " (unsaved)")
-  local okApply, applyErr = applyDecoded(
-    result,
-    label,
-    quiet,
-    ("Shown %dx%d (not saved)"):format(result.width, result.height)
-  )
-  result = nil
-  if collectgarbage then pcall(collectgarbage) end
-  if not okApply then return nil, applyErr end
-  return true
+  return nil, "PNG decode failed: " .. tostring(lastErr)
 end
 
 local function githubPng(spec, saveAs, quiet)
