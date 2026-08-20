@@ -18,6 +18,19 @@ Requires an **advanced (color) monitor** for the nav GUI. The loader quantizes t
 
 **Fetch** on the monitor uses the link currently shown on the computer. Last link / last image are saved in `.image_loader.cfg`.
 
+## Storage (floppy recommended)
+
+By default (**`storage auto`**) Image Loader puts files under **`disk/images`** when a floppy is in an attached disk drive, otherwise **`images/`** on the computer.
+
+```
+storage           # show path + free space
+storage disk      # require floppy
+storage local     # computer images/ only
+storage auto      # floppy if present (default)
+```
+
+ComputerCraft uses separate quotas: `computer_space_limit` vs `floppy_space_limit` in `computercraft-server.toml`. Default floppies are often **smaller** than the computer (~125KB) — raise `floppy_space_limit` (e.g. `5000000`) if you want big screenshot downloads on the floppy.
+
 ## How to copy PNGs correctly (binary)
 
 CC:Tweaked stores each computer’s files under the world save:
@@ -56,7 +69,8 @@ image_loader
 - Downloads use **binary** HTTP and write with `fs.open(..., "wb")` into `images/`, then auto-load.
 - Prefer raw PNG URLs — HTML pages (404 / blob UI) will be rejected with a clear error.
 - If the computer disk is full (`Out of space`), Fetch still **decodes and shows** the PNG from RAM, but it will **not** be saved under `images/` until you free space or use a smaller file.
-- **Minecraft screenshots** are often 1–5MB+. Default CC computer space is often ~1MB (`computer_space_limit` in `computercraft-server.toml`). Resize/compress to something like **160×90** or **under ~200KB** before uploading to GitHub.
+- **Minecraft screenshots** are often 1–5MB+. Default CC computer space is often ~1MB (`computer_space_limit` in `computercraft-server.toml`). Prefer streaming download to disk when space allows; the decoder **downsamples** to about monitor size (≤~160×100 packed RGB) so full‑res pixel tables do not exhaust Lua RAM.
+- Best practice: still resize/compress before upload when you can — huge downloads can OOM during HTTP even before decode.
 
 ## Supported PNG kinds
 

@@ -1,6 +1,6 @@
 --[[
   lib/png.lua  -  Compact PNG decoder for CC: Tweaked
-  Titan-Version: 1.0.4
+  Titan-Version: 1.1.0
 
   Decodes non-interlaced PNG:
     - 8-bit grey / RGB / indexed / grey+A / RGBA
@@ -10,10 +10,13 @@
 
   Includes a small zlib/deflate inflater.
 
+  Large images use a streaming, downsampled decode (default max ~160x100)
+  so ComputerCraft RAM can hold Minecraft screenshots without OOMing.
+
   Usage:
     local png = require("lib.png")   -- or require("lib/png") / dofile("lib/png.lua")
     local img = png.decodeFile("images/logo.png")
-    -- or: local img = png("images/logo.png")
+    -- or: local img = png.decode(data, maxW, maxH)
     local r, g, b, a = img:get_pixel(1, 1):unpack()  -- 0..1 floats
 
   Paths starting with http:// or https:// are fetched with http binary mode.
@@ -328,6 +331,26 @@ local DIST_EXTRA = {
 
 local CL_ORDER = { 16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15 }
 
+-- out may be a plain byte table, or a sink with :push(b) / :backref(dist, len)
+local function emitByte(out, b)
+  if out.push then
+    out:push(b)
+  else
+    out[#out + 1] = b
+  end
+end
+
+local function emitCopy(out, distance, len)
+  if out.backref then
+    out:backref(distance, len)
+    return
+  end
+  local start = #out - distance + 1
+  for i = 1, len do
+    out[#out + 1] = out[start + i - 1]
+  end
+end
+
 local function inflateBlock(bs, out)
   local bfinal = bs:bits(1)
   local btype = bs:bits(2)
@@ -339,7 +362,7 @@ local function inflateBlock(bs, out)
       error("bad uncompressed block length", 0)
     end
     for _ = 1, len do
-      out[#out + 1] = bs:bits(8)
+      emitByte(out, bs:bits(8))
     end
   elseif btype == 1 or btype == 2 then
     local lit, dist
@@ -384,17 +407,14 @@ local function inflateBlock(bs, out)
     while true do
       local sym = lit:decode(bs)
       if sym < 256 then
-        out[#out + 1] = sym
+        emitByte(out, sym)
       elseif sym == 256 then
         break
       else
         local len = LEN_BASE[sym] + (bs:bits(LEN_EXTRA[sym]) or 0)
         local dsym = dist:decode(bs)
         local distance = DIST_BASE[dsym] + (bs:bits(DIST_EXTRA[dsym]) or 0)
-        local start = #out - distance + 1
-        for i = 1, len do
-          out[#out + 1] = out[start + i - 1]
-        end
+        emitCopy(out, distance, len)
       end
     end
   else
@@ -421,6 +441,22 @@ local function inflateZlib(raw)
   local chars = {}
   for i = 1, #out do chars[i] = string.char(out[i]) end
   return table.concat(chars)
+end
+
+local function inflateZlibInto(raw, sink)
+  local bs = Bitstream(raw)
+  local cmf = bs:bits(8)
+  local flg = bs:bits(8)
+  if band(cmf, 0x0F) ~= 8 then error("unsupported zlib compression method", 0) end
+  if band(flg, 0x20) ~= 0 then
+    bs:bits(32)
+  end
+  repeat
+    local done = inflateBlock(bs, sink)
+  until done
+  bs:align()
+  bs:bits(32)
+  if sink.finish then sink:finish() end
 end
 
 --------------------------------------------------------------------------------
@@ -550,7 +586,195 @@ local function unpackSamples(rowBytes, width, bitDepth, spp)
   return samples, max
 end
 
-local function decodePng(bytes)
+--------------------------------------------------------------------------------
+-- Streaming downsampled decode (CC RAM-friendly)
+--------------------------------------------------------------------------------
+-- Keep only a 32KiB deflate window + one scanline; emit packed RGB at maxW×maxH.
+local DEFAULT_MAX_W, DEFAULT_MAX_H = 160, 100
+
+local function concatChunks(chunks)
+  if #chunks == 0 then return "" end
+  if #chunks == 1 then return chunks[1] end
+  return table.concat(chunks)
+end
+
+local function packRgbString(bytes)
+  -- bytes: array of 0..255 numbers → string, in chunks to avoid huge unpack
+  local n = #bytes
+  if n == 0 then return "" end
+  local parts = {}
+  local step = 2048
+  for i = 1, n, step do
+    local last = math.min(i + step - 1, n)
+    local chunk = {}
+    local c = 0
+    for j = i, last do
+      c = c + 1
+      chunk[c] = string.char(bytes[j])
+    end
+    parts[#parts + 1] = table.concat(chunk)
+  end
+  return table.concat(parts)
+end
+
+local function makeScaledSink(meta)
+  local width, height = meta.width, meta.height
+  local stride, filterBpp = meta.stride, meta.filterBpp
+  local bitDepth, colorType = meta.bitDepth, meta.colorType
+  local spp = meta.spp
+  local palette, transGrey, transRGB = meta.palette, meta.transGrey, meta.transRGB
+  local outW, outH = meta.outW, meta.outH
+
+  local WIN = 32768
+  local ring = {}
+  local total = 0
+  local head = 0
+  local filled = 0
+  local consumed = 0
+  local rowY = 0
+  local prev = {}
+  for i = 1, stride do prev[i] = 0 end
+
+  local rgb = {}
+  local rgbN = outW * outH * 3
+  for i = 1, rgbN do rgb[i] = 0 end
+
+  -- Which output rows need source row sy (1-based)
+  local needRow = {}
+  for oy = 1, outH do
+    local sy = math.floor((oy - 0.5) * height / outH) + 1
+    if sy < 1 then sy = 1 end
+    if sy > height then sy = height end
+    if not needRow[sy] then needRow[sy] = {} end
+    needRow[sy][#needRow[sy] + 1] = oy
+  end
+
+  local function ringAt(absPos)
+    local distFromEnd = total - absPos
+    if distFromEnd < 0 or distFromEnd >= filled then
+      error("PNG inflate window miss", 0)
+    end
+    local idx = head - distFromEnd
+    if idx < 1 then idx = idx + WIN end
+    return ring[idx]
+  end
+
+  local function sampleRow(sy, cur)
+    local oys = needRow[sy]
+    if not oys then return end
+    local samples, maxV = unpackSamples(cur, width, bitDepth, spp)
+    for oi = 1, #oys do
+      local oy = oys[oi]
+      for ox = 1, outW do
+        local sx = math.floor((ox - 0.5) * width / outW) + 1
+        if sx < 1 then sx = 1 end
+        if sx > width then sx = width end
+        local si = (sx - 1) * spp + 1
+        local R, G, B, A = 0, 0, 0, 1
+        if colorType == 0 then
+          local g = samples[si] or 0
+          local gf = g / maxV
+          R, G, B = gf, gf, gf
+          if transGrey ~= nil and g == transGrey then A = 0 end
+        elseif colorType == 2 then
+          local rv, gv, bv = samples[si] or 0, samples[si + 1] or 0, samples[si + 2] or 0
+          R, G, B = rv / maxV, gv / maxV, bv / maxV
+          if transRGB and rv == transRGB[1] and gv == transRGB[2] and bv == transRGB[3] then
+            A = 0
+          end
+        elseif colorType == 3 then
+          local pi = samples[si] or 0
+          local c = palette[pi] or { 0, 0, 0, 1 }
+          R, G, B, A = c[1], c[2], c[3], c[4]
+        elseif colorType == 4 then
+          local g = samples[si] or 0
+          local av = samples[si + 1] or 0
+          local gf = g / maxV
+          R, G, B, A = gf, gf, gf, av / maxV
+        else -- 6 RGBA
+          local rv = samples[si] or 0
+          local gv = samples[si + 1] or 0
+          local bv = samples[si + 2] or 0
+          local av = samples[si + 3] or 0
+          R, G, B, A = rv / maxV, gv / maxV, bv / maxV, av / maxV
+        end
+        if A < 0.5 then R, G, B = 0, 0, 0 end
+        local o = ((oy - 1) * outW + (ox - 1)) * 3
+        rgb[o + 1] = math.floor(R * 255 + 0.5)
+        rgb[o + 2] = math.floor(G * 255 + 0.5)
+        rgb[o + 3] = math.floor(B * 255 + 0.5)
+      end
+    end
+  end
+
+  local function drain()
+    while (total - consumed) >= (stride + 1) and rowY < height do
+      local ftype = ringAt(consumed + 1)
+      local cur = {}
+      for i = 1, stride do
+        cur[i] = ringAt(consumed + 1 + i)
+      end
+      if ftype == 0 then
+        -- none
+      elseif ftype == 1 then
+        for i = 1, stride do
+          local left = (i > filterBpp) and cur[i - filterBpp] or 0
+          cur[i] = (cur[i] + left) % 256
+        end
+      elseif ftype == 2 then
+        for i = 1, stride do
+          cur[i] = (cur[i] + prev[i]) % 256
+        end
+      elseif ftype == 3 then
+        for i = 1, stride do
+          local left = (i > filterBpp) and cur[i - filterBpp] or 0
+          cur[i] = (cur[i] + math.floor((left + prev[i]) / 2)) % 256
+        end
+      elseif ftype == 4 then
+        for i = 1, stride do
+          local left = (i > filterBpp) and cur[i - filterBpp] or 0
+          local up = prev[i]
+          local upLeft = (i > filterBpp) and prev[i - filterBpp] or 0
+          cur[i] = (cur[i] + paeth(left, up, upLeft)) % 256
+        end
+      else
+        error("unsupported PNG filter " .. tostring(ftype), 0)
+      end
+      consumed = consumed + stride + 1
+      rowY = rowY + 1
+      sampleRow(rowY, cur)
+      for i = 1, stride do prev[i] = cur[i] end
+    end
+  end
+
+  local sink = {}
+  function sink:push(b)
+    total = total + 1
+    head = head % WIN + 1
+    ring[head] = b
+    if filled < WIN then filled = filled + 1 end
+    if (total - consumed) >= (stride + 1) then
+      drain()
+    end
+  end
+  function sink:backref(distance, len)
+    for _ = 1, len do
+      self:push(ringAt(total - distance + 1))
+    end
+  end
+  function sink:finish()
+    drain()
+    if rowY < height then
+      error("truncated PNG image data", 0)
+    end
+  end
+  function sink:rgbBytes()
+    return rgb
+  end
+  return sink
+end
+
+local function parsePngMeta(bytes)
   if type(bytes) ~= "string" then
     error("PNG data must be a string (got " .. type(bytes) .. ")", 0)
   end
@@ -564,7 +788,7 @@ local function decodePng(bytes)
   end
 
   local width, height, bitDepth, colorType
-  local palette = {} -- [i] = {r,g,b,a} floats
+  local palette = {}
   local idat = {}
   local trns = nil
 
@@ -589,7 +813,6 @@ local function decodePng(bytes)
       if bitDepth ~= 1 and bitDepth ~= 2 and bitDepth ~= 4 and bitDepth ~= 8 and bitDepth ~= 16 then
         error("unsupported PNG bit depth " .. tostring(bitDepth), 0)
       end
-      -- Restrict: 16-bit only for grey/RGB/greyA/RGBA; indexed max 8
       if colorType == 3 and bitDepth == 16 then
         error("indexed PNG cannot be 16-bit", 0)
       end
@@ -619,7 +842,6 @@ local function decodePng(bytes)
   if not width then error("missing IHDR", 0) end
   if #idat == 0 then error("missing IDAT", 0) end
 
-  -- Apply tRNS to palette / store key colour
   local transGrey, transRGB
   if trns then
     if colorType == 3 then
@@ -630,7 +852,6 @@ local function decodePng(bytes)
       end
     elseif colorType == 0 and #trns >= 2 then
       transGrey = trns:byte(1) * 256 + trns:byte(2)
-      -- We decode 16-bit as high-byte-only (0..255); match that. 8-bit uses low byte.
       if bitDepth == 16 then
         transGrey = rshift(transGrey, 8)
       elseif bitDepth == 8 then
@@ -649,71 +870,79 @@ local function decodePng(bytes)
     end
   end
 
-  local inflated = inflateZlib(table.concat(idat))
   local spp = samplesPerPixel(colorType)
   local bitsPerPixel = bitDepth * spp
   local filterBpp = math.max(1, math.floor((bitsPerPixel + 7) / 8))
   local stride = math.floor((bitsPerPixel * width + 7) / 8)
-  local expected = (stride + 1) * height
-  if #inflated < expected then
-    error("truncated PNG image data", 0)
-  end
-  local rawBytes = unfilterRowsEx(inflated, height, stride, filterBpp)
 
-  local pixels = {} -- [y][x] = Pixel
-  local rowOffset = 0
-  for y = 1, height do
-    pixels[y] = {}
-    local row = {}
-    for i = 1, stride do
-      row[i] = rawBytes[rowOffset + i]
-    end
-    rowOffset = rowOffset + stride
-    local samples, maxV = unpackSamples(row, width, bitDepth, spp)
-    local si = 1
-    for x = 1, width do
-      local R, G, B, A = 0, 0, 0, 1
-      if colorType == 0 then
-        local g = samples[si]; si = si + 1
-        local gf = g / maxV
-        R, G, B = gf, gf, gf
-        if transGrey ~= nil and g == transGrey then A = 0 end
-      elseif colorType == 2 then
-        local rv, gv, bv = samples[si], samples[si + 1], samples[si + 2]
-        si = si + 3
-        R, G, B = rv / maxV, gv / maxV, bv / maxV
-        if transRGB and rv == transRGB[1] and gv == transRGB[2] and bv == transRGB[3] then
-          A = 0
-        end
-      elseif colorType == 3 then
-        local pi = samples[si]; si = si + 1
-        local c = palette[pi] or { 0, 0, 0, 1 }
-        R, G, B, A = c[1], c[2], c[3], c[4]
-      elseif colorType == 4 then
-        local g = samples[si]; local av = samples[si + 1]; si = si + 2
-        local gf = g / maxV
-        R, G, B, A = gf, gf, gf, av / maxV
-      elseif colorType == 6 then
-        local rv, gv, bv, av = samples[si], samples[si + 1], samples[si + 2], samples[si + 3]
-        si = si + 4
-        R, G, B, A = rv / maxV, gv / maxV, bv / maxV, av / maxV
-      end
-      pixels[y][x] = Pixel.new(R, G, B, A)
-    end
-  end
-
-  local img = {
+  return {
     width = width,
     height = height,
+    bitDepth = bitDepth,
+    colorType = colorType,
+    palette = palette,
+    transGrey = transGrey,
+    transRGB = transRGB,
+    spp = spp,
+    filterBpp = filterBpp,
+    stride = stride,
+    idat = idat,
+  }
+end
+
+local function makePackedImage(outW, outH, rgbBytes, srcW, srcH, bitDepth, colorType)
+  local packed = packRgbString(rgbBytes)
+  local img = {
+    width = outW,
+    height = outH,
+    srcWidth = srcW,
+    srcHeight = srcH,
     depth = bitDepth,
     colorType = colorType,
-    _pixels = pixels,
+    scaled = (outW ~= srcW) or (outH ~= srcH),
+    _rgb = packed,
   }
   function img:get_pixel(x, y)
-    local row = self._pixels[y]
-    return row and row[x] or nil
+    if x < 1 or y < 1 or x > self.width or y > self.height then return nil end
+    local o = ((y - 1) * self.width + (x - 1)) * 3 + 1
+    local r, g, b = self._rgb:byte(o, o + 2)
+    return Pixel.new((r or 0) / 255, (g or 0) / 255, (b or 0) / 255, 1)
   end
   return img
+end
+
+-- maxW/maxH: decode target size (monitor-friendly). Nil → defaults.
+local function decodePng(bytes, maxW, maxH)
+  maxW = tonumber(maxW) or DEFAULT_MAX_W
+  maxH = tonumber(maxH) or DEFAULT_MAX_H
+  if maxW < 1 then maxW = 1 end
+  if maxH < 1 then maxH = 1 end
+  if maxW > 320 then maxW = 320 end
+  if maxH > 200 then maxH = 200 end
+
+  local meta = parsePngMeta(bytes)
+  local outW = meta.width
+  local outH = meta.height
+  if outW > maxW or outH > maxH then
+    local s = math.min(maxW / outW, maxH / outH)
+    outW = math.max(1, math.floor(outW * s + 0.5))
+    outH = math.max(1, math.floor(outH * s + 0.5))
+  end
+
+  meta.outW = outW
+  meta.outH = outH
+
+  local zlibData = concatChunks(meta.idat)
+  meta.idat = nil
+  bytes = nil
+  if collectgarbage then pcall(collectgarbage) end
+
+  local sink = makeScaledSink(meta)
+  inflateZlibInto(zlibData, sink)
+  zlibData = nil
+  if collectgarbage then pcall(collectgarbage) end
+
+  return makePackedImage(outW, outH, sink:rgbBytes(), meta.width, meta.height, meta.bitDepth, meta.colorType)
 end
 
 local function isHttpUrl(path)
@@ -723,33 +952,112 @@ local function isHttpUrl(path)
 end
 
 local function decodeFile(path, custom_stream)
+  local maxW, maxH
   local data
-  if custom_stream and custom_stream.input then
-    data = custom_stream.input
-  elseif isHttpUrl(path) then
-    local err
-    data, err = fetchHttpBinary(path)
-    if not data then error(err or "http fetch failed", 0) end
-  else
-    if not path then error("png.decodeFile: path required", 0) end
-    local err
-    data, err = readBinaryFile(path)
-    if not data then error(err or ("cannot open " .. tostring(path)), 0) end
+  if type(custom_stream) == "table" then
+    maxW, maxH = custom_stream.maxW, custom_stream.maxH
+    if custom_stream.input then
+      data = custom_stream.input
+    end
   end
-  return decodePng(data)
+  if data == nil then
+    if isHttpUrl(path) then
+      local err
+      data, err = fetchHttpBinary(path)
+      if not data then error(err or "http fetch failed", 0) end
+    else
+      if not path then error("png.decodeFile: path required", 0) end
+      local err
+      data, err = readBinaryFile(path)
+      if not data then error(err or ("cannot open " .. tostring(path)), 0) end
+    end
+  end
+  local img = decodePng(data, maxW, maxH)
+  data = nil
+  if collectgarbage then pcall(collectgarbage) end
+  return img
+end
+
+-- Stream HTTP body straight to a file (avoids holding the whole download in RAM).
+local function fetchHttpToFile(url, path)
+  if not http or not http.get then
+    return nil, "http API not available (enable http in CC:Tweaked config)"
+  end
+  local fetchUrl = url
+  if not fetchUrl:find("?", 1, true) then
+    fetchUrl = fetchUrl .. "?cb=" .. tostring(os.epoch and os.epoch("utc") or os.time())
+  end
+  local h, err = http.get(fetchUrl, nil, true)
+  if not h then
+    local okCall, a, b = pcall(http.get, { url = fetchUrl, binary = true })
+    if okCall then
+      h, err = a, b
+    else
+      err = err or a
+    end
+  end
+  if not h then
+    return nil, "http get failed: " .. tostring(err or "unknown")
+  end
+  local code = h.getResponseCode and h.getResponseCode() or 200
+  if code ~= 200 then
+    h.close()
+    local hint = (code == 404) and " (not found — check path/branch)" or ""
+    return nil, "HTTP " .. tostring(code) .. hint
+  end
+
+  local f = fs.open(path, "wb")
+  if not f then
+    h.close()
+    return nil, "cannot write " .. tostring(path)
+  end
+
+  local size = 0
+  local ok, werr = pcall(function()
+    while true do
+      local chunk = h.read(2048)
+      if chunk == nil then break end
+      if type(chunk) == "number" then
+        f.write(chunk)
+        size = size + 1
+      elseif chunk == "" then
+        break
+      else
+        for i = 1, #chunk do
+          f.write(chunk:byte(i))
+        end
+        size = size + #chunk
+      end
+    end
+  end)
+  f.close()
+  h.close()
+  if not ok then
+    pcall(fs.delete, path)
+    return nil, tostring(werr)
+  end
+  if size == 0 then
+    pcall(fs.delete, path)
+    return nil, "http response empty"
+  end
+  return size
 end
 
 -- Table export (functions cannot hold fields in Lua / CC:Tweaked)
 local pngImage = {
   decode = decodePng,
+  decodeScaled = decodePng,
   decodeFile = decodeFile,
   readBinary = readBinaryFile,
   writeBinary = writeBinaryFile,
   fetchHttp = fetchHttpBinary,
+  fetchHttpToFile = fetchHttpToFile,
   httpGetBinary = fetchHttpBinary,
   hexBytes = hexBytes,
   describePrefix = describePrefix,
   MAGIC = PNG_MAGIC,
+  DEFAULT_MAX_W = DEFAULT_MAX_W,
+  DEFAULT_MAX_H = DEFAULT_MAX_H,
 }
 
 setmetatable(pngImage, {

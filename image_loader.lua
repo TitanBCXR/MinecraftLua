@@ -1,6 +1,6 @@
 --[[
   image_loader.lua  -  PNG → advanced (color) monitor (split UI)
-  Titan-Version: 1.1.2
+  Titan-Version: 1.3.0
 
   Computer terminal: paste/enter a download link + short status/help.
   Color monitor: tap navigation GUI (list, Load / Fetch / Refresh / Fit / Prev / Next).
@@ -9,11 +9,16 @@
   character/blit grid (not a true framebuffer); pixels are quantized to the
   nearest CC palette colour.
 
+  Storage: PNGs live under images/ — on a floppy when a disk drive is present
+  (recommended for large screenshots), otherwise on the computer. Use:
+      storage auto|disk|local
+      storage                 show free space / mount
+
   Usage:
       image_loader
       image_loader <path.png|http-url>
 
-  Put PNGs under images/ on the computer. Computer commands:
+  Computer commands:
       <url>                   set download link (Fetch on monitor uses this)
       fetch [url] [filename]  download PNG → images/, then load
       github <ref> [filename] download from GitHub → images/, then load
@@ -21,7 +26,7 @@
       up / down / prev / next navigate list
       fit / refresh / help / quit
 
-  Persist: .image_loader.cfg (last link + last image).
+  Persist: .image_loader.cfg (last link + last image + storage mode).
 ]]
 
 local pngImage
@@ -61,7 +66,7 @@ local alive = true
 local guiDirty = true
 local statusMsg = "Ready"
 local linkBuf = ""
-local imageList = {} -- relative paths under images/
+local imageList = {} -- full paths under imagesRoot
 local selected = 1
 local listScroll = 0
 local img = nil
@@ -70,6 +75,11 @@ local scaleMul = 1.0
 local mon = nil
 local monName = nil
 local hitZones = {} -- filled each monitor draw
+-- Image store: "auto" prefers floppy images/, else computer images/
+local storageMode = "auto" -- auto | disk | local
+local imagesRoot = "images"
+local diskMount = nil
+local diskDriveName = nil
 
 --------------------------------------------------------------------------------
 -- CC default palette (RGB 0..1) + blit chars
@@ -108,6 +118,12 @@ local function nearestBlit(r, g, b, a)
 end
 
 local function pixelRGBA(image, x, y)
+  -- Packed RGB path (streaming downsampled decode) — no Pixel allocs while drawing
+  if image._rgb then
+    local o = ((y - 1) * image.width + (x - 1)) * 3 + 1
+    local r, g, b = image._rgb:byte(o, o + 2)
+    return (r or 0) / 255, (g or 0) / 255, (b or 0) / 255, 1
+  end
   local px = image:get_pixel(x, y)
   if not px then return 0, 0, 0, 0 end
   local r = px.r or px.R or 0
@@ -120,6 +136,20 @@ local function pixelRGBA(image, x, y)
   end
   if a > 1 then a = a / 255 end
   return r, g, b, a
+end
+
+local function decodeLimits()
+  local mw = (pngImage and pngImage.DEFAULT_MAX_W) or 160
+  local mh = (pngImage and pngImage.DEFAULT_MAX_H) or 100
+  if mon then
+    local ok, w, h = pcall(function() return mon.getSize() end)
+    if ok and type(w) == "number" and type(h) == "number" then
+      -- Oversample monitor a bit for Fit/zoom; hard-cap for CC RAM
+      mw = math.min(320, math.max(48, (w - 10) * 2))
+      mh = math.min(200, math.max(27, (h - 5) * 2))
+    end
+  end
+  return mw, mh
 end
 
 local function setStatus(msg)
@@ -138,6 +168,7 @@ local function loadCfg()
   f.close()
   local link = raw:match("lastLink%s*=%s*(.-)\n") or raw:match("lastLink%s*=%s*(.+)$")
   local last = raw:match("lastImage%s*=%s*(.-)\n") or raw:match("lastImage%s*=%s*(.+)$")
+  local stor = raw:match("storage%s*=%s*(.-)\n") or raw:match("storage%s*=%s*(.+)$")
   if link then
     link = link:gsub("^%s+", ""):gsub("%s+$", "")
     if link ~= "" then linkBuf = link end
@@ -146,6 +177,13 @@ local function loadCfg()
     last = last:gsub("^%s+", ""):gsub("%s+$", "")
     if last ~= "" then imgPath = last end
   end
+  if stor then
+    stor = stor:gsub("^%s+", ""):gsub("%s+$", ""):lower()
+    if stor == "auto" or stor == "disk" or stor == "local" or stor == "computer" then
+      if stor == "computer" then stor = "local" end
+      storageMode = stor
+    end
+  end
 end
 
 local function saveCfg()
@@ -153,7 +191,126 @@ local function saveCfg()
   if not f then return end
   f.write("lastLink=" .. tostring(linkBuf or "") .. "\n")
   f.write("lastImage=" .. tostring(imgPath or "") .. "\n")
+  f.write("storage=" .. tostring(storageMode or "auto") .. "\n")
   f.close()
+end
+
+--------------------------------------------------------------------------------
+-- Floppy / images root
+--------------------------------------------------------------------------------
+local function findFloppyMounts()
+  local list = {}
+  for _, name in ipairs(peripheral.getNames()) do
+    if peripheral.getType(name) == "drive" then
+      local d = peripheral.wrap(name)
+      if d and d.isDiskPresent and d.isDiskPresent() then
+        local mount = d.getMountPath and d.getMountPath()
+        if mount and mount ~= "" then
+          local free = fs.getFreeSpace(mount)
+          list[#list + 1] = {
+            name = name,
+            mount = mount,
+            free = (type(free) == "number" and free) or -1,
+            hasImages = fs.exists(fs.combine(mount, "images")),
+          }
+        end
+      end
+    end
+  end
+  return list
+end
+
+local function pickFloppy()
+  local mounts = findFloppyMounts()
+  if #mounts == 0 then return nil, nil end
+  -- Prefer a disk that already has images/, else the one with most free space
+  local best, bestScore = nil, -2
+  for i = 1, #mounts do
+    local m = mounts[i]
+    local score = m.free
+    if m.hasImages then score = score + 100000000 end
+    if score > bestScore then
+      bestScore = score
+      best = m
+    end
+  end
+  return best.name, best.mount
+end
+
+local function ensureImagesRoot()
+  if not fs.exists(imagesRoot) then
+    pcall(fs.makeDir, imagesRoot)
+  end
+  return fs.exists(imagesRoot)
+end
+
+local function resolveImagesRoot()
+  diskMount, diskDriveName = nil, nil
+  if storageMode == "local" then
+    imagesRoot = "images"
+    ensureImagesRoot()
+    return imagesRoot, nil
+  end
+
+  local name, mount = pickFloppy()
+  if mount then
+    diskDriveName, diskMount = name, mount
+    imagesRoot = fs.combine(mount, "images"):gsub("\\", "/")
+    ensureImagesRoot()
+    return imagesRoot, nil
+  end
+
+  if storageMode == "disk" then
+    imagesRoot = "images"
+    ensureImagesRoot()
+    return imagesRoot, "No floppy — insert a disk in a drive (or: storage local)"
+  end
+
+  -- auto without floppy
+  imagesRoot = "images"
+  ensureImagesRoot()
+  return imagesRoot, nil
+end
+
+local function storageLabel()
+  if diskMount then
+    return diskMount .. "/images"
+  end
+  return "images"
+end
+
+local function formatBytes(n)
+  if type(n) ~= "number" or n < 0 then return "?" end
+  if n >= 1024 * 1024 then
+    return ("%.1fMB"):format(n / (1024 * 1024))
+  end
+  if n >= 1024 then
+    return ("%.0fKB"):format(n / 1024)
+  end
+  return tostring(n) .. "B"
+end
+
+local function storageFree()
+  local free = fs.getFreeSpace(imagesRoot)
+  if type(free) ~= "number" then
+    free = fs.getFreeSpace(diskMount or "")
+  end
+  return free
+end
+
+local function printStorageStatus()
+  resolveImagesRoot()
+  local free = storageFree()
+  print("Storage mode: " .. tostring(storageMode))
+  print("Images path:  " .. storageLabel())
+  print("Free space:   " .. formatBytes(free))
+  if diskMount then
+    print("Floppy:       " .. tostring(diskDriveName) .. " → " .. tostring(diskMount))
+  else
+    print("Floppy:       none inserted")
+  end
+  print("Tip: large screenshots need room on the floppy — raise floppy_space_limit")
+  print("     in computercraft-server.toml if downloads still hit Out of space.")
 end
 
 --------------------------------------------------------------------------------
@@ -203,9 +360,10 @@ end
 -- Image list / load / fetch
 --------------------------------------------------------------------------------
 local function listImages()
+  resolveImagesRoot()
   imageList = {}
-  if not fs.exists("images") then
-    pcall(fs.makeDir, "images")
+  if not fs.exists(imagesRoot) then
+    pcall(fs.makeDir, imagesRoot)
     return
   end
   local function walk(dir, prefix)
@@ -218,11 +376,11 @@ local function listImages()
       if fs.isDir(path) then
         walk(path, rel)
       elseif name:lower():match("%.png$") then
-        imageList[#imageList + 1] = fs.combine("images", rel):gsub("\\", "/")
+        imageList[#imageList + 1] = fs.combine(imagesRoot, rel):gsub("\\", "/")
       end
     end
   end
-  walk("images", "")
+  walk(imagesRoot, "")
   if selected > #imageList then selected = math.max(1, #imageList) end
   if selected < 1 then selected = 1 end
 end
@@ -319,9 +477,13 @@ local function applyDecoded(result, pathLabel, quiet, status)
     end
   end
   saveCfg()
-  setStatus(status or (("Loaded %dx%d"):format(img.width, img.height)))
+  local dim = ("%dx%d"):format(img.width, img.height)
+  if img.srcWidth and img.scaled then
+    dim = dim .. (" from %dx%d"):format(img.srcWidth, img.srcHeight)
+  end
+  setStatus(status or ("Loaded " .. dim))
   if not quiet then
-    print(("Loaded %dx%d (%s)"):format(img.width, img.height, pathLabel))
+    print("Loaded " .. dim .. " (" .. tostring(pathLabel) .. ")")
   end
   guiDirty = true
   return true
@@ -337,9 +499,11 @@ local function loadPng(path, quiet)
     if fs.isDir(path) then return nil, "Not a file: " .. path end
   end
 
-  if not quiet then print("Decoding " .. path .. " …") end
-  local decode = pngImage.decodeFile or pngImage
-  local ok, result = pcall(decode, path)
+  local mw, mh = decodeLimits()
+  if not quiet then
+    print(("Decoding %s → ≤%dx%d …"):format(path, mw, mh))
+  end
+  local ok, result = pcall(pngImage.decodeFile, path, { maxW = mw, maxH = mh })
   if not ok then
     if not viaHttp then probeLocalPng(path) end
     return nil, "PNG decode failed: " .. tostring(result)
@@ -359,22 +523,28 @@ local function urlBasename(url)
 end
 
 local function imagesDest(saveAs, fallbackUrl)
-  if not fs.exists("images") then fs.makeDir("images") end
+  resolveImagesRoot()
+  ensureImagesRoot()
   local name = saveAs
   if name == nil or name == "" then
     name = urlBasename(fallbackUrl or "download.png")
   end
   name = tostring(name):gsub("\\", "/")
-  if name:sub(1, 7) == "images/" then
+  -- Absolute / already under imagesRoot
+  if name:sub(1, #imagesRoot + 1) == (imagesRoot .. "/") then
     local dir = fs.getDir(name)
     if dir and dir ~= "" and not fs.exists(dir) then fs.makeDir(dir) end
     return name
+  end
+  -- Legacy "images/foo.png" → remap into current root
+  if name:sub(1, 7) == "images/" then
+    name = name:sub(8)
   end
   name = name:match("([^/]+)$") or name
   name = name:gsub("[^%w%._%-]", "_")
   if name == "" then name = "download.png" end
   if not name:lower():match("%.png$") then name = name .. ".png" end
-  return fs.combine("images", name)
+  return fs.combine(imagesRoot, name):gsub("\\", "/")
 end
 
 local function resolveGithubRef(spec, defaultBranch)
@@ -441,6 +611,59 @@ local function fetchPng(url, saveAs, quiet)
   saveCfg()
   setStatus("Fetching…")
   if not quiet then print("Fetching " .. url .. " …") end
+
+  local dest = imagesDest(saveAs, url)
+  local dir = fs.getDir(dest)
+  if not dir or dir == "" then dir = "" end
+  local free = fs.getFreeSpace(dir)
+  local mw, mh = decodeLimits()
+
+  -- Prefer streaming HTTP → disk (never hold the whole file in Lua RAM).
+  -- Need a little free space; screenshots are often >1MB so this may still fail.
+  local minFree = 1024
+  local tryStream = pngImage.fetchHttpToFile
+    and (type(free) ~= "number" or free < 0 or free >= minFree)
+
+  if tryStream then
+    setStatus("Downloading to disk…")
+    local size, serr = pngImage.fetchHttpToFile(url, dest)
+    if size then
+      if not quiet then print(("Saved %s (%d bytes)"):format(dest, size)) end
+      -- Only peek at the PNG signature (do not reload the whole file into RAM)
+      local hf = fs.open(dest, "rb")
+      local magic = ""
+      if hf then
+        for _ = 1, 8 do
+          local b = hf.read()
+          if b == nil then break end
+          if type(b) == "number" then
+            magic = magic .. string.char(b)
+          else
+            magic = magic .. tostring(b):sub(1, 1)
+          end
+        end
+        hf.close()
+      end
+      if #magic >= 8 and magic ~= pngImage.MAGIC then
+        pcall(fs.delete, dest)
+        return nil, "Download is not a PNG: " .. pngImage.describePrefix(magic)
+      end
+      if collectgarbage then pcall(collectgarbage) end
+      listImages()
+      return loadPng(dest, quiet)
+    end
+    pcall(fs.delete, dest)
+    local sm = tostring(serr or "")
+    if sm:lower():find("out of space", 1, true) then
+      return nil, "Out of space while downloading to " .. storageLabel()
+        .. ". Free space, use a floppy (storage disk), or raise floppy_space_limit / computer_space_limit."
+    end
+    if not quiet then
+      print("Stream save failed: " .. sm .. " — trying RAM fetch")
+    end
+  end
+
+  -- Fallback: full download in RAM, then downsampled streaming decode
   local data, err = pngImage.fetchHttp(url)
   if not data then return nil, err or "fetch failed" end
 
@@ -449,16 +672,9 @@ local function fetchPng(url, saveAs, quiet)
     return nil, "Download is not a PNG: " .. pngImage.describePrefix(data)
   end
 
-  local dest = imagesDest(saveAs, url)
-  local dir = fs.getDir(dest)
-  if not dir or dir == "" then dir = "" end
-  local free = fs.getFreeSpace(dir)
   local need = #data
   local canSave = not (type(free) == "number" and free >= 0 and free < need)
-
-  -- Prefer save-then-decode-from-disk so peak RAM is not download+pixels together.
   if canSave then
-    setStatus("Saving…")
     local wok, werr = pngImage.writeBinary(dest, data)
     if wok then
       data = nil
@@ -467,33 +683,30 @@ local function fetchPng(url, saveAs, quiet)
       listImages()
       return loadPng(dest, quiet)
     end
-    if not quiet then
-      print("Warning: " .. tostring(werr or "save failed") .. " — decoding from RAM")
-    end
+    if not quiet then print("Warning: " .. tostring(werr) .. " — decode in RAM") end
   else
     if not quiet then
-      print(("Not enough disk (%d free, need %d) — decode in RAM only"):format(free, need))
+      print(("Not enough disk (%s free, need %d) — RAM decode ≤%dx%d"):format(
+        tostring(free), need, mw, mh))
     end
-    setStatus("Decoding (no disk)…")
   end
 
-  -- Apply image from the download buffer BEFORE dropping it
-  if not quiet then print("Decoding " .. tostring(need) .. " bytes …") end
-  local okDec, result = pcall(pngImage.decode, data)
+  setStatus(("Decoding ≤%dx%d…"):format(mw, mh))
+  if not quiet then print(("Decoding %d bytes → ≤%dx%d …"):format(need, mw, mh)) end
+  local okDec, result = pcall(pngImage.decode, data, mw, mh)
+  data = nil
+  if collectgarbage then pcall(collectgarbage) end
   if not okDec then
-    data = nil
-    if collectgarbage then pcall(collectgarbage) end
     return nil, "PNG decode failed: " .. tostring(result)
   end
 
+  local label = canSave and (dest .. " (unsaved)") or (dest .. " (unsaved)")
   local okApply, applyErr = applyDecoded(
     result,
-    dest .. " (unsaved)",
+    label,
     quiet,
     ("Shown %dx%d (not saved)"):format(result.width, result.height)
   )
-  -- Drop download buffer only after img is set
-  data = nil
   result = nil
   if collectgarbage then pcall(collectgarbage) end
   if not okApply then return nil, applyErr end
@@ -620,7 +833,7 @@ local function drawMonitorGui()
 
   -- Nav panel
   monFill(1, bodyTop, navW, bodyH, colors.gray, colors.white)
-  monText(2, bodyTop, "images/", colors.white, colors.gray)
+  monText(2, bodyTop, storageLabel():sub(1, navW - 2), colors.white, colors.gray)
   ensureSelectedVisible(listRows)
   if #imageList == 0 then
     monText(2, listTop, "(empty)", colors.lightGray, colors.gray)
@@ -743,9 +956,10 @@ local function drawComputerUi()
   local n = #imageList
   local cur = imgPath and (imgPath:match("([^/]+)$") or imgPath) or "(none)"
   print(("Images: %d  |  Showing: %s"):format(n, cur))
+  print("Store: " .. storageLabel() .. "  (" .. formatBytes(storageFree()) .. " free)")
   print("")
   print("Paste a GitHub/raw URL, then Fetch on the monitor.")
-  print("Or: fetch / github / load / up / down / help / quit")
+  print("Or: fetch / github / storage / help / quit")
   print("")
 end
 
@@ -757,6 +971,7 @@ Computer (this screen):
   fetch [url] [filename]  download → images/, load
   github <ref> [filename] GitHub → images/, load
   load <path|url>         load a PNG
+  storage [auto|disk|local]  use floppy images/ when possible
   up / down               move list selection
   prev / next             load previous / next image
   fit / refresh           fit scale / rescan images/
@@ -768,6 +983,9 @@ Monitor (color):
   Fetch uses the link shown on this computer
   Refresh / Fit / Prev / Next
 
+Floppy tip:
+  Attach a disk drive + floppy. Mode "auto"/"disk" stores under disk/images.
+  Raise floppy_space_limit if huge screenshots still OOM the disk.
 Examples:
   github TitanBCXR/MinecraftLua/images/Map.png
   https://raw.githubusercontent.com/OWNER/REPO/main/a.png]])
@@ -839,7 +1057,23 @@ local function handleComputerLine(line)
   elseif cmd == "refresh" or cmd == "ls" then
     listImages()
     setStatus(("Refreshed (%d)"):format(#imageList))
-    print(#imageList .. " PNG(s) in images/")
+    print(#imageList .. " PNG(s) in " .. storageLabel())
+  elseif cmd == "storage" or cmd == "disk" or cmd == "floppy" then
+    local mode = rest:lower()
+    if mode == "" or mode == "status" then
+      printStorageStatus()
+    elseif mode == "auto" or mode == "disk" or mode == "local" or mode == "computer" then
+      if mode == "computer" then mode = "local" end
+      storageMode = mode
+      saveCfg()
+      local _, warn = resolveImagesRoot()
+      listImages()
+      printStorageStatus()
+      if warn then printError(warn) end
+      setStatus("Storage: " .. storageLabel())
+    else
+      printError("Usage: storage [auto|disk|local]")
+    end
   elseif cmd == "up" then
     selectDelta(-1)
     if imageList[selected] then print("Selected: " .. imageList[selected]) end
@@ -927,9 +1161,21 @@ local function monitorLoop()
         end
       elseif ev == "monitor_resize" then
         guiDirty = true
-      elseif ev == "peripheral_detach" and tostring(p1) == tostring(monName) then
-        mon, monName = nil, nil
-        setStatus("Monitor detached")
+      elseif ev == "disk" or ev == "disk_eject"
+          or ev == "peripheral" or ev == "peripheral_detach" then
+        if ev == "peripheral_detach" and tostring(p1) == tostring(monName) then
+          mon, monName = nil, nil
+          setStatus("Monitor detached")
+        else
+          resolveImagesRoot()
+          listImages()
+          if diskMount then
+            setStatus("Floppy " .. storageLabel())
+          elseif storageMode == "disk" then
+            setStatus("No floppy — insert disk")
+          end
+        end
+        guiDirty = true
       elseif ev == "key" then
         -- Drive selection from computer keyboard when not consumed by read()
         local K = keys
@@ -975,11 +1221,15 @@ if not term.isColor or not term.isColor() then
 end
 
 loadCfg()
-
-if not fs.exists("images") then
-  pcall(fs.makeDir, "images")
-end
+resolveImagesRoot()
 listImages()
+do
+  local free = storageFree()
+  print("Images: " .. storageLabel() .. " (" .. formatBytes(free) .. " free)")
+  if not diskMount and storageMode ~= "local" then
+    print("Tip: put a floppy in a disk drive to store screenshots off the computer.")
+  end
+end
 
 do
   local ok, err = bindMonitor("find")
