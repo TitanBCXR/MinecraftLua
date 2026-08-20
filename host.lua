@@ -1,6 +1,6 @@
 --[[
   host.lua  -  Titan install / update host + games leaderboards (CC: Tweaked)
-  Titan-Version: 1.2.19
+  Titan-Version: 1.2.20
 
   Run this on ONE computer that already has the Titan files (your "update
   server"). It serves those files over rednet so pockets and other devices can
@@ -94,6 +94,8 @@ local FILES = {
   "exclude.txt",
   "github_install.lua",
   "pastebin_install.lua",
+  "image_loader.lua",
+  "lib/png.lua",
 }
 
 local function openModem()

@@ -1,6 +1,6 @@
 --[[
   pastebin_install.lua  -  Pastebin bootstrap installer for the Titan system
-  Titan-Version: 1.2.15
+  Titan-Version: 1.2.16
 
   Pulls the Titan files straight from Pastebin (no in-game host needed). Upload
   each file to pastebin.com once, paste its CODE into the table below, then
@@ -62,6 +62,8 @@ local CODES = {
   ["host.lua"]      = "",
   ["exclude.txt"]   = "",
   ["versions.lua"]  = "",
+  ["image_loader.lua"] = "",
+  ["lib/png.lua"] = "",
 }
 
 local KEEP_ALL = {
@@ -81,6 +83,7 @@ local KEEP_ALL = {
   "games/managers/currency_manager.lua", "currency_manager.lua",
   "games/managers/casino_atm.lua", "casino_atm.lua",
   "games.lua", "games_catalog.lua", "host.lua", "versions.lua",
+  "image_loader.lua", "lib/png.lua",
 }
 
 local GAMES_SUITE = {
@@ -149,6 +152,11 @@ local STORAGE = {
   { key = "m", name = "Managers...", submenu = "storage_managers" },
 }
 
+local TOOLS = {
+  { key = "1", name = "Image Loader (PNG → monitor)", run = "image_loader.lua",
+    files = { "image_loader.lua", "lib/png.lua" } },
+}
+
 local SUBMENUS = {
   games = GAMES,
   quarry = QUARRY,
@@ -157,6 +165,7 @@ local SUBMENUS = {
   storage = STORAGE,
   storage_workers = STORAGE_WORKERS,
   storage_managers = STORAGE_MANAGERS,
+  tools = TOOLS,
 }
 
 local ROLES = {
@@ -179,6 +188,7 @@ local ROLES = {
   { key = "g", name = "Games launcher (all + auto-update)", run = "games.lua",
     files = GAMES_SUITE },
   { key = "i", name = "Install one game...", submenu = "games" },
+  { key = "t", name = "Tools...", submenu = "tools" },
   { key = "h", name = "Install / update host (serves files over rednet)", run = "host.lua",
     files = { "lib/titan.lua", "host.lua", "install.lua", "versions.lua" } },
   { key = "9", name = "Everything (kept files, no auto-run)", run = nil,
@@ -380,6 +390,7 @@ local LABELS = {
   ["casino_atm.lua"] = "ATM",
   ["games.lua"] = "Games",
   ["host.lua"] = "TitanHost",
+  ["image_loader.lua"] = "ImageLoader",
 }
 local lbl = role.run and LABELS[role.run]
 if lbl and not os.getComputerLabel() then

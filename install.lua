@@ -1,6 +1,6 @@
 --[[
   install.lua  -  Titan network installer (CC: Tweaked)
-  Titan-Version: 1.2.15
+  Titan-Version: 1.2.16
 
   Downloads the Titan bot-network system onto this device from a running
   `host.lua` on the same rednet network (no pastebin / external web host).
@@ -39,6 +39,7 @@ local KEEP_ALL = {
   "games/managers/casino_atm.lua", "casino_atm.lua",
   "games.lua", "games_catalog.lua",
   "host.lua", "versions.lua", "install.lua",
+  "image_loader.lua", "lib/png.lua",
 }
 
 local GAMES_SUITE = {
@@ -104,6 +105,11 @@ local STORAGE = {
   { key = "m", name = "Managers...", submenu = "storage_managers" },
 }
 
+local TOOLS = {
+  { key = "1", name = "Image Loader (PNG → monitor)", run = "image_loader.lua",
+    files = { "image_loader.lua", "lib/png.lua" } },
+}
+
 local SUBMENUS = {
   games = GAMES,
   quarry = QUARRY,
@@ -112,6 +118,7 @@ local SUBMENUS = {
   storage = STORAGE,
   storage_workers = STORAGE_WORKERS,
   storage_managers = STORAGE_MANAGERS,
+  tools = TOOLS,
 }
 
 local ROLES = {
@@ -134,6 +141,7 @@ local ROLES = {
   { key = "g", name = "Games launcher (all + auto-update)", run = "games.lua",
     files = GAMES_SUITE },
   { key = "i", name = "Install one game...", submenu = "games" },
+  { key = "t", name = "Tools...", submenu = "tools" },
   { key = "h", name = "Install / update host (serves files over rednet)", run = "host.lua",
     files = { "lib/titan.lua", "host.lua", "install.lua", "versions.lua" } },
   { key = "9", name = "Everything (kept files, no auto-run)", run = nil,
