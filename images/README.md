@@ -7,7 +7,16 @@ image_loader
 image_loader images/my_picture.png
 ```
 
-Requires an **advanced (color) monitor**. The loader quantizes to CC’s 16-colour palette and scales to fit (letterboxed).
+Requires an **advanced (color) monitor** for the nav GUI. The loader quantizes to CC’s 16-colour palette and scales to fit (letterboxed) in the monitor view panel.
+
+## Split UI
+
+| Where | What |
+|-------|------|
+| **Computer** | Paste/enter a download link; status; short commands (`fetch`, `github`, `load`, `help`, `quit`) |
+| **Monitor** | Title bar + `images/` list + view area + **Load / Fetch / Refresh / Fit / Prev / Next** |
+
+**Fetch** on the monitor uses the link currently shown on the computer. Last link / last image are saved in `.image_loader.cfg`.
 
 ## How to copy PNGs correctly (binary)
 
@@ -33,16 +42,18 @@ If decode fails, the loader prints the first 8 bytes in hex so you can see corru
 
 With HTTP enabled in the CC:Tweaked config:
 
+**On the computer** — paste a URL, then tap **Fetch** on the monitor; or:
+
 ```
 image_loader
 > github TitanBCXR/MinecraftLua/images/Map.png
 > github https://github.com/TitanBCXR/MinecraftLua/blob/main/images/Map.png
-> github https://raw.githubusercontent.com/TitanBCXR/MinecraftLua/main/images/Map.png Map.png
-> fetch https://raw.githubusercontent.com/OWNER/REPO/main/path/to/file.png map.png
+> https://raw.githubusercontent.com/TitanBCXR/MinecraftLua/main/images/Map.png
+> fetch
 ```
 
 - `github` resolves blob / short `owner/repo/path` forms to **raw.githubusercontent.com** (default branch `main`; optional `owner/repo@branch/path`).
-- Both commands use **binary** HTTP and write with `fs.open(..., "wb")` into `images/`, then auto-load.
+- Downloads use **binary** HTTP and write with `fs.open(..., "wb")` into `images/`, then auto-load.
 - Prefer raw PNG URLs — HTML pages (404 / blob UI) will be rejected with a clear error.
 
 ## Supported PNG kinds
