@@ -1,6 +1,6 @@
 --[[
   image_loader.lua  -  Load a PNG onto an advanced (color) monitor
-  Titan-Version: 1.0.2
+  Titan-Version: 1.0.3
 
   Needs an advanced computer + attached color monitor. Monitors are a 16-color
   character/blit grid (not a true framebuffer); pixels are quantized to the
@@ -29,10 +29,33 @@
 
 local pngImage
 do
-  if not fs.exists("lib/png.lua") then
+  -- Prefer require() (lib.png / lib/png / png); fall back to dofile.
+  -- CC resolves dots to path segments; also allow bare "png" via lib/?.lua.
+  if type(package) == "table" and type(package.path) == "string" then
+    if not package.path:find("lib/%?%.lua", 1, false) and not package.path:find("lib/?.lua", 1, true) then
+      package.path = "lib/?.lua;" .. package.path
+    end
+  end
+  local function isPngModule(mod)
+    return type(mod) == "table" and (mod.decodeFile or mod.decode or mod.readBinary)
+  end
+  local names = { "lib.png", "lib/png", "png" }
+  for i = 1, #names do
+    local ok, mod = pcall(require, names[i])
+    if ok and isPngModule(mod) then
+      pngImage = mod
+      break
+    end
+  end
+  if not pngImage and fs.exists("lib/png.lua") then
+    local ok, mod = pcall(dofile, "lib/png.lua")
+    if ok and isPngModule(mod) then
+      pngImage = mod
+    end
+  end
+  if not pngImage then
     error("Missing lib/png.lua — reinstall Tools → Image Loader", 0)
   end
-  pngImage = dofile("lib/png.lua")
 end
 
 --------------------------------------------------------------------------------
@@ -232,7 +255,8 @@ local function loadPng(path)
   end
 
   print("Decoding " .. path .. " …")
-  local ok, result = pcall(pngImage, path)
+  local decode = pngImage.decodeFile or pngImage
+  local ok, result = pcall(decode, path)
   if not ok then
     if not viaHttp then probeLocalPng(path) end
     return nil, "PNG decode failed: " .. tostring(result)

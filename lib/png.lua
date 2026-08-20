@@ -1,6 +1,6 @@
 --[[
   lib/png.lua  -  Compact PNG decoder for CC: Tweaked
-  Titan-Version: 1.0.2
+  Titan-Version: 1.0.3
 
   Decodes non-interlaced PNG:
     - 8-bit grey / RGB / indexed / grey+A / RGBA
@@ -11,8 +11,9 @@
   Includes a small zlib/deflate inflater.
 
   Usage:
-    local pngImage = dofile("lib/png.lua")
-    local img = pngImage("images/logo.png")
+    local png = require("lib.png")   -- or require("lib/png") / dofile("lib/png.lua")
+    local img = png.decodeFile("images/logo.png")
+    -- or: local img = png("images/logo.png")
     local r, g, b, a = img:get_pixel(1, 1):unpack()  -- 0..1 floats
 
   Paths starting with http:// or https:// are fetched with http binary mode.
@@ -697,7 +698,7 @@ local function isHttpUrl(path)
   return p:sub(1, 7) == "http://" or p:sub(1, 8) == "https://"
 end
 
-local function pngImage(path, custom_stream)
+local function decodeFile(path, custom_stream)
   local data
   if custom_stream and custom_stream.input then
     data = custom_stream.input
@@ -706,7 +707,7 @@ local function pngImage(path, custom_stream)
     data, err = fetchHttpBinary(path)
     if not data then error(err or "http fetch failed", 0) end
   else
-    if not path then error("pngImage: path required", 0) end
+    if not path then error("png.decodeFile: path required", 0) end
     local err
     data, err = readBinaryFile(path)
     if not data then error(err or ("cannot open " .. tostring(path)), 0) end
@@ -714,13 +715,23 @@ local function pngImage(path, custom_stream)
   return decodePng(data)
 end
 
--- Expose helpers for the loader CLI
-pngImage.decode = decodePng
-pngImage.readBinary = readBinaryFile
-pngImage.writeBinary = writeBinaryFile
-pngImage.fetchHttp = fetchHttpBinary
-pngImage.hexBytes = hexBytes
-pngImage.describePrefix = describePrefix
-pngImage.MAGIC = PNG_MAGIC
+-- Table export (functions cannot hold fields in Lua / CC:Tweaked)
+local pngImage = {
+  decode = decodePng,
+  decodeFile = decodeFile,
+  readBinary = readBinaryFile,
+  writeBinary = writeBinaryFile,
+  fetchHttp = fetchHttpBinary,
+  httpGetBinary = fetchHttpBinary,
+  hexBytes = hexBytes,
+  describePrefix = describePrefix,
+  MAGIC = PNG_MAGIC,
+}
+
+setmetatable(pngImage, {
+  __call = function(_, path, custom_stream)
+    return decodeFile(path, custom_stream)
+  end,
+})
 
 return pngImage
