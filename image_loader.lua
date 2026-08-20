@@ -1,6 +1,6 @@
 --[[
   image_loader.lua  -  PNG → advanced (color) monitor (split UI)
-  Titan-Version: 1.1.1
+  Titan-Version: 1.1.2
 
   Computer terminal: paste/enter a download link + short status/help.
   Color monitor: tap navigation GUI (list, Load / Fetch / Refresh / Fit / Prev / Next).
@@ -304,6 +304,29 @@ local function probeLocalPng(path)
   end
 end
 
+local function applyDecoded(result, pathLabel, quiet, status)
+  if type(result) ~= "table" or not result.width then
+    return nil, "Invalid PNG decode result"
+  end
+  img = result
+  imgPath = pathLabel
+  scaleMul = 1.0
+  local base = tostring(pathLabel or ""):gsub(" %(unsaved%)$", "")
+  for i = 1, #imageList do
+    if imageList[i] == pathLabel or imageList[i] == base then
+      selected = i
+      break
+    end
+  end
+  saveCfg()
+  setStatus(status or (("Loaded %dx%d"):format(img.width, img.height)))
+  if not quiet then
+    print(("Loaded %dx%d (%s)"):format(img.width, img.height, pathLabel))
+  end
+  guiDirty = true
+  return true
+end
+
 local function loadPng(path, quiet)
   path = tostring(path or ""):gsub("^%s+", ""):gsub("%s+$", "")
   if path == "" then return nil, "Usage: load <path.png|http-url>" end
@@ -321,24 +344,7 @@ local function loadPng(path, quiet)
     if not viaHttp then probeLocalPng(path) end
     return nil, "PNG decode failed: " .. tostring(result)
   end
-  if type(result) ~= "table" or not result.width then
-    return nil, "Invalid PNG decode result"
-  end
-  img = result
-  imgPath = path
-  scaleMul = 1.0
-  for i = 1, #imageList do
-    if imageList[i] == path then
-      selected = i
-      break
-    end
-  end
-  saveCfg()
-  setStatus(("Loaded %dx%d"):format(img.width, img.height))
-  if not quiet then
-    print(("Loaded %dx%d (%s)"):format(img.width, img.height, path))
-  end
-  return true
+  return applyDecoded(result, path, quiet)
 end
 
 local function urlBasename(url)
@@ -443,50 +449,54 @@ local function fetchPng(url, saveAs, quiet)
     return nil, "Download is not a PNG: " .. pngImage.describePrefix(data)
   end
 
-  -- Decode from RAM first so a full computer disk still shows the image
-  if not quiet then print("Decoding " .. tostring(#data) .. " bytes …") end
+  local dest = imagesDest(saveAs, url)
+  local dir = fs.getDir(dest)
+  if not dir or dir == "" then dir = "" end
+  local free = fs.getFreeSpace(dir)
+  local need = #data
+  local canSave = not (type(free) == "number" and free >= 0 and free < need)
+
+  -- Prefer save-then-decode-from-disk so peak RAM is not download+pixels together.
+  if canSave then
+    setStatus("Saving…")
+    local wok, werr = pngImage.writeBinary(dest, data)
+    if wok then
+      data = nil
+      if collectgarbage then pcall(collectgarbage) end
+      if not quiet then print("Saved " .. dest .. " (" .. tostring(need) .. " bytes)") end
+      listImages()
+      return loadPng(dest, quiet)
+    end
+    if not quiet then
+      print("Warning: " .. tostring(werr or "save failed") .. " — decoding from RAM")
+    end
+  else
+    if not quiet then
+      print(("Not enough disk (%d free, need %d) — decode in RAM only"):format(free, need))
+    end
+    setStatus("Decoding (no disk)…")
+  end
+
+  -- Apply image from the download buffer BEFORE dropping it
+  if not quiet then print("Decoding " .. tostring(need) .. " bytes …") end
   local okDec, result = pcall(pngImage.decode, data)
   if not okDec then
+    data = nil
+    if collectgarbage then pcall(collectgarbage) end
     return nil, "PNG decode failed: " .. tostring(result)
   end
-  if type(result) ~= "table" or not result.width then
-    return nil, "Invalid PNG decode result"
-  end
 
-  local dest = imagesDest(saveAs, url)
-  local wok, werr = pngImage.writeBinary(dest, data)
-  data = nil -- allow GC after decode + write attempt
-  if wok then
-    if not quiet then print("Saved " .. dest) end
-    listImages()
-    img = result
-    imgPath = dest
-    scaleMul = 1.0
-    for i = 1, #imageList do
-      if imageList[i] == dest then
-        selected = i
-        break
-      end
-    end
-    saveCfg()
-    setStatus(("Loaded %dx%d"):format(img.width, img.height))
-    if not quiet then
-      print(("Loaded %dx%d (%s)"):format(img.width, img.height, dest))
-    end
-    return true
-  end
-
-  -- Disk full / write failed: still display from memory (won't persist across reboot)
-  img = result
-  imgPath = dest .. " (unsaved)"
-  scaleMul = 1.0
-  saveCfg()
-  local warn = werr or ("cannot write " .. dest)
-  setStatus("Shown, not saved — disk full")
-  if not quiet then
-    print("Warning: " .. warn)
-    print(("Showing %dx%d from RAM (not on disk)"):format(img.width, img.height))
-  end
+  local okApply, applyErr = applyDecoded(
+    result,
+    dest .. " (unsaved)",
+    quiet,
+    ("Shown %dx%d (not saved)"):format(result.width, result.height)
+  )
+  -- Drop download buffer only after img is set
+  data = nil
+  result = nil
+  if collectgarbage then pcall(collectgarbage) end
+  if not okApply then return nil, applyErr end
   return true
 end
 
