@@ -1,6 +1,6 @@
 --[[
   storage/managers/storage_manager.lua  -  Create vault rate + fill board
-  Titan-Version: 1.1.0
+  Titan-Version: 1.1.1
 
   Auto-detects every Create item vault on the wired modem network and
   tracks the *joined* pool (not per-vault):
@@ -9,8 +9,8 @@
     Output rate  — items / min leaving the vaults
     Fill percent — used / capacity across all vaults
 
-  Advanced monitor: right-click (or tap a chip / footer tab) to cycle
-  INPUT → OUTPUT → FILL. Vaults can be added or removed at any time.
+  Advanced monitor: quiet centered board. Right-click (or tap a dot)
+  to cycle INPUT → OUTPUT → FILL. Vaults can be added or removed anytime.
 
   Hardware:
     [Create vault] --wired modem--+
@@ -37,7 +37,7 @@ end
 local MSG = titan and titan.MSG or {}
 local PROTO = (titan and titan.PROTOCOL) or "titan_net"
 local CFG = "storage_manager.cfg"
-local VERSION = "1.1.0"
+local VERSION = "1.1.1"
 
 local SCREENS = { "input", "output", "fill" }
 local DEFAULT_SLOT_LIMIT = 512
@@ -622,7 +622,7 @@ local function announceStorage()
 end
 
 --------------------------------------------------------------------------------
--- Monitor UI
+-- Monitor UI  (quiet, centered — not the fleet chip/header boards)
 --------------------------------------------------------------------------------
 local function outIsColor(out)
   local ok, c = pcall(function() return out.isColor and out.isColor() end)
@@ -633,56 +633,21 @@ local function boardPal(color)
   if color then
     return {
       bg = colors.black,
-      header = colors.cyan,
-      headerFg = colors.black,
-      input = colors.lime,
-      output = colors.orange,
-      fill = colors.yellow,
-      steam = colors.white,
+      fg = colors.white,
+      mute = colors.lightGray,
       dim = colors.gray,
-      muted = colors.lightGray,
-      soot = colors.gray,
-      card = colors.gray,
-      ok = colors.lime,
-      warn = colors.yellow,
-      danger = colors.red,
-      iron = colors.lightGray,
+      bar = colors.white,
+      track = colors.gray,
     }
   end
   return {
     bg = colors.black,
-    header = colors.white,
-    headerFg = colors.black,
-    input = colors.white,
-    output = colors.white,
-    fill = colors.white,
-    steam = colors.white,
+    fg = colors.white,
+    mute = colors.white,
     dim = colors.white,
-    muted = colors.white,
-    soot = colors.black,
-    card = colors.black,
-    ok = colors.white,
-    warn = colors.white,
-    danger = colors.white,
-    iron = colors.white,
+    bar = colors.white,
+    track = colors.black,
   }
-end
-
-local function screenAccent(screen, pal)
-  if screen == 1 then return pal.input
-  elseif screen == 2 then return pal.output
-  else return pal.fill
-  end
-end
-
-local function fillBarColor(pct, pal, color)
-  pct = tonumber(pct) or 0
-  if not color then return pal.steam end
-  if pct >= 90 then return pal.danger
-  elseif pct >= 70 then return pal.warn
-  elseif pct >= 40 then return pal.output
-  else return pal.ok
-  end
 end
 
 local function guiFill(out, x, y, ww, hh, bg, fg)
@@ -721,124 +686,62 @@ local function addHit(monName, x, y, ww, screen)
   }
 end
 
-local function guiChip(out, monName, x, y, label, fg, bg, colorOk, screen)
-  label = " " .. tostring(label) .. " "
-  local w = #label
-  if colorOk then
-    guiText(out, x, y, label, fg or colors.white, bg or colors.gray)
-  else
-    local bare = tostring(label):match("^%s*(.-)%s*$") or ""
-    guiText(out, x, y, "[" .. bare .. "]", fg or colors.white, colors.black)
-    w = #bare + 2
-  end
-  if screen then addHit(monName, x, y, w, screen) end
-  return x + w + 1
+local function centerX(w, text)
+  return math.max(1, math.floor((w - #tostring(text)) / 2) + 1)
 end
 
+local function fmtHero(n)
+  n = tonumber(n) or 0
+  local a = math.abs(n)
+  if a >= 1e6 then return fmtCount(n) end
+  return commas(n)
+end
+
+--- Prefer scale 1 so type is large and the board stays sparse.
 local function applyMonitorScale(out)
   if not out or not out.setTextScale then
     local w, h = out.getSize()
     return 1, w, h
   end
-  local chosen = 0.5
-  for _, scale in ipairs({ 1, 0.5 }) do
-    pcall(function() out.setTextScale(scale) end)
-    local ww, hh = out.getSize()
-    if ww >= 26 and hh >= 12 then
-      chosen = scale
-      break
-    end
-    chosen = scale
-  end
-  pcall(function() out.setTextScale(chosen) end)
+  pcall(function() out.setTextScale(1) end)
   local w, h = out.getSize()
-  return chosen, w, h
+  if w >= 15 and h >= 6 then return 1, w, h end
+  pcall(function() out.setTextScale(0.5) end)
+  w, h = out.getSize()
+  return 0.5, w, h
 end
 
-local function layoutTier(w, h)
-  if w < 18 or h < 6 then return "tiny"
-  elseif w < 28 or h < 10 then return "small"
-  elseif w < 40 or h < 14 then return "medium"
-  else return "large"
+local function drawDots(out, monName, w, h, screen, pal, color)
+  local n, gap = 3, 2
+  local total = n + (n - 1) * gap
+  local x0 = math.max(1, math.floor((w - total) / 2) + 1)
+  for i = 1, n do
+    local x = x0 + (i - 1) * (1 + gap)
+    local on = screen == i
+    if color then
+      guiFill(out, x, h, 1, 1, on and pal.fg or pal.dim, pal.bg)
+    else
+      guiText(out, x, h, on and "o" or ".", pal.fg, pal.bg)
+    end
+    addHit(monName, math.max(1, x - 1), h, 3, i)
   end
 end
 
-local function drawGauge(out, x, y, ww, pct, fillBg, pal, color)
+local function drawTrack(out, x, y, ww, pct, pal, color)
   local W = select(1, out.getSize())
   ww = math.min(ww, W - x + 1)
   if ww < 4 then return end
   pct = math.max(0, math.min(100, tonumber(pct) or 0))
-  local inner = ww - 2
-  local filled = math.floor((pct / 100) * inner + 0.5)
+  local filled = math.floor((pct / 100) * ww + 0.5)
   if color then
-    guiText(out, x, y, "[", pal.iron, pal.soot)
-    guiFill(out, x + 1, y, inner, 1, pal.soot, pal.steam)
+    guiFill(out, x, y, ww, 1, pal.track, pal.fg)
     if filled > 0 then
-      guiFill(out, x + 1, y, filled, 1, fillBg, colors.black)
-    end
-    guiText(out, x + ww - 1, y, "]", pal.iron, pal.soot)
-  else
-    local bar = string.rep("=", filled) .. string.rep("-", math.max(0, inner - filled))
-    guiText(out, x, y, "[" .. bar .. "]", pal.steam, pal.bg)
-  end
-end
-
-local function drawSpark(out, x, y, ww, hh, values, pal, accent, color)
-  if ww < 4 or hh < 2 or #values < 1 then return end
-  local mx = 0.001
-  for _, v in ipairs(values) do
-    if v > mx then mx = v end
-  end
-  for col = 1, ww do
-    local idx = math.max(1, math.ceil((col / ww) * #values))
-    local v = values[idx] or 0
-    local bh = math.floor((v / mx) * hh + 0.5)
-    for row = 1, hh do
-      local fromBot = hh - row + 1
-      local px, py = x + col - 1, y + row - 1
-      if fromBot <= bh and bh > 0 then
-        if color then
-          guiText(out, px, py, " ", colors.black, accent)
-        else
-          guiText(out, px, py, "#", pal.steam, pal.bg)
-        end
-      else
-        if color then
-          guiText(out, px, py, " ", pal.dim, pal.soot)
-        else
-          guiText(out, px, py, ".", pal.dim, pal.bg)
-        end
-      end
-    end
-  end
-end
-
-local function drawFlow(out, x, y, ww, pal, accent, color, dir)
-  if ww < 4 then return end
-  local t = math.floor(os.clock() * 6)
-  local ch = (dir or 1) >= 0 and ">" or "<"
-  if color then
-    guiFill(out, x, y, ww, 1, pal.soot, accent)
-    for i = 1, ww do
-      local on = ((i + t * dir) % 4) == 0
-      guiText(out, x + i - 1, y, on and ch or " ", on and colors.black or pal.dim,
-        on and accent or pal.soot)
+      guiFill(out, x, y, filled, 1, pal.bar, pal.bg)
     end
   else
-    local s = {}
-    for i = 1, ww do
-      s[i] = ((i + t * dir) % 4) == 0 and ch or "-"
-    end
-    guiText(out, x, y, table.concat(s), pal.steam, pal.bg)
+    local bar = string.rep("#", filled) .. string.rep("-", math.max(0, ww - filled))
+    guiText(out, x, y, bar, pal.fg, pal.bg)
   end
-end
-
-local function histValues(key)
-  local out = {}
-  for _, h in ipairs(cache.hist) do
-    out[#out + 1] = math.max(0, tonumber(h[key]) or 0)
-  end
-  return out
 end
 
 local function drawOneMonitor(mon)
@@ -848,200 +751,90 @@ local function drawOneMonitor(mon)
   local pal = boardPal(color)
   local _, w, h = applyMonitorScale(out)
   local screen = cfg.screen or 1
-  local accent = screenAccent(screen, pal)
-  local tier = layoutTier(w, h)
   local nVault = #cache.vaults
   local ready = cache.rateReady
   local pct = cache.pct or 0
-  local fillFg = fillBarColor(pct, pal, color)
 
   if out.setBackgroundColor then out.setBackgroundColor(pal.bg) end
   out.clear()
 
-  local headerH = (tier == "tiny") and 1 or ((tier == "small") and 2 or 3)
-  local title = " STORAGE "
-  local right = (nVault == 1) and "1 vault" or (nVault .. " vaults")
-  if color then
-    guiFill(out, 1, 1, w, headerH, pal.header, pal.headerFg)
-    guiText(out, 2, 1, title:sub(1, w - 2), pal.headerFg, pal.header)
-    if #title + #right + 3 < w then
-      guiText(out, math.max(2, w - #right), 1, right, pal.headerFg, pal.header)
-    end
-    if headerH >= 2 then
-      local sub = os.getComputerLabel() or cfg.label or ("id " .. os.getComputerID())
-      guiText(out, 2, 2, tostring(sub):sub(1, w - 2), colors.gray, pal.header)
-    end
+  local labels = { "in", "out", "fill" }
+  local hero, unit
+  if nVault == 0 then
+    hero, unit = "no vaults", nil
+  elseif screen == 3 then
+    hero = fmtPct(pct)
+    unit = nil
+  elseif not ready then
+    hero, unit = "—", "/min"
   else
-    guiText(out, 1, 1, (title .. right):sub(1, w), pal.steam, pal.bg)
-  end
-
-  local y = headerH + 1
-  local inLab = "IN " .. (ready and fmtCount(cache.inRate) .. "/m" or "…")
-  local outLab = "OUT " .. (ready and fmtCount(cache.outRate) .. "/m" or "…")
-  local fillLab = "FILL " .. fmtPct(pct)
-  if w < 36 then
-    inLab, outLab, fillLab = "IN", "OUT", fmtPct(pct)
-  end
-
-  if y <= h - 1 then
-    if color then
-      guiFill(out, 1, y, w, 1, pal.bg, pal.steam)
-      local x = 2
-      local function chip(label, sc, ac)
-        local on = screen == sc
-        local fg = on and colors.black or pal.steam
-        local bg = on and ac or pal.soot
-        x = guiChip(out, monName, x, y, label, fg, bg, true, sc)
-      end
-      chip(inLab, 1, pal.input)
-      chip(outLab, 2, pal.output)
-      chip(fillLab, 3, fillFg)
+    local rate = (screen == 1) and cache.inRate or cache.outRate
+    if math.abs(tonumber(rate) or 0) < 0.5 then
+      hero = "0"
     else
-      guiText(out, 1, y, (inLab .. "  " .. outLab .. "  " .. fillLab):sub(1, w), pal.steam, pal.bg)
-      addHit(monName, 1, y, w, (screen % #SCREENS) + 1)
+      hero = fmtHero(rate)
     end
+    unit = "/min"
+  end
+
+  -- Vertically center the block; last row is reserved for page dots.
+  local bodyH = math.max(1, h - 1)
+  local block = 1 -- hero
+  if nVault > 0 then
+    block = 3 -- label + gap + hero
+    if unit then block = block + 2 end -- gap + unit
+    if screen == 3 then block = block + 4 end -- gap + bar + gap + used/cap
+  end
+  if h <= 6 then
+    block = 1
+    if nVault > 0 and screen == 3 and h >= 5 then block = 3 end
+  end
+  local y = math.max(1, math.floor((bodyH - block) / 2) + 1)
+
+  local function line(txt, fg)
+    if y > bodyH then return end
+    guiText(out, centerX(w, txt), y, txt, fg or pal.fg, pal.bg)
     y = y + 1
   end
-
-  -- Tiny: hero metric only
-  if tier == "tiny" then
-    local hero = (screen == 3) and fmtPct(pct)
-      or fmtRate(screen == 1 and cache.inRate or cache.outRate, ready)
-    guiText(out, 1, math.min(h, y), hero:sub(1, w), accent, pal.bg)
-    return
-  end
-
-  local footerH = 1
-  local bodyBot = h - footerH
-
-  local names = { "INPUT RATE", "OUTPUT RATE", "FILL" }
-  local heroes = {
-    fmtRate(cache.inRate, ready),
-    fmtRate(cache.outRate, ready),
-    fmtPct(pct),
-  }
-  local name = names[screen]
-  local hero = heroes[screen]
-
-  if y <= bodyBot then
-    if color then
-      guiFill(out, 1, y, w, 1, accent, colors.black)
-      local nx = math.max(2, math.floor((w - #name) / 2) + 1)
-      guiText(out, nx, y, name, colors.black, accent)
-    else
-      guiText(out, 1, y, name:sub(1, w), pal.steam, pal.bg)
-    end
-    y = y + 1
-  end
-
-  if y <= bodyBot then
-    local hx = math.max(1, math.floor((w - #hero) / 2) + 1)
-    if color then
-      guiFill(out, 1, y, w, 1, pal.bg, pal.steam)
-      guiText(out, hx, y, hero, accent, pal.bg)
-    else
-      guiText(out, hx, y, hero, pal.steam, pal.bg)
-    end
-    y = y + 1
-  end
-
-  if screen ~= 3 and y <= bodyBot then
-    drawFlow(out, 2, y, w - 2, pal, accent, color, screen == 1 and 1 or -1)
-    y = y + 1
-  elseif screen == 3 and y <= bodyBot then
-    drawGauge(out, 2, y, w - 2, pct, fillFg, pal, color)
-    y = y + 1
-  end
-
-  local sparkH = 0
-  if tier == "large" then sparkH = 6
-  elseif tier == "medium" then sparkH = 4
-  elseif tier == "small" then sparkH = 2
-  end
-  sparkH = math.min(sparkH, math.max(0, bodyBot - y - 4))
-  if sparkH >= 2 and y + sparkH - 1 <= bodyBot then
-    local key = (screen == 1 and "inR") or (screen == 2 and "outR") or "pct"
-    drawSpark(out, 2, y, w - 2, sparkH, histValues(key), pal, accent, color)
-    y = y + sparkH + 1
-  end
-
-  local cards
-  if screen == 3 then
-    cards = {
-      { "USED", fmtCount(cache.items) },
-      { "CAP", fmtCount(cache.cap) },
-      { "SLOTS", ("%s/%s"):format(fmtCount(cache.used), fmtCount(cache.slots)) },
-      { "VAULTS", tostring(nVault) },
-    }
-  else
-    local win = tostring(cfg.windowSecs or 60) .. "s"
-    cards = {
-      { "WINDOW", win },
-      { "ITEMS", fmtCount(cache.items) },
-      { "VAULTS", tostring(nVault) },
-      { "FILL", fmtPct(pct) },
-    }
+  local function skip()
+    if y < bodyH then y = y + 1 end
   end
 
   if nVault == 0 then
-    if y <= bodyBot then
-      guiText(out, 2, y, "No vaults on this cable.", pal.warn, pal.bg)
-      y = y + 1
-    end
-    if y <= bodyBot then
-      guiText(out, 2, y, "Right-click wired modems.", pal.muted, pal.bg)
+    line(hero, pal.mute)
+  elseif h <= 6 then
+    line(hero, pal.fg)
+    if screen == 3 and h >= 5 then
+      skip()
+      local barW = math.max(6, math.floor(w * 0.45))
+      barW = math.min(barW, w - 2)
+      drawTrack(out, centerX(w, string.rep(" ", barW)), y, barW, pct, pal, color)
       y = y + 1
     end
   else
-    if color and w >= 28 then
-      local colW = math.floor(w / 2)
-      local i = 1
-      while i <= #cards and y <= bodyBot do
-        local a, b = cards[i], cards[i + 1]
-        guiFill(out, 1, y, w, 1, pal.soot, pal.steam)
-        guiText(out, 2, y, (a[1] .. "  " .. a[2]):sub(1, colW - 2), pal.steam, pal.soot)
-        if b then
-          guiText(out, colW + 2, y, (b[1] .. "  " .. b[2]):sub(1, colW - 2), pal.steam, pal.soot)
-        end
-        i = i + 2
+    line(labels[screen], pal.dim)
+    skip()
+    line(hero, pal.fg)
+    if unit then
+      skip()
+      line(unit, pal.mute)
+    end
+    if screen == 3 then
+      skip()
+      if y <= bodyH then
+        local barW = math.max(8, math.floor(w * 0.42))
+        barW = math.min(barW, w - 4)
+        drawTrack(out, math.max(1, math.floor((w - barW) / 2) + 1), y, barW, pct, pal, color)
         y = y + 1
       end
-    else
-      for _, c in ipairs(cards) do
-        if y > bodyBot then break end
-        guiText(out, 2, y, (c[1] .. "  " .. c[2]):sub(1, w - 2), pal.steam, pal.bg)
-        y = y + 1
+      skip()
+      if y <= bodyH and (cache.cap or 0) > 0 then
+        line(fmtHero(cache.items) .. "  /  " .. fmtHero(cache.cap), pal.mute)
       end
     end
   end
 
-  -- Footer tabs
-  local tabs = { "INPUT", "OUTPUT", "FILL" }
-  local hint = "TAP to switch"
-  if color then
-    guiFill(out, 1, h, w, 1, pal.soot, pal.steam)
-    local x = 2
-    if w >= 36 then
-      guiText(out, 2, h, hint, pal.muted, pal.soot)
-      x = 2 + #hint + 2
-    end
-    for i, tab in ipairs(tabs) do
-      local on = screen == i
-      local fg = on and colors.black or pal.steam
-      local bg = on and screenAccent(i, pal) or pal.soot
-      local lab = on and ("[" .. tab .. "]") or (" " .. tab .. " ")
-      guiText(out, x, h, lab, fg, bg)
-      addHit(monName, x, h, #lab, i)
-      x = x + #lab + 1
-    end
-  else
-    local line = ""
-    for i, tab in ipairs(tabs) do
-      line = line .. (screen == i and ("[" .. tab .. "] ") or (tab .. " "))
-    end
-    guiText(out, 1, h, line:sub(1, w), pal.steam, pal.bg)
-    addHit(monName, 1, h, w, (screen % #SCREENS) + 1)
-  end
+  drawDots(out, monName, w, h, screen, pal, color)
 end
 
 local function drawMonitor()

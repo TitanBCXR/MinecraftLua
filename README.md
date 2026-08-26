@@ -737,7 +737,7 @@ Vaults can be added or removed at any time — the board rediscovers them.
 1. Wire each vault and the Storage Manager PC onto the same modem cable.
 2. Right-click every vault modem until it is connected.
 3. Attach an advanced (color) monitor. Run `storage_manager` (or put it in `startup`).
-4. Right-click the monitor (or tap a chip / footer tab) to switch INPUT / OUTPUT / FILL.
+4. Right-click the monitor to switch INPUT / OUTPUT / FILL (dots jump to a screen).
 
 Rates come from vault item-count deltas over a sliding window (default 60s).
 Fill uses `list()` + `getItemLimit` across every detected vault.
