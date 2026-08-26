@@ -1,6 +1,6 @@
 --[[
   github_install.lua  -  Install the Titan system straight from a GitHub repo
-  Titan-Version: 1.2.19
+  Titan-Version: 1.2.20
 
   Point RAW_BASE at your repo's raw content root, then on each Minecraft device:
 
@@ -45,7 +45,7 @@ local KEEP_ALL = {
   "games/managers/currency_manager.lua", "currency_manager.lua",
   "games/managers/casino_atm.lua", "casino_atm.lua",
   "games.lua", "games_catalog.lua", "games_install.lua", "host.lua", "versions.lua",
-  "image_loader.lua", "lib/png.lua",
+  "image_loader.lua", "lib/png.lua", "image_remote.lua", "web_browser.lua",
 }
 
 -- Full suite installed by the Games launcher role (keeps itself + catalog updated).
@@ -99,7 +99,7 @@ local STORAGE_WORKERS = {
 }
 
 local STORAGE_MANAGERS = {
-  { key = "1", name = "Storage Manager (vault + I/O)", run = "storage/managers/storage_manager.lua",
+  { key = "1", name = "Storage Manager (vault rates + fill)", run = "storage/managers/storage_manager.lua",
     files = { "lib/titan.lua", "storage/managers/storage_manager.lua", "storage_manager.lua" } },
   { key = "2", name = "Storage ATM (modem ↔ vault)", run = "storage/managers/storage_atm.lua",
     files = { "storage/managers/storage_atm.lua", "storage_atm.lua" } },
@@ -115,6 +115,10 @@ local STORAGE = {
 local TOOLS = {
   { key = "1", name = "Image Loader (PNG → monitor)", run = "image_loader.lua",
     files = { "image_loader.lua", "lib/png.lua" } },
+  { key = "2", name = "Image Remote (pocket → loader)", run = "image_remote.lua",
+    files = { "image_remote.lua" } },
+  { key = "3", name = "Web Browser (text HTTP)", run = "web_browser.lua",
+    files = { "web_browser.lua" } },
 }
 
 local SUBMENUS = {

@@ -11,14 +11,15 @@ A wireless dispatch system for Minecraft's **CC: Tweaked** mod (active packages)
   - **Managers:** `quarry/managers/offline_site.lua` (cell site board + optional Geo Scanner)
   - Root `offline_miner.lua` / `offline_site.lua` are compat shims.
 - **Storage** (`storage/`) — installer submenu **s**:
-  - **Managers:** `storage/managers/storage_manager.lua` (Create vault + Sophisticated I/O) · `storage/managers/storage_atm.lua` · `storage/managers/storage_clutch.lua` (fill → Create clutch)
+  - **Managers:** `storage/managers/storage_manager.lua` (Create vault rates + fill board) · `storage/managers/storage_atm.lua` · `storage/managers/storage_clutch.lua` (fill → Create clutch)
   - **Workers:** `storage/workers/storage_builder.lua` (places the vault cell)
   - Root `storage_manager.lua` / `storage_builder.lua` / `storage_atm.lua` / `storage_clutch.lua` are compat shims.
 - **`perimeter_sensor.lua` / `perimeter_manager.lua`** — Player Detector territory (one manager + admin alerts).
 - **`tetris.lua`** — Tetris for pocket / advanced PC + monitor (host LB via install host; note music; monitor bottom half = touch pad).
 - **`minesweeper.lua`** — Minesweeper for pocket / advanced PC + monitor (no modem; monitor bottom half = Open/Flag touch pad).
 - **`sandstorm.lua`** — Darude Sandstorm note-block knockoff + desert pixel visualizer (speaker + color monitor).
-- **`image_loader.lua`** — Split UI PNG loader: computer terminal for download links; **advanced (color) monitor** nav GUI (list / Load / Fetch / Fit). Put files in `images/`.
+- **`web_browser.lua`** — Standalone **text** web browser (HTTP fetch, strip HTML, follow links). Not Chromium — CC character grid only.
+- **`image_loader.lua`** — Split UI PNG loader: computer terminal for download links; **advanced (color) monitor** nav GUI (list / Load / Fetch / Fit). Put files in `images/`. Pair with **`image_remote.lua`** (pocket + modem) to paste URLs remotely over rednet.
 - **`luigi_poker.lua`** — Luigi Picture Poker (beat Luigi’s visible hand; pocket-first; hold/draw).
 - **`higher_lower.lua`** — Pair of Jacks+ video poker → Higher/Lower streak (cash out or risk for jackpot at 10).
 - **`slots.lua`** — 3-reel slots (bet/spin animation, coin bank; monitor tap UI).
@@ -124,15 +125,26 @@ Each device needs (active installer roles):
 | Quarry → Workers → Cell scanner | `quarry/workers/cell_scanner.lua`, `lib/titan.lua` |
 | Quarry → Workers → Strip miner | `quarry/workers/strip_miner.lua`, `lib/titan.lua`, `exclude.txt` |
 | Quarry → Managers → Site board | `quarry/managers/offline_site.lua`, `lib/titan.lua` (+ modem; Geo Scanner optional) |
-| Storage → Managers → Vault hub | `storage/managers/storage_manager.lua`, `lib/titan.lua` (+ wired modems to vault/I/O) |
+| Storage → Managers → Vault hub | `storage/managers/storage_manager.lua`, `lib/titan.lua` (+ wired modems to Create vaults; advanced monitor) |
 | Storage → Workers → Builder | `storage/workers/storage_builder.lua`, `lib/titan.lua` |
 | Perimeter sensor/manager | `perimeter_*.lua`, `lib/titan.lua`  |
 | Games launcher (**g**) | `games.lua` + catalog + all games (auto-update / auto-add) |
 | One game (**i**) | individual `tetris` / `minesweeper` / … |
 | Tools → Image Loader (**t** → **1**) | `image_loader.lua`, `lib/png.lua` (+ color monitor; PNGs in `images/`) |
+| Tools → Image Remote (**t** → **2**) | `image_remote.lua` (pocket/computer + modem → send URLs to loader) |
+| Tools → Web Browser (**t** → **3**) | `web_browser.lua` (text HTTP browser; optional color monitor) |
 
 Keep `lib/titan.lua` in a `lib` folder next to the program. Older roles are in
 [`archive/`](archive/).
+
+### Web Browser (text HTTP)
+
+1. Install **Tools → Web Browser** (or copy `web_browser.lua`).
+2. Ensure **http** is enabled in CC:Tweaked config.
+3. Run `web_browser` or `web_browser https://example.com`.
+4. Type a URL, or `go <url>`. Use link numbers to follow `<a href>`. `back` / `forward` / `refresh`. Optional color monitor: Back / Fwd / Reload / scroll.
+
+This is a **standalone text browser** (readable pages + links). It cannot run Chromium, JavaScript apps, or modern CSS layouts.
 
 ### Image Loader (PNG → monitor)
 
@@ -142,6 +154,8 @@ Keep `lib/titan.lua` in a `lib` folder next to the program. Older roles are in
 4. **Computer terminal** — paste a GitHub/raw URL (sets the shared link). Status + short commands (`fetch`, `github`, `help`, `quit`).
 5. **Monitor GUI** — browse `images/*.png`, tap a row, then **Load**; **Fetch** uses the link from the computer; also **Refresh** / **Fit** / **Prev** / **Next**.
 6. Or download from the computer CLI: `github TitanBCXR/MinecraftLua/images/Map.png` / `fetch <url>`.
+
+**Remote (pocket):** install **Tools → Image Remote**, put a modem on both devices, run `image_loader` on the display PC and `image_remote` on the pocket. `find` → paste a URL → the loader fetches. Protocol: `titan_image`.
 
 Without a color monitor, the computer UI still works (fetch/load to disk); attach a monitor for the GUI. Monitors are a 16-colour blit grid — the loader quantizes and letterboxes into the view panel. See [`images/README.md`](images/README.md).
 ## 4. Run
@@ -701,6 +715,37 @@ Header shows **CHIPS** (sum of player balances) and **VAULT** (physical coin ite
 Installer: **s → Storage → Managers / Workers**. Root `storage_manager.lua` /
 `storage_builder.lua` / `storage_atm.lua` / `storage_clutch.lua` are thin shims.
 
+## Storage Manager (vault rates + fill)
+
+Installer: **s → Storage → Managers → 1**. Auto-detects every Create item vault
+on the wired modem network and shows **joined** totals (not per-vault) on an
+**advanced monitor**. Right-click the monitor to cycle screens:
+
+| Screen | Metric |
+|--------|--------|
+| **INPUT** | items / min entering the vaults |
+| **OUTPUT** | items / min leaving the vaults |
+| **FILL** | used / capacity as a percent |
+
+Vaults can be added or removed at any time — the board rediscovers them.
+
+```text
+[Create vault] --wired modem--+
+[Create vault] --wired modem--+-- cable -- [PC + wired modem + advanced monitor]
+```
+
+1. Wire each vault and the Storage Manager PC onto the same modem cable.
+2. Right-click every vault modem until it is connected.
+3. Attach an advanced (color) monitor. Run `storage_manager` (or put it in `startup`).
+4. Right-click the monitor (or tap a chip / footer tab) to switch INPUT / OUTPUT / FILL.
+
+Rates come from vault item-count deltas over a sliding window (default 60s).
+Fill uses `list()` + `getItemLimit` across every detected vault.
+
+Optional I/O chests on the same cable (`bind input` / `bind output`) keep
+`ingest` and admin-tablet `request` working. Console: `status`, `vaults`,
+`screen in|out|fill`, `poll`, `window`, `stock`, `find`.
+
 ## Storage Clutch (fill → Create clutch)
 
 Installer: **s → Storage → Managers → 3**. Watches a Sophisticated Storage
@@ -769,32 +814,8 @@ withdraw                  # multi-item wizard; Tab autocompletes names
 - **link** / **unbind vault** — manage the vault pool  
 Right-click each vault modem until connected; use a vanilla chest for I/O.
 
-Bulk storage cell (v1 — no auto-crafting, no GPS courier):
-
-```text
-[Input chest]  -->  [Create Vault]  -->  [Output chest]
-  Sophisticated        mass storage       Sophisticated
-       ^                     ^                  ^
-       +------ wired modems / cable to Storage Manager PC ------+
-```
-
-1. Place (or run the builder turtle `bom` / `build`) vault + Sophisticated input
-   and output chests in a line; put a computer pad at the front.
-2. Right-click wired modems on vault, both chests, and the Storage Manager PC
-   (same cable network). Attach a wireless modem on the PC for the Titan mesh.
-3. On the manager: `invs` then bind peripherals:
-   ```
-   bind vault <peripheralName|side>
-   bind input <peripheralName|side>
-   bind output <peripheralName|side>
-   ```
-4. Drop items in the **input** chest — `ingest` (or the timer) pulls them into
-   the vault. Stock is read from the vault inventory.
-5. From the admin pocket: tile **Storage**, or advanced `stock [filter]` /
-   `request <item> [count]`. Orders go over rednet (`STORAGE_REQUEST`); the
-   manager `pushItems` into the **output** chest for you to pick up.
-
-Manager commands: `status`, `stock`, `find`, `ingest`, `request`, `monitor`.
+Admin pocket tile **Storage** still talks to the Storage Manager over rednet
+(`stock` / `request`) when an output chest is bound.
 
 ---
 
@@ -1053,8 +1074,7 @@ from the install source (GitHub / pastebin / `host.lua`). Extras on disk that
 aren’t listed show as `*` and are not updated.
 
 Bump versions in `versions.lua` (and each file’s `Titan-Version:` header) when
-you ship a change; current system version is **1.7.7** (`currency_manager` **1.1.1**,
-`higher_lower` **1.0.2**, `games` **1.0.6**).
+you ship a change; current system version is **1.7.35**.
 
 **Cell fleet:** the site board owns unique XZ cells; miners obey cell assigns and
 drop stale local jobs. Archived packages are under `archive/` (not in installers).

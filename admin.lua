@@ -2574,7 +2574,7 @@ local function runStorageApp()
   local mid, row = pickStorageManager()
   if not mid then
     print("No Storage Manager on the mesh.")
-    print("Install storage/managers/storage_manager and bind vault/input/output.")
+    print("Install storage/managers/storage_manager and wire Create vaults.")
     return
   end
   print(("Manager #%d %s"):format(mid, tostring(row and row.name or "?")))

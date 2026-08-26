@@ -1,24 +1,29 @@
 --[[
-  storage/managers/storage_manager.lua  -  Vault + I/O chest hub
-  Titan-Version: 1.0.0
+  storage/managers/storage_manager.lua  -  Create vault rate + fill board
+  Titan-Version: 1.1.0
 
-  Bulk storage cell:
-    [Input chest] --> [Create Vault] --> [Output chest]
-     Sophisticated      mass storage      Sophisticated
+  Auto-detects every Create item vault on the wired modem network and
+  tracks the *joined* pool (not per-vault):
 
-  Wire all three (+ this computer) with wired modems on one cable network.
-  Bind peripherals, then stock is tracked from the vault. Input is ingested
-  on a timer; pocket/admin `request` pushes items into the output chest.
+    Input rate   — items / min entering the vaults
+    Output rate  — items / min leaving the vaults
+    Fill percent — used / capacity across all vaults
+
+  Advanced monitor: right-click (or tap a chip / footer tab) to cycle
+  INPUT → OUTPUT → FILL. Vaults can be added or removed at any time.
+
+  Hardware:
+    [Create vault] --wired modem--+
+    [Create vault] --wired modem--+-- cable -- [PC + wired modem + advanced monitor]
+    (optional I/O chests on the same cable for ingest / admin request)
 
   Commands:
-    bind vault|input|output <name|side>
-    unbind vault|input|output
-    invs | status | stock [filter] | find <item>
-    ingest              input -> vault now
-    request <item> [count]
-    monrate [secs]
-    net | hostname [name]
-    help | exit
+    status | vaults | invs | screen [in|out|fill]
+    poll [secs] | window [secs]
+    bind input|output <name|side>   (optional I/O)
+    unbind input|output
+    ingest | request <item> [count] | stock [filter] | find <item>
+    net | hostname [name] | help | exit
 
   Run:  storage/managers/storage_manager
 ]]
@@ -32,7 +37,12 @@ end
 local MSG = titan and titan.MSG or {}
 local PROTO = (titan and titan.PROTOCOL) or "titan_net"
 local CFG = "storage_manager.cfg"
-local VERSION = "1.0.0"
+local VERSION = "1.1.0"
+
+local SCREENS = { "input", "output", "fill" }
+local DEFAULT_SLOT_LIMIT = 512
+local RATE_MAX_SAMPLES = 180
+local HIST_LEN = 48
 
 local SIDE_ALIASES = {
   front = "front", forward = "front", f = "front",
@@ -44,31 +54,54 @@ local SIDE_ALIASES = {
 }
 
 local cfg = {
-  vault = nil,
   input = nil,
   output = nil,
+  vault = nil,       -- legacy single-vault bind; unused (auto-detect)
+  screen = 1,        -- 1=input 2=output 3=fill
+  pollSecs = 1,
+  windowSecs = 60,
   monRate = 5,
   ingestSecs = 3,
   label = nil,
 }
 
 local cache = {
-  items = {},
+  vaults = {},       -- { name, size, items, cap, used }
+  vaultKey = "",
+  items = 0,
+  cap = 0,
+  used = 0,
+  slots = 0,
+  pct = 0,
+  inRate = 0,
+  outRate = 0,
+  rateReady = false,
   totals = {},
   display = {},
+  stockRows = {},
   updated = 0,
+  lastItems = nil,
+  inCum = 0,
+  outCum = 0,
+  samples = {},      -- { t, items, inCum, outCum }
+  hist = {},         -- sparkline { inR, outR, pct }
+  capCache = {},     -- [name] = { size, limit, cap }
+  hits = {},
   lastRequest = nil,
   netMain = nil,
   netOk = false,
   ingested = 0,
+  lastScanErr = nil,
 }
 
-local monitor = peripheral.find("monitor")
-if monitor then pcall(function() monitor.setTextScale(0.5) end) end
+--------------------------------------------------------------------------------
+-- Config / clock
+--------------------------------------------------------------------------------
+local function nowMs()
+  if type(os.epoch) == "function" then return os.epoch("utc") end
+  return math.floor(os.clock() * 1000)
+end
 
---------------------------------------------------------------------------------
--- Config / helpers
---------------------------------------------------------------------------------
 local function loadCfg()
   if not fs.exists(CFG) then return end
   local f = fs.open(CFG, "r")
@@ -78,14 +111,15 @@ local function loadCfg()
   if ok and type(data) == "table" then
     for k, v in pairs(data) do cfg[k] = v end
   end
+  cfg.screen = math.max(1, math.min(#SCREENS, tonumber(cfg.screen) or 1))
+  cfg.pollSecs = math.max(0.25, tonumber(cfg.pollSecs) or 1)
+  cfg.windowSecs = math.max(10, math.min(300, tonumber(cfg.windowSecs) or 60))
 end
 
 local function saveCfg()
   local f = fs.open(CFG, "w")
   if f then f.write(textutils.serialize(cfg)); f.close() end
 end
-
-local function now() return os.epoch("utc") end
 
 local function shortName(name)
   if not name then return "?" end
@@ -97,6 +131,9 @@ local function normalizeSide(s)
   return SIDE_ALIASES[tostring(s):lower()]
 end
 
+--------------------------------------------------------------------------------
+-- Peripherals
+--------------------------------------------------------------------------------
 local function openModem()
   if titan and titan.openModem then
     local ok = pcall(titan.openModem)
@@ -117,7 +154,75 @@ local function isInventory(name)
   if not name or not peripheral.isPresent(name) then return false end
   if peripheral.hasType and peripheral.hasType(name, "inventory") then return true end
   local w = peripheral.wrap(name)
-  return w and type(w.list) == "function" and type(w.pushItems) == "function"
+  return w and type(w.list) == "function" and type(w.size) == "function"
+end
+
+local function allNames()
+  local seen, out = {}, {}
+  local function add(n)
+    if n and not seen[n] then
+      seen[n] = true
+      out[#out + 1] = n
+    end
+  end
+  for _, n in ipairs(peripheral.getNames()) do add(n) end
+  for _, side in ipairs(peripheral.getNames()) do
+    if peripheral.getType(side) == "modem" then
+      local m = peripheral.wrap(side)
+      if m and type(m.getNamesRemote) == "function" then
+        local ok, rem = pcall(m.getNamesRemote)
+        if ok then
+          for _, n in ipairs(rem or {}) do add(n) end
+        end
+      end
+    end
+  end
+  return out
+end
+
+local function isVault(name)
+  if not name or not isInventory(name) then return false end
+  if name == cfg.input or name == cfg.output then return false end
+  local low = tostring(name):lower()
+  if low:find("vault", 1, true) then return true end
+  local types = { peripheral.getType(name) }
+  for _, t in ipairs(types) do
+    if tostring(t or ""):lower():find("vault", 1, true) then return true end
+  end
+  if peripheral.hasType then
+    local ok, yes = pcall(peripheral.hasType, name, "create:item_vault")
+    if ok and yes then return true end
+  end
+  return false
+end
+
+local function discoverVaults()
+  local names = {}
+  for _, n in ipairs(allNames()) do
+    if isVault(n) then names[#names + 1] = n end
+  end
+  table.sort(names)
+  return names
+end
+
+local function listInventories()
+  local names = {}
+  for _, n in ipairs(allNames()) do
+    if isInventory(n) then names[#names + 1] = n end
+  end
+  table.sort(names)
+  return names
+end
+
+local function listMonitors()
+  local out = {}
+  for _, n in ipairs(peripheral.getNames()) do
+    if peripheral.getType(n) == "monitor" then
+      local w = peripheral.wrap(n)
+      if w then out[#out + 1] = { name = n, wrap = w } end
+    end
+  end
+  return out
 end
 
 local function resolvePeripheral(ref)
@@ -126,47 +231,175 @@ local function resolvePeripheral(ref)
   if peripheral.isPresent(s) and isInventory(s) then return s end
   local side = normalizeSide(s)
   if side and peripheral.isPresent(side) then
-    local t = peripheral.getType(side)
     if isInventory(side) then return side end
-    -- Wired modem on that face: pick first remote inventory.
+    local t = peripheral.getType(side)
     local wrap = peripheral.wrap(side)
     if t == "modem" and wrap and type(wrap.getNamesRemote) == "function" then
-      local names = wrap.getNamesRemote()
-      for _, n in ipairs(names or {}) do
+      for _, n in ipairs(wrap.getNamesRemote() or {}) do
         if isInventory(n) then return n end
       end
     end
   end
-  -- Partial name match among inventories.
   local want = s:lower()
-  for _, name in ipairs(peripheral.getNames()) do
-    if isInventory(name) and name:lower():find(want, 1, true) then
-      return name
-    end
+  local hits = {}
+  for _, name in ipairs(listInventories()) do
+    if name:lower():find(want, 1, true) then hits[#hits + 1] = name end
   end
+  if #hits == 1 then return hits[1] end
+  if #hits > 1 then return nil, hits end
   return nil
 end
 
-local function wrapRole(role)
-  local name = cfg[role]
-  if not name or not peripheral.isPresent(name) then return nil, name end
-  if not isInventory(name) then return nil, name end
-  return peripheral.wrap(name), name
-end
-
-local function listInventories()
-  local names = {}
-  for _, name in ipairs(peripheral.getNames()) do
-    if isInventory(name) then names[#names + 1] = name end
+--------------------------------------------------------------------------------
+-- Vault scan + rates
+--------------------------------------------------------------------------------
+local function slotLimit(wrap, size, list)
+  if type(wrap.getItemLimit) ~= "function" then return DEFAULT_SLOT_LIMIT end
+  local probe = 1
+  if type(list) == "table" and size and size > 0 then
+    for i = 1, math.min(size, 40) do
+      if list[i] == nil then
+        probe = i
+        break
+      end
+    end
   end
-  table.sort(names)
-  return names
+  local ok, lim = pcall(wrap.getItemLimit, probe)
+  if ok and type(lim) == "number" and lim > 0 then return lim end
+  return DEFAULT_SLOT_LIMIT
 end
 
---------------------------------------------------------------------------------
--- Stock / transfer
---------------------------------------------------------------------------------
-local function rebuildRows()
+local function vaultCapacity(name, wrap, size, list)
+  local prev = cache.capCache[name]
+  if prev and prev.size == size then return prev.cap, prev.limit end
+  local limit = slotLimit(wrap, size, list)
+  local cap = limit * math.max(0, size)
+  cache.capCache[name] = { size = size, limit = limit, cap = cap }
+  return cap, limit
+end
+
+local function scanVaults()
+  local names = discoverVaults()
+  local key = table.concat(names, "\n")
+  if key ~= cache.vaultKey then
+    cache.lastItems = nil
+    cache.vaultKey = key
+    for n in pairs(cache.capCache) do
+      local keep = false
+      for _, vn in ipairs(names) do
+        if vn == n then keep = true; break end
+      end
+      if not keep then cache.capCache[n] = nil end
+    end
+  end
+
+  local prevByName = {}
+  for _, v in ipairs(cache.vaults) do
+    prevByName[v.name] = v
+  end
+
+  local vaults, totals = {}, {}
+  local items, cap, used, slots = 0, 0, 0, 0
+  local err = nil
+
+  for _, name in ipairs(names) do
+    local w = peripheral.wrap(name)
+    if w and type(w.list) == "function" then
+      local okL, list = pcall(w.list)
+      if not okL or type(list) ~= "table" then
+        err = "list failed: " .. name
+        local prev = prevByName[name]
+        if prev then
+          vaults[#vaults + 1] = prev
+          items = items + (prev.items or 0)
+          cap = cap + (prev.cap or 0)
+          used = used + (prev.used or 0)
+          slots = slots + (prev.size or 0)
+        end
+      else
+        local size = 0
+        if type(w.size) == "function" then
+          local okS, sz = pcall(w.size)
+          if okS then size = tonumber(sz) or 0 end
+        end
+        local vItems, vUsed = 0, 0
+        for _, stack in pairs(list) do
+          if type(stack) == "table" and stack.name then
+            local c = tonumber(stack.count) or 0
+            if c > 0 then
+              vItems = vItems + c
+              vUsed = vUsed + 1
+              totals[stack.name] = (totals[stack.name] or 0) + c
+            end
+          end
+        end
+        local vCap = vaultCapacity(name, w, size, list)
+        vaults[#vaults + 1] = {
+          name = name, size = size, items = vItems, cap = vCap, used = vUsed,
+        }
+        items = items + vItems
+        cap = cap + vCap
+        used = used + vUsed
+        slots = slots + size
+      end
+    end
+  end
+
+  cache.vaults = vaults
+  cache.totals = totals
+  cache.items = items
+  cache.cap = cap
+  cache.used = used
+  cache.slots = slots
+  cache.pct = (cap > 0) and math.floor((items / cap) * 1000 + 0.5) / 10 or 0
+  cache.updated = nowMs()
+  cache.lastScanErr = err
+  return vaults
+end
+
+local function recordRates(items)
+  local t = nowMs()
+  if cache.lastItems ~= nil then
+    local d = items - cache.lastItems
+    if d > 0 then
+      cache.inCum = cache.inCum + d
+    elseif d < 0 then
+      cache.outCum = cache.outCum + (-d)
+    end
+  end
+  cache.lastItems = items
+  local samples = cache.samples
+  samples[#samples + 1] = {
+    t = t, items = items, inCum = cache.inCum, outCum = cache.outCum,
+  }
+  local cutoff = t - (tonumber(cfg.windowSecs) or 60) * 1000
+  while #samples > 1 and samples[1].t < cutoff do
+    table.remove(samples, 1)
+  end
+  while #samples > RATE_MAX_SAMPLES do
+    table.remove(samples, 1)
+  end
+
+  local inR, outR, ready = 0, 0, false
+  if #samples >= 2 then
+    local a, b = samples[1], samples[#samples]
+    local dt = (b.t - a.t) / 1000
+    if dt >= 2 then
+      inR = ((b.inCum - a.inCum) / dt) * 60
+      outR = ((b.outCum - a.outCum) / dt) * 60
+      ready = true
+    end
+  end
+  cache.inRate = inR
+  cache.outRate = outR
+  cache.rateReady = ready
+
+  local hist = cache.hist
+  hist[#hist + 1] = { inR = inR, outR = outR, pct = cache.pct or 0 }
+  while #hist > HIST_LEN do table.remove(hist, 1) end
+end
+
+local function rebuildStockRows()
   local rows = {}
   for name, count in pairs(cache.totals) do
     rows[#rows + 1] = {
@@ -179,47 +412,61 @@ local function rebuildRows()
     if a.count ~= b.count then return a.count > b.count end
     return a.name < b.name
   end)
-  cache.items = rows
-end
-
-local function scanInv(name, totals, display)
-  local inv = peripheral.wrap(name)
-  if not inv then return 0 end
-  local ok, list = pcall(inv.list)
-  if not ok or type(list) ~= "table" then return 0 end
-  local n = 0
-  for slot, item in pairs(list) do
-    if type(item) == "table" and item.name then
-      local c = tonumber(item.count) or 0
-      totals[item.name] = (totals[item.name] or 0) + c
-      n = n + c
-      if not display[item.name] and type(inv.getItemDetail) == "function" then
-        local okd, det = pcall(inv.getItemDetail, slot)
-        if okd and type(det) == "table" and det.displayName then
-          display[item.name] = det.displayName
-        end
-      end
-    end
-  end
-  return n
+  cache.stockRows = rows
 end
 
 local function refresh()
-  local totals, display = {}, {}
-  local vault, vname = wrapRole("vault")
-  if vault then
-    scanInv(vname, totals, display)
+  scanVaults()
+  recordRates(cache.items)
+  rebuildStockRows()
+  return #cache.vaults > 0
+end
+
+--------------------------------------------------------------------------------
+-- Formatting
+--------------------------------------------------------------------------------
+local function commas(n)
+  n = math.floor(math.abs(tonumber(n) or 0) + 0.5)
+  local s = tostring(n)
+  local k
+  while true do
+    s, k = s:gsub("^(%d+)(%d%d%d)", "%1,%2")
+    if k == 0 then break end
   end
-  -- Optionally show input still waiting to ingest.
-  local input, iname = wrapRole("input")
-  if input then
-    scanInv(iname, totals, display)
+  return s
+end
+
+local function fmtCount(n)
+  n = tonumber(n) or 0
+  local a = math.abs(n)
+  local sign = (n < 0) and "-" or ""
+  if a >= 1e9 then return sign .. string.format("%.1fB", a / 1e9)
+  elseif a >= 1e6 then return sign .. string.format("%.1fM", a / 1e6)
+  elseif a >= 10000 then return sign .. string.format("%.1fk", a / 1000)
+  else return sign .. commas(a)
   end
-  cache.totals = totals
-  cache.display = display
-  cache.updated = now()
-  rebuildRows()
-  return vault ~= nil
+end
+
+local function fmtRate(n, ready)
+  if not ready then return "…" end
+  n = tonumber(n) or 0
+  if math.abs(n) < 0.5 then return "0 /min" end
+  return fmtCount(n) .. " /min"
+end
+
+local function fmtPct(p)
+  p = tonumber(p) or 0
+  if p == math.floor(p) then return string.format("%d%%", p) end
+  return string.format("%.1f%%", p)
+end
+
+--------------------------------------------------------------------------------
+-- Optional I/O (admin request / ingest)
+--------------------------------------------------------------------------------
+local function wrapInv(name)
+  if not name or not peripheral.isPresent(name) then return nil, name end
+  if not isInventory(name) then return nil, name end
+  return peripheral.wrap(name), name
 end
 
 local function matchFilter(row, filter)
@@ -232,7 +479,7 @@ end
 
 local function filteredRows(filter, limit)
   local out = {}
-  for _, row in ipairs(cache.items) do
+  for _, row in ipairs(cache.stockRows) do
     if matchFilter(row, filter) then
       out[#out + 1] = row
       if limit and #out >= limit then break end
@@ -246,15 +493,15 @@ local function resolveItemQuery(query)
   if q == "" then return nil end
   local ql = q:lower()
   if ql:find(":", 1, true) then return q end
-  refresh()
-  for _, row in ipairs(cache.items) do
+  if (nowMs() - (cache.updated or 0)) > 5000 then refresh() end
+  for _, row in ipairs(cache.stockRows) do
     if row.name:lower() == ql
        or shortName(row.name):lower() == ql
        or (row.displayName and row.displayName:lower() == ql) then
       return row.name
     end
   end
-  for _, row in ipairs(cache.items) do
+  for _, row in ipairs(cache.stockRows) do
     if row.name:lower():find(ql, 1, true)
        or (row.displayName and row.displayName:lower():find(ql, 1, true)) then
       return row.name
@@ -264,61 +511,67 @@ local function resolveItemQuery(query)
 end
 
 local function ingestOnce()
-  local input, iname = wrapRole("input")
-  local vault, vname = wrapRole("vault")
-  if not input or not vault then return 0, "need bound input + vault" end
+  local input, iname = wrapInv(cfg.input)
+  if not input then return 0, "need bound input" end
+  if #cache.vaults == 0 then scanVaults() end
+  if #cache.vaults == 0 then return 0, "no vaults" end
   local ok, list = pcall(input.list)
   if not ok or type(list) ~= "table" then return 0, "input list failed" end
   local moved = 0
   for slot, item in pairs(list) do
     if type(item) == "table" and item.name and (tonumber(item.count) or 0) > 0 then
-      local okp, n = pcall(input.pushItems, vname, slot)
-      if okp and type(n) == "number" then moved = moved + n end
+      for _, v in ipairs(cache.vaults) do
+        local okp, n = pcall(input.pushItems, v.name, slot)
+        if okp and type(n) == "number" and n > 0 then
+          moved = moved + n
+          if (tonumber(item.count) or 0) - n <= 0 then break end
+        end
+      end
     end
   end
   cache.ingested = (cache.ingested or 0) + moved
-  if moved > 0 then refresh() end
   return moved
 end
 
 local function fulfillRequest(itemQuery, count)
   count = math.max(1, math.floor(tonumber(count) or 64))
-  local vault, vname = wrapRole("vault")
-  local output, oname = wrapRole("output")
-  if not vault then return false, "vault not bound", 0, nil end
+  local output, oname = wrapInv(cfg.output)
   if not output then return false, "output not bound", 0, nil end
-
-  -- Ingest first so input stock is available.
   pcall(ingestOnce)
-
+  scanVaults()
+  rebuildStockRows()
   local itemName = resolveItemQuery(itemQuery)
   if not itemName then return false, "item not found: " .. tostring(itemQuery), 0, nil end
-
-  local moved = 0
-  local guard = 0
+  local moved, guard = 0, 0
   while moved < count and guard < 512 do
     guard = guard + 1
-    local ok, list = pcall(vault.list)
-    if not ok or type(list) ~= "table" then break end
-    local slotFind = nil
-    local avail = 0
-    for slot, item in pairs(list) do
-      if type(item) == "table" and item.name == itemName then
-        slotFind = slot
-        avail = tonumber(item.count) or 0
-        break
+    local progress = false
+    for _, v in ipairs(cache.vaults) do
+      local vault = peripheral.wrap(v.name)
+      if vault then
+        local ok, list = pcall(vault.list)
+        if ok and type(list) == "table" then
+          for slot, item in pairs(list) do
+            if type(item) == "table" and item.name == itemName then
+              local avail = tonumber(item.count) or 0
+              if avail > 0 then
+                local need = math.min(count - moved, avail)
+                local okp, n = pcall(vault.pushItems, oname, slot, need)
+                if okp and type(n) == "number" and n > 0 then
+                  moved = moved + n
+                  progress = true
+                  if moved >= count then break end
+                end
+              end
+            end
+          end
+        end
       end
+      if moved >= count then break end
     end
-    if not slotFind or avail < 1 then break end
-    local need = math.min(count - moved, avail)
-    local okp, n = pcall(vault.pushItems, oname, slotFind, need)
-    if not okp or type(n) ~= "number" or n < 1 then break end
-    moved = moved + n
+    if not progress then break end
   end
-
-  cache.lastRequest = {
-    item = itemName, want = count, moved = moved, at = now(),
-  }
+  cache.lastRequest = { item = itemName, want = count, moved = moved, at = nowMs() }
   refresh()
   if moved < 1 then
     return false, "none moved (empty or output full?)", 0, itemName
@@ -330,112 +583,547 @@ end
 -- Network
 --------------------------------------------------------------------------------
 local function statusPayload()
-  local kinds = #cache.items
-  local units = 0
-  for _, r in ipairs(cache.items) do units = units + r.count end
+  local kinds = #cache.stockRows
   return {
     name = os.getComputerLabel() or ("Storage-" .. os.getComputerID()),
     kind = "storage",
     mode = "vault",
-    vault = cfg.vault,
+    vault = cache.vaults[1] and cache.vaults[1].name or cfg.vault,
+    vaults = #cache.vaults,
     input = cfg.input,
     output = cfg.output,
     types = kinds,
-    units = units,
+    units = cache.items,
+    items = cache.items,
+    capacity = cache.cap,
+    fillPct = cache.pct,
+    inRate = cache.inRate,
+    outRate = cache.outRate,
     lastRequest = cache.lastRequest,
     version = VERSION,
   }
 end
 
 local function announceStorage()
-  if not titan then return end
   local payload = statusPayload()
-  if titan.broadcast then
+  if titan and titan.broadcast then
     pcall(titan.broadcast, MSG.STORAGE_HELLO or "storage_hello", payload)
-  else
-    rednet.broadcast({
-      type = MSG.STORAGE_HELLO or "storage_hello",
-      from = os.getComputerID(),
-      name = payload.name,
-      kind = "storage",
-      data = payload,
-    }, PROTO)
   end
-  -- Also plain rednet for admin tablets listening on titan_net.
   rednet.broadcast({
     type = "storage_hello",
     from = os.getComputerID(),
     name = payload.name,
     kind = "storage",
-    vault = cfg.vault, input = cfg.input, output = cfg.output,
+    vault = payload.vault, input = cfg.input, output = cfg.output,
     types = payload.types, units = payload.units,
+    vaults = payload.vaults, fillPct = payload.fillPct,
+    inRate = payload.inRate, outRate = payload.outRate,
   }, PROTO)
 end
 
 --------------------------------------------------------------------------------
--- Monitor / console
+-- Monitor UI
 --------------------------------------------------------------------------------
-local function drawMonitor()
-  local out = monitor
-  if not out then return end
-  local w, h = out.getSize()
-  if out.setBackgroundColor then out.setBackgroundColor(colors.black) end
-  out.clear()
-  local function line(y, text, c)
-    if y < 1 or y > h then return end
-    out.setCursorPos(1, y)
-    if out.setTextColor then out.setTextColor(c or colors.white) end
-    out.write(tostring(text):sub(1, w))
+local function outIsColor(out)
+  local ok, c = pcall(function() return out.isColor and out.isColor() end)
+  return ok and c == true
+end
+
+local function boardPal(color)
+  if color then
+    return {
+      bg = colors.black,
+      header = colors.cyan,
+      headerFg = colors.black,
+      input = colors.lime,
+      output = colors.orange,
+      fill = colors.yellow,
+      steam = colors.white,
+      dim = colors.gray,
+      muted = colors.lightGray,
+      soot = colors.gray,
+      card = colors.gray,
+      ok = colors.lime,
+      warn = colors.yellow,
+      danger = colors.red,
+      iron = colors.lightGray,
+    }
   end
-  local units = 0
-  for _, r in ipairs(cache.items) do units = units + r.count end
-  line(1, " STORAGE MANAGER ", colors.yellow)
-  line(2, ("vault=%s"):format(tostring(cfg.vault or "?")):sub(1, w), colors.lime)
-  line(3, ("in=%s  out=%s"):format(
-    tostring(cfg.input or "?"), tostring(cfg.output or "?")):sub(1, w), colors.lightGray)
-  line(4, ("types:%d  items:%d  net:%s"):format(
-    #cache.items, units, cache.netOk and "ok" or "--"), colors.white)
-  if cache.lastRequest then
-    local lr = cache.lastRequest
-    line(5, ("last: %dx %s"):format(
-      tonumber(lr.moved) or 0, shortName(lr.item)):sub(1, w), colors.orange)
-  else
-    line(5, "last: (none)", colors.gray)
-  end
-  line(6, "COUNT   ITEM", colors.gray)
-  local y = 7
-  for _, row in ipairs(cache.items) do
-    if y > h then break end
-    line(y, ("%6d  %s"):format(row.count, (row.displayName or shortName(row.name)):sub(1, w - 8)), colors.white)
-    y = y + 1
-  end
-  if #cache.items == 0 then
-    line(7, "Bind vault + chests, then ingest.", colors.orange)
+  return {
+    bg = colors.black,
+    header = colors.white,
+    headerFg = colors.black,
+    input = colors.white,
+    output = colors.white,
+    fill = colors.white,
+    steam = colors.white,
+    dim = colors.white,
+    muted = colors.white,
+    soot = colors.black,
+    card = colors.black,
+    ok = colors.white,
+    warn = colors.white,
+    danger = colors.white,
+    iron = colors.white,
+  }
+end
+
+local function screenAccent(screen, pal)
+  if screen == 1 then return pal.input
+  elseif screen == 2 then return pal.output
+  else return pal.fill
   end
 end
 
+local function fillBarColor(pct, pal, color)
+  pct = tonumber(pct) or 0
+  if not color then return pal.steam end
+  if pct >= 90 then return pal.danger
+  elseif pct >= 70 then return pal.warn
+  elseif pct >= 40 then return pal.output
+  else return pal.ok
+  end
+end
+
+local function guiFill(out, x, y, ww, hh, bg, fg)
+  if not out or ww < 1 or hh < 1 then return end
+  local W, H = out.getSize()
+  bg = bg or colors.black
+  fg = fg or colors.white
+  for row = y, math.min(H, y + hh - 1) do
+    if row >= 1 then
+      local cx = math.max(1, x)
+      local cw = math.min(ww - (cx - x), W - cx + 1)
+      if cw > 0 then
+        if out.setBackgroundColor then out.setBackgroundColor(bg) end
+        if out.setTextColor then out.setTextColor(fg) end
+        out.setCursorPos(cx, row)
+        out.write(string.rep(" ", cw))
+      end
+    end
+  end
+end
+
+local function guiText(out, x, y, txt, fg, bg)
+  if not out or y < 1 then return end
+  local W, H = out.getSize()
+  if y > H or x > W then return end
+  txt = tostring(txt or "")
+  if out.setBackgroundColor then out.setBackgroundColor(bg or colors.black) end
+  if out.setTextColor then out.setTextColor(fg or colors.white) end
+  out.setCursorPos(math.max(1, x), y)
+  out.write(txt:sub(1, math.max(0, W - math.max(1, x) + 1)))
+end
+
+local function addHit(monName, x, y, ww, screen)
+  cache.hits[#cache.hits + 1] = {
+    mon = monName, x1 = x, x2 = x + ww - 1, y = y, screen = screen,
+  }
+end
+
+local function guiChip(out, monName, x, y, label, fg, bg, colorOk, screen)
+  label = " " .. tostring(label) .. " "
+  local w = #label
+  if colorOk then
+    guiText(out, x, y, label, fg or colors.white, bg or colors.gray)
+  else
+    local bare = tostring(label):match("^%s*(.-)%s*$") or ""
+    guiText(out, x, y, "[" .. bare .. "]", fg or colors.white, colors.black)
+    w = #bare + 2
+  end
+  if screen then addHit(monName, x, y, w, screen) end
+  return x + w + 1
+end
+
+local function applyMonitorScale(out)
+  if not out or not out.setTextScale then
+    local w, h = out.getSize()
+    return 1, w, h
+  end
+  local chosen = 0.5
+  for _, scale in ipairs({ 1, 0.5 }) do
+    pcall(function() out.setTextScale(scale) end)
+    local ww, hh = out.getSize()
+    if ww >= 26 and hh >= 12 then
+      chosen = scale
+      break
+    end
+    chosen = scale
+  end
+  pcall(function() out.setTextScale(chosen) end)
+  local w, h = out.getSize()
+  return chosen, w, h
+end
+
+local function layoutTier(w, h)
+  if w < 18 or h < 6 then return "tiny"
+  elseif w < 28 or h < 10 then return "small"
+  elseif w < 40 or h < 14 then return "medium"
+  else return "large"
+  end
+end
+
+local function drawGauge(out, x, y, ww, pct, fillBg, pal, color)
+  local W = select(1, out.getSize())
+  ww = math.min(ww, W - x + 1)
+  if ww < 4 then return end
+  pct = math.max(0, math.min(100, tonumber(pct) or 0))
+  local inner = ww - 2
+  local filled = math.floor((pct / 100) * inner + 0.5)
+  if color then
+    guiText(out, x, y, "[", pal.iron, pal.soot)
+    guiFill(out, x + 1, y, inner, 1, pal.soot, pal.steam)
+    if filled > 0 then
+      guiFill(out, x + 1, y, filled, 1, fillBg, colors.black)
+    end
+    guiText(out, x + ww - 1, y, "]", pal.iron, pal.soot)
+  else
+    local bar = string.rep("=", filled) .. string.rep("-", math.max(0, inner - filled))
+    guiText(out, x, y, "[" .. bar .. "]", pal.steam, pal.bg)
+  end
+end
+
+local function drawSpark(out, x, y, ww, hh, values, pal, accent, color)
+  if ww < 4 or hh < 2 or #values < 1 then return end
+  local mx = 0.001
+  for _, v in ipairs(values) do
+    if v > mx then mx = v end
+  end
+  for col = 1, ww do
+    local idx = math.max(1, math.ceil((col / ww) * #values))
+    local v = values[idx] or 0
+    local bh = math.floor((v / mx) * hh + 0.5)
+    for row = 1, hh do
+      local fromBot = hh - row + 1
+      local px, py = x + col - 1, y + row - 1
+      if fromBot <= bh and bh > 0 then
+        if color then
+          guiText(out, px, py, " ", colors.black, accent)
+        else
+          guiText(out, px, py, "#", pal.steam, pal.bg)
+        end
+      else
+        if color then
+          guiText(out, px, py, " ", pal.dim, pal.soot)
+        else
+          guiText(out, px, py, ".", pal.dim, pal.bg)
+        end
+      end
+    end
+  end
+end
+
+local function drawFlow(out, x, y, ww, pal, accent, color, dir)
+  if ww < 4 then return end
+  local t = math.floor(os.clock() * 6)
+  local ch = (dir or 1) >= 0 and ">" or "<"
+  if color then
+    guiFill(out, x, y, ww, 1, pal.soot, accent)
+    for i = 1, ww do
+      local on = ((i + t * dir) % 4) == 0
+      guiText(out, x + i - 1, y, on and ch or " ", on and colors.black or pal.dim,
+        on and accent or pal.soot)
+    end
+  else
+    local s = {}
+    for i = 1, ww do
+      s[i] = ((i + t * dir) % 4) == 0 and ch or "-"
+    end
+    guiText(out, x, y, table.concat(s), pal.steam, pal.bg)
+  end
+end
+
+local function histValues(key)
+  local out = {}
+  for _, h in ipairs(cache.hist) do
+    out[#out + 1] = math.max(0, tonumber(h[key]) or 0)
+  end
+  return out
+end
+
+local function drawOneMonitor(mon)
+  local out, monName = mon.wrap, mon.name
+  if not out then return end
+  local color = outIsColor(out)
+  local pal = boardPal(color)
+  local _, w, h = applyMonitorScale(out)
+  local screen = cfg.screen or 1
+  local accent = screenAccent(screen, pal)
+  local tier = layoutTier(w, h)
+  local nVault = #cache.vaults
+  local ready = cache.rateReady
+  local pct = cache.pct or 0
+  local fillFg = fillBarColor(pct, pal, color)
+
+  if out.setBackgroundColor then out.setBackgroundColor(pal.bg) end
+  out.clear()
+
+  local headerH = (tier == "tiny") and 1 or ((tier == "small") and 2 or 3)
+  local title = " STORAGE "
+  local right = (nVault == 1) and "1 vault" or (nVault .. " vaults")
+  if color then
+    guiFill(out, 1, 1, w, headerH, pal.header, pal.headerFg)
+    guiText(out, 2, 1, title:sub(1, w - 2), pal.headerFg, pal.header)
+    if #title + #right + 3 < w then
+      guiText(out, math.max(2, w - #right), 1, right, pal.headerFg, pal.header)
+    end
+    if headerH >= 2 then
+      local sub = os.getComputerLabel() or cfg.label or ("id " .. os.getComputerID())
+      guiText(out, 2, 2, tostring(sub):sub(1, w - 2), colors.gray, pal.header)
+    end
+  else
+    guiText(out, 1, 1, (title .. right):sub(1, w), pal.steam, pal.bg)
+  end
+
+  local y = headerH + 1
+  local inLab = "IN " .. (ready and fmtCount(cache.inRate) .. "/m" or "…")
+  local outLab = "OUT " .. (ready and fmtCount(cache.outRate) .. "/m" or "…")
+  local fillLab = "FILL " .. fmtPct(pct)
+  if w < 36 then
+    inLab, outLab, fillLab = "IN", "OUT", fmtPct(pct)
+  end
+
+  if y <= h - 1 then
+    if color then
+      guiFill(out, 1, y, w, 1, pal.bg, pal.steam)
+      local x = 2
+      local function chip(label, sc, ac)
+        local on = screen == sc
+        local fg = on and colors.black or pal.steam
+        local bg = on and ac or pal.soot
+        x = guiChip(out, monName, x, y, label, fg, bg, true, sc)
+      end
+      chip(inLab, 1, pal.input)
+      chip(outLab, 2, pal.output)
+      chip(fillLab, 3, fillFg)
+    else
+      guiText(out, 1, y, (inLab .. "  " .. outLab .. "  " .. fillLab):sub(1, w), pal.steam, pal.bg)
+      addHit(monName, 1, y, w, (screen % #SCREENS) + 1)
+    end
+    y = y + 1
+  end
+
+  -- Tiny: hero metric only
+  if tier == "tiny" then
+    local hero = (screen == 3) and fmtPct(pct)
+      or fmtRate(screen == 1 and cache.inRate or cache.outRate, ready)
+    guiText(out, 1, math.min(h, y), hero:sub(1, w), accent, pal.bg)
+    return
+  end
+
+  local footerH = 1
+  local bodyBot = h - footerH
+
+  local names = { "INPUT RATE", "OUTPUT RATE", "FILL" }
+  local heroes = {
+    fmtRate(cache.inRate, ready),
+    fmtRate(cache.outRate, ready),
+    fmtPct(pct),
+  }
+  local name = names[screen]
+  local hero = heroes[screen]
+
+  if y <= bodyBot then
+    if color then
+      guiFill(out, 1, y, w, 1, accent, colors.black)
+      local nx = math.max(2, math.floor((w - #name) / 2) + 1)
+      guiText(out, nx, y, name, colors.black, accent)
+    else
+      guiText(out, 1, y, name:sub(1, w), pal.steam, pal.bg)
+    end
+    y = y + 1
+  end
+
+  if y <= bodyBot then
+    local hx = math.max(1, math.floor((w - #hero) / 2) + 1)
+    if color then
+      guiFill(out, 1, y, w, 1, pal.bg, pal.steam)
+      guiText(out, hx, y, hero, accent, pal.bg)
+    else
+      guiText(out, hx, y, hero, pal.steam, pal.bg)
+    end
+    y = y + 1
+  end
+
+  if screen ~= 3 and y <= bodyBot then
+    drawFlow(out, 2, y, w - 2, pal, accent, color, screen == 1 and 1 or -1)
+    y = y + 1
+  elseif screen == 3 and y <= bodyBot then
+    drawGauge(out, 2, y, w - 2, pct, fillFg, pal, color)
+    y = y + 1
+  end
+
+  local sparkH = 0
+  if tier == "large" then sparkH = 6
+  elseif tier == "medium" then sparkH = 4
+  elseif tier == "small" then sparkH = 2
+  end
+  sparkH = math.min(sparkH, math.max(0, bodyBot - y - 4))
+  if sparkH >= 2 and y + sparkH - 1 <= bodyBot then
+    local key = (screen == 1 and "inR") or (screen == 2 and "outR") or "pct"
+    drawSpark(out, 2, y, w - 2, sparkH, histValues(key), pal, accent, color)
+    y = y + sparkH + 1
+  end
+
+  local cards
+  if screen == 3 then
+    cards = {
+      { "USED", fmtCount(cache.items) },
+      { "CAP", fmtCount(cache.cap) },
+      { "SLOTS", ("%s/%s"):format(fmtCount(cache.used), fmtCount(cache.slots)) },
+      { "VAULTS", tostring(nVault) },
+    }
+  else
+    local win = tostring(cfg.windowSecs or 60) .. "s"
+    cards = {
+      { "WINDOW", win },
+      { "ITEMS", fmtCount(cache.items) },
+      { "VAULTS", tostring(nVault) },
+      { "FILL", fmtPct(pct) },
+    }
+  end
+
+  if nVault == 0 then
+    if y <= bodyBot then
+      guiText(out, 2, y, "No vaults on this cable.", pal.warn, pal.bg)
+      y = y + 1
+    end
+    if y <= bodyBot then
+      guiText(out, 2, y, "Right-click wired modems.", pal.muted, pal.bg)
+      y = y + 1
+    end
+  else
+    if color and w >= 28 then
+      local colW = math.floor(w / 2)
+      local i = 1
+      while i <= #cards and y <= bodyBot do
+        local a, b = cards[i], cards[i + 1]
+        guiFill(out, 1, y, w, 1, pal.soot, pal.steam)
+        guiText(out, 2, y, (a[1] .. "  " .. a[2]):sub(1, colW - 2), pal.steam, pal.soot)
+        if b then
+          guiText(out, colW + 2, y, (b[1] .. "  " .. b[2]):sub(1, colW - 2), pal.steam, pal.soot)
+        end
+        i = i + 2
+        y = y + 1
+      end
+    else
+      for _, c in ipairs(cards) do
+        if y > bodyBot then break end
+        guiText(out, 2, y, (c[1] .. "  " .. c[2]):sub(1, w - 2), pal.steam, pal.bg)
+        y = y + 1
+      end
+    end
+  end
+
+  -- Footer tabs
+  local tabs = { "INPUT", "OUTPUT", "FILL" }
+  local hint = "TAP to switch"
+  if color then
+    guiFill(out, 1, h, w, 1, pal.soot, pal.steam)
+    local x = 2
+    if w >= 36 then
+      guiText(out, 2, h, hint, pal.muted, pal.soot)
+      x = 2 + #hint + 2
+    end
+    for i, tab in ipairs(tabs) do
+      local on = screen == i
+      local fg = on and colors.black or pal.steam
+      local bg = on and screenAccent(i, pal) or pal.soot
+      local lab = on and ("[" .. tab .. "]") or (" " .. tab .. " ")
+      guiText(out, x, h, lab, fg, bg)
+      addHit(monName, x, h, #lab, i)
+      x = x + #lab + 1
+    end
+  else
+    local line = ""
+    for i, tab in ipairs(tabs) do
+      line = line .. (screen == i and ("[" .. tab .. "] ") or (tab .. " "))
+    end
+    guiText(out, 1, h, line:sub(1, w), pal.steam, pal.bg)
+    addHit(monName, 1, h, w, (screen % #SCREENS) + 1)
+  end
+end
+
+local function drawMonitor()
+  cache.hits = {}
+  local mons = listMonitors()
+  if #mons == 0 then return false, "no monitor" end
+  for _, m in ipairs(mons) do
+    pcall(drawOneMonitor, m)
+  end
+  return true
+end
+
+local function setScreen(n)
+  n = math.max(1, math.min(#SCREENS, tonumber(n) or 1))
+  if cfg.screen ~= n then
+    cfg.screen = n
+    saveCfg()
+  end
+  drawMonitor()
+end
+
+local function cycleScreen()
+  setScreen((cfg.screen % #SCREENS) + 1)
+end
+
+local function touchToScreen(monName, x, y)
+  for _, h in ipairs(cache.hits or {}) do
+    if (not h.mon or h.mon == monName)
+       and y == h.y and x >= h.x1 and x <= h.x2 then
+      return h.screen
+    end
+  end
+  return nil
+end
+
+--------------------------------------------------------------------------------
+-- Console
+--------------------------------------------------------------------------------
 local function printHelp()
   print("Storage Manager v" .. VERSION)
-  print("  bind vault|input|output <peripheral|side>")
-  print("  unbind vault|input|output")
-  print("  invs | status | stock [filter] | find <item>")
-  print("  ingest                 input -> vault")
-  print("  request <item> [count] vault -> output")
-  print("  monrate [secs] | net | hostname [name]")
-  print("  help | exit")
+  print("  Auto-detects Create vaults on the wired network.")
+  print("  Right-click the monitor: INPUT / OUTPUT / FILL")
+  print("  status | vaults | invs | screen [in|out|fill]")
+  print("  poll [secs] | window [secs]")
+  print("  bind input|output <peripheral|side>   (optional I/O)")
+  print("  unbind input|output")
+  print("  ingest | request <item> [count]")
+  print("  stock [filter] | find <item>")
+  print("  net | hostname [name] | help | exit")
+end
+
+local function printStatus()
+  print(("vaults: %d   items: %s / %s  (%s)"):format(
+    #cache.vaults, fmtCount(cache.items), fmtCount(cache.cap), fmtPct(cache.pct)))
+  print(("in:  %s"):format(fmtRate(cache.inRate, cache.rateReady)))
+  print(("out: %s"):format(fmtRate(cache.outRate, cache.rateReady)))
+  print(("screen: %s   poll: %ss   window: %ss"):format(
+    SCREENS[cfg.screen], tostring(cfg.pollSecs), tostring(cfg.windowSecs)))
+  print(("input:  %s"):format(tostring(cfg.input or "(unbound)")))
+  print(("output: %s"):format(tostring(cfg.output or "(unbound)")))
+  print(("net: %s"):format(cache.netOk and ("MAIN #" .. tostring(cache.netMain)) or "offline"))
 end
 
 local function printStock(filter, limit)
   limit = limit or 40
-  refresh()
+  if (nowMs() - (cache.updated or 0)) > 2000 then refresh() end
   local rows = filteredRows(filter, limit)
-  print(("Stock (vault+input)  %d type(s)%s"):format(
-    #cache.items, filter and ("  filter='" .. filter .. "'") or ""))
+  print(("Stock (all vaults)  %d type(s)%s"):format(
+    #cache.stockRows, filter and ("  filter='" .. filter .. "'") or ""))
   if #rows == 0 then print("  (no matches)"); return end
   for _, row in ipairs(rows) do
-    print(("  %6d  %-22s %s"):format(
-      row.count, (row.displayName or shortName(row.name)):sub(1, 22), row.name))
+    print(("  %6s  %-22s %s"):format(
+      fmtCount(row.count), (row.displayName or shortName(row.name)):sub(1, 22), row.name))
   end
+end
+
+local function parseScreen(s)
+  s = tostring(s or ""):lower()
+  if s == "1" or s == "in" or s == "input" then return 1 end
+  if s == "2" or s == "out" or s == "output" then return 2 end
+  if s == "3" or s == "fill" or s == "pct" or s == "full" then return 3 end
+  return nil
 end
 
 local function handleCommand(line)
@@ -445,37 +1133,68 @@ local function handleCommand(line)
   if cmd == "" then return true
   elseif cmd == "help" or cmd == "?" then printHelp()
   elseif cmd == "status" then
-    refresh()
-    print(("vault:  %s"):format(tostring(cfg.vault or "(unbound)")))
-    print(("input:  %s"):format(tostring(cfg.input or "(unbound)")))
-    print(("output: %s"):format(tostring(cfg.output or "(unbound)")))
-    print(("types: %d"):format(#cache.items))
-    print(("net: %s"):format(cache.netOk and ("MAIN #" .. tostring(cache.netMain)) or "offline"))
-    if cache.lastRequest then
-      local lr = cache.lastRequest
-      print(("last request: %d/%d %s"):format(
-        tonumber(lr.moved) or 0, tonumber(lr.want) or 0, tostring(lr.item)))
+    refresh(); printStatus(); drawMonitor()
+  elseif cmd == "vaults" then
+    scanVaults()
+    print(("Vaults (%d):"):format(#cache.vaults))
+    if #cache.vaults == 0 then
+      print("  (none) — right-click wired modems on each Create vault")
+    else
+      for _, v in ipairs(cache.vaults) do
+        local p = (v.cap > 0) and (v.items / v.cap * 100) or 0
+        print(("  %s  %s/%s  %s"):format(
+          v.name, fmtCount(v.items), fmtCount(v.cap), fmtPct(p)))
+      end
     end
-    drawMonitor()
+    print("Board shows joined totals, not per-vault.")
   elseif cmd == "invs" or cmd == "peripherals" then
     local invs = listInventories()
     print(("Inventories (%d):"):format(#invs))
+    local vset = {}
+    for _, v in ipairs(cache.vaults) do vset[v.name] = true end
     for _, n in ipairs(invs) do
       local tag = ""
-      if n == cfg.vault then tag = "  [vault]"
+      if vset[n] then tag = "  [vault]"
       elseif n == cfg.input then tag = "  [input]"
       elseif n == cfg.output then tag = "  [output]" end
       print("  " .. n .. tag)
     end
+  elseif cmd == "screen" then
+    if a[2] then
+      local n = parseScreen(a[2])
+      if not n then print("Usage: screen in|out|fill")
+      else setScreen(n); print("screen=" .. SCREENS[cfg.screen]) end
+    else
+      cycleScreen()
+      print("screen=" .. SCREENS[cfg.screen])
+    end
+  elseif cmd == "poll" then
+    if a[2] then
+      cfg.pollSecs = math.max(0.25, tonumber(a[2]) or cfg.pollSecs)
+      saveCfg()
+    end
+    print("poll=" .. tostring(cfg.pollSecs) .. "s")
+  elseif cmd == "window" then
+    if a[2] then
+      cfg.windowSecs = math.max(10, math.min(300, tonumber(a[2]) or cfg.windowSecs))
+      saveCfg()
+    end
+    print("window=" .. tostring(cfg.windowSecs) .. "s")
   elseif cmd == "bind" then
     local role = tostring(a[2] or ""):lower()
     local ref = a[3] and table.concat(a, " ", 3) or nil
-    if (role ~= "vault" and role ~= "input" and role ~= "output") or not ref then
-      print("Usage: bind vault|input|output <peripheralName|side>")
+    if (role ~= "input" and role ~= "output") or not ref then
+      print("Usage: bind input|output <peripheralName|side>")
+      print("Vaults are auto-detected — no bind needed.")
     else
-      local name = resolvePeripheral(ref)
+      local name, hits = resolvePeripheral(ref)
       if not name then
-        print("No inventory matching: " .. tostring(ref))
+        if hits then
+          print("Ambiguous — matches:")
+          for _, h in ipairs(hits) do print("  " .. h) end
+        else
+          print("No inventory matching: " .. tostring(ref))
+        end
       else
         cfg[role] = name
         saveCfg()
@@ -485,8 +1204,8 @@ local function handleCommand(line)
     end
   elseif cmd == "unbind" then
     local role = tostring(a[2] or ""):lower()
-    if role ~= "vault" and role ~= "input" and role ~= "output" then
-      print("Usage: unbind vault|input|output")
+    if role ~= "input" and role ~= "output" then
+      print("Usage: unbind input|output")
     else
       cfg[role] = nil
       saveCfg()
@@ -502,8 +1221,8 @@ local function handleCommand(line)
   elseif cmd == "ingest" then
     local n, err = ingestOnce()
     if err and n == 0 then print("ingest: " .. tostring(err))
-    else print(("Ingested %d item(s) into vault."):format(n or 0)) end
-    drawMonitor()
+    else print(("Ingested %d item(s) into vaults."):format(n or 0)) end
+    refresh(); drawMonitor()
   elseif cmd == "request" or cmd == "req" then
     if not a[2] then
       print("Usage: request <item> [count]")
@@ -529,7 +1248,7 @@ local function handleCommand(line)
       cfg.monRate = math.max(1, tonumber(a[2]) or cfg.monRate)
       saveCfg()
     end
-    print("monRate=" .. tostring(cfg.monRate) .. "s  ingestSecs=" .. tostring(cfg.ingestSecs))
+    print("monRate=" .. tostring(cfg.monRate) .. "s  (board follows poll=" .. tostring(cfg.pollSecs) .. "s)")
   elseif cmd == "net" then
     if titan and titan.reauth then pcall(titan.reauth, "storage") end
     cache.netMain = titan and titan.getMainRouterId and titan.getMainRouterId() or nil
@@ -545,7 +1264,7 @@ local function handleCommand(line)
       announceStorage()
     end
     print("hostname: " .. tostring(os.getComputerLabel()))
-  elseif cmd == "refresh" then
+  elseif cmd == "refresh" or cmd == "monitor" then
     refresh(); drawMonitor(); print("Refreshed.")
   elseif cmd == "exit" or cmd == "quit" then
     return "exit"
@@ -558,32 +1277,25 @@ end
 --------------------------------------------------------------------------------
 -- Loops
 --------------------------------------------------------------------------------
-local function uiLoop()
-  while true do
-    monitor = peripheral.find("monitor") or monitor
-    pcall(drawMonitor)
-    sleep(tonumber(cfg.monRate) or 5)
-  end
-end
-
-local function ingestLoop()
-  while true do
-    pcall(ingestOnce)
-    sleep(tonumber(cfg.ingestSecs) or 3)
-  end
-end
-
-local function netLoop()
+local function eventLoop()
+  local pollT = os.startTimer(0.2)
   local helloT = os.startTimer(2)
   while true do
     local ev, p1, p2, p3 = os.pullEvent()
-    if ev == "timer" and p1 == helloT then
+    if ev == "timer" and p1 == pollT then
+      pcall(refresh)
+      pcall(drawMonitor)
+      pollT = os.startTimer(tonumber(cfg.pollSecs) or 1)
+    elseif ev == "timer" and p1 == helloT then
       if titan and titan.getMainRouterId then
         cache.netMain = titan.getMainRouterId()
         cache.netOk = cache.netMain ~= nil
       end
-      announceStorage()
+      pcall(announceStorage)
       helloT = os.startTimer(20)
+    elseif ev == "monitor_touch" then
+      local jumped = touchToScreen(p1, p2, p3)
+      if jumped then setScreen(jumped) else cycleScreen() end
     elseif ev == "rednet_message" and (p3 == PROTO or p3 == nil) and type(p2) == "table" then
       local msg, from = p2, p1
       local t = msg.type
@@ -598,7 +1310,7 @@ local function netLoop()
           pcall(titan.send, from, MSG.STORAGE_STATUS, statusPayload())
         end
       elseif t == "storage_stock_req" or t == MSG.STORAGE_STOCK_REQ then
-        if (now() - (cache.updated or 0)) > 5000 then refresh() end
+        if (nowMs() - (cache.updated or 0)) > 5000 then pcall(refresh) end
         local rows = filteredRows(msg.filter, tonumber(msg.limit) or 40)
         local slim = {}
         for i, r in ipairs(rows) do
@@ -609,7 +1321,7 @@ local function netLoop()
           ok = true,
           from = os.getComputerID(),
           items = slim,
-          types = #cache.items,
+          types = #cache.stockRows,
           mode = "vault",
         }, PROTO)
       elseif t == "storage_request" or t == MSG.STORAGE_REQUEST then
@@ -624,12 +1336,19 @@ local function netLoop()
           count = msg.count,
           from = os.getComputerID(),
         }, PROTO)
-        drawMonitor()
+        pcall(drawMonitor)
       end
     elseif ev == "peripheral" or ev == "peripheral_detach" then
-      monitor = peripheral.find("monitor")
-      refresh()
+      pcall(scanVaults)
+      pcall(drawMonitor)
     end
+  end
+end
+
+local function ingestLoop()
+  while true do
+    if cfg.input then pcall(ingestOnce) end
+    sleep(tonumber(cfg.ingestSecs) or 3)
   end
 end
 
@@ -646,7 +1365,7 @@ end
 -- Boot
 --------------------------------------------------------------------------------
 if not openModem() then
-  printError("No modem — attach a wired/wireless modem for mesh + binds.")
+  printError("No modem — attach a wired modem to the vault cable.")
 end
 loadCfg()
 os.setComputerLabel(os.getComputerLabel() or cfg.label or ("StorageManager-" .. os.getComputerID()))
@@ -655,23 +1374,21 @@ saveCfg()
 
 term.clear(); term.setCursorPos(1, 1)
 print("== Storage Manager v" .. VERSION .. " ==")
-print("Vault + Sophisticated input/output chests.")
+print("Create vault board — joined INPUT / OUTPUT / FILL")
+print("Right-click the advanced monitor to switch screens.")
 if titan and titan.reauth then pcall(titan.reauth, "storage") end
 cache.netMain = titan and titan.getMainRouterId and titan.getMainRouterId() or nil
 cache.netOk = cache.netMain ~= nil
 refresh()
 announceStorage()
 drawMonitor()
-if not cfg.vault then
-  print("Bind peripherals:  bind vault <name>")
-  print("                   bind input <name>")
-  print("                   bind output <name>")
-  print("List with: invs")
+if #cache.vaults == 0 then
+  print("No vaults yet. Right-click wired modems on each Create vault.")
 else
-  print(("vault=%s input=%s output=%s"):format(
-    tostring(cfg.vault), tostring(cfg.input), tostring(cfg.output)))
+  print(("Tracking %d vault(s), %s items (%s)."):format(
+    #cache.vaults, fmtCount(cache.items), fmtPct(cache.pct)))
 end
 print("Type help.")
 
-parallel.waitForAny(consoleLoop, netLoop, uiLoop, ingestLoop)
+parallel.waitForAny(consoleLoop, eventLoop, ingestLoop)
 print("Storage manager closed.")

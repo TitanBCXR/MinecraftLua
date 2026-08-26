@@ -293,7 +293,7 @@ local function buildCell()
   print("Build pass done.")
   print("1) Right-click wired modems so they connect.")
   print("2) Run cable to the Storage Manager computer on the pad.")
-  print("3) On the manager: invs  then  bind vault|input|output …")
+  print("3) On the manager: right-click its modem — vaults auto-detect.")
   cfg.lastBuild = os.epoch("utc")
   saveCfg()
   return true
