@@ -1,6 +1,6 @@
 --[[
   Compat shim — Storage Manager lives under storage/managers/.
-  Titan-Version: 1.1.1
+  Titan-Version: 1.1.3
 ]]
 local path = "storage/managers/storage_manager.lua"
 if not fs.exists(path) then

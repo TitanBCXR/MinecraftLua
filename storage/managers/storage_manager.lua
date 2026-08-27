@@ -1,6 +1,6 @@
 --[[
   storage/managers/storage_manager.lua  -  Create vault rate + fill board
-  Titan-Version: 1.1.1
+  Titan-Version: 1.1.3
 
   Auto-detects every Create item vault on the wired modem network and
   tracks the *joined* pool (not per-vault):
@@ -9,16 +9,19 @@
     Output rate  — items / min leaving the vaults
     Fill percent — used / capacity across all vaults
 
-  Advanced monitor: quiet centered board. Right-click (or tap a dot)
-  to cycle INPUT → OUTPUT → FILL. Vaults can be added or removed anytime.
+  Monitor:
+    1×1               — in or out (right-click to set that monitor)
+    larger than 3×3   — fill wall (title header, boxed fill, max footer)
 
   Hardware:
     [Create vault] --wired modem--+
-    [Create vault] --wired modem--+-- cable -- [PC + wired modem + advanced monitor]
+    [Create vault] --wired modem--+-- cable -- [PC + wired modem]
+    [1×1 in]  [1×1 out]  [>3×3 fill]  -- monitors on the PC
     (optional I/O chests on the same cable for ingest / admin request)
 
   Commands:
-    status | vaults | invs | screen [in|out|fill]
+    title [text] | title clear | mons
+    status | vaults | invs
     poll [secs] | window [secs]
     bind input|output <name|side>   (optional I/O)
     unbind input|output
@@ -37,7 +40,7 @@ end
 local MSG = titan and titan.MSG or {}
 local PROTO = (titan and titan.PROTOCOL) or "titan_net"
 local CFG = "storage_manager.cfg"
-local VERSION = "1.1.1"
+local VERSION = "1.1.3"
 
 local SCREENS = { "input", "output", "fill" }
 local DEFAULT_SLOT_LIMIT = 512
@@ -63,6 +66,8 @@ local cfg = {
   monRate = 5,
   ingestSecs = 3,
   label = nil,
+  title = nil,       -- large-board header (falls back to computer label)
+  monRoles = {},     -- [monitorName] = 1 (in) | 2 (out)  — 1×1 rate boards
 }
 
 local cache = {
@@ -114,6 +119,8 @@ local function loadCfg()
   cfg.screen = math.max(1, math.min(#SCREENS, tonumber(cfg.screen) or 1))
   cfg.pollSecs = math.max(0.25, tonumber(cfg.pollSecs) or 1)
   cfg.windowSecs = math.max(10, math.min(300, tonumber(cfg.windowSecs) or 60))
+  if type(cfg.monRoles) ~= "table" then cfg.monRoles = {} end
+  if type(cfg.title) == "string" and cfg.title == "" then cfg.title = nil end
 end
 
 local function saveCfg()
@@ -636,6 +643,7 @@ local function boardPal(color)
       fg = colors.white,
       mute = colors.lightGray,
       dim = colors.gray,
+      line = colors.gray,
       bar = colors.white,
       track = colors.gray,
     }
@@ -645,6 +653,7 @@ local function boardPal(color)
     fg = colors.white,
     mute = colors.white,
     dim = colors.white,
+    line = colors.white,
     bar = colors.white,
     track = colors.black,
   }
@@ -690,6 +699,12 @@ local function centerX(w, text)
   return math.max(1, math.floor((w - #tostring(text)) / 2) + 1)
 end
 
+local function boxTextX(ix, iw, txt)
+  txt = tostring(txt or "")
+  if #txt >= iw then return ix end
+  return ix + math.floor((iw - #txt) / 2)
+end
+
 local function fmtHero(n)
   n = tonumber(n) or 0
   local a = math.abs(n)
@@ -697,7 +712,90 @@ local function fmtHero(n)
   return commas(n)
 end
 
---- Prefer scale 1 so type is large and the board stays sparse.
+local function boardTitle()
+  local t = cfg.title
+  if type(t) == "string" and t:match("%S") then return t end
+  return os.getComputerLabel() or cfg.label or "storage"
+end
+
+local function ratePair(rate, ready)
+  if not ready then return "—", "/min" end
+  rate = tonumber(rate) or 0
+  if math.abs(rate) < 0.5 then return "0", "/min" end
+  return fmtHero(rate), "/min"
+end
+
+--- Advanced monitor block is 8×6 at scale 1. Measure at scale 1.
+local function measureBlocks(out)
+  if out.setTextScale then pcall(function() out.setTextScale(1) end) end
+  local w, h = out.getSize()
+  local bw = math.max(1, math.floor(w / 8 + 0.05))
+  local bh = math.max(1, math.floor(h / 6 + 0.05))
+  return bw, bh, w, h
+end
+
+local function isSingleBlock(bw, bh)
+  return bw <= 1 and bh <= 1
+end
+
+local function isFillWall(bw, bh)
+  return bw > 3 or bh > 3
+end
+
+local function collectSingleNames()
+  local names = {}
+  for _, m in ipairs(listMonitors()) do
+    local bw, bh = measureBlocks(m.wrap)
+    if isSingleBlock(bw, bh) then names[#names + 1] = m.name end
+  end
+  table.sort(names)
+  return names
+end
+
+local function ensureRateRoles()
+  if type(cfg.monRoles) ~= "table" then cfg.monRoles = {} end
+  local names = collectSingleNames()
+  local dirty = false
+  local taken = { [1] = false, [2] = false }
+  for _, n in ipairs(names) do
+    local r = tonumber(cfg.monRoles[n])
+    if r == 1 or r == 2 then taken[r] = true end
+  end
+  for _, n in ipairs(names) do
+    local r = tonumber(cfg.monRoles[n])
+    if r ~= 1 and r ~= 2 then
+      if not taken[1] then r = 1
+      elseif not taken[2] then r = 2
+      else r = 1 end
+      cfg.monRoles[n] = r
+      taken[r] = true
+      dirty = true
+    end
+  end
+  if dirty then saveCfg() end
+end
+
+local function rateRoleFor(monName)
+  ensureRateRoles()
+  local r = tonumber(cfg.monRoles[monName])
+  if r == 2 then return 2 end
+  return 1
+end
+
+local function toggleRateRole(monName)
+  ensureRateRoles()
+  local cur = rateRoleFor(monName)
+  local new = (cur == 1) and 2 or 1
+  for n, r in pairs(cfg.monRoles) do
+    if n ~= monName and tonumber(r) == new then
+      cfg.monRoles[n] = cur
+    end
+  end
+  cfg.monRoles[monName] = new
+  saveCfg()
+end
+
+--- Keep scale 1 (1×1 stays 8×6; walls stay large type).
 local function applyMonitorScale(out)
   if not out or not out.setTextScale then
     local w, h = out.getSize()
@@ -705,26 +803,7 @@ local function applyMonitorScale(out)
   end
   pcall(function() out.setTextScale(1) end)
   local w, h = out.getSize()
-  if w >= 15 and h >= 6 then return 1, w, h end
-  pcall(function() out.setTextScale(0.5) end)
-  w, h = out.getSize()
-  return 0.5, w, h
-end
-
-local function drawDots(out, monName, w, h, screen, pal, color)
-  local n, gap = 3, 2
-  local total = n + (n - 1) * gap
-  local x0 = math.max(1, math.floor((w - total) / 2) + 1)
-  for i = 1, n do
-    local x = x0 + (i - 1) * (1 + gap)
-    local on = screen == i
-    if color then
-      guiFill(out, x, h, 1, 1, on and pal.fg or pal.dim, pal.bg)
-    else
-      guiText(out, x, h, on and "o" or ".", pal.fg, pal.bg)
-    end
-    addHit(monName, math.max(1, x - 1), h, 3, i)
-  end
+  return 1, w, h
 end
 
 local function drawTrack(out, x, y, ww, pct, pal, color)
@@ -744,20 +823,102 @@ local function drawTrack(out, x, y, ww, pct, pal, color)
   end
 end
 
-local function drawOneMonitor(mon)
-  local out, monName = mon.wrap, mon.name
-  if not out then return end
-  local color = outIsColor(out)
-  local pal = boardPal(color)
-  local _, w, h = applyMonitorScale(out)
-  local screen = cfg.screen or 1
+local function drawFrame(out, x, y, ww, hh, pal, color)
+  if ww < 3 or hh < 3 then return end
+  if color then
+    guiFill(out, x, y, ww, 1, pal.line, pal.bg)
+    guiFill(out, x, y + hh - 1, ww, 1, pal.line, pal.bg)
+    for row = y + 1, y + hh - 2 do
+      guiFill(out, x, row, 1, 1, pal.line, pal.bg)
+      guiFill(out, x + ww - 1, row, 1, 1, pal.line, pal.bg)
+    end
+  else
+    guiText(out, x, y, "+" .. string.rep("-", ww - 2) .. "+", pal.fg, pal.bg)
+    guiText(out, x, y + hh - 1, "+" .. string.rep("-", ww - 2) .. "+", pal.fg, pal.bg)
+    for row = y + 1, y + hh - 2 do
+      guiText(out, x, row, "|", pal.fg, pal.bg)
+      guiText(out, x + ww - 1, row, "|", pal.fg, pal.bg)
+    end
+  end
+end
+
+local function drawMetricBox(out, x, y, ww, hh, spec, pal, color)
+  drawFrame(out, x, y, ww, hh, pal, color)
+  local ix, iy = x + 2, y + 1
+  local iw, ih = ww - 4, hh - 2
+  if iw < 1 or ih < 1 then return end
+  guiText(out, ix, iy, tostring(spec.label or ""):sub(1, iw), pal.dim, pal.bg)
+
+  local hasBar = spec.pct ~= nil
+  local heroY
+  if hasBar then
+    heroY = iy + math.max(1, math.floor(ih * 0.28))
+  else
+    heroY = iy + math.max(1, math.floor((ih - 1) / 2) - (spec.unit and 1 or 0))
+  end
+  if heroY > iy + ih - 1 then heroY = iy + ih - 1 end
+  guiText(out, boxTextX(ix, iw, spec.hero), heroY, tostring(spec.hero or ""), pal.fg, pal.bg)
+  if spec.unit and heroY + 1 <= iy + ih - 1 then
+    guiText(out, boxTextX(ix, iw, spec.unit), heroY + 1, spec.unit, pal.mute, pal.bg)
+  end
+  if hasBar then
+    local barY = iy + ih - (spec.sub and 2 or 1)
+    if barY <= heroY + 1 then barY = heroY + 2 end
+    if barY <= iy + ih - 1 and barY > iy then
+      drawTrack(out, ix, barY, math.max(4, iw), spec.pct, pal, color)
+    end
+    if spec.sub and barY + 1 <= iy + ih - 1 then
+      guiText(out, ix, barY + 1, tostring(spec.sub):sub(1, iw), pal.mute, pal.bg)
+    end
+  end
+end
+
+local function drawHairline(out, x, y, ww, pal, color)
+  if ww < 1 then return end
+  if color then
+    guiFill(out, x, y, ww, 1, pal.line, pal.bg)
+  else
+    guiText(out, x, y, string.rep("-", ww), pal.dim, pal.bg)
+  end
+end
+
+local function drawLargeBoard(out, w, h, pal, color)
+  local title = boardTitle()
+  guiText(out, 3, 2, title:sub(1, math.max(0, w - 4)), pal.fg, pal.bg)
+  drawHairline(out, 3, 3, math.max(1, w - 4), pal, color)
+
+  local capTxt = ((cache.cap or 0) > 0) and fmtHero(cache.cap) or "—"
+  drawHairline(out, 3, h - 1, math.max(1, w - 4), pal, color)
+  guiText(out, 3, h, "max", pal.dim, pal.bg)
+  guiText(out, math.max(8, w - 1 - #capTxt), h, capTxt, pal.fg, pal.bg)
+
+  local pad = 2
+  local top, bot = 5, h - 2
+  local x0 = 1 + pad
+  local innerW = w - 2 * pad
+  local innerH = bot - top + 1
+  if innerW < 10 or innerH < 6 then return end
+
   local nVault = #cache.vaults
-  local ready = cache.rateReady
+  local fillHero = (nVault == 0) and "—" or fmtPct(cache.pct or 0)
+  local fillSub
+  if nVault == 0 then
+    fillSub = "no vaults"
+  elseif (cache.cap or 0) > 0 then
+    fillSub = fmtHero(cache.items) .. "  /  " .. fmtHero(cache.cap)
+  end
+  drawMetricBox(out, x0, top, innerW, innerH, {
+    label = "fill",
+    hero = fillHero,
+    pct = cache.pct or 0,
+    sub = fillSub,
+  }, pal, color)
+end
+
+local function drawSparseBoard(out, w, h, pal, color, screen)
+  screen = screen or 1
+  local nVault = #cache.vaults
   local pct = cache.pct or 0
-
-  if out.setBackgroundColor then out.setBackgroundColor(pal.bg) end
-  out.clear()
-
   local labels = { "in", "out", "fill" }
   local hero, unit
   if nVault == 0 then
@@ -765,29 +926,16 @@ local function drawOneMonitor(mon)
   elseif screen == 3 then
     hero = fmtPct(pct)
     unit = nil
-  elseif not ready then
-    hero, unit = "—", "/min"
   else
-    local rate = (screen == 1) and cache.inRate or cache.outRate
-    if math.abs(tonumber(rate) or 0) < 0.5 then
-      hero = "0"
-    else
-      hero = fmtHero(rate)
-    end
-    unit = "/min"
+    hero, unit = ratePair(screen == 1 and cache.inRate or cache.outRate, cache.rateReady)
   end
 
-  -- Vertically center the block; last row is reserved for page dots.
-  local bodyH = math.max(1, h - 1)
-  local block = 1 -- hero
+  local bodyH = h
+  local block = 1
   if nVault > 0 then
-    block = 3 -- label + gap + hero
-    if unit then block = block + 2 end -- gap + unit
-    if screen == 3 then block = block + 4 end -- gap + bar + gap + used/cap
-  end
-  if h <= 6 then
-    block = 1
-    if nVault > 0 and screen == 3 and h >= 5 then block = 3 end
+    block = (h >= 4) and 3 or 1
+    if unit and h >= 5 then block = block + 1 end
+    if screen == 3 and h >= 5 then block = block + 2 end
   end
   local y = math.max(1, math.floor((bodyH - block) / 2) + 1)
 
@@ -802,39 +950,47 @@ local function drawOneMonitor(mon)
 
   if nVault == 0 then
     line(hero, pal.mute)
-  elseif h <= 6 then
-    line(hero, pal.fg)
-    if screen == 3 and h >= 5 then
-      skip()
-      local barW = math.max(6, math.floor(w * 0.45))
-      barW = math.min(barW, w - 2)
-      drawTrack(out, centerX(w, string.rep(" ", barW)), y, barW, pct, pal, color)
+    return
+  end
+  if h >= 4 then line(labels[screen], pal.dim) end
+  if h >= 6 then skip() end
+  line(hero, pal.fg)
+  if unit then
+    line(unit, pal.mute)
+  end
+  if screen == 3 and y <= bodyH and h >= 5 then
+    if h >= 8 then skip() end
+    local barW = math.max(4, math.min(w - 2, math.floor(w * 0.7)))
+    if y <= bodyH then
+      drawTrack(out, math.max(1, math.floor((w - barW) / 2) + 1), y, barW, pct, pal, color)
       y = y + 1
     end
-  else
-    line(labels[screen], pal.dim)
-    skip()
-    line(hero, pal.fg)
-    if unit then
+    if y <= bodyH and h >= 10 and (cache.cap or 0) > 0 then
       skip()
-      line(unit, pal.mute)
-    end
-    if screen == 3 then
-      skip()
-      if y <= bodyH then
-        local barW = math.max(8, math.floor(w * 0.42))
-        barW = math.min(barW, w - 4)
-        drawTrack(out, math.max(1, math.floor((w - barW) / 2) + 1), y, barW, pct, pal, color)
-        y = y + 1
-      end
-      skip()
-      if y <= bodyH and (cache.cap or 0) > 0 then
-        line(fmtHero(cache.items) .. "  /  " .. fmtHero(cache.cap), pal.mute)
-      end
+      line(fmtHero(cache.items) .. "  /  " .. fmtHero(cache.cap), pal.mute)
     end
   end
+end
 
-  drawDots(out, monName, w, h, screen, pal, color)
+local function drawOneMonitor(mon)
+  local out, monName = mon.wrap, mon.name
+  if not out then return end
+  local color = outIsColor(out)
+  local pal = boardPal(color)
+  local bw, bh, w, h = measureBlocks(out)
+  applyMonitorScale(out)
+  w, h = out.getSize()
+
+  if out.setBackgroundColor then out.setBackgroundColor(pal.bg) end
+  out.clear()
+
+  if isSingleBlock(bw, bh) then
+    drawSparseBoard(out, w, h, pal, color, rateRoleFor(monName))
+  elseif isFillWall(bw, bh) then
+    drawLargeBoard(out, w, h, pal, color)
+  else
+    drawSparseBoard(out, w, h, pal, color, 3)
+  end
 end
 
 local function drawMonitor()
@@ -876,8 +1032,10 @@ end
 local function printHelp()
   print("Storage Manager v" .. VERSION)
   print("  Auto-detects Create vaults on the wired network.")
-  print("  Right-click the monitor: INPUT / OUTPUT / FILL")
-  print("  status | vaults | invs | screen [in|out|fill]")
+  print("  1x1 monitor: right-click to set IN or OUT")
+  print("  >3x3 monitor: fill wall  (title / max footer)")
+  print("  title [text] | title clear")
+  print("  mons | status | vaults | invs")
   print("  poll [secs] | window [secs]")
   print("  bind input|output <peripheral|side>   (optional I/O)")
   print("  unbind input|output")
@@ -891,8 +1049,9 @@ local function printStatus()
     #cache.vaults, fmtCount(cache.items), fmtCount(cache.cap), fmtPct(cache.pct)))
   print(("in:  %s"):format(fmtRate(cache.inRate, cache.rateReady)))
   print(("out: %s"):format(fmtRate(cache.outRate, cache.rateReady)))
-  print(("screen: %s   poll: %ss   window: %ss"):format(
-    SCREENS[cfg.screen], tostring(cfg.pollSecs), tostring(cfg.windowSecs)))
+  print(("title: %s"):format(boardTitle()))
+  print(("poll: %ss   window: %ss"):format(
+    tostring(cfg.pollSecs), tostring(cfg.windowSecs)))
   print(("input:  %s"):format(tostring(cfg.input or "(unbound)")))
   print(("output: %s"):format(tostring(cfg.output or "(unbound)")))
   print(("net: %s"):format(cache.netOk and ("MAIN #" .. tostring(cache.netMain)) or "offline"))
@@ -952,15 +1111,41 @@ local function handleCommand(line)
       elseif n == cfg.output then tag = "  [output]" end
       print("  " .. n .. tag)
     end
-  elseif cmd == "screen" then
-    if a[2] then
-      local n = parseScreen(a[2])
-      if not n then print("Usage: screen in|out|fill")
-      else setScreen(n); print("screen=" .. SCREENS[cfg.screen]) end
-    else
-      cycleScreen()
-      print("screen=" .. SCREENS[cfg.screen])
+  elseif cmd == "mons" or cmd == "monitors" or cmd == "screens" then
+    ensureRateRoles()
+    local mons = listMonitors()
+    print(("Monitors (%d):"):format(#mons))
+    if #mons == 0 then print("  (none)"); return true end
+    for _, m in ipairs(mons) do
+      local bw, bh = measureBlocks(m.wrap)
+      local kind
+      if isSingleBlock(bw, bh) then
+        local r = rateRoleFor(m.name)
+        kind = (r == 2) and "OUT (right-click to set IN)" or "IN (right-click to set OUT)"
+      elseif isFillWall(bw, bh) then
+        kind = "FILL wall"
+      else
+        kind = "fill"
+      end
+      print(("  %s  %dx%d  %s"):format(m.name, bw, bh, kind))
     end
+  elseif cmd == "title" then
+    if not a[2] then
+      print("title: " .. boardTitle())
+    elseif tostring(a[2]):lower() == "clear" and not a[3] then
+      cfg.title = nil
+      saveCfg()
+      drawMonitor()
+      print("title cleared (using hostname)")
+    else
+      cfg.title = table.concat(a, " ", 2)
+      saveCfg()
+      drawMonitor()
+      print("title: " .. cfg.title)
+    end
+  elseif cmd == "screen" then
+    print("1x1 monitors: right-click to set IN or OUT.")
+    print("Fill is the >3x3 wall.  Type mons to list.")
   elseif cmd == "poll" then
     if a[2] then
       cfg.pollSecs = math.max(0.25, tonumber(a[2]) or cfg.pollSecs)
@@ -1087,8 +1272,15 @@ local function eventLoop()
       pcall(announceStorage)
       helloT = os.startTimer(20)
     elseif ev == "monitor_touch" then
-      local jumped = touchToScreen(p1, p2, p3)
-      if jumped then setScreen(jumped) else cycleScreen() end
+      local name = p1
+      local wrap = name and peripheral.wrap(name)
+      if wrap and peripheral.getType(name) == "monitor" then
+        local bw, bh = measureBlocks(wrap)
+        if isSingleBlock(bw, bh) then
+          toggleRateRole(name)
+          pcall(drawMonitor)
+        end
+      end
     elseif ev == "rednet_message" and (p3 == PROTO or p3 == nil) and type(p2) == "table" then
       local msg, from = p2, p1
       local t = msg.type
@@ -1167,8 +1359,9 @@ saveCfg()
 
 term.clear(); term.setCursorPos(1, 1)
 print("== Storage Manager v" .. VERSION .. " ==")
-print("Create vault board — joined INPUT / OUTPUT / FILL")
-print("Right-click the advanced monitor to switch screens.")
+print("Create vault board — 1x1 IN/OUT, >3x3 FILL")
+print("Right-click a 1x1 monitor to set in or out.")
+print("Fill wall: title <name>   |   mons to list screens.")
 if titan and titan.reauth then pcall(titan.reauth, "storage") end
 cache.netMain = titan and titan.getMainRouterId and titan.getMainRouterId() or nil
 cache.netOk = cache.netMain ~= nil

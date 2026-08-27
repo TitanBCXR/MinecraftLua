@@ -718,14 +718,22 @@ Installer: **s → Storage → Managers / Workers**. Root `storage_manager.lua` 
 ## Storage Manager (vault rates + fill)
 
 Installer: **s → Storage → Managers → 1**. Auto-detects every Create item vault
-on the wired modem network and shows **joined** totals (not per-vault) on an
-**advanced monitor**. Right-click the monitor to cycle screens:
+on the wired modem network and shows **joined** totals (not per-vault).
 
-| Screen | Metric |
-|--------|--------|
-| **INPUT** | items / min entering the vaults |
-| **OUTPUT** | items / min leaving the vaults |
-| **FILL** | used / capacity as a percent |
+Use **three monitors** on the Storage Manager PC:
+
+| Monitor | Size | Shows |
+|---------|------|--------|
+| Rate A | **1×1** | input **or** output — right-click to set |
+| Rate B | **1×1** | the other rate (right-click swaps if both would match) |
+| Fill wall | **larger than 3×3** | boxed fill %, used/capacity, header title, max footer |
+
+```text
+[Create vault] --wired modem--+
+[Create vault] --wired modem--+-- cable -- [PC + wired modem]
+                                      |
+                    [1×1 in] [1×1 out] [>3×3 fill]
+```
 
 Vaults can be added or removed at any time — the board rediscovers them.
 
@@ -736,15 +744,15 @@ Vaults can be added or removed at any time — the board rediscovers them.
 
 1. Wire each vault and the Storage Manager PC onto the same modem cable.
 2. Right-click every vault modem until it is connected.
-3. Attach an advanced (color) monitor. Run `storage_manager` (or put it in `startup`).
-4. Right-click the monitor to switch INPUT / OUTPUT / FILL (dots jump to a screen).
+3. Attach two **1×1** advanced monitors (in/out) and one wall **larger than 3×3** (fill).
+4. Right-click each 1×1 to set **in** or **out**. On the computer: `title Storage` for the fill header.
 
 Rates come from vault item-count deltas over a sliding window (default 60s).
 Fill uses `list()` + `getItemLimit` across every detected vault.
 
 Optional I/O chests on the same cable (`bind input` / `bind output`) keep
-`ingest` and admin-tablet `request` working. Console: `status`, `vaults`,
-`screen in|out|fill`, `poll`, `window`, `stock`, `find`.
+`ingest` and admin-tablet `request` working. Console: `title`, `mons`, `status`,
+`vaults`, `poll`, `window`, `stock`, `find`.
 
 ## Storage Clutch (fill → Create clutch)
 
