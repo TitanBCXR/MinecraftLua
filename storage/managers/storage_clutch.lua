@@ -1,6 +1,6 @@
 --[[
   storage/managers/storage_clutch.lua  -  Storage fill → Create clutch
-  Titan-Version: 1.8.0
+  Titan-Version: 1.8.1
 
   Reads a Sophisticated Storage (or any inventory) over the wired modem
   network and drives Create clutch(es) via redstone.
@@ -53,7 +53,7 @@
 ]]
 
 local LOCAL_CFG = "storage_clutch.cfg"
-local VERSION = "1.8.0"
+local VERSION = "1.8.1"
 
 local cfg = {
   storage = nil,           -- inventory peripheral name
@@ -198,6 +198,38 @@ local function isSideName(name)
   return SIDES[tostring(name or ""):lower()] == true
 end
 
+local function collectNames(pred)
+  local out, seen = {}, {}
+  local function add(n)
+    if n and not seen[n] and pred(n) then
+      seen[n] = true
+      out[#out + 1] = n
+    end
+  end
+  for _, name in ipairs(peripheral.getNames()) do add(name) end
+  for _, sideName in ipairs(peripheral.getNames()) do
+    if peripheral.getType(sideName) == "modem" then
+      local m = peripheral.wrap(sideName)
+      if m and type(m.getNamesRemote) == "function" then
+        for _, n in ipairs(m.getNamesRemote() or {}) do add(n) end
+      end
+    end
+  end
+  table.sort(out)
+  return out
+end
+
+local function findMonitor()
+  local m = peripheral.find("monitor")
+  if m then return m end
+  for _, side in ipairs(peripheral.getNames()) do
+    if peripheral.getType(side) == "monitor" then
+      return peripheral.wrap(side)
+    end
+  end
+  return nil
+end
+
 --------------------------------------------------------------------------------
 -- Auto-discovery: Find and link all integrators, monitor, and storage
 --------------------------------------------------------------------------------
@@ -254,27 +286,6 @@ local function autoDiscover()
   end
 
   return report, changed
-end
-
-local function collectNames(pred)
-  local out, seen = {}, {}
-  local function add(n)
-    if n and not seen[n] and pred(n) then
-      seen[n] = true
-      out[#out + 1] = n
-    end
-  end
-  for _, name in ipairs(peripheral.getNames()) do add(name) end
-  for _, sideName in ipairs(peripheral.getNames()) do
-    if peripheral.getType(sideName) == "modem" then
-      local m = peripheral.wrap(sideName)
-      if m and type(m.getNamesRemote) == "function" then
-        for _, n in ipairs(m.getNamesRemote() or {}) do add(n) end
-      end
-    end
-  end
-  table.sort(out)
-  return out
 end
 
 local function resolveByRef(ref, pred)
@@ -429,17 +440,6 @@ end
 -- status chips, filled section bars, framed gauge panels, gray footer.
 -- Palette stays brass / copper / iron for clutch only.
 --------------------------------------------------------------------------------
-local function findMonitor()
-  local m = peripheral.find("monitor")
-  if m then return m end
-  for _, side in ipairs(peripheral.getNames()) do
-    if peripheral.getType(side) == "monitor" then
-      return peripheral.wrap(side)
-    end
-  end
-  return nil
-end
-
 local function outIsColor(out)
   local ok, c = pcall(function()
     return out.isColor and out.isColor()
