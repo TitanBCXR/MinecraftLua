@@ -757,41 +757,62 @@ Optional I/O chests on the same cable (`bind input` / `bind output`) keep
 ## Storage Clutch (fill → Create clutch)
 
 Installer: **s → Storage → Managers → 3**. Watches a Sophisticated Storage
-inventory (any `inventory` peripheral on the wired network) and drives a
-Create clutch with redstone.
+inventory (any `inventory` peripheral on the wired network) and drives
+Create clutch(es) with redstone.
 
-**Wired modem cable does not carry redstone.** Pick one output path:
+**AUTO-DISCOVERY**: On boot, automatically discovers and links:
+- All Redstone Integrators on the network (multiple outputs supported)
+- Monitor (if attached)
+- Storage inventory (if only one candidate exists)
+
+Manual binding still available via `bind` commands.
+
+**Wired modem cable does not carry redstone.** Pick output path(s):
 
 ```text
 A) Local face
    [Sophisticated] --wired--> [PC] --redstone dust--> [Clutch]
 
-B) Remote (Advanced Peripherals Redstone Integrator)
+B) Remote (Advanced Peripherals Redstone Integrator — supports multiple)
    [Sophisticated] --wired modem--+
-   [Integrator]    --wired modem--+-- cable -- [PC + wired modem]
-        |
-     [Clutch]   (Integrator face touching clutch / dust)
+   [Integrator A]  --wired modem--+
+   [Integrator B]  --wired modem--+-- cable -- [PC + wired modem + monitor]
+        |              |
+     [Clutch A]     [Clutch B]   (Integrator faces touching clutches)
 ```
 
+**Quick start (auto-discovery):**
+1. Wire storage, integrator(s), monitor, and PC onto the same modem cable
+2. Right-click modems until connected
+3. Run `storage_clutch` — auto-discovery links everything on boot
+4. Adjust thresholds if needed: `on 20`, `off 60`
+5. `run` starts automatically when fully bound
+
+**Manual setup (advanced):**
 ```text
+discover                              # re-scan peripherals
 invs
 integrators
 bind storage sophisticatedstorage:chest_0
-bind integrator redstoneIntegrator_0 front
+bind integrator redstoneIntegrator_0 front    # add first integrator
+bind integrator redstoneIntegrator_1 back     # add second integrator (parallel)
+unbind integrator redstoneIntegrator_0        # remove one
 on 20
 off 60
 run
 ```
 
-Or local: `bind redstone back` instead of `bind integrator …`.
+Or local: `bind redstone back` instead of integrators.
 
 - **`on 20`** / **`off 60`** — hysteresis: resume feed ≤20%, stop feed ≥60% (holds in between). Create default: stop = redstone ON (clutch engaged), resume = OFF; use **invert** if powered = run
+- **Multiple outputs** — all integrators receive the same signal (parallel); useful for controlling multiple clutches from one storage monitor
 - **Latch persistence** — last RUN/STOP (`latchedOn` in `storage_clutch.cfg`) is saved on change and restored on boot so hold-band resumes correctly (default RUN if none saved)
 - **Auto-run** — when storage + redstone output are bound, the watch loop (`run`) starts on boot/launch (put `storage_clutch` in `startup`). Disable with **`autorun off`** (`autoRun` in cfg; default on)
 - **invert** — flip redstone polarity if your clutch is wired the other way
 - **test on|off** — force the output to verify wiring
 - **run** — poll loop; steampunk brass board on color monitor or advanced term (Ctrl+T to stop): solid header, fill/rate/clutch chips, riveted pressure gauge with run/stop band ticks, slots, band; **RS** state is a single green (ON) / red (OFF) lamp cell
 - **monitor** — redraw the brass board once
+- **discover** — manually re-scan and auto-link peripherals
 
 ## Storage ATM (wired modem ↔ vault)
 
