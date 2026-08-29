@@ -1,6 +1,6 @@
 --[[
   storage/managers/storage_clutch.lua  -  Storage fill → Create clutch
-  Titan-Version: 1.8.3
+  Titan-Version: 1.8.4
 
   Reads a Sophisticated Storage (or any inventory) over the wired modem
   network and drives Create clutch(es) via redstone.
@@ -53,7 +53,7 @@
 ]]
 
 local LOCAL_CFG = "storage_clutch.cfg"
-local VERSION = "1.8.3"
+local VERSION = "1.8.4"
 
 local cfg = {
   storage = nil,           -- inventory peripheral name
@@ -1412,50 +1412,27 @@ local function cmdRun()
   end
   rateSamples = {} -- fresh rate window when starting watch
   
-  -- Check display: if monitor exists, console stays interactive
-  -- If no monitor, term can show board (original fallback)
+  -- Check display: monitor (wired or direct) vs term fallback
   local hasMonitor = (findMonitor() ~= nil)
   local _, kind = resolveDisplay()
   
   if kind == "monitor" then
     print("Steampunk board → monitor")
-    print("Console remains interactive")
+    print("Console: prompt only (Ctrl+T to stop)")
   elseif kind == "term" then
     print("Steampunk board → this screen (Ctrl+T to stop)")
   else
     print("No color display — console only")
   end
-  print(("Watching %s — Ctrl+T to stop"):format(cfg.storage))
+  print(("Watching %s"):format(cfg.storage))
   
-  local last = nil
   while true do
     local ok, a, b, c = applyOnce()
     
-    -- When monitor exists: print status lines on console
-    -- When no monitor: let term show board (don't duplicate with prints)
-    if hasMonitor then
-      -- Monitor mode: console shows status lines
-      if ok then
-        local fill, on, src = a, b, c
-        local rate = fillRate()
-        local rateStr = rate and formatRate(rate) or "rate …"
-        local line = ("%s  %3d%%  %s  %d/%d  rs=%s"):format(
-          os.date("%H:%M:%S"), fill.pct, rateStr, fill.used, fill.size, on and "ON" or "OFF")
-        if line ~= last then
-          print(line)
-          last = line
-        end
-      else
-        print(os.date("%H:%M:%S") .. "  ERR " .. tostring(a))
-        last = nil
-        pcall(drawMonitor, nil, nil)
-      end
-    else
-      -- No monitor: term shows board, minimal console output
-      if not ok then
-        last = nil
-        pcall(drawMonitor, nil, nil)
-      end
+    -- Monitor exists: silent console, all UI on monitor
+    -- No monitor: term shows board (existing fallback)
+    if not ok and not hasMonitor then
+      pcall(drawMonitor, nil, nil)
     end
     
     -- Re-check for monitor attachment mid-run
