@@ -1,19 +1,26 @@
 --[[
   storage/managers/storage_clutch.lua  -  Storage fill → Create clutch
-  Titan-Version: 1.7.2
+  Titan-Version: 1.8.0
 
   Reads a Sophisticated Storage (or any inventory) over the wired modem
-  network and drives a Create clutch via redstone.
+  network and drives Create clutch(es) via redstone.
 
   IMPORTANT: Wired modem cable does NOT carry redstone. Use one of:
     A) Local face — PC touching redstone dust / clutch
-    B) Advanced Peripherals Redstone Integrator next to the clutch,
+    B) Advanced Peripherals Redstone Integrator(s) next to clutch(es),
        with a wired modem on the same cable as the PC + storage
 
   Hardware (typical):
     [Sophisticated chest] --wired modem--+
-    [Clutch + Integrator] --wired modem--+-- cable -- [PC + wired modem]
+    [Clutch + Integrator] --wired modem--+
+    [Clutch + Integrator] --wired modem--+-- cable -- [PC + wired modem + monitor]
     (or PC redstone face → dust → clutch)
+
+  AUTO-DISCOVERY: On boot, the clutch automatically discovers and links:
+    - All Redstone Integrators on the network (multiple outputs supported)
+    - Monitor (if attached)
+    - Storage inventory (if only one candidate exists)
+    Manual binding still available via bind commands.
 
   Hysteresis (default Create: powered clutch = STOP shaft):
     off 60% → stop feed (redstone ON / clutch engaged) at/above 60%
@@ -30,11 +37,13 @@
   status chips, RS lamp cell) on an attached color monitor, or the
   advanced computer term when no monitor is present.
 
-  Setup:
+  Setup (auto-discovery on boot, or manual):
+    discover                             -- scan and auto-link everything
     invs | integrators
     bind storage <side|name>
     bind redstone <side>                 -- local PC face
-    bind integrator <name> [side]        -- remote Redstone Integrator
+    bind integrator <name> [side]        -- add one Redstone Integrator
+    unbind integrator <name>             -- remove one
     on <percent>                         -- resume feed at/below this fill %
     off <percent>                        -- stop feed at/above this fill %
     invert on|off
@@ -44,13 +53,15 @@
 ]]
 
 local LOCAL_CFG = "storage_clutch.cfg"
-local VERSION = "1.7.2"
+local VERSION = "1.8.0"
 
 local cfg = {
   storage = nil,           -- inventory peripheral name
-  -- Redstone output (pick one):
-  rsSide = nil,            -- local computer face
-  integrator = nil,        -- redstoneIntegrator peripheral
+  -- Redstone outputs (multiple supported):
+  rsSide = nil,            -- local computer face (legacy/fallback)
+  integrators = {},        -- array of {name=..., side=...} for multiple outputs
+  -- Legacy single integrator (migrated to integrators array on load):
+  integrator = nil,
   integratorSide = "front",
   -- Hysteresis (feed): resume at onPct, stop at offPct (hold between)
   -- Create default: stop = redstone ON, resume = redstone OFF
@@ -64,6 +75,8 @@ local cfg = {
   latchedOn = false,
   -- Start the watch loop (`run`) automatically when fully bound (boot / launch).
   autoRun = true,
+  -- Auto-discovery on boot (default on)
+  autoDiscover = true,
 }
 
 -- Sliding window for fill-rate (pct/min, items/min)
@@ -108,10 +121,38 @@ local function loadCfg()
   if type(cfg.autoRun) ~= "boolean" then
     cfg.autoRun = true
   end
+  -- Auto-discovery on boot (default on)
+  if type(cfg.autoDiscover) ~= "boolean" then
+    cfg.autoDiscover = true
+  end
+  -- Migrate legacy single integrator to array format
+  if type(cfg.integrators) ~= "table" then
+    cfg.integrators = {}
+  end
+  if cfg.integrator and cfg.integrator ~= "" then
+    local exists = false
+    for _, entry in ipairs(cfg.integrators) do
+      if entry.name == cfg.integrator then
+        exists = true
+        break
+      end
+    end
+    if not exists then
+      table.insert(cfg.integrators, {
+        name = cfg.integrator,
+        side = cfg.integratorSide or "front"
+      })
+    end
+    cfg.integrator = nil
+  end
 end
 
 local function isFullyBound()
-  return cfg.storage and (cfg.rsSide or cfg.integrator)
+  return cfg.storage and (cfg.rsSide or (#cfg.integrators > 0))
+end
+
+local function hasAnyIntegrators()
+  return cfg.rsSide or (#cfg.integrators > 0)
 end
 
 local function saveCfg()
@@ -155,6 +196,64 @@ end
 
 local function isSideName(name)
   return SIDES[tostring(name or ""):lower()] == true
+end
+
+--------------------------------------------------------------------------------
+-- Auto-discovery: Find and link all integrators, monitor, and storage
+--------------------------------------------------------------------------------
+local function autoDiscover()
+  local changed = false
+  local report = {}
+
+  -- 1. Auto-link ALL Redstone Integrators on the network
+  local allIntegrators = collectNames(isIntegrator)
+  local newIntegrators = {}
+  for _, name in ipairs(allIntegrators) do
+    local exists = false
+    for _, entry in ipairs(cfg.integrators) do
+      if entry.name == name then
+        exists = true
+        break
+      end
+    end
+    if not exists then
+      table.insert(newIntegrators, name)
+      table.insert(cfg.integrators, {
+        name = name,
+        side = "front"  -- default side; user can adjust later
+      })
+      changed = true
+    end
+  end
+  if #newIntegrators > 0 then
+    table.insert(report, string.format("Linked %d integrator(s): %s",
+      #newIntegrators, table.concat(newIntegrators, ", ")))
+  end
+
+  -- 2. Auto-bind storage if unbound and exactly one inventory candidate exists
+  if not cfg.storage then
+    local invs = collectNames(isInventory)
+    if #invs == 1 then
+      cfg.storage = invs[1]
+      table.insert(report, "Auto-bound storage: " .. cfg.storage)
+      changed = true
+    elseif #invs > 1 then
+      table.insert(report, string.format(
+        "Multiple inventories found (%d) — use 'bind storage <name>' to pick one", #invs))
+    end
+  end
+
+  -- 3. Monitor is always auto-discovered via findMonitor() at runtime, no binding needed
+  local mon = findMonitor()
+  if mon then
+    table.insert(report, "Monitor detected (auto-displayed)")
+  end
+
+  if changed then
+    saveCfg()
+  end
+
+  return report, changed
 end
 
 local function collectNames(pred)
@@ -822,48 +921,76 @@ local function drawMonitor(fill, rsOn)
 end
 
 --------------------------------------------------------------------------------
--- Redstone output
+-- Redstone output (supports multiple integrators)
 --------------------------------------------------------------------------------
 local function setRedstone(on)
   on = not not on
   if cfg.invert then on = not on end
 
-  if cfg.integrator and peripheral.isPresent(cfg.integrator) then
-    local w = peripheral.wrap(cfg.integrator)
-    local side = tostring(cfg.integratorSide or "front"):lower()
-    if type(w.setOutput) == "function" then
-      local ok, err = pcall(w.setOutput, side, on)
-      if not ok then return false, err end
-      return true, on, "integrator"
-    elseif type(w.setAnalogOutput) == "function" then
-      local ok, err = pcall(w.setAnalogOutput, side, on and 15 or 0)
-      if not ok then return false, err end
-      return true, on, "integrator"
+  local success = false
+  local errors = {}
+
+  -- Set all integrators
+  for _, entry in ipairs(cfg.integrators) do
+    if entry.name and peripheral.isPresent(entry.name) then
+      local w = peripheral.wrap(entry.name)
+      local side = tostring(entry.side or "front"):lower()
+      if type(w.setOutput) == "function" then
+        local ok, err = pcall(w.setOutput, side, on)
+        if ok then
+          success = true
+        else
+          table.insert(errors, entry.name .. ": " .. tostring(err))
+        end
+      elseif type(w.setAnalogOutput) == "function" then
+        local ok, err = pcall(w.setAnalogOutput, side, on and 15 or 0)
+        if ok then
+          success = true
+        else
+          table.insert(errors, entry.name .. ": " .. tostring(err))
+        end
+      else
+        table.insert(errors, entry.name .. ": no setOutput method")
+      end
     end
-    return false, "integrator has no setOutput"
   end
 
+  -- Set local redstone side if configured
   if cfg.rsSide and isSideName(cfg.rsSide) then
     redstone.setOutput(cfg.rsSide:lower(), on)
-    return true, on, "local"
+    success = true
   end
 
-  return false, "no redstone output bound"
+  if success then
+    local count = #cfg.integrators + (cfg.rsSide and 1 or 0)
+    local kind = (#cfg.integrators > 0) and "integrator(s)" or "local"
+    if #errors > 0 then
+      return true, on, kind .. " (some errors: " .. table.concat(errors, "; ") .. ")"
+    end
+    return true, on, count > 1 and string.format("%d outputs", count) or kind
+  end
+
+  return false, #errors > 0 and table.concat(errors, "; ") or "no redstone output bound"
 end
 
 local function getRedstoneState()
-  if cfg.integrator and peripheral.isPresent(cfg.integrator) then
-    local w = peripheral.wrap(cfg.integrator)
-    local side = tostring(cfg.integratorSide or "front"):lower()
-    if type(w.getOutput) == "function" then
-      local ok, v = pcall(w.getOutput, side)
-      if ok then return not not v, "integrator" end
-    end
-    if type(w.getAnalogOutput) == "function" then
-      local ok, v = pcall(w.getAnalogOutput, side)
-      if ok then return (tonumber(v) or 0) > 0, "integrator" end
+  -- Check first integrator
+  if #cfg.integrators > 0 then
+    local entry = cfg.integrators[1]
+    if entry.name and peripheral.isPresent(entry.name) then
+      local w = peripheral.wrap(entry.name)
+      local side = tostring(entry.side or "front"):lower()
+      if type(w.getOutput) == "function" then
+        local ok, v = pcall(w.getOutput, side)
+        if ok then return not not v, "integrator" end
+      end
+      if type(w.getAnalogOutput) == "function" then
+        local ok, v = pcall(w.getAnalogOutput, side)
+        if ok then return (tonumber(v) or 0) > 0, "integrator" end
+      end
     end
   end
+  -- Fall back to local side
   if cfg.rsSide and isSideName(cfg.rsSide) then
     return redstone.getOutput(cfg.rsSide:lower()), "local"
   end
@@ -897,8 +1024,20 @@ local function cmdIntegrators()
     return
   end
   for _, n in ipairs(names) do
-    local mark = (n == cfg.integrator) and " *" or ""
+    local bound = false
+    local boundSide = nil
+    for _, entry in ipairs(cfg.integrators) do
+      if entry.name == n then
+        bound = true
+        boundSide = entry.side
+        break
+      end
+    end
+    local mark = bound and string.format(" * (side: %s)", boundSide or "?") or ""
     print("  " .. n .. mark)
+  end
+  if #cfg.integrators > 0 then
+    print(string.format("\n%d integrator(s) currently bound", #cfg.integrators))
   end
 end
 
@@ -935,16 +1074,17 @@ local function cmdBindRedstone(side)
     return
   end
   cfg.rsSide = side
-  cfg.integrator = nil -- prefer explicit local when set
   saveCfg()
   print("Local redstone output: " .. side)
-  print("(Integrator unbound — local face takes priority when set alone.)")
+  local total = #cfg.integrators + 1
+  print(string.format("Total outputs: %d (%d integrator(s) + local)", total, #cfg.integrators))
 end
 
 local function cmdBindIntegrator(ref, side)
   if not ref or ref == "" then
     print("Usage: bind integrator <name|substring> [outputSide]")
-    print("  outputSide = face of the Integrator block toward the clutch")
+    print("  Adds a Redstone Integrator to the output list.")
+    print("  outputSide = face of the Integrator block toward the clutch (default: front)")
     return
   end
   local n, hits = resolveByRef(ref, isIntegrator)
@@ -958,13 +1098,55 @@ local function cmdBindIntegrator(ref, side)
     end
     return
   end
-  cfg.integrator = n
-  if side and isSideName(side) then
-    cfg.integratorSide = side:lower()
+  
+  -- Check if already bound
+  for _, entry in ipairs(cfg.integrators) do
+    if entry.name == n then
+      print(("Integrator %s already bound (side: %s)"):format(n, entry.side or "front"))
+      if side and isSideName(side) then
+        entry.side = side:lower()
+        saveCfg()
+        print("Updated side to: " .. entry.side)
+      end
+      return
+    end
   end
-  cfg.rsSide = nil
+  
+  -- Add new integrator
+  local outSide = (side and isSideName(side)) and side:lower() or "front"
+  table.insert(cfg.integrators, {
+    name = n,
+    side = outSide
+  })
   saveCfg()
-  print(("Integrator bound: %s (output %s)"):format(n, cfg.integratorSide))
+  print(("Integrator bound: %s (output %s)"):format(n, outSide))
+  local total = #cfg.integrators + (cfg.rsSide and 1 or 0)
+  print(string.format("Total outputs: %d", total))
+end
+
+local function cmdUnbindIntegrator(ref)
+  if not ref or ref == "" then
+    print("Usage: unbind integrator <name|substring>")
+    print("  Removes an integrator from the output list.")
+    return
+  end
+  
+  local removed = false
+  for i = #cfg.integrators, 1, -1 do
+    local entry = cfg.integrators[i]
+    if entry.name and entry.name:lower():find(ref:lower(), 1, true) then
+      print("Removed: " .. entry.name)
+      table.remove(cfg.integrators, i)
+      removed = true
+    end
+  end
+  
+  if removed then
+    saveCfg()
+    print(string.format("Remaining integrators: %d", #cfg.integrators))
+  else
+    print("No matching integrator found: " .. ref)
+  end
 end
 
 local function clampPct(n)
@@ -1037,16 +1219,39 @@ local function cmdAutoRun(arg)
   print("autorun: " .. (cfg.autoRun and "on" or "off"))
 end
 
+local function cmdDiscover()
+  print("Discovering peripherals...")
+  local report, changed = autoDiscover()
+  if #report > 0 then
+    for _, line in ipairs(report) do
+      print("  " .. line)
+    end
+  else
+    print("  No changes — already configured or no peripherals found.")
+  end
+  if changed then
+    print("\nConfiguration updated and saved.")
+  end
+  print("\nCurrent status:")
+  cmdStatus()
+end
+
 local function cmdStatus()
   print(("Storage Clutch v%s"):format(VERSION))
   print(("  storage:    %s"):format(cfg.storage or "(unbound)"))
-  if cfg.integrator then
-    print(("  output:     integrator %s face %s"):format(
-      cfg.integrator, cfg.integratorSide or "?"))
-  elseif cfg.rsSide then
-    print(("  output:     local %s"):format(cfg.rsSide))
+  
+  -- Show all redstone outputs
+  local outputCount = #cfg.integrators + (cfg.rsSide and 1 or 0)
+  if outputCount == 0 then
+    print("  outputs:    (unbound)")
   else
-    print("  output:     (unbound)")
+    print(("  outputs:    %d total"):format(outputCount))
+    if cfg.rsSide then
+      print(("    - local %s"):format(cfg.rsSide))
+    end
+    for _, entry in ipairs(cfg.integrators) do
+      print(("    - integrator %s (side: %s)"):format(entry.name, entry.side or "front"))
+    end
   end
   local onP, offP = cfg.onPct or 20, cfg.offPct or 60
   local invNote = cfg.invert and " (inverted)" or ""
@@ -1123,31 +1328,38 @@ end
 
 local function cmdHelp()
   print([[
-Storage Clutch — Sophisticated Storage → Create clutch
+Storage Clutch — Sophisticated Storage → Create clutch(es)
 
+  discover                     auto-discover and link all peripherals
   invs                         list inventories (+ fill %)
-  integrators                  list Redstone Integrators
-  bind storage <side|name>
+  integrators                  list Redstone Integrators (shows bound *)
+  bind storage <side|name>     bind storage inventory
   bind redstone <side>         local PC face → dust → clutch
   bind integrator <name> [side]
-                               remote Integrator (side faces clutch)
+                               add Redstone Integrator (supports multiple)
+  unbind integrator <name>     remove an integrator
   on <percent>                 resume feed at/below this fill % (default 20)
   off <percent>                stop feed at/above this fill %  (default 60)
   invert [on|off]              flip redstone polarity
-  interval <seconds>
+  interval <seconds>           poll interval (default 1s)
   autorun on|off               auto-start run on boot (default on)
-  status
+  status                       show config + current state
   monitor                      redraw steampunk brass board
   test on|off                  force output (ignores invert)
   run                          watch loop (Ctrl+T to stop)
   help
+
+  AUTO-DISCOVERY: On boot, all integrators, monitor, and storage (if only one)
+  are automatically discovered and linked. Use 'discover' to re-scan manually.
+
+  MULTIPLE OUTPUTS: All bound integrators receive the same signal (parallel).
 
   Default (Create: power=stop): stop >=60% (rs ON), resume <=20% (rs OFF),
   hold in between. invert if powered=run instead.
   When storage + output are bound, run starts on boot (autorun off to disable).
 ]])
   print("Wired modems share peripherals only — not redstone.")
-  print("Use a local face OR an Advanced Peripherals Redstone Integrator.")
+  print("Use local face OR Advanced Peripherals Redstone Integrator(s).")
   print("Display: color monitor or advanced PC — brass board + RS lamp cell.")
   print("Fill % is slot occupancy (used/size), not item-count fullness.")
 end
@@ -1163,7 +1375,7 @@ end
 
 local function applyOnce()
   if not cfg.storage then return false, "bind storage first" end
-  if not cfg.rsSide and not cfg.integrator then
+  if not hasAnyIntegrators() then
     return false, "bind redstone <side> or bind integrator <name>"
   end
   local fill, err = storageFill(cfg.storage)
@@ -1178,7 +1390,7 @@ end
 
 local function cmdRun()
   if not cfg.storage then print("bind storage first"); return end
-  if not cfg.rsSide and not cfg.integrator then
+  if not hasAnyIntegrators() then
     print("bind redstone <side> or bind integrator <name> first")
     return
   end
@@ -1228,7 +1440,8 @@ local function dispatch(line)
   for w in string.gmatch(line or "", "%S+") do args[#args + 1] = w end
   local cmd = (args[1] or ""):lower()
   if cmd == "" then return end
-  if cmd == "invs" or cmd == "inventories" then cmdInvs()
+  if cmd == "discover" or cmd == "scan" then cmdDiscover()
+  elseif cmd == "invs" or cmd == "inventories" then cmdInvs()
   elseif cmd == "integrators" or cmd == "ri" then cmdIntegrators()
   elseif cmd == "bind" then
     local what = (args[2] or ""):lower()
@@ -1240,6 +1453,13 @@ local function dispatch(line)
       cmdBindIntegrator(args[3], args[4])
     else
       print("bind storage|redstone|integrator …")
+    end
+  elseif cmd == "unbind" then
+    local what = (args[2] or ""):lower()
+    if what == "integrator" or what == "ri" then
+      cmdUnbindIntegrator(args[3])
+    else
+      print("unbind integrator <name>")
     end
   elseif cmd == "on" then cmdOn(args[2])
   elseif cmd == "off" then cmdOff(args[2])
@@ -1263,6 +1483,18 @@ if cfg.label and cfg.label ~= "" then
   pcall(os.setComputerLabel, cfg.label)
 end
 
+-- Auto-discovery on boot (default on)
+if cfg.autoDiscover ~= false then
+  local report, changed = autoDiscover()
+  if changed and #report > 0 then
+    print(("Storage Clutch v%s — Auto-discovery"):format(VERSION))
+    for _, line in ipairs(report) do
+      print("  " .. line)
+    end
+    print()
+  end
+end
+
 -- Restore physical clutch from saved latch before the interactive loop
 -- (hold band would otherwise wait for the next threshold cross).
 if isFullyBound() then
@@ -1270,7 +1502,7 @@ if isFullyBound() then
 end
 
 print(("Storage Clutch v%s — type help"):format(VERSION))
-if cfg.storage or cfg.rsSide or cfg.integrator then
+if cfg.storage or cfg.rsSide or #cfg.integrators > 0 then
   cmdStatus()
 end
 
