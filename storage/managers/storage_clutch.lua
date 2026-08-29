@@ -1,6 +1,6 @@
 --[[
   storage/managers/storage_clutch.lua  -  Storage fill → Create clutch
-  Titan-Version: 1.8.6
+  Titan-Version: 1.8.7
 
   Reads a Sophisticated Storage (or any inventory) over the wired modem
   network and drives Create clutch(es) via redstone.
@@ -53,7 +53,7 @@
 ]]
 
 local LOCAL_CFG = "storage_clutch.cfg"
-local VERSION = "1.8.6"
+local VERSION = "1.8.7"
 
 local cfg = {
   storage = nil,           -- inventory peripheral name
@@ -733,8 +733,8 @@ local function layoutTier(w, h)
 end
 
 --- Steampunk brass instrument board. fill/rsOn optional.
---- Returns: success, error_or_touchArea
---- touchArea = {x, y, w, h, row} for RS tap detection (nil if no color/monitor)
+--- Returns: success, touchAreas
+--- touchAreas = {rs = {x,y,w,h}, stop = {x,y,w,h}, start = {x,y,w,h}}
 local function drawMonitor(fill, rsOn)
   local out, kind = resolveDisplay()
   if not out then return false, "no monitor / color term" end
@@ -795,9 +795,14 @@ local function drawMonitor(fill, rsOn)
       guiText(out, 2, 2, sub:sub(1, w - 2), pal.rivet, pal.brass)
     end
     if headerH >= 3 then
-      local meta = ("stop>=%d%%  run<=%d%%%s"):format(
-        offP, onP, cfg.invert and "  inv" or "")
+      local stopText = ("stop>=%d%%"):format(offP)
+      local startText = ("run<=%d%%"):format(onP)
+      local invText = cfg.invert and "  inv" or ""
+      local meta = stopText .. "  " .. startText .. invText
       guiText(out, 2, 3, meta:sub(1, w - 2), colors.black, pal.brass)
+      -- Touch areas for threshold buttons (header row 3)
+      stopTouchArea = {x = 2, y = 3, w = #stopText, h = 1}
+      startTouchArea = {x = 2 + #stopText + 2, y = 3, w = #startText, h = 1}
     end
   else
     guiText(out, 1, 1, (title .. ver):sub(1, w), pal.steam, pal.bg)
@@ -830,6 +835,8 @@ local function drawMonitor(fill, rsOn)
   -- Status chip row (fill / rate / clutch)
   --------------------------------------------------------------------------
   local rsTouchArea = nil
+  local stopTouchArea = nil
+  local startTouchArea = nil
   if y <= h - footerH then
     if color then
       guiFill(out, 1, y, w, 1, pal.bg, pal.steam)
@@ -976,7 +983,7 @@ local function drawMonitor(fill, rsOn)
     guiText(out, 1, h, (left .. right):sub(1, w), pal.dim, pal.bg)
   end
 
-  return true, rsTouchArea
+  return true, {rs = rsTouchArea, stop = stopTouchArea, start = startTouchArea}
 end
 
 --------------------------------------------------------------------------------
@@ -1454,8 +1461,8 @@ local function applyOnce(manualOverride)
   
   local ok, outOrErr, src = setRedstone(want)
   if not ok then return false, outOrErr end
-  local drawOk, touchArea = pcall(drawMonitor, fill, outOrErr)
-  return true, fill, outOrErr, src, touchArea
+  local drawOk, touchAreas = pcall(drawMonitor, fill, outOrErr)
+  return true, fill, outOrErr, src, touchAreas
 end
 
 local function cmdRun()
@@ -1472,7 +1479,7 @@ local function cmdRun()
   local _, kind = resolveDisplay()
   
   if kind == "monitor" then
-    print("Steampunk board → monitor (tap RS to toggle)")
+    print("Steampunk board → monitor (tap RS/stop/start to control)")
     print("Console: prompt only (Ctrl+T to stop)")
   elseif kind == "term" then
     print("Steampunk board → this screen (Ctrl+T to stop)")
@@ -1481,7 +1488,7 @@ local function cmdRun()
   end
   print(("Watching %s"):format(cfg.storage))
   
-  local rsTouchArea = nil
+  local touchAreas = {}
   local lastUpdate = os.clock()
   local interval = tonumber(cfg.interval) or 1
   
@@ -1492,10 +1499,10 @@ local function cmdRun()
     
     if shouldUpdate then
       -- Apply clutch logic
-      local ok, fill, rsOn, src, touchArea = applyOnce()
+      local ok, fill, rsOn, src, areas = applyOnce()
       
-      if touchArea then
-        rsTouchArea = touchArea
+      if areas then
+        touchAreas = areas
       end
       
       -- Monitor exists: silent console, all UI on monitor
@@ -1516,16 +1523,45 @@ local function cmdRun()
     local timerId = os.startTimer(timeout)
     local event, p1, p2, p3 = os.pullEvent()
     
-    if event == "monitor_touch" and hasMonitor and rsTouchArea then
+    if event == "monitor_touch" and hasMonitor then
       -- p1 = side/name, p2 = x, p3 = y
       local x, y = p2, p3
-      -- Check if touch is within RS area
-      if x >= rsTouchArea.x and x < rsTouchArea.x + rsTouchArea.w 
-         and y == rsTouchArea.y then
+      local needsUpdate = false
+      
+      -- Check RS toggle
+      if touchAreas.rs and x >= touchAreas.rs.x and x < touchAreas.rs.x + touchAreas.rs.w 
+         and y == touchAreas.rs.y then
         -- Toggle: flip the current latch and apply immediately
         local newState = not cfg.latchedOn
         applyOnce(newState)
-        -- Force update time so normal polling doesn't undo it immediately
+        lastUpdate = os.clock()
+        needsUpdate = false  -- Already updated
+      
+      -- Check stop threshold button
+      elseif touchAreas.stop and x >= touchAreas.stop.x and x < touchAreas.stop.x + touchAreas.stop.w
+         and y == touchAreas.stop.y then
+        -- Increment stop threshold by 10%, wrap 100 -> 10
+        cfg.offPct = cfg.offPct + 10
+        if cfg.offPct > 100 then cfg.offPct = 10 end
+        saveCfg()
+        needsUpdate = true
+      
+      -- Check start threshold button  
+      elseif touchAreas.start and x >= touchAreas.start.x and x < touchAreas.start.x + touchAreas.start.w
+         and y == touchAreas.start.y then
+        -- Increment start threshold by 10%, wrap 100 -> 10
+        cfg.onPct = cfg.onPct + 10
+        if cfg.onPct > 100 then cfg.onPct = 10 end
+        saveCfg()
+        needsUpdate = true
+      end
+      
+      -- Redraw immediately after threshold change
+      if needsUpdate then
+        local ok, fill, rsOn, src, areas = applyOnce()
+        if areas then
+          touchAreas = areas
+        end
         lastUpdate = os.clock()
       end
     elseif event == "timer" and p1 == timerId then
