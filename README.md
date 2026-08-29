@@ -1321,3 +1321,26 @@ a parallel task — that covers announce, OTA update listen, and hop relay.
 Tip: with **ender modems** you already have unlimited range, so a router is
 mainly useful for **plain wireless modems** (extending range) or as a **central
 directory/monitor** of everything on the network.
+
+---
+
+# Utility Scripts (`scripts/`)
+
+Small standalone scripts for specific tasks.
+
+## Command Block Sheep Spawner (`scripts/sheep_command_block.lua`)
+
+**Requires:** Command Computer (Creative-mode only, needs op permissions)
+
+Places a command block that summons 1 sheep above itself when activated.
+
+```
+wget https://raw.githubusercontent.com/TitanBCXR/MinecraftLua/main/scripts/sheep_command_block.lua
+sheep_command_block         -- place in front
+sheep_command_block 0 -1 0  -- place below
+sheep_command_block 5 10 3  -- place at x+5 y+10 z+3
+```
+
+The command block is impulse type (runs once per activation). Activate with a button, lever, or redstone signal.
+
+**Note:** Command Computers are Creative-only and cannot be crafted. Use `/give @p computercraft:command_computer` to obtain one. Regular computers and turtles cannot set command-block NBT.
