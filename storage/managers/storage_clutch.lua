@@ -1,6 +1,6 @@
 --[[
   storage/managers/storage_clutch.lua  -  Storage fill → Create clutch
-  Titan-Version: 1.8.4
+  Titan-Version: 1.8.5
 
   Reads a Sophisticated Storage (or any inventory) over the wired modem
   network and drives Create clutch(es) via redstone.
@@ -53,7 +53,7 @@
 ]]
 
 local LOCAL_CFG = "storage_clutch.cfg"
-local VERSION = "1.8.4"
+local VERSION = "1.8.5"
 
 local cfg = {
   storage = nil,           -- inventory peripheral name
@@ -145,6 +145,26 @@ local function loadCfg()
     end
     cfg.integrator = nil
   end
+  
+  -- Validate saved storage is still present (important for side-attached inventories)
+  -- If not present or not an inventory, clear it so autoDiscover can re-scan
+  if cfg.storage and cfg.storage ~= "" then
+    if not peripheral.isPresent(cfg.storage) then
+      cfg.storage = nil
+    else
+      -- Check if it's still an inventory
+      local isInv = false
+      if peripheral.hasType and peripheral.hasType(cfg.storage, "inventory") then
+        isInv = true
+      else
+        local w = peripheral.wrap(cfg.storage)
+        isInv = w and type(w.list) == "function"
+      end
+      if not isInv then
+        cfg.storage = nil
+      end
+    end
+  end
 end
 
 local function isFullyBound()
@@ -206,7 +226,20 @@ local function collectNames(pred)
       out[#out + 1] = n
     end
   end
-  for _, name in ipairs(peripheral.getNames()) do add(name) end
+  
+  -- Explicitly check all six sides first (important for directly attached peripherals)
+  for side in pairs(SIDES) do
+    if peripheral.isPresent(side) then
+      add(side)
+    end
+  end
+  
+  -- Then check other local peripherals
+  for _, name in ipairs(peripheral.getNames()) do
+    add(name)
+  end
+  
+  -- Finally scan wired modem networks
   for _, sideName in ipairs(peripheral.getNames()) do
     if peripheral.getType(sideName) == "modem" then
       local m = peripheral.wrap(sideName)
@@ -215,6 +248,7 @@ local function collectNames(pred)
       end
     end
   end
+  
   table.sort(out)
   return out
 end
