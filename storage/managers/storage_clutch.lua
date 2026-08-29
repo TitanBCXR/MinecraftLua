@@ -1,6 +1,6 @@
 --[[
   storage/managers/storage_clutch.lua  -  Storage fill → Create clutch
-  Titan-Version: 1.8.7
+  Titan-Version: 1.8.8
 
   Reads a Sophisticated Storage (or any inventory) over the wired modem
   network and drives Create clutch(es) via redstone.
@@ -53,7 +53,7 @@
 ]]
 
 local LOCAL_CFG = "storage_clutch.cfg"
-local VERSION = "1.8.7"
+local VERSION = "1.8.8"
 
 local cfg = {
   storage = nil,           -- inventory peripheral name
@@ -750,6 +750,11 @@ local function drawMonitor(fill, rsOn)
   local rate = fillRate()
   local color = outIsColor(out)
   local pal = steamPalette(color)
+  
+  -- Touch areas for tap detection (declared once, set in header/status sections)
+  local rsTouchArea = nil
+  local stopTouchArea = nil
+  local startTouchArea = nil
 
   local w, h
   if kind == "monitor" then
@@ -834,9 +839,6 @@ local function drawMonitor(fill, rsOn)
   --------------------------------------------------------------------------
   -- Status chip row (fill / rate / clutch)
   --------------------------------------------------------------------------
-  local rsTouchArea = nil
-  local stopTouchArea = nil
-  local startTouchArea = nil
   if y <= h - footerH then
     if color then
       guiFill(out, 1, y, w, 1, pal.bg, pal.steam)
@@ -1461,8 +1463,8 @@ local function applyOnce(manualOverride)
   
   local ok, outOrErr, src = setRedstone(want)
   if not ok then return false, outOrErr end
-  local drawOk, touchAreas = pcall(drawMonitor, fill, outOrErr)
-  return true, fill, outOrErr, src, touchAreas
+  local pok, okDraw, areas = pcall(drawMonitor, fill, outOrErr)
+  return true, fill, outOrErr, src, areas
 end
 
 local function cmdRun()
