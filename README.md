@@ -1330,8 +1330,6 @@ Small standalone scripts for specific tasks.
 
 ## Command Block Sheep Spawner (`scripts/sheep_command_block.lua`)
 
-**Try-and-report utility:** Runs on any computer but only **succeeds** on Command Computers (Creative-mode, op permissions required).
-
 Places a command block that summons 1 sheep above itself when activated.
 
 ```
@@ -1341,8 +1339,4 @@ sheep_command_block 0 -1 0  -- place below
 sheep_command_block 5 10 3  -- place at x+5 y+10 z+3
 ```
 
-Reports **SUCCESS** or **FAILED** with clear error messages. Regular computers and turtles will report FAILED (cannot set command-block NBT without the `commands` API).
-
-The command block is impulse type (runs once per activation). Activate with a button, lever, or redstone signal.
-
-**Command Computers:** Creative-only, cannot be crafted. Obtain via `/give @p computercraft:command_computer`.
+Reports SUCCESS or FAILED. Activate the command block with a button, lever, or redstone signal.
