@@ -1,6 +1,6 @@
 --[[
   storage/managers/storage_clutch.lua  -  Storage fill → Create clutch
-  Titan-Version: 1.8.1
+  Titan-Version: 1.8.2
 
   Reads a Sophisticated Storage (or any inventory) over the wired modem
   network and drives Create clutch(es) via redstone.
@@ -53,7 +53,7 @@
 ]]
 
 local LOCAL_CFG = "storage_clutch.cfg"
-local VERSION = "1.8.1"
+local VERSION = "1.8.2"
 
 local cfg = {
   storage = nil,           -- inventory peripheral name
@@ -1395,22 +1395,32 @@ local function cmdRun()
     return
   end
   rateSamples = {} -- fresh rate window when starting watch
+  
+  -- Check display: if monitor exists, console stays interactive
+  -- If no monitor, term can show board (original fallback)
+  local hasMonitor = (findMonitor() ~= nil)
   local _, kind = resolveDisplay()
+  
   if kind == "monitor" then
     print("Steampunk board → monitor")
+    print("Console remains interactive")
   elseif kind == "term" then
     print("Steampunk board → this screen (Ctrl+T to stop)")
   else
     print("No color display — console only")
   end
   print(("Watching %s — Ctrl+T to stop"):format(cfg.storage))
+  
   local last = nil
-  local useTermUi = (kind == "term")
   while true do
     local ok, a, b, c = applyOnce()
-    if ok then
-      local fill, on, src = a, b, c
-      if not useTermUi then
+    
+    -- When monitor exists: print status lines on console
+    -- When no monitor: let term show board (don't duplicate with prints)
+    if hasMonitor then
+      -- Monitor mode: console shows status lines
+      if ok then
+        local fill, on, src = a, b, c
         local rate = fillRate()
         local rateStr = rate and formatRate(rate) or "rate …"
         local line = ("%s  %3d%%  %s  %d/%d  rs=%s"):format(
@@ -1419,17 +1429,21 @@ local function cmdRun()
           print(line)
           last = line
         end
+      else
+        print(os.date("%H:%M:%S") .. "  ERR " .. tostring(a))
+        last = nil
+        pcall(drawMonitor, nil, nil)
       end
     else
-      if not useTermUi then
-        print(os.date("%H:%M:%S") .. "  ERR " .. tostring(a))
+      -- No monitor: term shows board, minimal console output
+      if not ok then
+        last = nil
+        pcall(drawMonitor, nil, nil)
       end
-      last = nil
-      pcall(drawMonitor, nil, nil)
     end
-    -- Re-resolve in case a monitor is attached mid-run
-    local _, k2 = resolveDisplay()
-    useTermUi = (k2 == "term")
+    
+    -- Re-check for monitor attachment mid-run
+    hasMonitor = (findMonitor() ~= nil)
     sleep(tonumber(cfg.interval) or 1)
   end
 end
