@@ -1,6 +1,6 @@
 --[[
   storage/managers/storage_clutch.lua  -  Storage fill → Create clutch
-  Titan-Version: 1.8.5
+  Titan-Version: 1.8.6
 
   Reads a Sophisticated Storage (or any inventory) over the wired modem
   network and drives Create clutch(es) via redstone.
@@ -53,7 +53,7 @@
 ]]
 
 local LOCAL_CFG = "storage_clutch.cfg"
-local VERSION = "1.8.5"
+local VERSION = "1.8.6"
 
 local cfg = {
   storage = nil,           -- inventory peripheral name
@@ -733,6 +733,8 @@ local function layoutTier(w, h)
 end
 
 --- Steampunk brass instrument board. fill/rsOn optional.
+--- Returns: success, error_or_touchArea
+--- touchArea = {x, y, w, h, row} for RS tap detection (nil if no color/monitor)
 local function drawMonitor(fill, rsOn)
   local out, kind = resolveDisplay()
   if not out then return false, "no monitor / color term" end
@@ -827,6 +829,7 @@ local function drawMonitor(fill, rsOn)
   --------------------------------------------------------------------------
   -- Status chip row (fill / rate / clutch)
   --------------------------------------------------------------------------
+  local rsTouchArea = nil
   if y <= h - footerH then
     if color then
       guiFill(out, 1, y, w, 1, pal.bg, pal.steam)
@@ -835,13 +838,19 @@ local function drawMonitor(fill, rsOn)
       x = guiChip(out, x, y, "FILL " .. pctText, fillFg, gfg, true)
       x = guiChip(out, x, y, rateText, colors.white, pal.soot, true)
       -- RS single-pixel lamp + short label
+      local rsX = x
       guiText(out, x, y, "RS", pal.iron, pal.bg)
       drawRsLamp(out, x + 2, y, rsOn, pal, color)
       if x + 5 < w then
         local feedBg = (rsOn == true) and pal.lampOff
           or ((rsOn == false) and pal.lampOn or pal.soot)
         local feedFg = (rsOn == true) and colors.white or colors.black
-        guiChip(out, x + 4, y, feedLabel, feedFg, feedBg, true)
+        local chipEnd = guiChip(out, x + 4, y, feedLabel, feedFg, feedBg, true)
+        -- Touch area: from RS text through FEED chip (generous hit target)
+        rsTouchArea = {x = rsX, y = y, w = math.max(8, chipEnd - rsX), h = 1, row = y}
+      else
+        -- No feed chip, smaller touch area
+        rsTouchArea = {x = rsX, y = y, w = 3, h = 1, row = y}
       end
     else
       guiText(out, x0, y,
@@ -967,7 +976,7 @@ local function drawMonitor(fill, rsOn)
     guiText(out, 1, h, (left .. right):sub(1, w), pal.dim, pal.bg)
   end
 
-  return true
+  return true, rsTouchArea
 end
 
 --------------------------------------------------------------------------------
@@ -1423,7 +1432,7 @@ local function cmdMonitor()
   end
 end
 
-local function applyOnce()
+local function applyOnce(manualOverride)
   if not cfg.storage then return false, "bind storage first" end
   if not hasAnyIntegrators() then
     return false, "bind redstone <side> or bind integrator <name>"
@@ -1431,11 +1440,22 @@ local function applyOnce()
   local fill, err = storageFill(cfg.storage)
   if not fill then return false, err end
   recordFill(fill)
-  local want = desiredOn(fill)
+  
+  -- Determine desired state: manual override or auto hysteresis
+  local want
+  if manualOverride ~= nil then
+    -- Manual toggle: use override, update latch
+    want = manualOverride
+    setLatch(want)
+  else
+    -- Auto hysteresis
+    want = desiredOn(fill)
+  end
+  
   local ok, outOrErr, src = setRedstone(want)
   if not ok then return false, outOrErr end
-  pcall(drawMonitor, fill, outOrErr)
-  return true, fill, outOrErr, src
+  local drawOk, touchArea = pcall(drawMonitor, fill, outOrErr)
+  return true, fill, outOrErr, src, touchArea
 end
 
 local function cmdRun()
@@ -1447,11 +1467,12 @@ local function cmdRun()
   rateSamples = {} -- fresh rate window when starting watch
   
   -- Check display: monitor (wired or direct) vs term fallback
-  local hasMonitor = (findMonitor() ~= nil)
+  local mon = findMonitor()
+  local hasMonitor = (mon ~= nil)
   local _, kind = resolveDisplay()
   
   if kind == "monitor" then
-    print("Steampunk board → monitor")
+    print("Steampunk board → monitor (tap RS to toggle)")
     print("Console: prompt only (Ctrl+T to stop)")
   elseif kind == "term" then
     print("Steampunk board → this screen (Ctrl+T to stop)")
@@ -1460,18 +1481,58 @@ local function cmdRun()
   end
   print(("Watching %s"):format(cfg.storage))
   
+  local rsTouchArea = nil
+  local lastUpdate = os.clock()
+  local interval = tonumber(cfg.interval) or 1
+  
   while true do
-    local ok, a, b, c = applyOnce()
+    -- Check if it's time to update
+    local now = os.clock()
+    local shouldUpdate = (now - lastUpdate) >= interval
     
-    -- Monitor exists: silent console, all UI on monitor
-    -- No monitor: term shows board (existing fallback)
-    if not ok and not hasMonitor then
-      pcall(drawMonitor, nil, nil)
+    if shouldUpdate then
+      -- Apply clutch logic
+      local ok, fill, rsOn, src, touchArea = applyOnce()
+      
+      if touchArea then
+        rsTouchArea = touchArea
+      end
+      
+      -- Monitor exists: silent console, all UI on monitor
+      -- No monitor: term shows board (existing fallback)
+      if not ok and not hasMonitor then
+        pcall(drawMonitor, nil, nil)
+      end
+      
+      lastUpdate = now
+      
+      -- Re-check for monitor attachment
+      mon = findMonitor()
+      hasMonitor = (mon ~= nil)
     end
     
-    -- Re-check for monitor attachment mid-run
-    hasMonitor = (findMonitor() ~= nil)
-    sleep(tonumber(cfg.interval) or 1)
+    -- Listen for events (touch or terminate)
+    local timeout = math.max(0.1, interval - (os.clock() - lastUpdate))
+    local timerId = os.startTimer(timeout)
+    local event, p1, p2, p3 = os.pullEvent()
+    
+    if event == "monitor_touch" and hasMonitor and rsTouchArea then
+      -- p1 = side/name, p2 = x, p3 = y
+      local x, y = p2, p3
+      -- Check if touch is within RS area
+      if x >= rsTouchArea.x and x < rsTouchArea.x + rsTouchArea.w 
+         and y == rsTouchArea.y then
+        -- Toggle: flip the current latch and apply immediately
+        local newState = not cfg.latchedOn
+        applyOnce(newState)
+        -- Force update time so normal polling doesn't undo it immediately
+        lastUpdate = os.clock()
+      end
+    elseif event == "timer" and p1 == timerId then
+      -- Timer expired, loop will check shouldUpdate
+    elseif event == "terminate" then
+      error("Terminated", 0)
+    end
   end
 end
 
