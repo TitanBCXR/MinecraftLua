@@ -1,6 +1,6 @@
 --[[
   storage/managers/storage_clutch.lua  -  Storage fill → Create clutch
-  Titan-Version: 1.8.2
+  Titan-Version: 1.8.3
 
   Reads a Sophisticated Storage (or any inventory) over the wired modem
   network and drives Create clutch(es) via redstone.
@@ -53,7 +53,7 @@
 ]]
 
 local LOCAL_CFG = "storage_clutch.cfg"
-local VERSION = "1.8.2"
+local VERSION = "1.8.3"
 
 local cfg = {
   storage = nil,           -- inventory peripheral name
@@ -220,13 +220,29 @@ local function collectNames(pred)
 end
 
 local function findMonitor()
-  local m = peripheral.find("monitor")
-  if m then return m end
-  for _, side in ipairs(peripheral.getNames()) do
-    if peripheral.getType(side) == "monitor" then
-      return peripheral.wrap(side)
+  -- Prefer directly attached monitor (sides), then scan wired network
+  -- Check local peripherals first
+  for _, name in ipairs(peripheral.getNames()) do
+    local ptype = peripheral.getType(name)
+    if ptype == "monitor" then
+      return peripheral.wrap(name)
     end
   end
+  
+  -- Scan wired modems for remote monitors
+  for _, sideName in ipairs(peripheral.getNames()) do
+    if peripheral.getType(sideName) == "modem" then
+      local m = peripheral.wrap(sideName)
+      if m and type(m.getNamesRemote) == "function" then
+        for _, remoteName in ipairs(m.getNamesRemote() or {}) do
+          if peripheral.getType(remoteName) == "monitor" then
+            return peripheral.wrap(remoteName)
+          end
+        end
+      end
+    end
+  end
+  
   return nil
 end
 
