@@ -848,6 +848,132 @@ Admin pocket tile **Storage** still talks to the Storage Manager over rednet
 
 ---
 
+## Factory Control System (Vault Storage Manager + Factory Clutch)
+
+**Wireless factory control** — central manager tracks vault inventory and commands remote factory clutches to start/stop production based on buffer thresholds. Manager alone polls the vault; factories only listen for ON/OFF commands.
+
+### Overview
+
+Unlike `storage_clutch` (local fill-based control), the Factory Control System uses a **manager-worker architecture**:
+
+- **Storage Manager** (brain): tracks vault totals, calculates per-item buffer thresholds, sends wireless ON/OFF commands
+- **Factory Clutches** (workers): bound to ONE item each, listen for manager commands, drive redstone/integrators
+
+**Key design:**
+- Manager polls vault on existing refresh cycle (slow, no spam)
+- Factories receive state-change commands only (no continuous polling)
+- Per-item thresholds: maxShare (% of vault), daysBuffer (target stock in MC days), demandRate (items/day)
+- Hysteresis logic prevents rapid toggling
+
+### Storage Manager (Manager Brain)
+
+**Extension to `storage_manager.lua` (v1.2.0+)** — adds factory control mode.
+
+**Hardware:**
+```text
+[Create vaults] --wired modem-- [Manager PC + wired + wireless modem]
+                                         |
+                                    (wireless)
+                                         |
+[Factory PCs with wireless modems + Redstone Integrators + Clutches]
+```
+
+**Manager Setup:**
+
+1. Ensure **wireless modem** is attached (in addition to wired modem for vaults)
+2. `factory on` — enable factory control mode (restart to activate loop)
+3. Configure per-item thresholds:
+   ```
+   factory set minecraft:iron_ingot share 0.3    # max 30% of vault
+   factory set minecraft:iron_ingot days 4       # 4 MC day buffer
+   factory set minecraft:iron_ingot rate 100     # 100 items/day demand
+   ```
+4. `factory list` — show registered factories
+5. `factory items` — show per-item configs
+
+**Commands:**
+- `factory on|off` — enable/disable factory control
+- `factory list` — show registered factories (computer ID, label, item, state)
+- `factory items` — show per-item configs (share, days, rate)
+- `factory set <item> share <0.01-1.0>` — max vault share (default 0.5 = 50%)
+- `factory set <item> days <number>` — buffer in MC days (default 4)
+- `factory set <item> rate <number>` — demand rate in items/MC day (default 0)
+
+**How It Works:**
+
+1. Manager tracks total vault stock for each item type
+2. For each item, manager calculates:
+   - `maxAllowed = vault_capacity × maxShare`
+   - `bufferNeeded = demandRate × daysBuffer`
+   - `resumeThreshold = bufferNeeded × 0.75`
+3. Manager evaluates each registered factory:
+   - **Turn OFF** if stock ≥ bufferNeeded OR stock ≥ maxAllowed
+   - **Turn ON** if stock ≤ resumeThreshold
+   - **Hold current state** in between (hysteresis band)
+4. Manager sends wireless ON/OFF commands only when state changes
+5. Factories ACK commands and report state via 30-second heartbeats
+
+**Example: Iron Ingot Factory**
+- Vault capacity: 10,000 items
+- Config: `share 0.3`, `days 4`, `rate 100`
+- Calculations:
+  - maxAllowed = 10,000 × 0.3 = 3,000 items
+  - bufferNeeded = 100 × 4 = 400 items
+  - resumeThreshold = 400 × 0.75 = 300 items
+- Behavior:
+  - Factory turns OFF when iron stock reaches 400 (or 3,000)
+  - Factory stays OFF until iron drops to 300
+  - Factory turns ON and produces until stock reaches 400 again
+
+### Factory Clutch (Wireless Worker)
+
+**New script: `factory_clutch.lua` (v1.0.0)** — wireless worker that produces ONE item type and obeys manager commands.
+
+Installer: **s → Storage → Workers → 2** (or `wget run` the installer).
+
+**Hardware:**
+```text
+[Clutch + Integrator] --wired modem--+
+[Clutch + Integrator] --wired modem--+-- cable -- [Factory PC + wired modem]
+[Factory PC] -- wireless modem (for manager commands)
+```
+Or: PC redstone face → dust → clutch
+
+**Factory Setup:**
+
+1. `item minecraft:iron_ingot` — bind to item this factory produces
+2. `manager <computerId>` — bind to manager computer ID (find with `id` on manager PC)
+3. `bind integrator <name> [side]` — bind Redstone Integrator outputs
+   - Or `bind redstone <side>` for local PC face
+4. (optional) `invert on` — if powered clutch = run (vs stop)
+5. (optional) `label Iron Smelter` — friendly name for manager
+6. `register` — send FACTORY_REGISTER to manager
+7. `run` — start listening for manager commands (Ctrl+T to stop)
+
+**Commands:**
+- `item <minecraft:id>` — bind to item this factory produces
+- `manager <computerId>` — bind to manager computer ID
+- `bind redstone <side>` — add local PC face redstone output
+- `bind integrator <name> [side]` — add Redstone Integrator (default side: front)
+- `unbind integrator <name>` — remove integrator
+- `invert on|off` — powered clutch = run (vs stop)
+- `label <text>` — friendly name for manager
+- `register` — send FACTORY_REGISTER to manager
+- `run` — start listening for manager commands
+- `status` — show current config and state
+- `test on|off` — force output to verify wiring
+- `help` — command list
+
+**Network Protocol:**
+
+Uses `titan_net` rednet protocol with message types:
+- `FACTORY_REGISTER` — factory → manager: I produce `<item>`
+- `FACTORY_STATUS` — factory → manager: heartbeat (every 30s)
+- `FACTORY_COMMAND` — manager → factory: ON|OFF
+- `FACTORY_ACK` — factory → manager: command received
+
+---
+
 # Quarry (`quarry/workers` + `quarry/managers`)
 
 Installer: **q → Quarry → Workers / Managers**. Scripts live under those folders;

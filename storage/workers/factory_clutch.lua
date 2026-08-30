@@ -1,9 +1,10 @@
 --[[
   storage/workers/factory_clutch.lua  -  Wireless factory clutch worker
-  Titan-Version: 1.0.0
+  Titan-Version: 1.1.0
 
-  A wireless worker that produces ONE item type. Listens to the Vault Storage
-  Manager for ON/OFF commands and drives Create clutch(es) via redstone.
+  A wireless worker that produces items and optionally consumes inputs.
+  Listens to the Vault Storage Manager for ON/OFF commands and drives
+  Create clutch(es) via redstone.
 
   Unlike storage_clutch (fill-based local control), this is a remote worker
   that obeys the manager's buffer decisions. The manager alone polls the vault.
@@ -12,14 +13,17 @@
     [Clutch + Integrator] --wired modem--+
     [Clutch + Integrator] --wired modem--+-- cable -- [PC + wired modem]
     [PC] -- wireless modem (for manager commands)
+    [Frog port / output inventory] -- wired modem (optional, for transfer notify)
     (or PC redstone face → dust → clutch)
 
   Setup:
-    item <minecraft:item_id>             -- bind to the item this factory produces
+    output <minecraft:item_id>           -- add output item this factory produces
+    input <minecraft:item_id>            -- add input item this factory consumes
     manager <computerId>                 -- bind to manager computer ID
     bind redstone <side>                 -- local PC face
     bind integrator <name> [side]        -- add Redstone Integrator
-    unbind integrator <name>             -- remove integrator
+    bind frogport <name>                 -- bind frog port (output inventory for transfer notify)
+    unbind integrator|frogport <name>    -- remove peripheral
     invert on|off                        -- powered clutch = run (vs stop)
     label <text>                         -- factory name for manager
     register                             -- send FACTORY_REGISTER to manager
@@ -31,7 +35,7 @@
 ]]
 
 local LOCAL_CFG = "factory_clutch.cfg"
-local VERSION = "1.0.0"
+local VERSION = "1.1.0"
 
 local titan = nil
 if fs.exists("lib/titan.lua") then
@@ -43,14 +47,19 @@ local MSG = titan and titan.MSG or {}
 local PROTO = (titan and titan.PROTOCOL) or "titan_net"
 
 local cfg = {
-  item = nil,              -- minecraft:item_id this factory produces
+  outputs = {},            -- array of minecraft:item_id this factory produces
+  inputs = {},             -- array of minecraft:item_id this factory consumes
   managerId = nil,         -- computer ID of the manager
   label = nil,             -- factory name
   integrators = {},        -- array of {name=..., side=...}
   rsSide = nil,            -- local face (fallback)
+  frogPort = nil,          -- output inventory for transfer notify (optional)
   invert = false,          -- true = powered clutch runs (vs stops)
   latchedOn = false,       -- last commanded state (ON = stop feed if not inverted)
   heartbeatSecs = 30,      -- heartbeat interval
+  
+  -- Legacy single item (migrated to outputs)
+  item = nil,
 }
 
 --------------------------------------------------------------------------------
@@ -81,6 +90,23 @@ local function loadCfg()
     end
     cfg.integrator = nil
   end
+  
+  -- Migrate legacy single item to outputs
+  if cfg.item and cfg.item ~= "" then
+    local found = false
+    for _, out in ipairs(cfg.outputs) do
+      if out == cfg.item then found = true; break end
+    end
+    if not found then
+      table.insert(cfg.outputs, cfg.item)
+    end
+    cfg.item = nil
+  end
+  
+  -- Ensure arrays
+  if type(cfg.outputs) ~= "table" then cfg.outputs = {} end
+  if type(cfg.inputs) ~= "table" then cfg.inputs = {} end
+  if type(cfg.integrators) ~= "table" then cfg.integrators = {} end
 end
 
 local function saveCfg()
@@ -142,14 +168,34 @@ local function openWireless()
   return nil
 end
 
+-- Check if frog port is actively sending (has items)
+local function isSending()
+  if not cfg.frogPort or cfg.frogPort == "" then return false end
+  if not peripheral.isPresent(cfg.frogPort) then return false end
+  
+  local wrap = peripheral.wrap(cfg.frogPort)
+  if not wrap or type(wrap.list) ~= "function" then return false end
+  
+  local ok, list = pcall(wrap.list)
+  if not ok or type(list) ~= "table" then return false end
+  
+  -- If frog port has items, we're sending
+  for _ in pairs(list) do
+    return true
+  end
+  return false
+end
+
 local function sendToManager(msgType, payload)
   if not cfg.managerId then return false end
   payload = payload or {}
   payload.type = msgType
   payload.from = os.getComputerID()
-  payload.item = cfg.item
+  payload.outputs = cfg.outputs
+  payload.inputs = cfg.inputs
   payload.label = cfg.label or os.getComputerLabel() or ("Factory-" .. os.getComputerID())
   payload.version = VERSION
+  payload.sending = isSending()
   rednet.send(cfg.managerId, payload, PROTO)
   return true
 end
@@ -160,11 +206,14 @@ end
 local function cmdHelp()
   print("Factory Clutch v" .. VERSION)
   print("\nSetup:")
-  print("  item <minecraft:id>")
+  print("  output <minecraft:id>     -- add output item")
+  print("  input <minecraft:id>      -- add input item")
+  print("  remove output|input <id>  -- remove item")
   print("  manager <computerId>")
   print("  bind redstone <side>")
   print("  bind integrator <name> [side]")
-  print("  unbind integrator <name>")
+  print("  bind frogport <name>      -- output inventory")
+  print("  unbind integrator|frogport <name>")
   print("  invert on|off")
   print("  label <text>")
   print("  register    -- send FACTORY_REGISTER")
@@ -177,11 +226,13 @@ end
 
 local function cmdStatus()
   print("Factory Clutch v" .. VERSION)
-  print(("Item:    %s"):format(cfg.item or "(not set)"))
+  print(("Outputs: %s"):format(#cfg.outputs > 0 and table.concat(cfg.outputs, ", ") or "(none)"))
+  print(("Inputs:  %s"):format(#cfg.inputs > 0 and table.concat(cfg.inputs, ", ") or "(none)"))
   print(("Manager: %s"):format(cfg.managerId or "(not set)"))
   print(("Label:   %s"):format(cfg.label or "(not set)"))
   print(("State:   %s"):format(cfg.latchedOn and "OFF (stopped)" or "ON (running)"))
   print(("Invert:  %s"):format(cfg.invert and "on" or "off"))
+  print(("Sending: %s"):format(isSending() and "YES (frog port active)" or "no"))
   
   local rsOut = {}
   if cfg.rsSide then
@@ -191,16 +242,78 @@ local function cmdStatus()
     table.insert(rsOut, ("%s:%s"):format(i.name, i.side))
   end
   print(("Redstone: %s"):format(#rsOut > 0 and table.concat(rsOut, ", ") or "(none)"))
+  
+  if cfg.frogPort then
+    print(("Frog port: %s"):format(cfg.frogPort))
+  end
 end
 
-local function cmdItem(args)
+local function cmdOutput(args)
   if #args < 2 then
-    print("Usage: item <minecraft:item_id>")
+    print("Usage: output <minecraft:item_id>")
     return
   end
-  cfg.item = args[2]
+  local itemId = args[2]
+  for _, out in ipairs(cfg.outputs) do
+    if out == itemId then
+      print(("Already in outputs: %s"):format(itemId))
+      return
+    end
+  end
+  table.insert(cfg.outputs, itemId)
   saveCfg()
-  print(("Bound to item: %s"):format(cfg.item))
+  print(("Added output: %s"):format(itemId))
+end
+
+local function cmdInput(args)
+  if #args < 2 then
+    print("Usage: input <minecraft:item_id>")
+    return
+  end
+  local itemId = args[2]
+  for _, inp in ipairs(cfg.inputs) do
+    if inp == itemId then
+      print(("Already in inputs: %s"):format(itemId))
+      return
+    end
+  end
+  table.insert(cfg.inputs, itemId)
+  saveCfg()
+  print(("Added input: %s"):format(itemId))
+end
+
+local function cmdRemove(args)
+  if #args < 3 then
+    print("Usage: remove output|input <minecraft:item_id>")
+    return
+  end
+  
+  local kind = args[2]:lower()
+  local itemId = args[3]
+  
+  if kind == "output" then
+    for i, out in ipairs(cfg.outputs) do
+      if out == itemId then
+        table.remove(cfg.outputs, i)
+        saveCfg()
+        print(("Removed output: %s"):format(itemId))
+        return
+      end
+    end
+    print(("Output not found: %s"):format(itemId))
+  elseif kind == "input" then
+    for i, inp in ipairs(cfg.inputs) do
+      if inp == itemId then
+        table.remove(cfg.inputs, i)
+        saveCfg()
+        print(("Removed input: %s"):format(itemId))
+        return
+      end
+    end
+    print(("Input not found: %s"):format(itemId))
+  else
+    print("Usage: remove output|input <minecraft:item_id>")
+  end
 end
 
 local function cmdManager(args)
@@ -220,7 +333,7 @@ end
 
 local function cmdBind(args)
   if #args < 3 then
-    print("Usage: bind redstone <side> | bind integrator <name> [side]")
+    print("Usage: bind redstone <side> | bind integrator <name> [side] | bind frogport <name>")
     return
   end
   
@@ -245,14 +358,18 @@ local function cmdBind(args)
     table.insert(cfg.integrators, {name = name, side = side})
     saveCfg()
     print(("Added integrator: %s:%s"):format(name, side))
+  elseif args[2] == "frogport" then
+    cfg.frogPort = args[3]
+    saveCfg()
+    print(("Bound frog port to: %s"):format(cfg.frogPort))
   else
-    print("Usage: bind redstone <side> | bind integrator <name> [side]")
+    print("Usage: bind redstone <side> | bind integrator <name> [side] | bind frogport <name>")
   end
 end
 
 local function cmdUnbind(args)
   if #args < 3 then
-    print("Usage: unbind integrator <name>")
+    print("Usage: unbind integrator|frogport <name>")
     return
   end
   
@@ -267,8 +384,12 @@ local function cmdUnbind(args)
       end
     end
     print(("Integrator not found: %s"):format(name))
+  elseif args[2] == "frogport" then
+    cfg.frogPort = nil
+    saveCfg()
+    print("Removed frog port")
   else
-    print("Usage: unbind integrator <name>")
+    print("Usage: unbind integrator|frogport <name>")
   end
 end
 
@@ -325,8 +446,8 @@ local function cmdTest(args)
 end
 
 local function cmdRegister()
-  if not cfg.item then
-    print("Set item first: item <minecraft:id>")
+  if #cfg.outputs == 0 then
+    print("Set outputs first: output <minecraft:id>")
     return
   end
   if not cfg.managerId then
@@ -347,8 +468,8 @@ local function cmdRegister()
 end
 
 local function cmdRun()
-  if not cfg.item then
-    print("Set item first: item <minecraft:id>")
+  if #cfg.outputs == 0 then
+    print("Set outputs first: output <minecraft:id>")
     return
   end
   if not cfg.managerId then
@@ -362,7 +483,11 @@ local function cmdRun()
     return
   end
   
-  print(("Factory Clutch running (item: %s)"):format(cfg.item))
+  print(("Factory Clutch running"))
+  print(("  Outputs: %s"):format(table.concat(cfg.outputs, ", ")))
+  if #cfg.inputs > 0 then
+    print(("  Inputs:  %s"):format(table.concat(cfg.inputs, ", ")))
+  end
   print("Listening for manager commands (Ctrl+T to stop)")
   
   -- Register on start
@@ -414,8 +539,8 @@ end
 -- Main loop
 --------------------------------------------------------------------------------
 local function main()
-  if cfg.item and cfg.managerId then
-    print(("Factory: %s → Manager %d"):format(cfg.item, cfg.managerId))
+  if #cfg.outputs > 0 and cfg.managerId then
+    print(("Factory: %s → Manager %d"):format(table.concat(cfg.outputs, ", "), cfg.managerId))
     print("Type 'run' to start, 'help' for commands")
   else
     print("Factory Clutch v" .. VERSION)
@@ -439,8 +564,12 @@ local function main()
         cmdHelp()
       elseif cmd == "status" then
         cmdStatus()
-      elseif cmd == "item" then
-        cmdItem(args)
+      elseif cmd == "output" then
+        cmdOutput(args)
+      elseif cmd == "input" then
+        cmdInput(args)
+      elseif cmd == "remove" then
+        cmdRemove(args)
       elseif cmd == "manager" then
         cmdManager(args)
       elseif cmd == "bind" then
