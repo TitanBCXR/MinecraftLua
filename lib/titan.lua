@@ -1,6 +1,6 @@
 --[[
   titan.lua  -  Shared library for the Titan bot network (CC: Tweaked)
-  Titan-Version: 1.2.26
+  Titan-Version: 1.2.27
 
   Provides:
     * Rednet protocol constants + message type enum
@@ -70,6 +70,12 @@ titan.MSG = {
   STORAGE_STOCK   = "storage_stock",   -- storage -> asker : item rows
   STORAGE_REQUEST = "storage_request", -- anyone -> storage : request Create package
   STORAGE_REQUEST_ACK = "storage_request_ack",
+
+  -- Factory control (Vault Manager <-> Factory Clutches)
+  FACTORY_REGISTER = "factory_register", -- factory -> manager : I produce <item>
+  FACTORY_STATUS   = "factory_status",   -- factory -> manager : heartbeat + state
+  FACTORY_COMMAND  = "factory_command",  -- manager -> factory : ON|OFF
+  FACTORY_ACK      = "factory_ack",      -- factory -> manager : command received
 
   -- Fleet mine / flatten jobs + Create break permits (Parent Center)
   MINE_JOB        = "mine_job",        -- datacenter -> miner : strip to dig

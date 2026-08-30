@@ -35,7 +35,7 @@ return {
     ["quarry/managers/offline_site.lua"] = "1.8.2",
     ["offline_miner.lua"]  = "1.0.0",
     ["offline_site.lua"]   = "1.0.0",
-    ["storage/managers/storage_manager.lua"] = "1.1.3",
+    ["storage/managers/storage_manager.lua"] = "1.2.0",
     ["storage/workers/storage_builder.lua"] = "1.0.0",
     ["storage/managers/storage_atm.lua"] = "1.4.0",
     ["storage/managers/storage_clutch.lua"] = "1.8.8",

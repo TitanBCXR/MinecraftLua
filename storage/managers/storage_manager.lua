@@ -1,6 +1,6 @@
 --[[
   storage/managers/storage_manager.lua  -  Create vault rate + fill board
-  Titan-Version: 1.1.3
+  Titan-Version: 1.2.0
 
   Auto-detects every Create item vault on the wired modem network and
   tracks the *joined* pool (not per-vault):
@@ -40,7 +40,8 @@ end
 local MSG = titan and titan.MSG or {}
 local PROTO = (titan and titan.PROTOCOL) or "titan_net"
 local CFG = "storage_manager.cfg"
-local VERSION = "1.1.3"
+local FACTORY_CFG = "factory_control.cfg"
+local VERSION = "1.2.0"
 
 local SCREENS = { "input", "output", "fill" }
 local DEFAULT_SLOT_LIMIT = 512
@@ -68,6 +69,13 @@ local cfg = {
   label = nil,
   title = nil,       -- large-board header (falls back to computer label)
   monRoles = {},     -- [monitorName] = 1 (in) | 2 (out)  — 1×1 rate boards
+  factoryMode = false,  -- enable factory control mode
+}
+
+-- Factory control config (per-item thresholds + factory registry)
+local factoryCfg = {
+  items = {},        -- [itemId] = {maxShare, daysBuffer, demandRate}
+  factories = {},    -- [computerId] = {item, label, state, lastHeartbeat, lastCommand}
 }
 
 local cache = {
@@ -126,6 +134,24 @@ end
 local function saveCfg()
   local f = fs.open(CFG, "w")
   if f then f.write(textutils.serialize(cfg)); f.close() end
+end
+
+local function loadFactoryCfg()
+  if not fs.exists(FACTORY_CFG) then return end
+  local f = fs.open(FACTORY_CFG, "r")
+  if not f then return end
+  local ok, data = pcall(textutils.unserialize, f.readAll())
+  f.close()
+  if ok and type(data) == "table" then
+    for k, v in pairs(data) do factoryCfg[k] = v end
+  end
+  if type(factoryCfg.items) ~= "table" then factoryCfg.items = {} end
+  if type(factoryCfg.factories) ~= "table" then factoryCfg.factories = {} end
+end
+
+local function saveFactoryCfg()
+  local f = fs.open(FACTORY_CFG, "w")
+  if f then f.write(textutils.serialize(factoryCfg)); f.close() end
 end
 
 local function shortName(name)
@@ -1083,6 +1109,49 @@ local function handleCommand(line)
   for w in tostring(line or ""):gmatch("%S+") do a[#a + 1] = w end
   local cmd = tostring(a[1] or ""):lower()
   if cmd == "" then return true
+  elseif cmd == "factory" then
+    if a[2] == "on" then
+      cfg.factoryMode = true
+      saveCfg()
+      print("Factory control: ENABLED (restart to activate loop)")
+    elseif a[2] == "off" then
+      cfg.factoryMode = false
+      saveCfg()
+      print("Factory control: DISABLED")
+    elseif a[2] == "list" then
+      local count = 0
+      for _ in pairs(factoryCfg.factories) do count = count + 1 end
+      print(("Factories (%d):"):format(count))
+      for id, f in pairs(factoryCfg.factories) do
+        print(("  #%d %s → %s [%s]"):format(id, f.label, f.item, f.state))
+      end
+    elseif a[2] == "items" then
+      local count = 0
+      for _ in pairs(factoryCfg.items) do count = count + 1 end
+      print(("Item configs (%d):"):format(count))
+      for itemId, icfg in pairs(factoryCfg.items) do
+        print(("  %s: share=%.0f%% days=%.1f rate=%d/day"):format(
+          shortName(itemId), (icfg.maxShare or 0.5) * 100, icfg.daysBuffer or 4, icfg.demandRate or 0))
+      end
+    elseif a[2] == "set" and a[3] then
+      local itemId = a[3]
+      factoryCfg.items[itemId] = factoryCfg.items[itemId] or {}
+      local icfg = factoryCfg.items[itemId]
+      if a[4] == "share" and a[5] then
+        icfg.maxShare = math.max(0.01, math.min(1, tonumber(a[5]) or 0.5))
+      elseif a[4] == "days" and a[5] then
+        icfg.daysBuffer = math.max(0.1, tonumber(a[5]) or 4)
+      elseif a[4] == "rate" and a[5] then
+        icfg.demandRate = math.max(0, tonumber(a[5]) or 0)
+      else
+        print("Usage: factory set <item> share|days|rate <value>")
+        return true
+      end
+      saveFactoryCfg()
+      print(("Set %s %s = %s"):format(shortName(itemId), a[4], a[5]))
+    else
+      print("Usage: factory on|off|list|items|set <item> <param> <value>")
+    end
   elseif cmd == "help" or cmd == "?" then printHelp()
   elseif cmd == "status" then
     refresh(); printStatus(); drawMonitor()
@@ -1253,6 +1322,113 @@ local function handleCommand(line)
 end
 
 --------------------------------------------------------------------------------
+-- Factory control
+--------------------------------------------------------------------------------
+local MC_DAY_MINS = 20  -- Minecraft day = 20 real minutes
+
+local function sendToFactory(factoryId, command)
+  if not factoryId then return false end
+  local msg = {
+    type = MSG.FACTORY_COMMAND,
+    command = command,
+    from = os.getComputerID(),
+  }
+  rednet.send(factoryId, msg, PROTO)
+  return true
+end
+
+local function handleFactoryRegister(senderId, msg)
+  if not msg.item or msg.item == "" then return end
+  
+  factoryCfg.factories[senderId] = {
+    item = msg.item,
+    label = msg.label or ("Factory-" .. senderId),
+    state = msg.state or "OFF",
+    lastHeartbeat = os.clock(),
+    lastCommand = nil,
+  }
+  saveFactoryCfg()
+  
+  print(("← Factory %d registered: %s"):format(senderId, msg.item))
+end
+
+local function handleFactoryStatus(senderId, msg)
+  local factory = factoryCfg.factories[senderId]
+  if not factory then return end
+  
+  factory.state = msg.state or factory.state
+  factory.lastHeartbeat = os.clock()
+  saveFactoryCfg()
+end
+
+local function handleFactoryAck(senderId, msg)
+  local factory = factoryCfg.factories[senderId]
+  if not factory then return end
+  
+  factory.state = msg.state or factory.state
+  factory.lastCommand = msg.command
+  saveFactoryCfg()
+end
+
+-- Calculate if a factory should be ON or OFF based on vault stock
+local function evaluateFactory(factory)
+  local itemId = factory.item
+  local stock = cache.totals[itemId] or 0
+  local itemCfg = factoryCfg.items[itemId]
+  
+  if not itemCfg then
+    -- No config for this item, default to ON
+    return "ON"
+  end
+  
+  local maxShare = itemCfg.maxShare or 0.5  -- default 50% of vault
+  local daysBuffer = itemCfg.daysBuffer or 4  -- default 4 MC days
+  local demandRate = itemCfg.demandRate or 0  -- items per MC day
+  
+  -- Calculate thresholds
+  local maxAllowed = math.floor(cache.cap * maxShare)
+  local bufferNeeded = math.floor(demandRate * daysBuffer)
+  
+  -- If stock exceeds buffer OR maxAllowed, turn OFF
+  -- If stock is below 75% of buffer, turn ON
+  local resumeThreshold = math.floor(bufferNeeded * 0.75)
+  
+  if stock >= bufferNeeded or stock >= maxAllowed then
+    return "OFF"
+  elseif stock <= resumeThreshold then
+    return "ON"
+  else
+    -- Hysteresis band: keep current state
+    return factory.state
+  end
+end
+
+local function updateFactories()
+  if not cfg.factoryMode then return end
+  
+  for factoryId, factory in pairs(factoryCfg.factories) do
+    local wanted = evaluateFactory(factory)
+    
+    if wanted ~= factory.state then
+      sendToFactory(factoryId, wanted)
+      factory.lastCommand = wanted
+      factory.state = wanted
+      saveFactoryCfg()
+      print(("→ Factory %d (%s): %s"):format(factoryId, factory.item, wanted))
+    end
+  end
+end
+
+local function factoryLoop()
+  while true do
+    if cfg.factoryMode then
+      pcall(updateFactories)
+    end
+    sleep(5)  -- Check factories every 5 seconds
+  end
+end
+
+--------------------------------------------------------------------------------
 -- Loops
 --------------------------------------------------------------------------------
 local function eventLoop()
@@ -1294,6 +1470,12 @@ local function eventLoop()
         if titan and titan.send and MSG.STORAGE_STATUS then
           pcall(titan.send, from, MSG.STORAGE_STATUS, statusPayload())
         end
+      elseif t == MSG.FACTORY_REGISTER then
+        pcall(handleFactoryRegister, from, msg)
+      elseif t == MSG.FACTORY_STATUS then
+        pcall(handleFactoryStatus, from, msg)
+      elseif t == MSG.FACTORY_ACK then
+        pcall(handleFactoryAck, from, msg)
       elseif t == "storage_stock_req" or t == MSG.STORAGE_STOCK_REQ then
         if (nowMs() - (cache.updated or 0)) > 5000 then pcall(refresh) end
         local rows = filteredRows(msg.filter, tonumber(msg.limit) or 40)
@@ -1376,5 +1558,10 @@ else
 end
 print("Type help.")
 
-parallel.waitForAny(consoleLoop, eventLoop, ingestLoop)
+if cfg.factoryMode then
+  print("Factory control: ENABLED")
+  parallel.waitForAny(consoleLoop, eventLoop, ingestLoop, factoryLoop)
+else
+  parallel.waitForAny(consoleLoop, eventLoop, ingestLoop)
+end
 print("Storage manager closed.")
