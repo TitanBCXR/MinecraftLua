@@ -1,6 +1,6 @@
 --[[
   storage/managers/factory_admin.lua  -  Factory Admin pocket tablet
-  Titan-Version: 1.0.0
+  Titan-Version: 1.0.1
 
   Pocket computer + wireless modem admin interface for factory control.
   Manage ALL factory systems from the tablet (not SSH, not generic admin).
@@ -29,7 +29,7 @@ end
 
 local MSG = titan and titan.MSG or {}
 local PROTO = (titan and titan.PROTOCOL) or "titan_net"
-local VERSION = "1.0.0"
+local VERSION = "1.0.1"
 
 titan.openModem()
 
@@ -46,12 +46,8 @@ local scrollOffset = 0
 local function discoverManager()
   if managerId then return managerId end
   
-  -- Ping for storage manager
-  if titan and titan.broadcast then
-    titan.broadcast({type = MSG.STORAGE_PING}, PROTO)
-  else
-    rednet.broadcast({type = MSG.STORAGE_PING}, PROTO)
-  end
+  -- Ping for storage manager (use string type and include from ID)
+  rednet.broadcast({type = "storage_ping", from = os.getComputerID()}, PROTO)
   
   -- Wait for response
   local timer = os.startTimer(2)
@@ -61,7 +57,8 @@ local function discoverManager()
       break
     elseif ev == "rednet_message" and (p3 == PROTO or p3 == nil) and type(p2) == "table" then
       local msg, from = p2, p1
-      if msg.type == MSG.STORAGE_STATUS or msg.type == "storage_status" then
+      local t = msg.type
+      if t == MSG.STORAGE_STATUS or t == "storage_status" or t == MSG.STORAGE_HELLO or t == "storage_hello" then
         managerId = from
         os.cancelTimer(timer)
         return managerId
@@ -81,11 +78,7 @@ local function requestSnap()
     if not managerId then return end
   end
   
-  if titan and titan.send then
-    titan.send(managerId, {type = MSG.FACTORY_ADMIN_REQ}, PROTO)
-  else
-    rednet.send(managerId, {type = MSG.FACTORY_ADMIN_REQ}, PROTO)
-  end
+  rednet.send(managerId, {type = "factory_admin_req", from = os.getComputerID()}, PROTO)
 end
 
 --------------------------------------------------------------------------------
@@ -94,50 +87,35 @@ end
 local function sendCommand(factoryId, command)
   if not managerId then return end
   
-  local msg = {
-    type = MSG.FACTORY_ADMIN_COMMAND,
+  rednet.send(managerId, {
+    type = "factory_admin_command",
     factoryId = factoryId,
-    command = command
-  }
-  
-  if titan and titan.send then
-    titan.send(managerId, msg, PROTO)
-  else
-    rednet.send(managerId, msg, PROTO)
-  end
+    command = command,
+    from = os.getComputerID()
+  }, PROTO)
 end
 
 local function setItemThreshold(itemId, maxShare, daysBuffer, demandRate)
   if not managerId then return end
   
-  local msg = {
-    type = MSG.FACTORY_ADMIN_SET,
+  rednet.send(managerId, {
+    type = "factory_admin_set",
     itemId = itemId,
     maxShare = maxShare,
     daysBuffer = daysBuffer,
-    demandRate = demandRate
-  }
-  
-  if titan and titan.send then
-    titan.send(managerId, msg, PROTO)
-  else
-    rednet.send(managerId, msg, PROTO)
-  end
+    demandRate = demandRate,
+    from = os.getComputerID()
+  }, PROTO)
 end
 
 local function setFactoryMode(enabled)
   if not managerId then return end
   
-  local msg = {
-    type = MSG.FACTORY_ADMIN_MODE,
-    factoryMode = enabled
-  }
-  
-  if titan and titan.send then
-    titan.send(managerId, msg, PROTO)
-  else
-    rednet.send(managerId, msg, PROTO)
-  end
+  rednet.send(managerId, {
+    type = "factory_admin_mode",
+    factoryMode = enabled,
+    from = os.getComputerID()
+  }, PROTO)
 end
 
 --------------------------------------------------------------------------------
@@ -159,8 +137,8 @@ local function drawHome()
   
   ui.clearScreen(out)
   
-  -- Header
-  local fillStr = snap and snap.fillPct and ("%d%%"):format(math.floor(snap.fillPct * 100)) or "?"
+  -- Header (fillPct is already 0-100, don't multiply)
+  local fillStr = snap and snap.fillPct and ("%d%%"):format(math.floor(snap.fillPct)) or "?"
   ui.headerBar(out, "FACTORY ADMIN", fillStr)
   
   -- Factory mode toggle
@@ -254,9 +232,15 @@ local function drawDetail()
   
   y = y + 1
   
-  -- Force buttons
-  ui.chip(out, 2, y, " Force ON ", ui.THEME.ok)
-  ui.chip(out, 15, y, " Force OFF ", ui.THEME.bad)
+  -- Force buttons (record hitboxes for tap detection)
+  local forceOnY = y
+  local forceOffY = y
+  ui.chip(out, 2, forceOnY, " Force ON ", ui.THEME.ok)
+  ui.chip(out, 15, forceOffY, " Force OFF ", ui.THEME.bad)
+  
+  -- Store hitboxes for click detection
+  selectedFactory._forceOnArea = {x1 = 2, x2 = 13, y = forceOnY}
+  selectedFactory._forceOffArea = {x1 = 15, x2 = 27, y = forceOffY}
   
   -- Footer
   local age = selectedFactory.lastHeartbeat or 999
@@ -358,16 +342,22 @@ local function handleDetailClick(x, y)
     return
   end
   
-  -- Force buttons (around y=dynamic, let's estimate y > h/2)
-  if y > h / 2 then
-    if x >= 2 and x <= 13 then
-      -- Force ON
+  -- Force buttons (use recorded hitboxes)
+  if selectedFactory._forceOnArea then
+    local a = selectedFactory._forceOnArea
+    if y == a.y and x >= a.x1 and x <= a.x2 then
       sendCommand(selectedFactory.id, "ON")
       requestSnap()
-    elseif x >= 15 and x <= 27 then
-      -- Force OFF
+      return
+    end
+  end
+  
+  if selectedFactory._forceOffArea then
+    local a = selectedFactory._forceOffArea
+    if y == a.y and x >= a.x1 and x <= a.x2 then
       sendCommand(selectedFactory.id, "OFF")
       requestSnap()
+      return
     end
   end
 end
@@ -412,8 +402,9 @@ end
 -- Main loop
 --------------------------------------------------------------------------------
 local function main()
-  if not pocket then
-    print("Factory Admin requires a pocket computer")
+  -- Allow pocket or advanced computer + wireless for testing
+  if not pocket and not (term.isColor and term.isColor()) then
+    print("Factory Admin requires a pocket computer or advanced computer")
     return
   end
   
@@ -452,7 +443,8 @@ local function main()
       
     elseif ev == "rednet_message" and (p3 == PROTO or p3 == nil) and type(p2) == "table" then
       local msg, from = p2, p1
-      if msg.type == MSG.FACTORY_ADMIN_SNAP and from == managerId then
+      local t = msg.type
+      if (t == MSG.FACTORY_ADMIN_SNAP or t == "factory_admin_snap") and from == managerId then
         snap = msg
         lastSnap = os.clock()
         draw()

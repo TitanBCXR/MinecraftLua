@@ -1,6 +1,6 @@
 --[[
   storage/managers/storage_manager.lua  -  Create vault rate + fill board
-  Titan-Version: 1.3.0
+  Titan-Version: 1.3.1
 
   Auto-detects every Create item vault on the wired modem network and
   tracks the *joined* pool (not per-vault):
@@ -41,7 +41,7 @@ local MSG = titan and titan.MSG or {}
 local PROTO = (titan and titan.PROTOCOL) or "titan_net"
 local CFG = "storage_manager.cfg"
 local FACTORY_CFG = "factory_control.cfg"
-local VERSION = "1.3.0"
+local VERSION = "1.3.1"
 
 local SCREENS = { "input", "output", "fill" }
 local DEFAULT_SLOT_LIMIT = 512
@@ -1543,13 +1543,13 @@ local function eventLoop()
         pcall(handleFactoryStatus, from, msg)
       elseif t == MSG.FACTORY_ACK then
         pcall(handleFactoryAck, from, msg)
-      elseif t == MSG.FACTORY_ADMIN_REQ then
+      elseif t == MSG.FACTORY_ADMIN_REQ or t == "factory_admin_req" then
         pcall(handleFactoryAdminReq, from, msg)
-      elseif t == MSG.FACTORY_ADMIN_COMMAND then
+      elseif t == MSG.FACTORY_ADMIN_COMMAND or t == "factory_admin_command" then
         pcall(handleFactoryAdminCommand, from, msg)
-      elseif t == MSG.FACTORY_ADMIN_SET then
+      elseif t == MSG.FACTORY_ADMIN_SET or t == "factory_admin_set" then
         pcall(handleFactoryAdminSet, from, msg)
-      elseif t == MSG.FACTORY_ADMIN_MODE then
+      elseif t == MSG.FACTORY_ADMIN_MODE or t == "factory_admin_mode" then
         pcall(handleFactoryAdminMode, from, msg)
       elseif t == "storage_stock_req" or t == MSG.STORAGE_STOCK_REQ then
         if (nowMs() - (cache.updated or 0)) > 5000 then pcall(refresh) end

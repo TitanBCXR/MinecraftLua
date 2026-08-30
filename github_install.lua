@@ -1,6 +1,6 @@
 --[[
   github_install.lua  -  Install the Titan system straight from a GitHub repo
-  Titan-Version: 1.2.22
+  Titan-Version: 1.2.23
 
   Point RAW_BASE at your repo's raw content root, then on each Minecraft device:
 
