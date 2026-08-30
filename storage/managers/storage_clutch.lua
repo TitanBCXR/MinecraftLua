@@ -1,6 +1,6 @@
 --[[
   storage/managers/storage_clutch.lua  -  Storage fill → Create clutch
-  Titan-Version: 1.8.8
+  Titan-Version: 1.8.9
 
   Reads a Sophisticated Storage (or any inventory) over the wired modem
   network and drives Create clutch(es) via redstone.
@@ -53,7 +53,7 @@
 ]]
 
 local LOCAL_CFG = "storage_clutch.cfg"
-local VERSION = "1.8.8"
+local VERSION = "1.8.9"
 
 local cfg = {
   storage = nil,           -- inventory peripheral name
@@ -1569,7 +1569,8 @@ local function cmdRun()
     elseif event == "timer" and p1 == timerId then
       -- Timer expired, loop will check shouldUpdate
     elseif event == "terminate" then
-      error("Terminated", 0)
+      print("\nStopped")
+      return  -- Clean exit to prompt
     end
   end
 end
@@ -1618,45 +1619,68 @@ local function dispatch(line)
 end
 
 --------------------------------------------------------------------------------
-loadCfg()
-if cfg.label and cfg.label ~= "" then
-  pcall(os.setComputerLabel, cfg.label)
-end
+-- Boot and main loop with error handling
+--------------------------------------------------------------------------------
+local function boot()
+  loadCfg()
+  if cfg.label and cfg.label ~= "" then
+    pcall(os.setComputerLabel, cfg.label)
+  end
 
--- Auto-discovery on boot (default on)
-if cfg.autoDiscover ~= false then
-  local report, changed = autoDiscover()
-  if changed and #report > 0 then
-    print(("Storage Clutch v%s — Auto-discovery"):format(VERSION))
-    for _, line in ipairs(report) do
-      print("  " .. line)
+  -- Auto-discovery on boot (default on)
+  if cfg.autoDiscover ~= false then
+    local report, changed = autoDiscover()
+    if changed and #report > 0 then
+      print(("Storage Clutch v%s — Auto-discovery"):format(VERSION))
+      for _, line in ipairs(report) do
+        print("  " .. line)
+      end
+      print()
     end
-    print()
+  end
+
+  -- Restore physical clutch from saved latch before the interactive loop
+  -- (hold band would otherwise wait for the next threshold cross).
+  if isFullyBound() then
+    pcall(setRedstone, cfg.latchedOn)
+  end
+
+  print(("Storage Clutch v%s — type help"):format(VERSION))
+  if cfg.storage or cfg.rsSide or #cfg.integrators > 0 then
+    cmdStatus()
+  end
+
+  -- Auto-start watch loop when fully bound (typical: launched from startup).
+  -- Ctrl+T stops the program (same as manual `run`). Unbound → stay at prompt.
+  if cfg.autoRun ~= false and isFullyBound() then
+    print("Auto-run — Ctrl+T to stop  (autorun off to disable)")
+    cmdRun()
+  end
+
+  while true do
+    write("> ")
+    local line = read()
+    if not line then break end
+    local r = dispatch(line)
+    if r == "exit" then break end
   end
 end
 
--- Restore physical clutch from saved latch before the interactive loop
--- (hold band would otherwise wait for the next threshold cross).
-if isFullyBound() then
-  pcall(setRedstone, cfg.latchedOn)
+-- Error handler for xpcall
+local function errorHandler(err)
+  local trace = debug.traceback(err, 2)
+  return trace
 end
 
-print(("Storage Clutch v%s — type help"):format(VERSION))
-if cfg.storage or cfg.rsSide or #cfg.integrators > 0 then
-  cmdStatus()
-end
-
--- Auto-start watch loop when fully bound (typical: launched from startup).
--- Ctrl+T stops the program (same as manual `run`). Unbound → stay at prompt.
-if cfg.autoRun ~= false and isFullyBound() then
-  print("Auto-run — Ctrl+T to stop  (autorun off to disable)")
-  cmdRun()
-end
-
-while true do
-  write("> ")
-  local line = read()
-  if not line then break end
-  local r = dispatch(line)
-  if r == "exit" then break end
+-- Run with error catching
+local ok, err = xpcall(boot, errorHandler)
+if not ok then
+  if printError then
+    printError(err)
+  else
+    print("\n=== Storage Clutch Error ===")
+    print(err)
+  end
+  print("\nPress Enter to exit")
+  read()
 end

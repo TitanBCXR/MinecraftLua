@@ -44,7 +44,7 @@ return {
     ["factory_clutch.lua"] = "1.1.0",
     ["storage_builder.lua"] = "1.0.0",
     ["storage_atm.lua"] = "1.4.0",
-    ["storage_clutch.lua"] = "1.8.8",
+    ["storage_clutch.lua"] = "1.8.9",
     ["games/managers/currency_manager.lua"] = "1.1.6",
     ["currency_manager.lua"] = "1.1.6",
     ["games/managers/casino_atm.lua"] = "1.1.0",
