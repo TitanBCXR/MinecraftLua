@@ -1,6 +1,6 @@
 --[[
   titan.lua  -  Shared library for the Titan bot network (CC: Tweaked)
-  Titan-Version: 1.2.27
+  Titan-Version: 1.2.28
 
   Provides:
     * Rednet protocol constants + message type enum
@@ -76,6 +76,13 @@ titan.MSG = {
   FACTORY_STATUS   = "factory_status",   -- factory -> manager : heartbeat + state
   FACTORY_COMMAND  = "factory_command",  -- manager -> factory : ON|OFF
   FACTORY_ACK      = "factory_ack",      -- factory -> manager : command received
+  
+  -- Factory Admin (Pocket Tablet <-> Storage Manager)
+  FACTORY_ADMIN_REQ  = "factory_admin_req",  -- tablet -> manager : want snap
+  FACTORY_ADMIN_SNAP = "factory_admin_snap", -- manager -> tablet : full state snapshot
+  FACTORY_ADMIN_COMMAND = "factory_admin_command", -- tablet -> manager : {factoryId, command=ON|OFF}
+  FACTORY_ADMIN_SET  = "factory_admin_set",  -- tablet -> manager : {itemId, maxShare?, daysBuffer?, demandRate?}
+  FACTORY_ADMIN_MODE = "factory_admin_mode", -- tablet -> manager : {factoryMode=true|false}
 
   -- Fleet mine / flatten jobs + Create break permits (Parent Center)
   MINE_JOB        = "mine_job",        -- datacenter -> miner : strip to dig

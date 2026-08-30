@@ -53,7 +53,14 @@
 ]]
 
 local LOCAL_CFG = "storage_clutch.cfg"
-local VERSION = "1.8.10"
+local VERSION = "1.8.11"
+
+-- Load shared UI
+local ui = nil
+if fs.exists("lib/titan_ui.lua") then
+  local ok, t = pcall(dofile, "lib/titan_ui.lua")
+  if ok then ui = t end
+end
 
 local cfg = {
   storage = nil,           -- inventory peripheral name
@@ -513,23 +520,34 @@ local function resolveDisplay()
 end
 
 -- Brass / copper / iron palette (color) with mono fallbacks
+-- Uses shared UI theme colors for factory family consistency
 local function steamPalette(color)
+  -- Use shared UI theme colors when available
+  local THEME = ui and ui.THEME or {
+    accentWarm = colors.orange,
+    ok = colors.lime,
+    bad = colors.red,
+    warn = colors.yellow,
+    dim = colors.gray,
+    muted = colors.lightGray,
+  }
+  
   if color then
     return {
       bg = colors.black,
-      brass = colors.orange,       -- header / primary brass
-      rivet = colors.yellow,       -- polished brass accents
-      iron = colors.lightGray,     -- section rails / labels
-      soot = colors.gray,          -- card rows / tube empty
-      copper = colors.brown,       -- secondary section bars
+      brass = THEME.accentWarm,       -- header / primary brass (orange)
+      rivet = colors.yellow,          -- polished brass accents
+      iron = THEME.muted,             -- section rails / labels
+      soot = THEME.dim,               -- card rows / tube empty
+      copper = colors.brown,          -- secondary section bars
       steam = colors.white,
-      accent = colors.orange,
-      danger = colors.red,
-      ok = colors.lime,
-      warn = colors.yellow,
-      dim = colors.gray,
-      lampOn = colors.lime,        -- RS ON  → green cell
-      lampOff = colors.red,        -- RS OFF → red cell
+      accent = THEME.accentWarm,
+      danger = THEME.bad,
+      ok = THEME.ok,
+      warn = THEME.warn,
+      dim = THEME.dim,
+      lampOn = THEME.ok,              -- RS ON  → green cell
+      lampOff = THEME.bad,            -- RS OFF → red cell
     }
   end
   return {

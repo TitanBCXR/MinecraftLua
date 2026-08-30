@@ -991,6 +991,25 @@ Or: PC redstone face → dust → clutch
 - `test on|off` — force output to verify wiring
 - `help` — command list
 
+### Factory Admin (Pocket Tablet)
+
+**Pocket computer + wireless modem admin interface** (`factory_admin.lua` v1.0.0) — manage all factory systems from the tablet.
+
+Installer: **s → Storage → Managers → 4** (or `wget run` the installer).
+
+**Screens:**
+- **Home**: factory mode toggle, factory list (ON/OFF status, SENDING badge, heartbeat age), vault fill %
+- **Detail**: per-factory outputs/inputs, force ON/OFF buttons
+- **Items**: per-item thresholds (maxShare, daysBuffer, demandRate), tap to edit
+
+**Usage:**
+- **Auto-discovers** Storage Manager on boot via wireless
+- **Refreshes** every 2s (automatic)
+- **Keyboard**: `h` = home, `i` = items, `q` = quit
+- **Tap**: factory row → detail, mode chip → toggle, force buttons → command
+
+All commands go through the Storage Manager (not direct to clutches). Shared UI theme (cyan header, lime ON, red OFF, orange accent) matches factory_clutch and storage_clutch.
+
 **Multi-Item Example:**
 ```
 output minecraft:iron_ingot

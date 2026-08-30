@@ -1,6 +1,6 @@
 --[[
   github_install.lua  -  Install the Titan system straight from a GitHub repo
-  Titan-Version: 1.2.21
+  Titan-Version: 1.2.22
 
   Point RAW_BASE at your repo's raw content root, then on each Minecraft device:
 
@@ -29,7 +29,7 @@ local RAW_BASE = "https://raw.githubusercontent.com/TitanBCXR/MinecraftLua/main/
 -- 2) Roles -> which files they need + what to auto-run (matches the README)
 --==============================================================================
 local KEEP_ALL = {
-  "lib/titan.lua", "datacenter.lua", "console.lua", "admin.lua",
+  "lib/titan.lua", "lib/titan_ui.lua", "datacenter.lua", "console.lua", "admin.lua",
   "router.lua", "router_main.lua", "router_modem.lua",
   "lib/router_hub_net.lua", "lib/router_hub_ui.lua", "lib/router_hub_cmd.lua",
   "quarry/workers/offline_miner.lua", "quarry/workers/strip_miner.lua",
@@ -37,9 +37,9 @@ local KEEP_ALL = {
   "quarry/managers/offline_site.lua",
   "storage/managers/storage_manager.lua", "storage/workers/storage_builder.lua",
   "storage/managers/storage_atm.lua", "storage/managers/storage_clutch.lua",
-  "storage/workers/factory_clutch.lua",
+  "storage/managers/factory_admin.lua", "storage/workers/factory_clutch.lua",
   "storage_manager.lua", "storage_builder.lua", "storage_atm.lua", "storage_clutch.lua",
-  "factory_clutch.lua",
+  "factory_clutch.lua", "factory_admin.lua",
   "offline_miner.lua", "offline_site.lua", "exclude.txt",
   "perimeter_sensor.lua", "perimeter_manager.lua", "tetris.lua", "minesweeper.lua",
   "sandstorm.lua", "luigi_poker.lua", "higher_lower.lua", "slots.lua",
@@ -99,7 +99,7 @@ local STORAGE_WORKERS = {
   { key = "1", name = "Storage builder turtle", run = "storage/workers/storage_builder.lua",
     files = { "lib/titan.lua", "storage/workers/storage_builder.lua", "storage_builder.lua" } },
   { key = "2", name = "Factory Clutch (wireless factory control)", run = "storage/workers/factory_clutch.lua",
-    files = { "lib/titan.lua", "storage/workers/factory_clutch.lua", "factory_clutch.lua" } },
+    files = { "lib/titan.lua", "lib/titan_ui.lua", "storage/workers/factory_clutch.lua", "factory_clutch.lua" } },
 }
 
 local STORAGE_MANAGERS = {
@@ -684,6 +684,8 @@ local function runInstaller()
     ["storage/managers/storage_clutch.lua"] = "StorageClutch",
     ["storage_clutch.lua"] = "StorageClutch",
     ["storage/workers/storage_builder.lua"] = "StorageBuilder",
+    ["storage/workers/factory_clutch.lua"] = "FactoryClutch",
+    ["storage/managers/factory_admin.lua"] = "FactoryAdmin",
     ["perimeter_sensor.lua"] = "PerimSensor",
     ["perimeter_manager.lua"] = "PerimMgr",
     ["tetris.lua"] = "Tetris",

@@ -11,7 +11,8 @@
 return {
   system = "1.7.37",
   packages = {
-    ["lib/titan.lua"]      = "1.2.26",
+    ["lib/titan.lua"]      = "1.2.28",
+    ["lib/titan_ui.lua"]   = "1.0.0",
     ["lib/casino.lua"]     = "1.0.1",
     ["lib/games_economy.lua"] = "1.0.0",
     ["lib/games_music.lua"] = "1.0.0",
@@ -25,7 +26,7 @@ return {
     ["lib/router_hub_ui.lua"]  = "1.4.3",
     ["lib/router_hub_cmd.lua"] = "1.4.3",
     ["install.lua"]        = "1.2.18",
-    ["github_install.lua"] = "1.2.21",
+    ["github_install.lua"] = "1.2.22",
     ["pastebin_install.lua"]= "1.2.18",
     ["datacenter.lua"]     = "1.2.14",
     ["admin.lua"]          = "1.5.13",

@@ -1543,6 +1543,14 @@ local function eventLoop()
         pcall(handleFactoryStatus, from, msg)
       elseif t == MSG.FACTORY_ACK then
         pcall(handleFactoryAck, from, msg)
+      elseif t == MSG.FACTORY_ADMIN_REQ then
+        pcall(handleFactoryAdminReq, from, msg)
+      elseif t == MSG.FACTORY_ADMIN_COMMAND then
+        pcall(handleFactoryAdminCommand, from, msg)
+      elseif t == MSG.FACTORY_ADMIN_SET then
+        pcall(handleFactoryAdminSet, from, msg)
+      elseif t == MSG.FACTORY_ADMIN_MODE then
+        pcall(handleFactoryAdminMode, from, msg)
       elseif t == "storage_stock_req" or t == MSG.STORAGE_STOCK_REQ then
         if (nowMs() - (cache.updated or 0)) > 5000 then pcall(refresh) end
         local rows = filteredRows(msg.filter, tonumber(msg.limit) or 40)
