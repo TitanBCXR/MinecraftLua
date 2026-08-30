@@ -1,6 +1,6 @@
 --[[
   storage/workers/factory_clutch.lua  -  Wireless factory clutch worker
-  Titan-Version: 1.1.0
+  Titan-Version: 1.2.0
 
   A wireless worker that produces items and optionally consumes inputs.
   Listens to the Vault Storage Manager for ON/OFF commands and drives
@@ -35,7 +35,7 @@
 ]]
 
 local LOCAL_CFG = "factory_clutch.cfg"
-local VERSION = "1.1.0"
+local VERSION = "1.2.0"
 
 local titan = nil
 if fs.exists("lib/titan.lua") then
@@ -57,6 +57,7 @@ local cfg = {
   invert = false,          -- true = powered clutch runs (vs stops)
   latchedOn = false,       -- last commanded state (ON = stop feed if not inverted)
   heartbeatSecs = 30,      -- heartbeat interval
+  autoDiscover = true,     -- auto-discovery on boot (default on)
   
   -- Legacy single item (migrated to outputs)
   item = nil,
@@ -118,6 +119,123 @@ local function saveCfg()
 end
 
 loadCfg()
+
+--------------------------------------------------------------------------------
+-- Auto-discovery
+--------------------------------------------------------------------------------
+local SIDES = {
+  left = true, right = true, front = true, back = true, top = true, bottom = true
+}
+
+-- Collect peripheral names matching a predicate (checks sides first, then wired network)
+local function collectNames(pred)
+  local out, seen = {}, {}
+  local function add(n)
+    if seen[n] or not pred(n) then return end
+    seen[n] = true
+    out[#out + 1] = n
+  end
+  
+  -- Check all six sides first
+  for side in pairs(SIDES) do
+    if peripheral.isPresent(side) then
+      add(side)
+    end
+  end
+  
+  -- Then check other local peripherals
+  for _, name in ipairs(peripheral.getNames()) do
+    add(name)
+  end
+  
+  -- Scan wired modem networks (open channel if needed)
+  for _, sideName in ipairs(peripheral.getNames()) do
+    if peripheral.getType(sideName) == "modem" then
+      local m = peripheral.wrap(sideName)
+      if m and not m.isWireless() and type(m.getNamesRemote) == "function" then
+        -- Wired modem - ensure it's open for peripheral scanning
+        if not m.isOpen(65535) then
+          pcall(m.open, 65535)
+        end
+        
+        for _, remoteName in ipairs(m.getNamesRemote() or {}) do
+          add(remoteName)
+        end
+      end
+    end
+  end
+  
+  table.sort(out)
+  return out
+end
+
+local function isIntegrator(name)
+  if not peripheral.isPresent(name) then return false end
+  local t = peripheral.getType(name)
+  return t and t:lower():find("integrator")
+end
+
+local function isInventory(name)
+  if not peripheral.isPresent(name) then return false end
+  local w = peripheral.wrap(name)
+  return w and type(w.list) == "function"
+end
+
+local function autoDiscover()
+  local report = {}
+  local changed = false
+  
+  -- Validate existing integrators (clear if missing)
+  for i = #cfg.integrators, 1, -1 do
+    local int = cfg.integrators[i]
+    if not peripheral.isPresent(int.name) then
+      table.remove(cfg.integrators, i)
+      table.insert(report, ("Removed missing integrator: %s"):format(int.name))
+      changed = true
+    end
+  end
+  
+  -- Validate frog port (clear if missing or not inventory)
+  if cfg.frogPort and cfg.frogPort ~= "" then
+    if not peripheral.isPresent(cfg.frogPort) or not isInventory(cfg.frogPort) then
+      cfg.frogPort = nil
+      table.insert(report, "Removed missing frog port")
+      changed = true
+    end
+  end
+  
+  -- Auto-discover integrators
+  local allIntegrators = collectNames(isIntegrator)
+  for _, name in ipairs(allIntegrators) do
+    local found = false
+    for _, int in ipairs(cfg.integrators) do
+      if int.name == name then found = true; break end
+    end
+    if not found then
+      table.insert(cfg.integrators, {name = name, side = "front"})
+      table.insert(report, ("Added integrator: %s"):format(name))
+      changed = true
+    end
+  end
+  
+  -- Auto-discover frog port (only if unbound and unambiguous)
+  if not cfg.frogPort or cfg.frogPort == "" then
+    local allInventories = collectNames(isInventory)
+    if #allInventories == 1 then
+      cfg.frogPort = allInventories[1]
+      table.insert(report, ("Bound frog port: %s"):format(cfg.frogPort))
+      changed = true
+    elseif #allInventories > 1 then
+      table.insert(report, ("%d inventories found (bind frogport <name> to choose)"):format(#allInventories))
+    end
+  end
+  
+  if changed then
+    saveCfg()
+  end
+  
+  return report, changed
+end
 
 --------------------------------------------------------------------------------
 -- Redstone control
@@ -210,6 +328,7 @@ local function cmdHelp()
   print("  input <minecraft:id>      -- add input item")
   print("  remove output|input <id>  -- remove item")
   print("  manager <computerId>")
+  print("  discover                  -- re-scan peripherals")
   print("  bind redstone <side>")
   print("  bind integrator <name> [side]")
   print("  bind frogport <name>      -- output inventory")
@@ -538,7 +657,31 @@ end
 --------------------------------------------------------------------------------
 -- Main loop
 --------------------------------------------------------------------------------
+local function cmdDiscover()
+  local report, changed = autoDiscover()
+  if #report > 0 then
+    print("Auto-discovery:")
+    for _, line in ipairs(report) do
+      print("  " .. line)
+    end
+  else
+    print("No changes")
+  end
+end
+
 local function main()
+  -- Auto-discovery on boot (default on)
+  if cfg.autoDiscover ~= false then
+    local report, changed = autoDiscover()
+    if changed and #report > 0 then
+      print(("Factory Clutch v%s — Auto-discovery"):format(VERSION))
+      for _, line in ipairs(report) do
+        print("  " .. line)
+      end
+      print()
+    end
+  end
+  
   if #cfg.outputs > 0 and cfg.managerId then
     print(("Factory: %s → Manager %d"):format(table.concat(cfg.outputs, ", "), cfg.managerId))
     print("Type 'run' to start, 'help' for commands")
@@ -564,6 +707,8 @@ local function main()
         cmdHelp()
       elseif cmd == "status" then
         cmdStatus()
+      elseif cmd == "discover" or cmd == "scan" then
+        cmdDiscover()
       elseif cmd == "output" then
         cmdOutput(args)
       elseif cmd == "input" then
