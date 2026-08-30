@@ -1,6 +1,6 @@
 --[[
   github_install.lua  -  Install the Titan system straight from a GitHub repo
-  Titan-Version: 1.2.20
+  Titan-Version: 1.2.21
 
   Point RAW_BASE at your repo's raw content root, then on each Minecraft device:
 
@@ -37,7 +37,9 @@ local KEEP_ALL = {
   "quarry/managers/offline_site.lua",
   "storage/managers/storage_manager.lua", "storage/workers/storage_builder.lua",
   "storage/managers/storage_atm.lua", "storage/managers/storage_clutch.lua",
+  "storage/workers/factory_clutch.lua",
   "storage_manager.lua", "storage_builder.lua", "storage_atm.lua", "storage_clutch.lua",
+  "factory_clutch.lua",
   "offline_miner.lua", "offline_site.lua", "exclude.txt",
   "perimeter_sensor.lua", "perimeter_manager.lua", "tetris.lua", "minesweeper.lua",
   "sandstorm.lua", "luigi_poker.lua", "higher_lower.lua", "slots.lua",
@@ -96,10 +98,12 @@ local QUARRY = {
 local STORAGE_WORKERS = {
   { key = "1", name = "Storage builder turtle", run = "storage/workers/storage_builder.lua",
     files = { "lib/titan.lua", "storage/workers/storage_builder.lua", "storage_builder.lua" } },
+  { key = "2", name = "Factory Clutch (wireless factory control)", run = "storage/workers/factory_clutch.lua",
+    files = { "lib/titan.lua", "storage/workers/factory_clutch.lua", "factory_clutch.lua" } },
 }
 
 local STORAGE_MANAGERS = {
-  { key = "1", name = "Storage Manager (vault rates + fill)", run = "storage/managers/storage_manager.lua",
+  { key = "1", name = "Storage Manager (vault + factory control)", run = "storage/managers/storage_manager.lua",
     files = { "lib/titan.lua", "storage/managers/storage_manager.lua", "storage_manager.lua" } },
   { key = "2", name = "Storage ATM (modem ↔ vault)", run = "storage/managers/storage_atm.lua",
     files = { "storage/managers/storage_atm.lua", "storage_atm.lua" } },

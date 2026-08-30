@@ -25,7 +25,7 @@ return {
     ["lib/router_hub_ui.lua"]  = "1.4.3",
     ["lib/router_hub_cmd.lua"] = "1.4.3",
     ["install.lua"]        = "1.2.17",
-    ["github_install.lua"] = "1.2.20",
+    ["github_install.lua"] = "1.2.21",
     ["pastebin_install.lua"]= "1.2.17",
     ["datacenter.lua"]     = "1.2.14",
     ["admin.lua"]          = "1.5.13",
