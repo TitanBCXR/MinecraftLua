@@ -1,6 +1,6 @@
 --[[
   storage/managers/storage_manager.lua  -  Create vault rate + fill board
-  Titan-Version: 1.2.0
+  Titan-Version: 1.3.0
 
   Auto-detects every Create item vault on the wired modem network and
   tracks the *joined* pool (not per-vault):
@@ -41,7 +41,7 @@ local MSG = titan and titan.MSG or {}
 local PROTO = (titan and titan.PROTOCOL) or "titan_net"
 local CFG = "storage_manager.cfg"
 local FACTORY_CFG = "factory_control.cfg"
-local VERSION = "1.2.0"
+local VERSION = "1.3.0"
 
 local SCREENS = { "input", "output", "fill" }
 local DEFAULT_SLOT_LIMIT = 512
@@ -1123,7 +1123,10 @@ local function handleCommand(line)
       for _ in pairs(factoryCfg.factories) do count = count + 1 end
       print(("Factories (%d):"):format(count))
       for id, f in pairs(factoryCfg.factories) do
-        print(("  #%d %s → %s [%s]"):format(id, f.label, f.item, f.state))
+        local outStr = table.concat(f.outputs or {}, ", ")
+        local inStr = #f.inputs > 0 and (" in=[" .. table.concat(f.inputs, ", ") .. "]") or ""
+        local sendStr = f.sending and " [SENDING]" or ""
+        print(("  #%d %s: out=[%s]%s [%s]%s"):format(id, f.label, outStr, inStr, f.state, sendStr))
       end
     elseif a[2] == "items" then
       local count = 0
@@ -1338,18 +1341,33 @@ local function sendToFactory(factoryId, command)
 end
 
 local function handleFactoryRegister(senderId, msg)
-  if not msg.item or msg.item == "" then return end
+  if not msg.outputs or type(msg.outputs) ~= "table" or #msg.outputs == 0 then
+    -- Legacy single item support
+    if msg.item and msg.item ~= "" then
+      msg.outputs = {msg.item}
+    else
+      return
+    end
+  end
   
   factoryCfg.factories[senderId] = {
-    item = msg.item,
+    outputs = msg.outputs or {},
+    inputs = msg.inputs or {},
     label = msg.label or ("Factory-" .. senderId),
     state = msg.state or "OFF",
+    sending = msg.sending or false,
     lastHeartbeat = os.clock(),
     lastCommand = nil,
   }
   saveFactoryCfg()
   
-  print(("← Factory %d registered: %s"):format(senderId, msg.item))
+  local outStr = table.concat(msg.outputs, ", ")
+  if #msg.inputs > 0 then
+    print(("← Factory %d registered: out=[%s] in=[%s]"):format(
+      senderId, outStr, table.concat(msg.inputs, ", ")))
+  else
+    print(("← Factory %d registered: out=[%s]"):format(senderId, outStr))
+  end
 end
 
 local function handleFactoryStatus(senderId, msg)
@@ -1357,7 +1375,17 @@ local function handleFactoryStatus(senderId, msg)
   if not factory then return end
   
   factory.state = msg.state or factory.state
+  factory.sending = msg.sending or false
   factory.lastHeartbeat = os.clock()
+  
+  -- Update outputs/inputs if provided
+  if msg.outputs and type(msg.outputs) == "table" then
+    factory.outputs = msg.outputs
+  end
+  if msg.inputs and type(msg.inputs) == "table" then
+    factory.inputs = msg.inputs
+  end
+  
   saveFactoryCfg()
 end
 
@@ -1367,35 +1395,74 @@ local function handleFactoryAck(senderId, msg)
   
   factory.state = msg.state or factory.state
   factory.lastCommand = msg.command
+  factory.sending = msg.sending or false
   saveFactoryCfg()
 end
 
 -- Calculate if a factory should be ON or OFF based on vault stock
+-- Multi-item logic:
+--   Turn OFF when: ALL primary outputs are above their buffer thresholds
+--   Turn ON when: ANY output is below its resume threshold OR ANY required input is running low
 local function evaluateFactory(factory)
-  local itemId = factory.item
-  local stock = cache.totals[itemId] or 0
-  local itemCfg = factoryCfg.items[itemId]
+  local outputs = factory.outputs or {}
+  local inputs = factory.inputs or {}
   
-  if not itemCfg then
-    -- No config for this item, default to ON
+  if #outputs == 0 then
+    -- No outputs configured, default to ON
     return "ON"
   end
   
-  local maxShare = itemCfg.maxShare or 0.5  -- default 50% of vault
-  local daysBuffer = itemCfg.daysBuffer or 4  -- default 4 MC days
-  local demandRate = itemCfg.demandRate or 0  -- items per MC day
+  local allOutputsHigh = true
+  local anyOutputLow = false
+  local anyInputLow = false
   
-  -- Calculate thresholds
-  local maxAllowed = math.floor(cache.cap * maxShare)
-  local bufferNeeded = math.floor(demandRate * daysBuffer)
+  -- Check outputs
+  for _, itemId in ipairs(outputs) do
+    local stock = cache.totals[itemId] or 0
+    local itemCfg = factoryCfg.items[itemId] or {}
+    
+    local maxShare = itemCfg.maxShare or 0.5  -- default 50% of vault
+    local daysBuffer = itemCfg.daysBuffer or 4  -- default 4 MC days
+    local demandRate = itemCfg.demandRate or 0  -- items per MC day
+    
+    local maxAllowed = math.floor(cache.cap * maxShare)
+    local bufferNeeded = math.floor(demandRate * daysBuffer)
+    local resumeThreshold = math.floor(bufferNeeded * 0.75)
+    
+    -- Output is "high" if above buffer OR above maxAllowed
+    if stock < bufferNeeded and stock < maxAllowed then
+      allOutputsHigh = false
+    end
+    
+    -- Output is "low" if below resume threshold
+    if stock <= resumeThreshold then
+      anyOutputLow = true
+    end
+  end
   
-  -- If stock exceeds buffer OR maxAllowed, turn OFF
-  -- If stock is below 75% of buffer, turn ON
-  local resumeThreshold = math.floor(bufferNeeded * 0.75)
+  -- Check inputs (if stock is low, turn factory ON to keep producing inputs for others)
+  for _, itemId in ipairs(inputs) do
+    local stock = cache.totals[itemId] or 0
+    local itemCfg = factoryCfg.items[itemId] or {}
+    
+    local daysBuffer = itemCfg.daysBuffer or 4
+    local demandRate = itemCfg.demandRate or 0
+    local bufferNeeded = math.floor(demandRate * daysBuffer)
+    local resumeThreshold = math.floor(bufferNeeded * 0.75)
+    
+    -- Input is "low" if below resume threshold (need to keep producers running)
+    if stock <= resumeThreshold then
+      anyInputLow = true
+    end
+  end
   
-  if stock >= bufferNeeded or stock >= maxAllowed then
+  -- Decision logic:
+  -- Turn OFF: all outputs above buffer
+  -- Turn ON: any output low OR any input low
+  -- Hold: hysteresis band
+  if allOutputsHigh then
     return "OFF"
-  elseif stock <= resumeThreshold then
+  elseif anyOutputLow or anyInputLow then
     return "ON"
   else
     -- Hysteresis band: keep current state
