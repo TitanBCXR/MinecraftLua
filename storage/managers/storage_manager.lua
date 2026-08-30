@@ -1399,6 +1399,85 @@ local function handleFactoryAck(senderId, msg)
   saveFactoryCfg()
 end
 
+--------------------------------------------------------------------------------
+-- Factory Admin Protocol
+--------------------------------------------------------------------------------
+local function factoryAdminSnap()
+  local factories = {}
+  for id, f in pairs(factoryCfg.factories or {}) do
+    factories[#factories + 1] = {
+      id = id,
+      label = f.label,
+      outputs = f.outputs or {},
+      inputs = f.inputs or {},
+      state = f.state or "OFF",
+      sending = f.sending and true or false,
+      lastHeartbeat = f.lastHeartbeat,
+      lastCommand = f.lastCommand,
+    }
+  end
+  table.sort(factories, function(a, b) return (a.id or 0) < (b.id or 0) end)
+  local items = {}
+  for itemId, icfg in pairs(factoryCfg.items or {}) do
+    items[#items + 1] = {
+      itemId = itemId,
+      maxShare = icfg.maxShare or 0.5,
+      daysBuffer = icfg.daysBuffer or 4,
+      demandRate = icfg.demandRate or 0,
+      stock = (cache.totals or {})[itemId] or 0,
+    }
+  end
+  table.sort(items, function(a, b) return tostring(a.itemId) < tostring(b.itemId) end)
+  return {
+    type = "factory_admin_snap",
+    from = os.getComputerID(),
+    factoryMode = cfg.factoryMode and true or false,
+    fillPct = cache.pct or 0,
+    itemsTotal = cache.items,
+    cap = cache.cap,
+    factories = factories,
+    items = items,
+  }
+end
+
+local function sendFactoryAdminSnap(toId)
+  rednet.send(toId, factoryAdminSnap(), PROTO)
+end
+
+local function handleFactoryAdminReq(from)
+  sendFactoryAdminSnap(from)
+end
+
+local function handleFactoryAdminCommand(from, msg)
+  local fid = tonumber(msg and msg.factoryId)
+  local cmd = tostring(msg and msg.command or ""):upper()
+  if fid and (cmd == "ON" or cmd == "OFF") then
+    sendToFactory(fid, cmd)
+    local f = factoryCfg.factories[fid]
+    if f then f.state = cmd; f.lastCommand = cmd; saveFactoryCfg() end
+  end
+  sendFactoryAdminSnap(from)
+end
+
+local function handleFactoryAdminSet(from, msg)
+  local itemId = msg and msg.itemId
+  if type(itemId) == "string" and itemId ~= "" then
+    factoryCfg.items[itemId] = factoryCfg.items[itemId] or {}
+    local icfg = factoryCfg.items[itemId]
+    if msg.maxShare ~= nil then icfg.maxShare = math.max(0.01, math.min(1, tonumber(msg.maxShare) or icfg.maxShare or 0.5)) end
+    if msg.daysBuffer ~= nil then icfg.daysBuffer = math.max(0.1, tonumber(msg.daysBuffer) or icfg.daysBuffer or 4) end
+    if msg.demandRate ~= nil then icfg.demandRate = math.max(0, tonumber(msg.demandRate) or icfg.demandRate or 0) end
+    saveFactoryCfg()
+  end
+  sendFactoryAdminSnap(from)
+end
+
+local function handleFactoryAdminMode(from, msg)
+  cfg.factoryMode = msg and (msg.factoryMode == true or msg.factoryMode == "on")
+  saveCfg()
+  sendFactoryAdminSnap(from)
+end
+
 -- Calculate if a factory should be ON or OFF based on vault stock
 -- Multi-item logic:
 --   Turn OFF when: ALL primary outputs are above their buffer thresholds
