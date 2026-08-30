@@ -1689,6 +1689,7 @@ if not openModem() then
   printError("No modem — attach a wired modem to the vault cable.")
 end
 loadCfg()
+loadFactoryCfg()
 os.setComputerLabel(os.getComputerLabel() or cfg.label or ("StorageManager-" .. os.getComputerID()))
 cfg.label = os.getComputerLabel()
 saveCfg()
