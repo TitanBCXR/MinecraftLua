@@ -1,6 +1,6 @@
 --[[
   storage/managers/storage_clutch.lua  -  Storage fill → Create clutch
-  Titan-Version: 1.8.9
+  Titan-Version: 1.8.10
 
   Reads a Sophisticated Storage (or any inventory) over the wired modem
   network and drives Create clutch(es) via redstone.
@@ -53,7 +53,7 @@
 ]]
 
 local LOCAL_CFG = "storage_clutch.cfg"
-local VERSION = "1.8.9"
+local VERSION = "1.8.10"
 
 local cfg = {
   storage = nil,           -- inventory peripheral name
@@ -255,7 +255,7 @@ end
 
 local function findMonitor()
   -- Prefer directly attached monitor (sides), then scan wired network
-  -- Check local peripherals first
+  -- Check local peripherals first (includes side-attached and already-networked)
   for _, name in ipairs(peripheral.getNames()) do
     local ptype = peripheral.getType(name)
     if ptype == "monitor" then
@@ -263,11 +263,16 @@ local function findMonitor()
     end
   end
   
-  -- Scan wired modems for remote monitors
+  -- Scan wired modems for remote monitors (open modem if needed for getNamesRemote)
   for _, sideName in ipairs(peripheral.getNames()) do
     if peripheral.getType(sideName) == "modem" then
       local m = peripheral.wrap(sideName)
-      if m and type(m.getNamesRemote) == "function" then
+      if m and not m.isWireless() and type(m.getNamesRemote) == "function" then
+        -- Wired modem - ensure it's open for network scanning
+        if not m.isOpen(65535) then
+          pcall(m.open, 65535)  -- Open a channel so getNamesRemote works
+        end
+        
         for _, remoteName in ipairs(m.getNamesRemote() or {}) do
           if peripheral.getType(remoteName) == "monitor" then
             return peripheral.wrap(remoteName)
@@ -1507,10 +1512,14 @@ local function cmdRun()
         touchAreas = areas
       end
       
-      -- Monitor exists: silent console, all UI on monitor
-      -- No monitor: term shows board (existing fallback)
-      if not ok and not hasMonitor then
-        pcall(drawMonitor, nil, nil)
+      -- Error handling: if applyOnce failed and no monitor, try to draw error state
+      if not ok then
+        if not hasMonitor then
+          pcall(drawMonitor, nil, nil)
+        else
+          -- Monitor exists but applyOnce failed - print visible error to console
+          print(("Error: %s"):format(tostring(fill)))
+        end
       end
       
       lastUpdate = now
