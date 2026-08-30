@@ -939,7 +939,7 @@ Unlike `storage_clutch` (local fill-based control), the Factory Control System u
 
 ### Factory Clutch (Wireless Worker)
 
-**New script: `factory_clutch.lua` (v1.1.0)** — wireless worker that produces items and optionally consumes inputs, obeys manager commands.
+**New script: `factory_clutch.lua` (v1.2.0)** — wireless worker that produces items and optionally consumes inputs, obeys manager commands.
 
 Installer: **s → Storage → Workers → 2** (or `wget run` the installer).
 
@@ -954,24 +954,31 @@ Or: PC redstone face → dust → clutch
 
 **Frog Port:** An output inventory (chest, funnel, depot, etc.) that the factory monitors for active item transfers. When the frog port has items, the clutch reports `sending=true` to the manager, letting it know a transfer is in-flight without constant vault scanning.
 
-**Factory Setup:**
+**Factory Setup (v1.2.0+):**
 
-1. `output minecraft:iron_ingot` — add output item this factory produces (repeat for multiple outputs)
-2. (optional) `input minecraft:iron_ore` — add input item this factory consumes (repeat for multiple inputs)
-3. `manager <computerId>` — bind to manager computer ID (find with `id` on manager PC)
-4. `bind integrator <name> [side]` — bind Redstone Integrator outputs
+1. **Boot PC** — auto-discovery runs on startup:
+   - Finds all Redstone Integrators (wired network + direct sides)
+   - Auto-binds frog port if exactly one inventory present
+   - Validates existing bindings, removes missing peripherals
+   - Prints discovery report when changes occur
+2. `output minecraft:iron_ingot` — add output item this factory produces (repeat for multiple outputs)
+3. (optional) `input minecraft:iron_ore` — add input item this factory consumes (repeat for multiple inputs)
+4. `manager <computerId>` — bind to manager computer ID (find with `id` on manager PC)
+5. (optional) `discover` — manually re-scan peripherals
+6. (optional) `bind integrator <name> [side]` — manually add Redstone Integrator
    - Or `bind redstone <side>` for local PC face
-5. (optional) `bind frogport <name>` — bind output inventory for transfer notify
-6. (optional) `invert on` — if powered clutch = run (vs stop)
-7. (optional) `label Iron Smelter` — friendly name for manager
-8. `register` — send FACTORY_REGISTER to manager
-9. `run` — start listening for manager commands (Ctrl+T to stop)
+7. (optional) `bind frogport <name>` — manually bind output inventory for transfer notify
+8. (optional) `invert on` — if powered clutch = run (vs stop)
+9. (optional) `label Iron Smelter` — friendly name for manager
+10. `register` — send FACTORY_REGISTER to manager
+11. `run` — start listening for manager commands (Ctrl+T to stop)
 
 **Commands:**
 - `output <minecraft:id>` — add output item this factory produces
 - `input <minecraft:id>` — add input item this factory consumes
 - `remove output|input <id>` — remove item from outputs or inputs
 - `manager <computerId>` — bind to manager computer ID
+- `discover` — manually re-scan peripherals (integrators, frog port)
 - `bind redstone <side>` — add local PC face redstone output
 - `bind integrator <name> [side]` — add Redstone Integrator (default side: front)
 - `bind frogport <name>` — bind output inventory for transfer notify
