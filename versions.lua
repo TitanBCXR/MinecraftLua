@@ -38,7 +38,7 @@ return {
     ["storage/managers/storage_manager.lua"] = "1.3.0",
     ["storage/workers/storage_builder.lua"] = "1.0.0",
     ["storage/managers/storage_atm.lua"] = "1.4.0",
-    ["storage/managers/storage_clutch.lua"] = "1.8.8",
+    ["storage/managers/storage_clutch.lua"] = "1.8.9",
     ["storage_manager.lua"] = "1.3.0",
     ["storage/workers/factory_clutch.lua"] = "1.1.0",
     ["factory_clutch.lua"] = "1.1.0",
