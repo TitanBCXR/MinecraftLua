@@ -1,6 +1,6 @@
 --[[
   storage/managers/factory_admin.lua  -  Factory Admin pocket tablet
-  Titan-Version: 1.0.1
+  Titan-Version: 1.0.2
 
   Pocket computer + wireless modem admin interface for factory control.
   Manage ALL factory systems from the tablet (not SSH, not generic admin).
@@ -29,7 +29,7 @@ end
 
 local MSG = titan and titan.MSG or {}
 local PROTO = (titan and titan.PROTOCOL) or "titan_net"
-local VERSION = "1.0.1"
+local VERSION = "1.0.2"
 
 titan.openModem()
 
@@ -137,8 +137,11 @@ local function drawHome()
   
   ui.clearScreen(out)
   
-  -- Header (fillPct is already 0-100, don't multiply)
-  local fillStr = snap and snap.fillPct and ("%d%%"):format(math.floor(snap.fillPct)) or "?"
+  -- Header (fillPct is already 0-100)
+  local fillStr = "?"
+  if snap and snap.fillPct then
+    fillStr = math.floor(snap.fillPct + 0.5) .. "%"
+  end
   ui.headerBar(out, "FACTORY ADMIN", fillStr)
   
   -- Factory mode toggle
@@ -402,9 +405,19 @@ end
 -- Main loop
 --------------------------------------------------------------------------------
 local function main()
-  -- Allow pocket or advanced computer + wireless for testing
-  if not pocket and not (term.isColor and term.isColor()) then
-    print("Factory Admin requires a pocket computer or advanced computer")
+  -- Require wireless modem for rednet communication
+  local hasWireless = false
+  for _, side in ipairs(peripheral.getNames()) do
+    if peripheral.getType(side) == "modem" then
+      local m = peripheral.wrap(side)
+      if m and m.isWireless and m.isWireless() then
+        hasWireless = true
+        break
+      end
+    end
+  end
+  if not hasWireless then
+    print("Factory Admin requires a wireless modem")
     return
   end
   

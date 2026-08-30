@@ -1,6 +1,6 @@
 --[[
   github_install.lua  -  Install the Titan system straight from a GitHub repo
-  Titan-Version: 1.2.23
+  Titan-Version: 1.2.24
 
   Point RAW_BASE at your repo's raw content root, then on each Minecraft device:
 
@@ -104,11 +104,13 @@ local STORAGE_WORKERS = {
 
 local STORAGE_MANAGERS = {
   { key = "1", name = "Storage Manager (vault + factory control)", run = "storage/managers/storage_manager.lua",
-    files = { "lib/titan.lua", "storage/managers/storage_manager.lua", "storage_manager.lua" } },
+    files = { "lib/titan.lua", "lib/titan_ui.lua", "storage/managers/storage_manager.lua", "storage_manager.lua" } },
   { key = "2", name = "Storage ATM (modem ↔ vault)", run = "storage/managers/storage_atm.lua",
     files = { "storage/managers/storage_atm.lua", "storage_atm.lua" } },
   { key = "3", name = "Storage Clutch (fill → redstone)", run = "storage/managers/storage_clutch.lua",
-    files = { "storage/managers/storage_clutch.lua", "storage_clutch.lua" } },
+    files = { "lib/titan.lua", "lib/titan_ui.lua", "storage/managers/storage_clutch.lua", "storage_clutch.lua" } },
+  { key = "4", name = "Factory Admin (pocket tablet)", run = "storage/managers/factory_admin.lua",
+    files = { "lib/titan.lua", "lib/titan_ui.lua", "storage/managers/factory_admin.lua", "factory_admin.lua" } },
 }
 
 local STORAGE = {

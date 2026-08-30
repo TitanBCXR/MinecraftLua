@@ -1,6 +1,6 @@
 --[[
   storage/managers/storage_manager.lua  -  Create vault rate + fill board
-  Titan-Version: 1.3.1
+  Titan-Version: 1.3.2
 
   Auto-detects every Create item vault on the wired modem network and
   tracks the *joined* pool (not per-vault):
@@ -41,7 +41,7 @@ local MSG = titan and titan.MSG or {}
 local PROTO = (titan and titan.PROTOCOL) or "titan_net"
 local CFG = "storage_manager.cfg"
 local FACTORY_CFG = "factory_control.cfg"
-local VERSION = "1.3.1"
+local VERSION = "1.3.2"
 
 local SCREENS = { "input", "output", "fill" }
 local DEFAULT_SLOT_LIMIT = 512
@@ -1635,8 +1635,6 @@ print("Type help.")
 
 if cfg.factoryMode then
   print("Factory control: ENABLED")
-  parallel.waitForAny(consoleLoop, eventLoop, ingestLoop, factoryLoop)
-else
-  parallel.waitForAny(consoleLoop, eventLoop, ingestLoop)
 end
+parallel.waitForAny(consoleLoop, eventLoop, ingestLoop, factoryLoop)
 print("Storage manager closed.")
